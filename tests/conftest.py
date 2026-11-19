@@ -1,0 +1,34 @@
+import logging
+import os
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+pytest_plugins = ["pytester"]
+
+_SOCKET_MARKERS = ("network", "slow", "llm")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    for item in items:
+        if any(item.get_closest_marker(m) for m in _SOCKET_MARKERS):
+            item.add_marker(pytest.mark.enable_socket)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for key in list(os.environ):
+        if key.startswith("EARMARK_"):
+            monkeypatch.delenv(key)
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture
+def restore_root_logging() -> Iterator[None]:
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    level = root.level
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)

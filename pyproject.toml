@@ -1,0 +1,103 @@
+[project]
+name = "earmark"
+version = "0.1.0"
+description = "Share a podcast episode, get a research note."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "fastapi>=0.165.0",
+  "uvicorn>=0.54.0",
+  "pydantic>=2.14.4",
+  "pydantic-settings>=2.16.3",
+  "httpx2>=2.16.2",
+  "typer>=0.29.2",
+  "tzdata>=2026.6",
+]
+
+[project.optional-dependencies]
+transcribe = []   # step 08: faster-whisper
+index = []        # step 14: lancedb, fastembed
+
+[project.scripts]
+earmark = "earmark.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=9.2.0",
+  "pytest-socket>=0.8.1",
+  "ruff>=0.17.6",
+  "mypy>=2.4.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# Lock fails if any dependency ships wheels but none for the deployment platform
+# (DGX Spark, linux/aarch64). See docs/steps/01-scaffold.md section 2.1.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
+
+[tool.pytest]
+minversion = "9.0"
+testpaths = ["tests"]
+strict = true
+addopts = [
+  "-ra",
+  "--disable-socket",
+  "--allow-unix-socket",          # asyncio/TestClient need an AF_UNIX socketpair
+  # NOTE: a command-line -m REPLACES this expression (last -m wins). `-m network` runs only
+  # network tests, but `-m "not slow"` would also include network, llm, and gpu tests.
+  "-m", "not network and not slow and not llm and not gpu",
+]
+markers = [
+  "network: hits real external endpoints (Apple, podcast feeds)",
+  "slow: downloads a model or does CPU-heavy work",
+  "llm: calls the real analysis model",
+  "gpu: needs CUDA",
+]
+filterwarnings = [
+  "error",
+  # pytest-socket warns before raising SocketBlockedError; under "error" the warning
+  # would replace the exception. The exception itself is still raised.
+  "ignore:A test tried to use socket:UserWarning",
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+enable_error_code = [
+  "ignore-without-code",
+  "redundant-expr",
+  "truthy-bool",
+  "possibly-undefined",
+  "deprecated",
+]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "DTZ", "T20", "PT", "PIE", "RET",
+  "SIM", "PTH", "S", "BLE", "LOG", "G", "ASYNC", "FAST", "PGH", "PERF", "RUF",
+]
+# Not selected on purpose: PL (PLC0415 conflicts with lazy imports of heavy deps),
+# TC (moves runtime-needed annotations under TYPE_CHECKING; breaks pydantic/typer/FastAPI).
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "S603"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+mark-parentheses = false

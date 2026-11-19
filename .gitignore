@@ -8,3 +8,9 @@ __pycache__/
 .ruff_cache/
 dist/
 /data/
+*.egg-info/
+build/
+.coverage
+htmlcov/
+.env.*
+!.env.example

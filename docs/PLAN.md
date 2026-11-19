@@ -11,7 +11,7 @@ Update this table when a step passes verification. Each step is one commit title
 
 | Step | Title | Depends on | Status |
 |---|---|---|---|
-| 01 | Scaffold, tooling, config | — | todo |
+| 01 | Scaffold, tooling, config | — | done |
 | 02 | Core contracts and fakes | 01 | todo |
 | 03 | Job store | 02 | todo |
 | 04 | Ingest API | 03 | todo |
@@ -83,7 +83,7 @@ the sandbox (GPU, Docker, live credentials) to the user after each step.
 
 **Build.**
 - `pyproject.toml` with a src layout, the `earmark` console script, runtime dependencies
-  (fastapi, uvicorn, pydantic, pydantic-settings, httpx, typer), a dev group (pytest,
+  (fastapi, uvicorn, pydantic, pydantic-settings, httpx2, typer), a dev group (pytest,
   pytest-socket, ruff, mypy), and empty `transcribe` and `index` extras to be filled later.
 - `Makefile` with `check`, `test`, `lint`, `fmt`, `typecheck`.
 - `earmark.config.Settings` with every variable in the architecture's configuration

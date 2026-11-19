@@ -19,7 +19,7 @@ backend, not the pipeline.
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process, with a remote OpenAI-compatible ASR endpoint as the alternative (step 09). | `EARMARK_ASR_BACKEND`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
-| Language and tooling | Python ≥ 3.12, uv, FastAPI, pydantic, httpx, typer, stdlib `sqlite3`. Sync code throughout the worker. | — |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`), typer, stdlib `sqlite3`. Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
@@ -47,7 +47,10 @@ Shortcut always gets its 202 in milliseconds.
 
 ```
 src/earmark/
-  config.py            Settings (pydantic-settings, EARMARK_* env, .env)
+  __init__.py          __version__ only; importing earmark loads nothing heavy
+  __main__.py          `python -m earmark`
+  config.py            Settings (pydantic-settings, EARMARK_* env, .env), load_settings, ConfigError
+  log.py               configure_logging: stderr handler with a secret-redacting formatter
   models.py            domain models
   errors.py            TransientError, PermanentError, SkipEpisode
   artifacts.py         ArtifactStore: per-episode cache paths, atomic writes
@@ -101,17 +104,31 @@ fixes them.
 
 ```python
 class Resolver(Protocol):
-    def resolve(self, url: str) -> Episode: ...          # raises SkipEpisode if no public feed
+    def resolve(self, url: str) -> Episode: ...  # raises SkipEpisode if no public feed
+
+
 class AudioFetcher(Protocol):
     def fetch(self, episode: Episode) -> Path: ...
+
+
 class Transcriber(Protocol):
     def transcribe(self, episode: Episode, audio: Path) -> Transcript: ...
+
+
 class Analyzer(Protocol):
     def analyze(self, episode: Episode, transcript: Transcript, prompt: str | None) -> Analysis: ...
+
+
 class Store(Protocol):
-    def store(self, episode: Episode, transcript: Transcript, analyses: list[Analysis]) -> StoreResult: ...
+    def store(
+        self, episode: Episode, transcript: Transcript, analyses: list[Analysis]
+    ) -> StoreResult: ...
+
+
 class Indexer(Protocol):
     def index(self, episode: Episode, transcript: Transcript, analyses: list[Analysis]) -> None: ...
+
+
 class Notifier(Protocol):
     def notify(self, job: Job, episode: Episode | None) -> None: ...
 ```
@@ -191,30 +208,46 @@ in constant time. The service refuses to start with an empty token.
 
 ## Configuration
 
-Environment variables, `EARMARK_` prefix, also read from `.env`. Step 01 defines all of
-them with defaults so later steps only read settings.
+Environment variables, `EARMARK_` prefix, also read from `.env` in the working
+directory (real environment variables win over `.env`). Step 01 defines all of them with
+defaults so later steps only read settings. An empty value (`EARMARK_X=`) means unset
+and takes the default. Unknown `EARMARK_*` keys are ignored, not rejected, because a
+shared `.env` may hold other tools' keys. `Settings` is frozen.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `API_TOKEN` | required to serve | Bearer token for the API |
+| `API_TOKEN` | unset; required to serve (step 04) | Bearer token for the API (secret) |
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | API bind address |
 | `DATA_DIR` | `./data` | Database, artifacts, index |
-| `VAULT_DIR`, `VAULT_SUBDIR` | required for the vault store, `Earmark` | Where notes go |
+| `VAULT_DIR`, `VAULT_SUBDIR` | unset (required for the vault store), `Earmark` | Where notes go. The subdir is a relative path without `..` |
 | `OBSIDIAN_VAULT_NAME` | unset | Enables `obsidian://` links in notifications |
-| `RESOLVER_BACKEND`, `FETCH_BACKEND`, `ASR_BACKEND`, `LLM_PROVIDER`, `STORE_BACKEND`, `INDEX_BACKEND`, `NOTIFY_BACKEND` | real backends | Each accepts `fake`; index and notify accept `none` |
-| `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, auto-detect | faster-whisper options |
-| `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset | Remote ASR backend |
+| `RESOLVER_BACKEND` | `apple` | `apple`, `fake` |
+| `FETCH_BACKEND` | `http` | `http`, `fake` |
+| `ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, `fake` |
+| `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai_compat`, `fake` |
+| `STORE_BACKEND` | `vault` | `vault`, `fake` |
+| `INDEX_BACKEND` | `lancedb` | `lancedb`, `fake`, `none` |
+| `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing |
+| `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options |
+| `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset (no upload limit) | Remote ASR backend (key is secret) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
 | `LLM_MODEL` | `claude-opus-5-5` | Analysis model |
-| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_CONTEXT_TOKENS` | unset | Local LLM endpoint and its context budget |
-| `EMBED_MODEL` | a small local model | Embedding model |
-| `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token |
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_CONTEXT_TOKENS` | unset | Local LLM endpoint and its context budget (key is secret) |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (fastembed's default; step 14 may revise) |
+| `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
 | `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
-| `TZ` | system | Timezone for note dates and digests |
+| `TZ` | unset (system) | IANA zone for note dates and digests, validated at load |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive) |
+
+Backend names are `Literal` types, so a misspelt name fails when settings load, naming
+the variable. A name that is valid but whose backend is not built yet is rejected by
+`pipeline/factory.py` (step 05).
 
 The Anthropic credential is read by the `anthropic` SDK from its own environment
-(`ANTHROPIC_API_KEY` or a stored profile), not from an `EARMARK_` variable.
+(`ANTHROPIC_API_KEY` or a stored profile), not from an `EARMARK_` variable. Note that
+pydantic-settings does not export `.env` entries to the process environment, so an
+`ANTHROPIC_API_KEY` line in `.env` is not seen by the SDK unless step 10 arranges it.
 
 ## Security
 
@@ -239,7 +272,11 @@ and writes into a vault the user cares about.
 
 `make check` runs ruff, ruff format check, mypy (strict), and pytest. The default suite
 needs no network, GPU, or credentials; `pytest-socket` blocks sockets so a test that
-reaches out fails. Opt-in markers:
+reaches out fails. Unix-domain sockets stay allowed (`--allow-unix-socket`) because the
+asyncio event loop, and so FastAPI's `TestClient`, needs a socketpair. Tests carrying
+`network`, `slow`, or `llm` get sockets back automatically (`tests/conftest.py`). The
+default `-m` expression deselects all four markers; passing `-m` on the command line
+replaces it, so `-m network` runs only network tests. Opt-in markers:
 
 - `network`: hits real Apple and feed endpoints.
 - `slow`: downloads a small Whisper model and transcribes a short clip on CPU.
@@ -257,13 +294,20 @@ Step planners should check these against current documentation instead of assumi
 1. **faster-whisper on the DGX Spark.** CTranslate2's published aarch64 wheels may be
    CPU-only, in which case GPU transcription on the Spark needs a source build or a
    different engine. Step 09's remote ASR backend exists so the worker can call whatever
-   GPU server runs well there (a Whisper server, or Parakeet).
+   GPU server runs well there (a Whisper server, or Parakeet). Step 01 found (2026-11-19)
+   that the `ctranslate2 4.9.0` cp313 manylinux aarch64 wheel links no CUDA libraries
+   (`readelf -d` lists only libc, libstdc++, libgomp, and similar) and reports
+   `get_supported_compute_types('cpu') == {float32, int8, int8_float32}`. Step 08 should
+   treat the PyPI wheel as CPU-only on aarch64.
 2. **iTunes Lookup window.** Verified on 2026-11-19: `lookup?id=<show>&entity=podcastEpisode`
    returns the show record with `feedUrl`, then episode records with `trackId` (the `?i=`
    value), `episodeGuid`, `episodeUrl`, `trackName`, `releaseDate`, and
    `trackTimeMillis`. Not verified: the maximum `limit`, and how to identify an episode
    older than the returned window.
 3. **Wheels on aarch64 and Python 3.13** for ctranslate2, lancedb, onnxruntime, and
-   fastembed. If one is missing, pin Python 3.12 before swapping libraries.
+   fastembed. Resolved in step 01 (2026-11-19): all have cp313 (or abi3/pure) manylinux
+   aarch64 wheels, install with `--only-binary :all:`, and import on this sandbox. Python
+   is pinned to 3.13. onnxruntime 1.32 has no cp315 wheels, which is why
+   `requires-python` carries an upper bound. See `docs/steps/01-scaffold.md`.
 4. **Container and GPU paths cannot be exercised in the dev sandbox.** They are reviewed
    statically and verified on the homelab.
