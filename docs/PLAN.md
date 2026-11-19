@@ -12,7 +12,7 @@ Update this table when a step passes verification. Each step is one commit title
 | Step | Title | Depends on | Status |
 |---|---|---|---|
 | 01 | Scaffold, tooling, config | — | done |
-| 01a | CI: the gate on every push | 01 | todo |
+| 01a | CI: the gate on every push | 01 | done |
 | 02 | Core contracts and fakes | 01 | todo |
 | 03 | Job store | 02 | todo |
 | 04 | Ingest API | 03 | todo |

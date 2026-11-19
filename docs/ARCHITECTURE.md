@@ -287,6 +287,33 @@ With every backend set to `fake`, the whole service runs in the sandbox:
 `earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears. Verifiers
 use this as the live smoke test from step 05 onward.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and `impl` and on every pull
+request. One job on a GitHub-hosted `ubuntu-24.04-arm` runner (linux/aarch64, the
+deployment architecture; free for public repositories) checks out the code, installs uv
+with `astral-sh/setup-uv` (uv cache and the managed Python cached, keyed on `uv.lock`),
+then runs exactly `uv sync --locked` and `make check`. Python comes from
+`.python-version` through uv, never from the workflow. A newer push to the same ref
+cancels the run in progress, and the job times out after 15 minutes.
+
+CI runs the default suite only. It does **not** run the opt-in markers (`network`,
+`slow`, `llm`, `gpu`), does not install the `transcribe` or `index` extras, never runs
+on a GPU, and does not build or run the container. Later steps add separate workflows:
+a scheduled and manual run of `-m network` (step 07) and `-m slow` with the `transcribe`
+extra (step 08), a manual-only `-m llm` run that reads its key from a GitHub environment
+secret (step 10), and an arm64 container build without push (step 16). None of those is
+a required check.
+
+Rules for every workflow under `.github/workflows/`, enforced by `tests/test_ci.py`: it
+passes `actionlint` (installed by the `actionlint-py` dev dependency and run offline by
+the test suite), every `uses:` of a remote action is pinned to a full 40-character commit
+SHA followed by a `# vX.Y.Z` comment, it declares a top-level `permissions` block, and it
+never uses `pull_request_target`. `ci.yml` additionally gets only `contents: read` and
+references no secrets. Dependabot (`.github/dependabot.yml`) proposes weekly updates for
+the `uv` and `github-actions` ecosystems; it reads its config from the default branch
+(`main`) and opens pull requests against it.
+
 ## Known risks
 
 Step planners should check these against current documentation instead of assuming.

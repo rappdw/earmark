@@ -27,6 +27,9 @@ dev = [
   "pytest-socket>=0.8.1",
   "ruff>=0.17.6",
   "mypy>=2.4.1",
+  "actionlint-py>=1.7.12.25",
+  "pyyaml>=6.0.3",
+  "types-pyyaml>=6.0.12.20261113",
 ]
 
 [build-system]
