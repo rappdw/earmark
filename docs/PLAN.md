@@ -1,6 +1,6 @@
 # Implementation plan
 
-Eighteen steps, each small enough for one implementer and checkable in the dev sandbox.
+Nineteen steps, each small enough for one implementer and checkable in the dev sandbox.
 Read `docs/ARCHITECTURE.md` first; this file says what to build in what order, that file
 says how the pieces fit.
 
@@ -12,6 +12,7 @@ Update this table when a step passes verification. Each step is one commit title
 | Step | Title | Depends on | Status |
 |---|---|---|---|
 | 01 | Scaffold, tooling, config | — | done |
+| 01a | CI: the gate on every push | 01 | todo |
 | 02 | Core contracts and fakes | 01 | todo |
 | 03 | Job store | 02 | todo |
 | 04 | Ingest API | 03 | todo |
@@ -34,6 +35,11 @@ Steps 01–05 are strictly sequential and end with a walking skeleton: the whole
 running end to end on fakes. After that, each step replaces one fake with a real
 backend. The chains 06→07, 08→09, 10→11, 12→13, and the single steps 14 and 15 are
 independent of each other and can run in any order, or in parallel in separate worktrees.
+
+Step 01a was added after step 01 was built, and is numbered that way so the other step
+numbers, which the architecture and step plans refer to, stay stable. It blocks nothing,
+but run it before step 02 so every later step lands on a branch with CI. Later steps
+that introduce opt-in tests (07, 08, 10) or the container (16) extend CI themselves.
 
 ## The build loop
 
@@ -103,6 +109,42 @@ the sandbox (GPU, Docker, live credentials) to the user after each step.
 
 **Research.** Confirm which Python version to pin given wheel availability for the later
 heavy dependencies (architecture risk 3). Prefer 3.13; fall back to 3.12.
+
+## Step 01a: CI: the gate on every push
+
+**Goal.** Every push and pull request runs `make check` on the architecture the service
+deploys to, so the gate the build loop uses locally is also enforced on GitHub.
+
+**Build.**
+- `.github/workflows/ci.yml`: runs on pushes to `main` and `impl` and on pull requests.
+  One job on an arm64 Linux runner: check out, install uv with caching,
+  `uv sync --locked`, `make check`.
+- `.github/dependabot.yml`: weekly updates for the `uv` and `github-actions` ecosystems.
+
+**Acceptance.**
+- The workflow's install and test commands are exactly `uv sync --locked` and
+  `make check`, enforced by a test that reads the workflow file, so CI and the local
+  gate cannot drift apart.
+- The job runs on an arm64 runner, and the Python version comes from `.python-version`,
+  not from the workflow.
+- The workflow declares `permissions: contents: read`, references no secrets, and uses
+  `pull_request`, never `pull_request_target`.
+- Every third-party action is pinned to a full commit SHA, with its version in a comment.
+- A newer push to the same branch or pull request cancels the run in progress, and the
+  job has a timeout.
+- The workflow file passes a workflow linter or schema check, run inside `make check` or
+  by a test.
+- `docs/ARCHITECTURE.md`'s testing section says what CI runs and what it does not.
+
+**Research.** Current release and commit SHA of `actions/checkout` and
+`astral-sh/setup-uv`; the current arm64 runner label and whether it is available to
+public repositories at no cost; whether `setup-uv` picks up `.python-version` on its
+own; how to lint a workflow in this sandbox (for example a PyPI-packaged `actionlint`).
+
+**Cannot be verified in the sandbox.** GitHub Actions does not run here. The verifier
+checks the files statically and lists the live run as unverified. The real test is the
+first push of `impl`, which the user does; if that run fails, fixing it is a follow-up
+to this step.
 
 ## Step 02: Core contracts and fakes
 
@@ -235,6 +277,8 @@ the `apple` resolver; `earmark resolve <url>`; recorded fixtures.
 - Malformed XML is handled, and the parser is safe against entity attacks.
 - The feed is fetched through `fetch.py`.
 - An opt-in `network` test resolves a real, recent episode.
+- A scheduled (weekly) and manually triggerable workflow runs `pytest -m network`. It is
+  not a required check, since its failures mean an outside service changed.
 
 **Research.** Architecture risk 2. Probe the live API for the maximum `limit`, whether
 `lookup?id=<episode id>` works directly, and what Apple URLs the share sheet produces
@@ -259,6 +303,8 @@ today.
 - Audio is deleted after success unless `KEEP_AUDIO` is set.
 - Unit tests inject a fake model. An opt-in `slow` test transcribes a short clip with
   the `tiny` model on CPU and gets non-empty text.
+- The scheduled workflow from step 07 (created here if step 07 has not run) also runs
+  `pytest -m slow` with the `transcribe` extra installed and the model download cached.
 
 **Research.** Architecture risk 1: check ctranslate2 wheel availability for aarch64 and
 the pinned Python, and whether CUDA works on the DGX Spark. Record the finding in
@@ -309,6 +355,9 @@ timestamps, including options for Parakeet on NVIDIA hardware.
 - Tests cover the analyzer with a fake `LLMClient` and the Anthropic client's request
   construction with a stubbed SDK client. An opt-in `llm` test runs a short fixture
   transcript against the real model.
+- A workflow that runs `pytest -m llm` exists and is triggered only by hand
+  (`workflow_dispatch`). It reads the API key from a GitHub environment secret and can
+  never run for a pull request.
 
 **Research.** Load the `claude-api` skill and read its Python README before planning.
 Use the official `anthropic` SDK, `claude-opus-5-5` unless configured otherwise, adaptive
@@ -422,8 +471,10 @@ first, Cloudflare Tunnel as the alternative), `docs/shortcut.md`, and the `READM
 - `docs/shortcut.md` lists each Shortcut action in order: accept URLs from the share
   sheet, ask for an optional prompt, POST JSON with the bearer header, show the response.
 - The README's configuration reference covers every `Settings` field, enforced by a test.
-- The container files are reviewed statically and marked in `docs/deploy.md` as not
-  build-tested, since the sandbox has no Docker.
+- CI builds the container image on an arm64 runner without pushing it. The sandbox has
+  no Docker, so the verifier reviews the container files statically, and
+  `docs/deploy.md` says the image is build-tested in CI but not run-tested, and that
+  the GPU profile is untested.
 
 ## Step 17: Extension: re-run a prompt
 
