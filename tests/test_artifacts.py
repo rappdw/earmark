@@ -282,3 +282,46 @@ def test_has_transcript(tmp_path: Path) -> None:
     assert not s.has_transcript(KEY)
     s.write_transcript(make_transcript())
     assert s.has_transcript(KEY)
+
+
+def test_record_share(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    assert store.read_share(KEY) is None
+    assert store.record_share(KEY, T0) == T0
+    path = store.share_path(KEY)
+    assert path == tmp_path / "episodes" / KEY / "shared.json"
+    record = store.read_share(KEY)
+    assert record is not None
+    assert record.first_shared_at == T0
+    before = path.read_bytes()
+    assert store.record_share(KEY, T0 + timedelta(hours=1)) == T0
+    assert store.record_share(KEY, T0) == T0
+    assert path.read_bytes() == before
+    assert store.record_share(KEY, T0 - timedelta(days=1)) == T0 - timedelta(days=1)
+    assert path.read_bytes() != before
+    reread = store.read_share(KEY)
+    assert reread is not None
+    assert reread.first_shared_at == T0 - timedelta(days=1)
+
+
+def test_record_share_rejects_naive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="timezone"):
+        ArtifactStore(tmp_path).record_share(KEY, T0.replace(tzinfo=None))
+
+
+def test_read_share_mismatched_key_is_corrupt(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    other = make_episode(guid="urn:example:other").key
+    store.record_share(other, T0)
+    store.share_path(KEY).parent.mkdir(parents=True)
+    store.share_path(KEY).write_bytes(store.share_path(other).read_bytes())
+    with pytest.raises(PermanentError, match="corrupt artifact"):
+        store.read_share(KEY)
+
+
+def test_read_share_garbage_is_corrupt(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    store.share_path(KEY).parent.mkdir(parents=True)
+    store.share_path(KEY).write_text("{nope")
+    with pytest.raises(PermanentError, match="corrupt artifact"):
+        store.read_share(KEY)

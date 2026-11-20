@@ -4,7 +4,7 @@ import logging
 import pytest
 
 from earmark.config import REDACTED
-from earmark.log import HANDLER_NAME, configure_logging
+from earmark.log import HANDLER_NAME, configure_logging, redact
 
 pytestmark = pytest.mark.usefixtures("restore_root_logging")
 
@@ -69,3 +69,9 @@ def test_level_applied() -> None:
     log.warning("loud")
     assert "quiet" not in stream.getvalue()
     assert "loud" in stream.getvalue()
+
+
+def test_redact() -> None:
+    assert redact("abcdef and abc", ["abc", "abcdef"]) == f"{REDACTED} and {REDACTED}"
+    assert redact("unchanged", ["", "zzz"]) == "unchanged"
+    assert redact("x", []) == "x"

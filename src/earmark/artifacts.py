@@ -6,6 +6,7 @@ import re
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -15,6 +16,7 @@ from earmark.errors import PermanentError
 from earmark.models import (
     Analysis,
     Episode,
+    ShareRecord,
     Transcript,
     is_episode_key,
     is_prompt_hash,
@@ -97,6 +99,9 @@ class ArtifactStore:
     def episode_path(self, key: str) -> Path:
         return self.episode_dir(key) / "episode.json"
 
+    def share_path(self, key: str) -> Path:
+        return self.episode_dir(key) / "shared.json"
+
     def transcript_json_path(self, key: str) -> Path:
         return self.episode_dir(key) / "transcript.json"
 
@@ -158,6 +163,25 @@ class ArtifactStore:
         if episode is not None and episode.key != key:
             raise _corrupt(path)
         return episode
+
+    def read_share(self, key: str) -> ShareRecord | None:
+        path = self.share_path(key)
+        record = self._read_json(path, ShareRecord)
+        if record is not None and record.episode_key != key:
+            raise _corrupt(path)
+        return record
+
+    def record_share(self, key: str, shared_at: datetime) -> datetime:
+        """Keep the earliest share time of the episode and return it."""
+        if shared_at.tzinfo is None or shared_at.utcoffset() is None:
+            raise ValueError("shared_at must be timezone-aware")
+        existing = self.read_share(key)
+        if existing is not None and existing.first_shared_at <= shared_at:
+            return existing.first_shared_at
+        self._write_json(
+            self.share_path(key), ShareRecord(episode_key=key, first_shared_at=shared_at)
+        )
+        return shared_at
 
     def write_transcript(self, transcript: Transcript) -> Path:
         key = transcript.episode_key

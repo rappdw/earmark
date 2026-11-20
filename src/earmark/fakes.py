@@ -28,6 +28,7 @@ from earmark.models import (
     episode_key,
     prompt_hash,
 )
+from earmark.pipeline.stages import Backends
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -321,6 +322,17 @@ class FakeBackends:
     store: FakeStore
     indexer: FakeIndexer
     notifier: FakeNotifier
+
+    def backends(self) -> Backends:
+        return Backends(
+            resolver=self.resolver,
+            fetcher=self.fetcher,
+            transcriber=self.transcriber,
+            analyzer=self.analyzer,
+            store=self.store,
+            indexer=self.indexer,
+            notifier=self.notifier,
+        )
 
 
 def make_fake_backends(

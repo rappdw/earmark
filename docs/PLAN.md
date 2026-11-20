@@ -16,7 +16,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 02 | Core contracts and fakes | 01 | done |
 | 03 | Job store | 02 | done |
 | 04 | Ingest API | 03 | done |
-| 05 | Pipeline runner and worker | 04 | todo |
+| 05 | Pipeline runner and worker | 04 | done |
 | 06 | Guarded fetch and audio download | 05 | todo |
 | 07 | Resolver: Apple → iTunes → RSS | 06 | todo |
 | 08 | Transcription: faster-whisper | 05 | todo |

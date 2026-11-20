@@ -1,0 +1,145 @@
+"""Composition root: the only place that constructs backends from Settings.
+
+Each registry maps a backend name (a value of the matching ``Literal`` in
+``earmark.config``) to a builder. Later steps add their backend by adding one entry; a
+builder imports its heavy modules inside the function, never at module top.
+"""
+
+import logging
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Final
+
+from earmark.artifacts import ArtifactStore
+from earmark.config import ConfigError, Settings, env_var
+from earmark.fakes import (
+    FakeAnalyzer,
+    FakeAudioFetcher,
+    FakeIndexer,
+    FakeNotifier,
+    FakeResolver,
+    FakeStore,
+    FakeTranscriber,
+)
+from earmark.jobs import JobStore, open_job_store
+from earmark.models import Clock, utc_now
+from earmark.pipeline.runner import Pipeline
+from earmark.pipeline.stages import (
+    Analyzer,
+    AudioFetcher,
+    Backends,
+    Indexer,
+    Notifier,
+    Resolver,
+    Store,
+    Transcriber,
+)
+from earmark.pipeline.worker import Worker, heartbeat_interval
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class BuildContext:
+    settings: Settings
+    artifacts: ArtifactStore
+    clock: Clock
+
+
+type Builder[T] = Callable[[BuildContext], T]
+
+RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
+    "fake": lambda ctx: FakeResolver(),
+}
+FETCHERS: Final[Mapping[str, Builder[AudioFetcher]]] = {
+    "fake": lambda ctx: FakeAudioFetcher(ctx.artifacts),
+}
+TRANSCRIBERS: Final[Mapping[str, Builder[Transcriber]]] = {
+    "fake": lambda ctx: FakeTranscriber(ctx.artifacts),
+}
+ANALYZERS: Final[Mapping[str, Builder[Analyzer]]] = {
+    "fake": lambda ctx: FakeAnalyzer(ctx.artifacts, clock=ctx.clock),
+}
+STORES: Final[Mapping[str, Builder[Store]]] = {
+    "fake": lambda ctx: FakeStore(ctx.settings.vault_dir, ctx.settings.vault_subdir),
+}
+INDEXERS: Final[Mapping[str, Builder[Indexer | None]]] = {
+    "fake": lambda ctx: FakeIndexer(),
+    "none": lambda ctx: None,
+}
+NOTIFIERS: Final[Mapping[str, Builder[Notifier | None]]] = {
+    "fake": lambda ctx: FakeNotifier(),
+    "none": lambda ctx: None,
+}
+
+
+def _lookup[T](
+    registry: Mapping[str, Builder[T]], field: str, name: str, problems: list[str]
+) -> Builder[T] | None:
+    builder = registry.get(name)
+    if builder is None:
+        choices = ", ".join(sorted(registry))
+        problems.append(
+            f"{env_var(field)}: backend {name!r} is not built into this version of earmark "
+            f"(choose one of: {choices})"
+        )
+    return builder
+
+
+def build_backends(
+    settings: Settings, artifacts: ArtifactStore, *, clock: Clock = utc_now
+) -> Backends:
+    problems: list[str] = []
+    resolver = _lookup(RESOLVERS, "resolver_backend", settings.resolver_backend, problems)
+    fetcher = _lookup(FETCHERS, "fetch_backend", settings.fetch_backend, problems)
+    transcriber = _lookup(TRANSCRIBERS, "asr_backend", settings.asr_backend, problems)
+    analyzer = _lookup(ANALYZERS, "llm_provider", settings.llm_provider, problems)
+    store = _lookup(STORES, "store_backend", settings.store_backend, problems)
+    indexer = _lookup(INDEXERS, "index_backend", settings.index_backend, problems)
+    notifier = _lookup(NOTIFIERS, "notify_backend", settings.notify_backend, problems)
+    if (
+        problems
+        or resolver is None
+        or fetcher is None
+        or transcriber is None
+        or analyzer is None
+        or store is None
+        or indexer is None
+        or notifier is None
+    ):
+        raise ConfigError(problems)
+    ctx = BuildContext(settings=settings, artifacts=artifacts, clock=clock)
+    return Backends(
+        resolver=resolver(ctx),
+        fetcher=fetcher(ctx),
+        transcriber=transcriber(ctx),
+        analyzer=analyzer(ctx),
+        store=store(ctx),
+        indexer=indexer(ctx),
+        notifier=notifier(ctx),
+    )
+
+
+def build_worker(
+    settings: Settings, *, jobs: JobStore | None = None, clock: Clock = utc_now
+) -> Worker:
+    artifacts = ArtifactStore(settings.data_dir)
+    backends = build_backends(settings, artifacts, clock=clock)
+    jobs = jobs or open_job_store(settings, clock=clock)
+    pipeline = Pipeline(backends, artifacts, jobs, secrets=settings.secret_values())
+    logger.info(
+        "backends: resolver=%s fetch=%s asr=%s llm=%s store=%s index=%s notify=%s",
+        settings.resolver_backend,
+        settings.fetch_backend,
+        settings.asr_backend,
+        settings.llm_provider,
+        settings.store_backend,
+        settings.index_backend,
+        settings.notify_backend,
+    )
+    return Worker(
+        jobs,
+        pipeline,
+        poll_seconds=settings.worker_poll_seconds,
+        heartbeat_seconds=heartbeat_interval(settings.job_lease_seconds),
+    )

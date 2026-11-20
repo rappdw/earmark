@@ -308,3 +308,15 @@ def test_notifier_records() -> None:
     n = FakeNotifier()
     n.notify(make_job(), None)
     assert n.call_count == 1
+
+
+def test_fake_backends_as_backends(tmp_path: Path) -> None:
+    fb = make_fake_backends(tmp_path)
+    b = fb.backends()
+    assert b.resolver is fb.resolver
+    assert b.fetcher is fb.fetcher
+    assert b.transcriber is fb.transcriber
+    assert b.analyzer is fb.analyzer
+    assert b.store is fb.store
+    assert b.indexer is fb.indexer
+    assert b.notifier is fb.notifier

@@ -11,6 +11,13 @@ HANDLER_NAME: Final = "earmark"
 LOG_FORMAT: Final = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
+def redact(text: str, secrets: Iterable[str]) -> str:
+    """Replace every non-empty secret in ``text`` with ``REDACTED``, longest first."""
+    for secret in sorted({s for s in secrets if s}, key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
+    return text
+
+
 class RedactingFormatter(logging.Formatter):
     def __init__(
         self, secrets: Iterable[str], fmt: str | None = None, datefmt: str | None = None
@@ -19,10 +26,7 @@ class RedactingFormatter(logging.Formatter):
         self._secrets = sorted({s for s in secrets if s}, key=len, reverse=True)
 
     def format(self, record: logging.LogRecord) -> str:
-        text = super().format(record)
-        for secret in self._secrets:
-            text = text.replace(secret, REDACTED)
-        return text
+        return redact(super().format(record), self._secrets)
 
 
 def configure_logging(

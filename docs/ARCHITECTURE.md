@@ -62,10 +62,10 @@ src/earmark/
   cli.py               `earmark` entry point
   api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
   pipeline/
-    stages.py          stage Protocols
-    runner.py          Pipeline
-    factory.py         composition root: Settings → backends
-    worker.py          claim/run loop, heartbeat, signals
+    stages.py          stage Protocols, Backends (the set of seven stage implementations)
+    runner.py          Pipeline: runs one claimed job, maps exceptions to job outcomes
+    factory.py         composition root: Settings → backends (registries), build_worker
+    worker.py          Worker (claim/run loop), Heartbeat thread, SIGTERM/SIGINT handling
   resolve/             apple.py (URL parsing), itunes.py, rss.py, resolver.py
   transcribe/          faster_whisper.py, remote.py
   analyze/             schema.py, prompts.py, render.py, analyzer.py, chunking.py, llm/
@@ -111,6 +111,8 @@ seconds are finite and non-negative.
   relative to `VAULT_DIR` (so they start with `VAULT_SUBDIR`), usable directly as the
   `file=` of an `obsidian://open` link.
 - `JobResult`: `note_path`, `transcript_note_path`, `analysis_hash`, all optional.
+- `ShareRecord`: `episode_key`, `first_shared_at`. The content of `shared.json`; the
+  earliest share time of the episode, passed to `Store.store` (step 05).
 - `Job`: `id` (`uuid4().hex`), `kind` (`ingest`, `reanalyze`), `status`, `stage`,
   `url | None` (required for `ingest`; the canonical episode URL, so `Episode.url` is
   canonical too), `prompt`, `episode_key | None` (required for `reanalyze`), `attempts`,
@@ -195,7 +197,8 @@ Every stage has a fake in `fakes.py` that records each call (`calls`), can be to
 raise (`fail_next(exc, times)`), and, for the cache-aware stages (fetch, transcribe,
 analyze), counts the calls that did real work (`computed`). The cache-aware fakes write
 real artifacts through `ArtifactStore`. `make_fake_backends(data_dir, vault_dir=...)`
-builds the whole set.
+builds the whole set, and `FakeBackends.backends()` turns it into the `Backends` the
+runner takes.
 
 Rules every backend follows:
 
@@ -221,6 +224,45 @@ Rules every backend follows:
    `warnings` of the `Transcript`, `Analysis`, or `StoreResult` it returns. The runner
    copies those into `job.warnings`. They are stored in the artifact, so a cache hit
    reports them again.
+
+### Runner and worker
+
+Step 05; exact signatures in `docs/steps/05-worker.md`.
+
+- **Backends.** `Backends` (in `stages.py`) holds the seven stages; `indexer` and
+  `notifier` are `None` when their backend is `none`. `factory.build_backends` is the
+  only code that constructs backends: one registry per setting maps a backend name to a
+  builder, and a name with no builder is a `ConfigError` naming the variable, raised
+  before the database is opened. Real backends import their heavy modules inside the
+  builder.
+- **Order.** `Pipeline.run(claim)`: resolve → write `episode.json`, record the episode
+  key on the job, record the share time in `shared.json` → if `transcript.json` exists,
+  read it and skip fetch and transcribe, else fetch → transcribe → analyze with
+  `job.prompt` → store with every analysis on disk and the episode's first share time →
+  index (if configured) → `complete` with a `JobResult` → notify. Stages are called
+  positionally. Each stage sets `job.stage` before it runs; a failed job keeps the
+  stage it failed in, and `notify` is never set as a stage.
+- **Outcomes.** `SkipEpisode` → `skipped`; `PermanentError` → `failed`;
+  `TransientError` → requeued with backoff (honouring `retry_after_s`) until attempts
+  run out; any other `Exception` → transient, with the traceback logged at ERROR and a
+  one-line summary naming the raising file, line, and function in `job.error`. Error
+  and warning text is whitespace-collapsed, redacted of every `Settings` secret, and
+  capped at 500 characters. Index failures, and notifier failures, are warnings
+  (`index failed: …`, `notify failed: …`) and never change the status.
+- **Notify.** Exactly once per job that reaches `done`, `failed`, or `skipped`, with the
+  job as written (warnings included) and the episode if resolution got that far. Not for
+  a requeued retry, a released job, or a lost lease.
+- **Heartbeat.** A thread heartbeats every `min(60 s, JOB_LEASE_SECONDS / 4)` while a
+  job runs. It shows the process is alive, not that a stage progresses.
+- **Shutdown.** SIGTERM and SIGINT stop the worker from claiming. During stage work the
+  handler raises a `Shutdown` (`BaseException`) out of the stage, and the worker
+  `release`s the job (back to `queued`, attempt undone). Once the job is completing or
+  notifying, the worker finishes it, then exits.
+- **Lost lease.** A fenced call raising `LeaseLostError` makes the runner abandon the
+  job without writing to it or notifying.
+- **Each poll** the worker first runs `requeue_stale` and notifies the jobs it failed.
+  `earmark worker --once` processes at most one job; `earmark submit` enqueues through
+  `ingest.enqueue_ingest`, like `POST /ingest`.
 
 ## Jobs
 
@@ -251,7 +293,7 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
 - **Leases.** The worker heartbeats while a stage runs. A `running` job whose heartbeat
   is older than `JOB_LEASE_SECONDS` is requeued by `requeue_stale` (or failed, if it has
   used its attempts), which covers a crashed worker. `requeue_stale` returns the jobs it
-  changed.
+  changed; the worker calls it on every poll and notifies the ones it failed.
 - **Dedupe.** Enqueueing the same `(kind, url or episode_key, prompt)` while an
   identical job is `queued` or `running` returns the existing job (`Enqueued.created`
   is `False`). A partial unique index on a `dedupe_key` column enforces one active job
@@ -269,6 +311,7 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
   earmark.db                    jobs (step 03), entity registry (step 13); WAL mode
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
+    shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
     audio.<ext>                 deleted after transcription unless EARMARK_KEEP_AUDIO
     transcript.json             written last; its existence marks the transcript cached
     transcript.txt              Transcript.to_text()
@@ -397,7 +440,8 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
 - `gpu`: needs CUDA.
 
 With every backend set to `fake`, the whole service runs in the sandbox:
-`earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears. Verifiers
+`earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears (the fake
+store writes a minimal note when `EARMARK_VAULT_DIR` is set). Verifiers
 use this as the live smoke test from step 05 onward.
 
 ### Continuous integration

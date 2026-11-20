@@ -272,6 +272,13 @@ class StoreResult(Model):
         return None if value is None else _check_relative_posix(value)
 
 
+class ShareRecord(Model):
+    """Content of ``shared.json``: the earliest time the episode was shared."""
+
+    episode_key: EpisodeKey
+    first_shared_at: AwareDatetime
+
+
 class JobResult(Model):
     note_path: str | None = None
     transcript_note_path: str | None = None

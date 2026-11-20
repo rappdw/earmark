@@ -5,6 +5,7 @@ runner must call stages positionally.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -88,3 +89,16 @@ class Notifier(Protocol):
         Must not raise for delivery problems; the runner also catches anything it does raise.
         """
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class Backends:
+    """The seven stage implementations the runner drives."""
+
+    resolver: Resolver
+    fetcher: AudioFetcher
+    transcriber: Transcriber
+    analyzer: Analyzer
+    store: Store
+    indexer: Indexer | None  # None when EARMARK_INDEX_BACKEND=none
+    notifier: Notifier | None  # None when EARMARK_NOTIFY_BACKEND=none

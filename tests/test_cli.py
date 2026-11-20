@@ -1,4 +1,6 @@
 import importlib.metadata
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,10 @@ from typer.testing import CliRunner
 import earmark
 from earmark.cli import app
 from earmark.config import Settings, env_var
+from earmark.jobs import open_job_store
+from earmark.models import MAX_PROMPT_CHARS
+from earmark.pipeline.worker import Worker
+from earmark.resolve.apple import MESSAGES, UrlProblem
 
 runner = CliRunner()
 VERSION = importlib.metadata.version("earmark")
@@ -195,3 +201,142 @@ def test_cli_import_is_light() -> None:
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
+
+
+# -- worker, submit, jobs ----------------------------------------------------------------
+
+SHARE = "https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981&uo=4"
+SHOW_LINK = "https://podcasts.apple.com/us/podcast/x/id1200361736"
+BACKEND_VARS = (
+    "RESOLVER_BACKEND",
+    "FETCH_BACKEND",
+    "ASR_BACKEND",
+    "LLM_PROVIDER",
+    "STORE_BACKEND",
+    "INDEX_BACKEND",
+    "NOTIFY_BACKEND",
+)
+
+
+@pytest.fixture
+def fake_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_root_logging: None) -> Path:
+    for name in BACKEND_VARS:
+        monkeypatch.setenv(f"EARMARK_{name}", "fake")
+    monkeypatch.setenv("EARMARK_VAULT_DIR", str(tmp_path / "vault"))
+    return tmp_path
+
+
+def _submit(*args: str) -> str:
+    result = runner.invoke(app, ["submit", *args])
+    assert result.exit_code == 0, result.stderr
+    return result.stdout
+
+
+def test_submit_then_worker_once(fake_env: Path) -> None:
+    out = _submit(SHARE, "--prompt", "q")
+    match = re.fullmatch(r"([0-9a-f]{32}) queued\n", out)
+    assert match
+    job_id = match.group(1)
+    worked = runner.invoke(app, ["worker", "--once"])
+    assert worked.exit_code == 0, worked.stderr
+    assert worked.stdout == f"job {job_id} done\n"
+    listed = runner.invoke(app, ["jobs", "--json"])
+    [job] = json.loads(listed.stdout)["jobs"]
+    assert (job["id"], job["status"]) == (job_id, "done")
+    assert list((fake_env / "vault" / "Earmark" / "Podcasts").glob("*.md"))
+
+
+def test_worker_once_empty(fake_env: Path) -> None:
+    result = runner.invoke(app, ["worker", "--once"])
+    assert result.exit_code == 0
+    assert result.stdout == "no job ready\n"
+
+
+def test_worker_runs_forever_without_once(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Worker] = []
+    monkeypatch.setattr(Worker, "run_forever", lambda self: calls.append(self))
+    result = runner.invoke(app, ["worker"])
+    assert result.exit_code == 0
+    assert len(calls) == 1
+
+
+def test_worker_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    blocker = fake_env / "file"
+    blocker.write_text("x")
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(blocker))
+    result = runner.invoke(app, ["worker", "--once"])
+    assert result.exit_code == 1
+    assert result.stderr.startswith("earmark worker: cannot open the job store")
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_worker_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "faster_whisper")
+    result = runner.invoke(app, ["worker", "--once"])
+    assert result.exit_code == 2
+    assert "EARMARK_ASR_BACKEND" in result.stderr
+    assert not (fake_env / "data").exists()
+
+
+def test_worker_invalid_backend_name_exits_2(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "whisperx-sentinel")
+    result = runner.invoke(app, ["worker", "--once"])
+    assert result.exit_code == 2
+    assert "EARMARK_ASR_BACKEND" in result.stderr
+    assert "whisperx-sentinel" not in result.stdout + result.stderr
+
+
+def test_submit_dedupe(fake_env: Path) -> None:
+    first = _submit(SHARE).split()[0]
+    second = _submit(SHARE)
+    assert second == f"{first} queued (existing job)\n"
+
+
+@pytest.mark.parametrize(("url", "problem"), [(SHOW_LINK, "show_link"), ("not a url", "malformed")])
+def test_submit_rejects_url(fake_env: Path, url: str, problem: UrlProblem) -> None:
+    result = runner.invoke(app, ["submit", url])
+    assert result.exit_code == 2
+    assert MESSAGES[problem] in result.stderr
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_submit_rejects_long_prompt(fake_env: Path) -> None:
+    result = runner.invoke(app, ["submit", SHARE, "--prompt", "x" * (MAX_PROMPT_CHARS + 1)])
+    assert result.exit_code == 2
+    assert f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)" in result.stderr
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_jobs_text_output(fake_env: Path) -> None:
+    first = _submit(SHARE, "--prompt", "one").split()[0]
+    second = _submit(SHARE, "--prompt", "two").split()[0]
+    runner.invoke(app, ["worker", "--once"])  # runs the first job
+    lines = runner.invoke(app, ["jobs"]).stdout.splitlines()
+    assert [ln.split("  ")[0] for ln in lines] == [second, first]
+    assert lines[0].split("  ")[1] == "queued"
+    assert lines[1].split("  ")[1:4] == ["done", "index", "1"]
+    assert lines[1].endswith("  https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981")
+    done = runner.invoke(app, ["jobs", "--status", "done"]).stdout.splitlines()
+    assert [ln.split("  ")[0] for ln in done] == [first]
+    assert len(runner.invoke(app, ["jobs", "--limit", "1"]).stdout.splitlines()) == 1
+    assert runner.invoke(app, ["jobs", "--limit", "0"]).exit_code == 2
+    assert runner.invoke(app, ["jobs", "--status", "bogus"]).exit_code == 2
+
+
+def test_jobs_sanitizes_control_chars(fake_env: Path) -> None:
+    store = open_job_store(Settings(_env_file=None))
+    store.enqueue("https://podcasts.apple.com/us/podcast/id1?i=2")
+    claim = store.claim_next()
+    assert claim is not None
+    store.fail(claim, "bad \x1b[31mred\x1b[0m\nsecond line", transient=False)
+    out = runner.invoke(app, ["jobs"]).stdout
+    assert "\x1b" not in out
+    assert "  error: bad ?[31mred?[0m?second line" in out
+
+
+def test_jobs_empty(fake_env: Path) -> None:
+    result = runner.invoke(app, ["jobs"])
+    assert result.exit_code == 0
+    assert result.stdout == "no jobs\n"
