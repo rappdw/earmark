@@ -325,3 +325,39 @@ def test_read_share_garbage_is_corrupt(tmp_path: Path) -> None:
     store.share_path(KEY).write_text("{nope")
     with pytest.raises(PermanentError, match="corrupt artifact"):
         store.read_share(KEY)
+
+
+def test_analysis_parts_paths(tmp_path: Path) -> None:
+    s = ArtifactStore(tmp_path)
+    analysis = make_analysis(prompt="a")
+    digest = analysis.prompt_hash
+    part = "0123456789abcdef"
+    assert s.analysis_parts_dir(KEY, digest) == s.analyses_dir(KEY) / f"{digest}.parts"
+    for bad in ("short", "0123456789ABCDEF", "../../etc/passwd0", "0123456789abcdef0"):
+        with pytest.raises(ValueError, match="part id"):
+            s.write_analysis_part(KEY, digest, bad, b"x")
+        with pytest.raises(ValueError, match="part id"):
+            s.read_analysis_part(KEY, digest, bad)
+    with pytest.raises(ValueError, match="prompt hash"):
+        s.analysis_parts_dir(KEY, "nope")
+
+    s.clear_analysis_parts(KEY, digest)  # a missing directory is fine
+    assert s.read_analysis_part(KEY, digest, part) is None
+    s.delete_analysis_part(KEY, digest, part)  # also fine
+
+    path = s.write_analysis_part(KEY, digest, part, b'{"a": 1}')
+    assert path == s.analysis_parts_dir(KEY, digest) / f"{part}.json"
+    assert s.read_analysis_part(KEY, digest, part) == b'{"a": 1}'
+    s.write_analysis_part(KEY, digest, part, b"two")  # replaces atomically
+    assert s.read_analysis_part(KEY, digest, part) == b"two"
+    assert _files(s.analysis_parts_dir(KEY, digest)) == [f"{part}.json"]
+
+    s.write_analysis(analysis)
+    assert s.list_analyses(KEY) == [analysis]  # the .parts directory is skipped
+
+    s.delete_analysis_part(KEY, digest, part)
+    assert s.read_analysis_part(KEY, digest, part) is None
+    s.write_analysis_part(KEY, digest, part, b"x")
+    s.clear_analysis_parts(KEY, digest)
+    assert not s.analysis_parts_dir(KEY, digest).exists()
+    assert s.read_analysis(KEY, digest) == analysis

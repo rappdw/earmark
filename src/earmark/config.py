@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic import Field, SecretStr, ValidationError, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ResolverBackend = Literal["apple", "fake"]
@@ -18,6 +18,7 @@ IndexBackend = Literal["lancedb", "fake", "none"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 LlmEffort = Literal["low", "medium", "high", "xhigh", "max"]
+LlmResponseFormat = Literal["json_schema", "json_object"]
 AsrDevice = Literal["auto", "cpu", "cuda"]
 AsrComputeType = Literal[
     "auto",
@@ -101,13 +102,28 @@ class Settings(BaseSettings):
         description="Retry a refused Claude request on Anthropic's recommended fallback model.",
     )
     llm_base_url: str | None = Field(
-        None, description="OpenAI-compatible endpoint (openai_compat only)."
+        None, description="OpenAI-compatible LLM base URL, ending in /v1 (openai_compat only)."
     )
     llm_api_key: SecretStr | None = Field(
         None, description="Analysis API key (Anthropic, or the local endpoint)."
     )
     llm_context_tokens: int | None = Field(
-        None, gt=0, description="Model context window in tokens (default 1,000,000 for Anthropic)."
+        None,
+        gt=0,
+        description=(
+            "Context window in tokens (Anthropic default 1,000,000; required for openai_compat)."
+        ),
+    )
+    llm_timeout_seconds: float = Field(
+        3600.0,
+        gt=0,
+        description="How long to wait for the local LLM server's answer (openai_compat).",
+    )
+    llm_response_format: LlmResponseFormat = Field(
+        "json_schema",
+        description=(
+            "openai_compat JSON request: json_schema (constrained) or json_object (JSON mode)."
+        ),
     )
     embed_model: str = Field("BAAI/bge-small-en-v1.5", description="Embedding model.")
     ntfy_url: str | None = Field(None, description="ntfy topic URL.")
@@ -152,7 +168,9 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty")
         return v
 
-    @field_validator("asr_device", "asr_compute_type", "llm_effort", mode="before")
+    @field_validator(
+        "asr_device", "asr_compute_type", "llm_effort", "llm_response_format", mode="before"
+    )
     @classmethod
     def _lower_asr_choice(cls, v: object) -> object:
         return v.strip().lower() if isinstance(v, str) else v
@@ -169,9 +187,9 @@ class Settings(BaseSettings):
             raise ValueError("must be a language code such as 'en', or 'auto'")
         return v
 
-    @field_validator("asr_base_url")
+    @field_validator("asr_base_url", "llm_base_url")
     @classmethod
-    def _check_asr_base_url(cls, v: str | None) -> str | None:
+    def _check_base_url(cls, v: str | None, info: ValidationInfo) -> str | None:
         if v is None:
             return None
         v = v.strip()
@@ -185,7 +203,8 @@ class Settings(BaseSettings):
         if parts.scheme.lower() not in ("http", "https") or not hostname:
             raise ValueError(shape)
         if parts.username is not None or parts.password is not None:
-            raise ValueError("must not contain credentials; use EARMARK_ASR_API_KEY")
+            key_setting = env_var((info.field_name or "").replace("_base_url", "_api_key"))
+            raise ValueError(f"must not contain credentials; use {key_setting}")
         if parts.query or parts.fragment:
             raise ValueError("must not contain a query or fragment")
         return v.rstrip("/")

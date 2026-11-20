@@ -9,10 +9,10 @@ import pytest
 
 from earmark.analyze.analyzer import LlmAnalyzer, effective_duration
 from earmark.analyze.llm.anthropic import AnthropicClient
-from earmark.analyze.llm.base import LLMClient, LLMResponse
+from earmark.analyze.llm.base import LLMClient, LLMRequest, LLMResponse
 from earmark.analyze.prompts import SYSTEM_PROMPT
 from earmark.artifacts import ArtifactStore
-from earmark.errors import NeedsChunking, PermanentError, TransientError
+from earmark.errors import PermanentError, TransientError
 from earmark.fakes import make_fake_backends
 from earmark.models import Segment, prompt_hash
 from earmark.pipeline.stages import Analyzer
@@ -25,6 +25,7 @@ from tests.anthropic_stub import (
     stream_reply,
 )
 from tests.llm_fakes import ScriptedLLMClient
+from tests.long_transcripts import map_reduce_responder
 from tests.pipeline_env import CANON, PipelineEnv, make_env
 
 NOW = datetime(2026, 5, 1, tzinfo=UTC)
@@ -257,20 +258,28 @@ def test_client_errors_propagate(tmp_path: Path) -> None:
 # -- chunking -----------------------------------------------------------------------------
 
 
-def test_needs_chunking_before_completion(tmp_path: Path) -> None:
-    client = ScriptedLLMClient(context_tokens=10_000, token_count=9_000, output_tokens=2_000)
+def test_over_budget_switches_to_map_reduce(tmp_path: Path) -> None:
+    responder = map_reduce_responder()
+
+    def count(request: LLMRequest) -> int:
+        return 9_000 if request.system == SYSTEM_PROMPT else 500
+
+    client = ScriptedLLMClient(
+        context_tokens=10_000,
+        token_count=count,
+        output_tokens=2_000,
+        respond=responder,
+    )
     analyzer, _, artifacts = make_analyzer(tmp_path, client)
-    with pytest.raises(NeedsChunking) as excinfo:
-        analyzer.analyze(sample_episode(), sample_transcript(), None)
-    exc = excinfo.value
-    assert isinstance(exc, PermanentError)
-    assert (exc.input_tokens, exc.limit_tokens) == (9000, 8000)
-    assert "EARMARK_LLM_CONTEXT_TOKENS" in exc.message
-    assert "not truncated" in exc.message
-    assert client.complete_calls == 0
-    assert not artifacts.analyses_dir(sample_episode().key).exists()
-    (counted,) = client.count_requests
-    assert all(line in counted.user for line in sample_transcript().to_text().splitlines())
+    analysis = analyzer.analyze(sample_episode(), sample_transcript(), None)
+    assert client.complete_requests[0].system != SYSTEM_PROMPT  # no one-shot completion
+    assert len(responder.maps) >= 1
+    assert len(responder.reduces) == 1
+    assert responder.others == []
+    assert analysis.warnings[0].startswith("the transcript was analyzed in ")
+    assert artifacts.read_analysis(sample_episode().key, analysis.prompt_hash) == analysis
+    one_shot = client.count_requests[0]
+    assert all(line in one_shot.user for line in sample_transcript().to_text().splitlines())
 
 
 def test_exact_fit_is_allowed(tmp_path: Path) -> None:
@@ -280,11 +289,16 @@ def test_exact_fit_is_allowed(tmp_path: Path) -> None:
     assert client.complete_calls == 1
 
 
-def test_context_exceeded_stop_raises_needs_chunking(tmp_path: Path) -> None:
+def test_context_exceeded_stop_switches_to_map_reduce(tmp_path: Path) -> None:
+    responder = map_reduce_responder()
     response = LLMResponse("", "context_exceeded", raw_stop="model_context_window_exceeded")
-    analyzer, _, _ = make_analyzer(tmp_path, ScriptedLLMClient([response]))
-    with pytest.raises(NeedsChunking):
-        analyzer.analyze(sample_episode(), sample_transcript(), None)
+    client = ScriptedLLMClient([response], respond=responder)
+    analyzer, _, _ = make_analyzer(tmp_path, client)
+    analysis = analyzer.analyze(sample_episode(), sample_transcript(), None)
+    assert client.complete_requests[0].system == SYSTEM_PROMPT
+    assert len(responder.maps) == 1
+    assert len(responder.reduces) == 1
+    assert analysis.summary == "Combined."
 
 
 def test_close_closes_client(tmp_path: Path) -> None:

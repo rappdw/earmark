@@ -13,7 +13,7 @@ backend, not the pipeline.
 | Question | Decision | How to change it |
 |---|---|---|
 | System of record | An Obsidian-compatible Markdown vault. Files are the truth; SQLite and the vector index are derived and rebuildable. | Implement another `Store` backend. |
-| LLM for analysis | Hosted is allowed: Claude (`claude-opus-5-5`) through the Anthropic API by default, via the official `anthropic` SDK (2.x): one streamed request with adaptive thinking, an explicit effort (`medium`), a JSON-schema structured output, and server-side refusal fallback (step 10). Transcription and embeddings always run locally. | `EARMARK_LLM_MODEL`, `EARMARK_LLM_EFFORT`, `EARMARK_LLM_FALLBACKS`; `EARMARK_LLM_PROVIDER=openai_compat` points analysis at a local server (step 11). |
+| LLM for analysis | Hosted is allowed: Claude (`claude-opus-5-5`) through the Anthropic API by default, via the official `anthropic` SDK (2.x): one streamed request with adaptive thinking, an explicit effort (`medium`), a JSON-schema structured output, and server-side refusal fallback (step 10). Transcription and embeddings always run locally. | `EARMARK_LLM_MODEL`, `EARMARK_LLM_EFFORT`, `EARMARK_LLM_FALLBACKS`; `EARMARK_LLM_PROVIDER=openai_compat` with `EARMARK_LLM_BASE_URL`, `EARMARK_LLM_MODEL`, `EARMARK_LLM_CONTEXT_TOKENS` points analysis at a self-hosted OpenAI-compatible server (vLLM, llama.cpp, Ollama, LM Studio; step 11, `docs/llm.md`). Transcripts longer than one request are map-reduced on either provider (step 11). |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
@@ -75,11 +75,17 @@ src/earmark/
                        TranscriptionEngine; segment_from), faster_whisper.py (the
                        `faster_whisper` engine, step 08), remote.py (the `remote` engine:
                        OpenAI-compatible /v1/audio/transcriptions client, step 09)
+  endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
+                       (remote ASR, local LLM; step 11)
   analyze/             schema.py (output JSON schema, wire models, build_analysis), prompts.py
-                       (SYSTEM_PROMPT, DEFAULT_PROMPT, build_user_message), render.py
-                       (render_analysis), analyzer.py (LlmAnalyzer, the `anthropic` and later
-                       `openai_compat` Analyzer), chunking.py (step 11), llm/ (base.py: the
-                       LLMClient Protocol; anthropic.py: AnthropicClient; step 10)
+                       (one-shot, map, reduce, and repair prompts and message builders),
+                       render.py (render_analysis), analyzer.py (LlmAnalyzer, the `anthropic`
+                       and `openai_compat` Analyzer: strategy selection), calls.py (ModelCaller:
+                       fit, completion retry, parse and repair), chunking.py (token estimate,
+                       part planning), merge.py (entity merging, PartNote), mapreduce.py
+                       (run_map_reduce; step 11), llm/ (base.py: the LLMClient Protocol;
+                       anthropic.py: AnthropicClient, step 10; openai_compat.py:
+                       OpenAICompatClient, step 11)
   vault/               notes.py, sanitize.py, entities.py
   index/               chunks.py, embed.py, lancedb_index.py
   notify/              ntfy.py
@@ -154,7 +160,8 @@ invalidate cached analyses.
 `SkipEpisode(reason)`. Messages are short, human-readable, and free of secrets and
 untrusted bulk text, because they are stored in `job.error` and shown in notifications.
 `NeedsChunking(PermanentError)` (step 10) means a transcript does not fit one LLM request
-(it carries `model`, `input_tokens`, `limit_tokens`); transcripts are never truncated.
+(it carries `model`, `input_tokens`, `limit_tokens`); since step 11 the analyzer catches it
+and switches to map-reduce, so it no longer fails a job. Transcripts are never truncated.
 
 ## Stage contracts
 
@@ -410,12 +417,14 @@ Step 10; exact signatures in `docs/steps/10-analysis.md`.
   the analyzer owns the policy below, so step 11's local client reuses it.
 - **Order.** Cache first: `analyses/<prompt_hash(prompt, LLM_MODEL)>.json` is returned with
   no API call at all. An empty transcript is permanent. Then `count_tokens`; if input plus
-  the first output cap exceeds `context_tokens`, `NeedsChunking` before any completion.
-  Then one completion; a `max_tokens` stop retries once with the larger cap
-  (64 000, then 128 000 for Claude), then fails permanently; a refusal is permanent and
-  names its category; `model_context_window_exceeded` is `NeedsChunking`. The answer is
-  validated against `schema.AnalysisOutput` (a `ValidationError` is permanent, with the
-  error count and location only) and mapped by `schema.build_analysis`: names and items
+  the first output cap exceeds `context_tokens`, the analyzer switches to map-reduce (step
+  11, below) before any completion. Otherwise one completion; a `max_tokens` stop retries
+  once with the larger cap (64 000, then 128 000 for Claude), then fails permanently; a
+  refusal is permanent and names its category; a `context_exceeded` stop
+  (`model_context_window_exceeded`, or a local server's context 400) also switches to
+  map-reduce. The answer is validated against `schema.AnalysisOutput` (a `ValidationError`
+  is permanent, with the error count and location only, unless repair is on, below) and
+  mapped by `schema.build_analysis`: names and items
   normalised, empty items dropped, timestamps (`HH:MM:SS` strings copied from transcript
   markers) parsed, and those unreadable or beyond `ceil(max(transcript.duration_s, last
   segment end))` dropped with a warning; `prompt_response` is forced to null without a
@@ -441,6 +450,60 @@ Step 10; exact signatures in `docs/steps/10-analysis.md`.
   429s, 400, 401, 402, 403, 404, 413, 422, and credential-provider errors are permanent.
   Messages name the status, the setting to check, at most 200 characters of the API's
   message with secrets redacted, and the request id. The SDK keeps its own two retries.
+- **Long transcripts: map-reduce** (step 11; exact rules in
+  `docs/steps/11-local-llm-map-reduce.md` section 5). Used for both providers when the
+  one-shot request does not fit.
+  - **Planning.** The part budget is `context_tokens − output cap − counted overhead of
+    an empty map request − 16`, and must be at least 1024, else a `PermanentError`.
+    Segments are packed in order into balanced parts that never exceed it, using the
+    estimate `ceil(UTF-8 bytes / 3) + 4 per line`. Every proposed part is then counted
+    with the client's `count_tokens` (exact for Anthropic) and halved until it fits.
+  - **Coverage and timestamps.** Parts do not overlap, and each segment is in exactly
+    one. A single segment too long for a part is split at sentence boundaries; every
+    piece keeps its start, and a warning is added. Lines keep their absolute
+    `[HH:MM:SS]` markers, and the part tag carries the absolute range.
+  - **Map.** Each part gets `MAP_SYSTEM_PROMPT`, the episode metadata without the
+    description, and the part's transcript, and answers with the same output schema.
+    Timestamps outside the part are dropped with a warning. Answers are cached under
+    `analyses/<prompt_hash>.parts/<sha256(request)[:16]>.json` until the final analysis is
+    written, so a retried job skips finished parts. A part that hits the output cap with
+    no larger cap left is split in two.
+  - **Reduce.** Entities are merged in code by `entity_key` (NFKC, casefold, punctuation
+    and symbols removed, whitespace collapsed; first name, first non-blank context,
+    union of timestamps; within one kind). `REDUCE_SYSTEM_PROMPT` combines the part notes
+    (summary, claims, questions, leads, answers) and the merged entities into one
+    `AnalysisOutput`. If they do not fit one request, groups are reduced level by level.
+    The final entity lists are merged again and their timestamps unioned with the
+    part-level ones.
+  - **Warning.** The analysis records that it was analyzed in N parts. The cache key and
+    `ANALYSIS_SCHEMA_VERSION` do not change; the map and reduce prompts are pinned by a
+    second fingerprint test.
+- **Repair.** With `repair_invalid_json` (on for `openai_compat`, off for Anthropic), an
+  answer that fails schema validation gets exactly one repair request:
+  `REPAIR_SYSTEM_PROMPT`, the escaped invalid answer, and the pydantic error locations
+  and types (no model text). A second failure is permanent.
+- **`openai_compat` client.** `analyze.llm.openai_compat.OpenAICompatClient` (step 11).
+  - **Request.** It sends one non-streaming `POST {LLM_BASE_URL}/chat/completions` with
+    `model`, `[system, user]` messages, `max_tokens`, `stream: false`, and
+    `response_format`. That is `{"type": "json_schema", "json_schema": {"name", "strict":
+    true, "schema"}}` by default, the one form vLLM, llama.cpp, Ollama, and LM Studio all
+    accept. `LLM_RESPONSE_FORMAT=json_object` sends `{"type": "json_object"}` and appends
+    the schema to the user message. No sampling or reasoning parameters are sent.
+  - **Tokens.** `count_tokens` is the local estimate plus the schema and 64 tokens; it
+    makes no request. The output cap is `min(16384, context/4)`, and the retry cap
+    `min(32768, context/2)`.
+  - **Response.** The answer is `choices[0].message.content`, with a leading
+    `<think>…</think>` block and one surrounding code fence stripped. `reasoning` and
+    `reasoning_content` are ignored. `finish_reason` maps `stop` → end, `length` →
+    max_tokens, `content_filter` (or a `refusal` field) → refusal.
+  - **Errors.** A 400 or 413 whose body names the context (`exceed_context_size_error`,
+    "maximum context length", …) is the `context_exceeded` stop. 408, 429, 5xx,
+    timeouts, and transport errors are transient. 401, 403, 404, other 4xx, 3xx (never
+    followed), and an unreadable or oversized (16 MiB) body are permanent. Messages name
+    the host and the setting to check.
+  - **Configuration.** Read timeout `LLM_TIMEOUT_SECONDS`. The builder requires
+    `LLM_BASE_URL` and `LLM_CONTEXT_TOKENS` (at least 8192), and refuses `claude-*` model
+    ids (Claude goes through the SDK only).
 - **Credentials.** `EARMARK_LLM_API_KEY` is passed to the SDK as `api_key` when set (then
   no `ANTHROPIC_*` credential variable or profile is consulted); otherwise the SDK's chain
   applies (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the process environment, an
@@ -509,6 +572,8 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
     transcript.json             written last; its existence marks the transcript cached
     transcript.txt              Transcript.to_text()
     analyses/<prompt_hash>.json   16 hex chars over prompt + model + schema version
+    analyses/<prompt_hash>.parts/<part_id>.json   map answers of an unfinished map-reduce
+                                (step 11); removed when the analysis is written
   lancedb/
 
 $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in the vault
@@ -579,12 +644,14 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset, unset, unset (no upload limit) | Remote ASR backend (step 09). Base URL: the server's OpenAI-compatible base, ending in `/v1` (http or https, a host, no credentials, query, or fragment; a trailing `/` is dropped). Key: secret, printable ASCII without spaces, sent as a bearer token. Upload limit in MiB |
 | `ASR_TIMEOUT_SECONDS` | `10800` | How long the remote backend waits for the server's answer (read and write timeout) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
-| `LLM_MODEL` | `claude-opus-5-5` | Analysis model id; part of the analysis cache key (`prompt_hash`) |
+| `LLM_MODEL` | `claude-opus-5-5` | Analysis model id; part of the analysis cache key (`prompt_hash`). For `openai_compat`, the server's model id (`claude-*` is refused) |
 | `LLM_EFFORT` | `medium` | Claude effort: `low`, `medium`, `high`, `xhigh`, `max` (case-insensitive). Not part of the cache key |
 | `LLM_FALLBACKS` | `true` | Claude server-side refusal fallback (`fallbacks: "default"`); set `false` for models without it (Opus 4.8 and older). Not part of the cache key |
-| `LLM_API_KEY` | unset | Analysis API key (secret, printable ASCII without spaces): the Anthropic key, or the local endpoint's key (step 11) |
-| `LLM_CONTEXT_TOKENS` | unset (Anthropic: 1 000 000) | Context window used for the fit check (`NeedsChunking`); set it for a smaller-context model |
-| `LLM_BASE_URL` | unset | Local OpenAI-compatible endpoint (`openai_compat` only; the Anthropic client ignores it and honours `ANTHROPIC_BASE_URL`) |
+| `LLM_API_KEY` | unset | Analysis API key (secret, printable ASCII without spaces): the Anthropic key, or the local endpoint's key, sent as a bearer token (step 11) |
+| `LLM_CONTEXT_TOKENS` | unset (Anthropic: 1 000 000; **required** for `openai_compat`, at least 8192) | Context window for the fit check and the part budget of map-reduce. For a local server, the window it runs the model with (per request); see `docs/llm.md` |
+| `LLM_BASE_URL` | unset | Local OpenAI-compatible base URL ending in `/v1`, validated like `ASR_BASE_URL` (`openai_compat` only, required there; the Anthropic client ignores it and honours `ANTHROPIC_BASE_URL`) |
+| `LLM_TIMEOUT_SECONDS` | `3600` | How long `openai_compat` waits for one answer (read and write timeout) |
+| `LLM_RESPONSE_FORMAT` | `json_schema` | `openai_compat` JSON request: `json_schema` (schema-constrained) or `json_object` (JSON mode, schema in the prompt). Not part of the cache key |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (fastembed's default; step 14 may revise) |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
 | `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
@@ -651,7 +718,10 @@ and writes into a vault the user cares about.
   rules: http(s) only and no credentials in the URL (checked at settings load), no
   redirects followed, no proxies from the environment, cookies cleared per request,
   responses capped (64 MiB), host-only messages, the API key only in the per-request
-  `Authorization` header. The response is untrusted text, validated before use.
+  `Authorization` header. The response is untrusted text, validated before use. The local
+  LLM server (step 11, `EARMARK_LLM_BASE_URL`) is reached the same way by its own httpx2
+  client in `analyze/llm/openai_compat.py`, with the same rules (responses capped at
+  16 MiB). Both share `endpoint.error_detail` and `endpoint.host_label`.
 - **Model downloads.** faster-whisper fetches models from Hugging Face with
   `huggingface_hub`, not through `fetch.py`: the repository is chosen by the operator
   (`ASR_MODEL`), not by a third party, and it honours the usual `HF_*` and proxy
@@ -690,7 +760,10 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   `tests/test_remote_asr_live.py` is also `network`: it transcribes the `slow` tests' clip
   on a real ASR server and is skipped unless `ASR_TEST_BASE_URL` (with `ASR_TEST_MODEL`,
   optional `ASR_TEST_API_KEY`) is set, so CI skips it and the operator runs it on the
-  homelab.
+  homelab. `tests/test_openai_compat_live.py` (step 11) is `network` too: a one-shot and a
+  map-reduce analysis against a real local LLM server, skipped unless `LLM_TEST_BASE_URL`
+  (with `LLM_TEST_MODEL`, optional `LLM_TEST_CONTEXT_TOKENS`, `LLM_TEST_API_KEY`,
+  `LLM_TEST_RESPONSE_FORMAT`) is set.
 - `slow`: downloads the `tiny` Whisper model and a public-domain clip (JFK's 1961
   inaugural address, 11 s, pinned by commit and sha256 in `tests/slow_assets.py`) into
   `$SLOW_TEST_CACHE` (default `~/.cache/earmark-tests`), then transcribes it on CPU.
@@ -708,7 +781,9 @@ The analysis client tests drive the real SDK through `httpx2.MockTransport`
 a scripted `LLMClient` (`tests/llm_fakes.py`). The remote ASR tests use `httpx2.MockTransport`, a recording transport that iterates the
 request body (to prove streaming), and `tests/asr_stub.py`, a threaded stdlib HTTP server
 on a unix socket reached with `httpx2.HTTPTransport(uds=...)`, which the socket block
-allows.
+allows. The local LLM client (step 11) is tested the same way with `tests/llm_stub.py`, an
+OpenAI-style chat server on a unix socket, and map-reduce with synthetic multi-hour
+transcripts (`tests/long_transcripts.py`) and the scripted `LLMClient`.
 
 With every backend set to `fake`, the whole service runs in the sandbox:
 `earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears (the fake
@@ -819,3 +894,13 @@ Step planners should check these against current documentation instead of assumi
    `av.open`, which PyAV 19.0.0 removed, so every transcription fails with a `TypeError`.
    The `transcribe` extra pins `av>=18.1,<19` until a faster-whisper release includes the
    fix already on its `master`. The weekly `slow` job would catch a regression.
+8. **Local LLM context and token counts** (step 11, 2026-11-20). OpenAI-compatible servers
+   have no common token-counting endpoint. earmark estimates conservatively
+   (`ceil(UTF-8 bytes / 3) + 4 per line`, plus the schema), which over-counts modern
+   large-vocabulary tokenizers but can under-count old small-vocabulary ones (Llama 2,
+   byte fallback for CJK). vLLM and llama.cpp reject an overflow with a 400, which earmark
+   reports. **Ollama's OpenAI API truncates an over-long prompt silently** (`truncate` and
+   `shift` default to true and cannot be set through `/v1`), so `OLLAMA_CONTEXT_LENGTH`
+   (or `num_ctx`) must be at least `EARMARK_LLM_CONTEXT_TOKENS`. earmark cannot detect it.
+   None of the four servers was run in the sandbox. See `docs/llm.md` and
+   `docs/steps/11-local-llm-map-reduce.md` section 2.

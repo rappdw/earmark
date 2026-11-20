@@ -1,6 +1,6 @@
 """A scripted LLMClient for analyzer tests."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from earmark.analyze.llm.base import LLMRequest, LLMResponse
 from tests.analysis_samples import valid_wire_json
@@ -15,7 +15,8 @@ class ScriptedLLMClient:
         context_tokens: int = 1_000_000,
         output_tokens: int = 64_000,
         max_output_tokens: int = 128_000,
-        token_count: int = 1000,
+        token_count: int | Callable[[LLMRequest], int] = 1000,
+        respond: Callable[[LLMRequest], LLMResponse | Exception] | None = None,
     ) -> None:
         self._script = list(responses)
         self._model = model
@@ -23,6 +24,7 @@ class ScriptedLLMClient:
         self._output_tokens = output_tokens
         self._max_output_tokens = max_output_tokens
         self.token_count = token_count
+        self._respond = respond
         self.count_requests: list[LLMRequest] = []
         self.complete_requests: list[LLMRequest] = []
         self.closed = False
@@ -53,11 +55,18 @@ class ScriptedLLMClient:
 
     def count_tokens(self, request: LLMRequest, /) -> int:
         self.count_requests.append(request)
+        if callable(self.token_count):
+            return self.token_count(request)
         return self.token_count
 
     def complete(self, request: LLMRequest, /) -> LLMResponse:
         self.complete_requests.append(request)
         if not self._script:
+            if self._respond is not None:
+                answer = self._respond(request)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
             return LLMResponse(text=valid_wire_json(), stop="end")
         item = self._script.pop(0)
         if isinstance(item, Exception):

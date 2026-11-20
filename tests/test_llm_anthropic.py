@@ -10,6 +10,7 @@ import pytest
 from pydantic import SecretStr
 
 from earmark.analyze.analyzer import LlmAnalyzer
+from earmark.analyze.chunking import estimate_tokens
 from earmark.analyze.llm.anthropic import (
     FALLBACK_BETA,
     NO_CREDENTIALS,
@@ -18,7 +19,7 @@ from earmark.analyze.llm.anthropic import (
     build_anthropic_analyzer,
 )
 from earmark.analyze.llm.base import LLMClient, LLMRequest
-from earmark.analyze.prompts import SYSTEM_PROMPT
+from earmark.analyze.prompts import MAP_SYSTEM_PROMPT, REDUCE_SYSTEM_PROMPT, SYSTEM_PROMPT
 from earmark.analyze.schema import ANALYSIS_OUTPUT_SCHEMA, SCHEMA_NAME
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
@@ -35,6 +36,7 @@ from tests.anthropic_stub import (
     request_json,
     stream_reply,
 )
+from tests.long_transcripts import long_transcript
 
 TRANSCRIPT_SENTINEL = "zebra-sentinel-transcript-text"
 
@@ -386,7 +388,53 @@ def test_count_tokens_value(stub: AnthropicStub, client: AnthropicClient) -> Non
     assert client.count_tokens(make_request()) == 4321
 
 
-def test_needs_chunking_via_settings(stub: AnthropicStub, tmp_path: Any) -> None:
+def _estimated_ten_times(body: dict[str, Any]) -> int:
+    system, user = body["system"], body["messages"][0]["content"]
+    return 10 * (estimate_tokens(system) + estimate_tokens(user))
+
+
+def test_map_reduce_via_settings(stub: AnthropicStub, tmp_path: Any) -> None:
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        llm_context_tokens=200_000,
+        llm_api_key=SecretStr(KEY),
+    )
+    stub.count = _estimated_ten_times
+    client = make_client(stub, AnthropicOptions.from_settings(settings))
+    analyzer = LlmAnalyzer(ArtifactStore(settings.data_dir), client)
+    for _ in range(40):
+        stub.replies.append(stream_reply(message_events(valid_wire_json())))
+    transcript = long_transcript(hours=3)
+    try:
+        analysis = analyzer.analyze(sample_episode(), transcript, None)
+    finally:
+        analyzer.close()
+    posted = [request_json(r) for r in stub.message_requests()]
+    parts = len(posted) - 1
+    assert parts >= 2
+    assert len(stub.count_requests()) >= parts + 2
+    for body in posted:
+        assert set(body) == {
+            "model",
+            "max_tokens",
+            "system",
+            "messages",
+            "thinking",
+            "output_config",
+            "fallbacks",
+            "stream",
+        }
+        assert body["stream"] is True
+    assert [b["system"] for b in posted[:-1]] == [MAP_SYSTEM_PROMPT] * parts
+    assert posted[-1]["system"] == REDUCE_SYSTEM_PROMPT
+    assert analysis.warnings[0].startswith(f"the transcript was analyzed in {parts} parts")
+    # the exact count decided: every part, as the server counts it, fits the window
+    for body in posted[:-1]:
+        assert _estimated_ten_times(body) + body["max_tokens"] <= 200_000
+
+
+def test_context_too_small_for_parts(stub: AnthropicStub, tmp_path: Any) -> None:
     settings = Settings(
         _env_file=None,
         data_dir=tmp_path / "data",
@@ -397,11 +445,12 @@ def test_needs_chunking_via_settings(stub: AnthropicStub, tmp_path: Any) -> None
     client = make_client(stub, AnthropicOptions.from_settings(settings))
     analyzer = LlmAnalyzer(ArtifactStore(settings.data_dir), client)
     try:
-        with pytest.raises(NeedsChunking) as excinfo:
+        with pytest.raises(PermanentError) as excinfo:
             analyzer.analyze(sample_episode(), sample_transcript(), None)
     finally:
         analyzer.close()
-    assert excinfo.value.input_tokens == 4500
+    assert not isinstance(excinfo.value, NeedsChunking)
+    assert "EARMARK_LLM_CONTEXT_TOKENS" in excinfo.value.message
     assert stub.message_requests() == []
 
 

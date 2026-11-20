@@ -146,7 +146,7 @@ class AnthropicStub:
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
         self.replies: list[httpx2.Response | Exception] = []
-        self.count: int | httpx2.Response = 1000
+        self.count: int | httpx2.Response | Callable[[dict[str, Any]], int] = 1000
 
     def _matching(self, path: str) -> list[httpx2.Request]:
         return [r for r in self.requests if r.method == "POST" and r.url.path == path]
@@ -163,6 +163,10 @@ class AnthropicStub:
         if request.method == "POST" and path == "/v1/messages/count_tokens":
             if isinstance(self.count, httpx2.Response):
                 return self.count
+            if callable(self.count):
+                return httpx2.Response(
+                    200, json={"input_tokens": self.count(json.loads(request.content))}
+                )
             return httpx2.Response(200, json={"input_tokens": self.count})
         if request.method == "POST" and path == "/v1/messages":
             if not self.replies:

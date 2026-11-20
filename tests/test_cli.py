@@ -756,6 +756,16 @@ def test_analyze_prompt(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert analysis.prompt == "Why?"
 
 
+def test_analyze_openai_compat_missing_settings(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode = _analyze_env(fake_env, monkeypatch, provider="openai_compat")
+    result = runner.invoke(app, ["analyze", episode.key])
+    assert result.exit_code == 2
+    assert "EARMARK_LLM_BASE_URL" in result.stderr
+    assert "EARMARK_LLM_CONTEXT_TOKENS" in result.stderr
+
+
 def test_analyze_bad_key(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _analyze_env(fake_env, monkeypatch)
     result = runner.invoke(app, ["analyze", "nothex"])

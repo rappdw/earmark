@@ -256,7 +256,9 @@ def test_build_analysis_maps_fields() -> None:
 def test_analyze_modules_import_light() -> None:
     code = (
         "import sys, earmark.analyze.analyzer, earmark.analyze.schema, earmark.analyze.prompts, "
-        "earmark.analyze.render, earmark.analyze.llm.base\n"
+        "earmark.analyze.render, earmark.analyze.llm.base, earmark.analyze.chunking, "
+        "earmark.analyze.merge, earmark.analyze.calls, earmark.analyze.mapreduce, "
+        "earmark.endpoint\n"
         "heavy = {'anthropic', 'httpx2', 'fastapi'}\n"
         "bad = sorted(m for m in sys.modules if m.split('.')[0] in heavy)\n"
         "assert not bad, bad\n"

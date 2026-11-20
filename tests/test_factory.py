@@ -189,11 +189,12 @@ def test_anthropic_without_credentials_touches_nothing(tmp_path: Path) -> None:
     assert not (tmp_path / "data").exists()
 
 
-def test_build_analyzer_only(tmp_path: Path) -> None:
+def test_build_analyzer_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(_env_file=None, data_dir=tmp_path / "data", llm_provider="fake")
     analyzer = factory.build_analyzer(settings)
     assert isinstance(analyzer, FakeAnalyzer)
-    unbuilt = Settings(_env_file=None, data_dir=tmp_path / "data", llm_provider="openai_compat")
+    unbuilt = Settings(_env_file=None, data_dir=tmp_path / "data", llm_provider="anthropic")
+    monkeypatch.setattr(factory, "ANALYZERS", {"fake": factory.ANALYZERS["fake"]})
     with pytest.raises(ConfigError) as info:
         factory.build_analyzer(unbuilt)
     assert info.value.errors[0].startswith("EARMARK_LLM_PROVIDER: ")
@@ -277,3 +278,44 @@ def test_build_resolver_unbuilt_name(tmp_path: Path, monkeypatch: pytest.MonkeyP
         factory.build_resolver(settings)
     [line] = info.value.errors
     assert line.startswith("EARMARK_RESOLVER_BACKEND: ")
+
+
+def test_openai_compat_analyzer_built(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx2
+
+    from earmark.analyze.analyzer import LlmAnalyzer
+    from earmark.analyze.llm.openai_compat import OpenAICompatClient
+
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(500)
+
+    monkeypatch.setattr(httpx2, "HTTPTransport", lambda *a, **k: httpx2.MockTransport(handler))
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        llm_provider="openai_compat",
+        llm_base_url="http://spark:8000/v1",
+        llm_model="local-model",
+        llm_context_tokens=32768,
+    )
+    analyzer = factory.build_analyzer(settings)
+    assert isinstance(analyzer, LlmAnalyzer)
+    assert isinstance(analyzer.client, OpenAICompatClient)
+    assert analyzer.repairs_invalid_json is True
+    assert seen == []
+    assert not (tmp_path / "data").exists()
+
+
+def test_openai_compat_config_error_touches_nothing(tmp_path: Path) -> None:
+    settings = _fake_settings(tmp_path, llm_provider="openai_compat")
+    with pytest.raises(ConfigError) as info:
+        factory.build_worker(settings)
+    assert [line.split(":")[0] for line in info.value.errors] == [
+        "EARMARK_LLM_BASE_URL",
+        "EARMARK_LLM_CONTEXT_TOKENS",
+        "EARMARK_LLM_MODEL",
+    ]
+    assert not (tmp_path / "data").exists()

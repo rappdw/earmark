@@ -79,6 +79,12 @@ def _anthropic_analyzer(ctx: BuildContext) -> Analyzer:
     return build_anthropic_analyzer(ctx.settings, ctx.artifacts, clock=ctx.clock)
 
 
+def _openai_compat_analyzer(ctx: BuildContext) -> Analyzer:
+    from earmark.analyze.llm.openai_compat import build_openai_compat_analyzer
+
+    return build_openai_compat_analyzer(ctx.settings, ctx.artifacts, clock=ctx.clock)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -94,6 +100,7 @@ TRANSCRIBERS: Final[Mapping[str, Builder[Transcriber]]] = {
 }
 ANALYZERS: Final[Mapping[str, Builder[Analyzer]]] = {
     "anthropic": _anthropic_analyzer,
+    "openai_compat": _openai_compat_analyzer,
     "fake": lambda ctx: FakeAnalyzer(ctx.artifacts, clock=ctx.clock),
 }
 STORES: Final[Mapping[str, Builder[Store]]] = {

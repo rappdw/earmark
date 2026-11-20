@@ -13,8 +13,7 @@ import json
 import logging
 import math
 import time
-import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Self
@@ -24,9 +23,11 @@ from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
+from earmark.endpoint import MAX_DETAIL_CHARS as MAX_DETAIL_CHARS  # re-export
+from earmark.endpoint import error_detail as error_detail  # re-export
+from earmark.endpoint import host_label
 from earmark.errors import PermanentError, TransientError
-from earmark.fetch import AUDIO_EXTENSIONS, MIB, USER_AGENT, media_type, parse_retry_after
-from earmark.log import redact
+from earmark.fetch import AUDIO_EXTENSIONS, MIB, USER_AGENT, parse_retry_after
 from earmark.models import Segment, Transcript, format_hms, utc_now
 from earmark.transcribe.base import (
     CachedTranscriber,
@@ -41,9 +42,7 @@ RESPONSE_FORMAT: Final = "verbose_json"
 CONNECT_TIMEOUT_S: Final = 10.0
 MAX_RESPONSE_BYTES: Final = 64 * MIB
 MAX_ERROR_BYTES: Final = 64 * 1024
-MAX_DETAIL_CHARS: Final = 200
 MAX_LANGUAGE_CHARS: Final = 32
-MAX_HOST_CHARS: Final = 100
 NO_TIMESTAMPS_WARNING: Final = (
     "the ASR server returned no segment timestamps; the transcript is one segment"
 )
@@ -83,16 +82,7 @@ class RemoteOptions:
 
     @property
     def host(self) -> str:
-        parts = urllib.parse.urlsplit(self.base_url)
-        name = parts.hostname or "?"
-        if ":" in name:
-            name = f"[{name}]"
-        try:
-            port = parts.port
-        except ValueError:
-            port = None
-        shown = name if port is None else f"{name}:{port}"
-        return shown if len(shown) <= MAX_HOST_CHARS else shown[: MAX_HOST_CHARS - 1] + "…"
+        return host_label(self.base_url)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
@@ -207,49 +197,6 @@ def transcript_from_response(
         segments=tuple(segments),
         warnings=warnings,
     )
-
-
-def _first_string(*candidates: object) -> str | None:
-    for item in candidates:
-        if isinstance(item, str):
-            return item
-    return None
-
-
-def _json_detail(data: object) -> str | None:
-    if not isinstance(data, dict):
-        return None
-    error = data.get("error")
-    detail = data.get("detail")
-    detail_msg: object = None
-    if isinstance(detail, list) and detail and isinstance(detail[0], dict):
-        detail_msg = detail[0].get("msg")
-    return _first_string(
-        error.get("message") if isinstance(error, dict) else None,
-        error,
-        detail,
-        detail_msg,
-        data.get("message"),
-    )
-
-
-def error_detail(body: bytes, content_type: str | None, secrets: Sequence[str]) -> str | None:
-    """A short, sanitised message from a server error body, or ``None``."""
-    text = body.decode("utf-8", errors="replace")
-    kind = media_type(content_type)
-    found: str | None = None
-    if (kind is not None and "json" in kind) or text.lstrip().startswith("{"):
-        try:
-            found = _json_detail(json.loads(text))
-        except ValueError:
-            found = None
-    elif kind == "text/plain":
-        found = text
-    if found is None:
-        return None
-    cleaned = _collapse("".join(c if c.isprintable() else " " for c in found))
-    cleaned = redact(cleaned, secrets)[:MAX_DETAIL_CHARS]
-    return cleaned or None
 
 
 # -- engine -------------------------------------------------------------------------------

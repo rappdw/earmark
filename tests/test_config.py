@@ -37,6 +37,8 @@ def test_defaults() -> None:
     assert s.llm_base_url is None
     assert s.llm_api_key is None
     assert s.llm_context_tokens is None
+    assert s.llm_timeout_seconds == 3600.0
+    assert s.llm_response_format == "json_schema"
     assert s.embed_model == "BAAI/bge-small-en-v1.5"
     assert s.ntfy_url is None
     assert s.ntfy_token is None
@@ -151,6 +153,13 @@ def test_secret_values_lists_only_set_secrets(monkeypatch: pytest.MonkeyPatch) -
         ("EARMARK_ASR_BASE_URL", "http://h:99999/v1", False),
         ("EARMARK_ASR_API_KEY", "sentinel key", True),
         ("EARMARK_ASR_TIMEOUT_SECONDS", "0", False),
+        ("EARMARK_LLM_BASE_URL", "ftp://sentinel-host/v1", True),
+        ("EARMARK_LLM_BASE_URL", "sentinel-nohost", True),
+        ("EARMARK_LLM_BASE_URL", "http://user:sentinel-pw@h/v1", True),
+        ("EARMARK_LLM_BASE_URL", "http://h/v1?k=sentinel-q", True),
+        ("EARMARK_LLM_BASE_URL", "http://h:99999/v1", False),
+        ("EARMARK_LLM_TIMEOUT_SECONDS", "0", False),
+        ("EARMARK_LLM_RESPONSE_FORMAT", "xml-sentinel", True),
     ],
 )
 def test_invalid_values_rejected(
@@ -299,3 +308,26 @@ def test_llm_api_key_blank_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
     s = load_settings(env_file=None)
     assert s.llm_api_key is None
     assert s.secret_values() == []
+
+
+def test_llm_base_url_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_LLM_BASE_URL", "http://user:pw@h/v1")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    assert info.value.errors == [
+        "EARMARK_LLM_BASE_URL: Value error, must not contain credentials; use EARMARK_LLM_API_KEY"
+    ]
+    monkeypatch.setenv("EARMARK_ASR_BASE_URL", "http://user:pw@h/v1")
+    monkeypatch.delenv("EARMARK_LLM_BASE_URL")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    assert "use EARMARK_ASR_API_KEY" in info.value.errors[0]
+    monkeypatch.delenv("EARMARK_ASR_BASE_URL")
+    assert Settings(_env_file=None, llm_base_url=" http://h:8000/v1/ ").llm_base_url == (
+        "http://h:8000/v1"
+    )
+
+
+def test_llm_response_format_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_LLM_RESPONSE_FORMAT", " JSON_OBJECT ")
+    assert load_settings(env_file=None).llm_response_format == "json_object"

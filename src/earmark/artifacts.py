@@ -3,6 +3,7 @@
 import contextlib
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from earmark.models import (
 
 _AUDIO_NAME = re.compile(r"audio\.[a-z0-9]{1,5}")
 _ANALYSIS_NAME = re.compile(r"[0-9a-f]{16}\.json")
+_PART_ID = re.compile(r"[0-9a-f]{16}")
 
 
 @contextmanager
@@ -78,6 +80,11 @@ def _check_hash(prompt_hash: str) -> None:
         raise ValueError(f"not a prompt hash: {prompt_hash!r}")
 
 
+def _check_part_id(part_id: str) -> None:
+    if not _PART_ID.fullmatch(part_id):
+        raise ValueError(f"not a part id: {part_id!r}")
+
+
 def _corrupt(path: Path) -> PermanentError:
     return PermanentError(f"corrupt artifact: {path}")
 
@@ -114,6 +121,33 @@ class ArtifactStore:
     def analysis_path(self, key: str, prompt_hash: str) -> Path:
         _check_hash(prompt_hash)
         return self.analyses_dir(key) / f"{prompt_hash}.json"
+
+    def analysis_parts_dir(self, key: str, prompt_hash: str) -> Path:
+        """``episodes/<key>/analyses/<prompt_hash>.parts``: map results of a map-reduce."""
+        _check_hash(prompt_hash)
+        return self.analyses_dir(key) / f"{prompt_hash}.parts"
+
+    def _part_path(self, key: str, prompt_hash: str, part_id: str) -> Path:
+        _check_part_id(part_id)
+        return self.analysis_parts_dir(key, prompt_hash) / f"{part_id}.json"
+
+    def read_analysis_part(self, key: str, prompt_hash: str, part_id: str) -> bytes | None:
+        try:
+            return self._part_path(key, prompt_hash, part_id).read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def write_analysis_part(self, key: str, prompt_hash: str, part_id: str, data: bytes) -> Path:
+        path = self._part_path(key, prompt_hash, part_id)
+        atomic_write_bytes(path, data)
+        return path
+
+    def delete_analysis_part(self, key: str, prompt_hash: str, part_id: str) -> None:
+        self._part_path(key, prompt_hash, part_id).unlink(missing_ok=True)
+
+    def clear_analysis_parts(self, key: str, prompt_hash: str) -> None:
+        """Remove the parts directory if present; a missing directory is fine."""
+        shutil.rmtree(self.analysis_parts_dir(key, prompt_hash), ignore_errors=True)
 
     def audio_path(self, key: str, ext: str) -> Path:
         if not re.fullmatch("[a-z0-9]{1,5}", ext):
