@@ -17,6 +17,7 @@ StoreBackend = Literal["vault", "fake"]
 IndexBackend = Literal["lancedb", "fake", "none"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+LlmEffort = Literal["low", "medium", "high", "xhigh", "max"]
 AsrDevice = Literal["auto", "cpu", "cuda"]
 AsrComputeType = Literal[
     "auto",
@@ -89,10 +90,25 @@ class Settings(BaseSettings):
         10800.0, gt=0, description="How long to wait for the remote ASR server's answer."
     )
     keep_audio: bool = Field(False, description="Keep audio after transcription.")
-    llm_model: str = Field("claude-opus-5-5", description="Analysis model id.")
-    llm_base_url: str | None = Field(None, description="OpenAI-compatible endpoint.")
-    llm_api_key: SecretStr | None = Field(None, description="Analysis API key.")
-    llm_context_tokens: int | None = Field(None, gt=0, description="Model context window.")
+    llm_model: str = Field(
+        "claude-opus-5-5", description="Analysis model id (also part of the analysis cache key)."
+    )
+    llm_effort: LlmEffort = Field(
+        "medium", description="Claude effort level: low, medium, high, xhigh, max."
+    )
+    llm_fallbacks: bool = Field(
+        True,
+        description="Retry a refused Claude request on Anthropic's recommended fallback model.",
+    )
+    llm_base_url: str | None = Field(
+        None, description="OpenAI-compatible endpoint (openai_compat only)."
+    )
+    llm_api_key: SecretStr | None = Field(
+        None, description="Analysis API key (Anthropic, or the local endpoint)."
+    )
+    llm_context_tokens: int | None = Field(
+        None, gt=0, description="Model context window in tokens (default 1,000,000 for Anthropic)."
+    )
     embed_model: str = Field("BAAI/bge-small-en-v1.5", description="Embedding model.")
     ntfy_url: str | None = Field(None, description="ntfy topic URL.")
     ntfy_token: SecretStr | None = Field(None, description="ntfy access token.")
@@ -128,15 +144,15 @@ class Settings(BaseSettings):
     def _upper_log_level(cls, v: object) -> object:
         return v.upper() if isinstance(v, str) else v
 
-    @field_validator("asr_model")
+    @field_validator("asr_model", "llm_model")
     @classmethod
-    def _check_asr_model(cls, v: str) -> str:
+    def _check_model_name(cls, v: str) -> str:
         v = v.strip()
         if not v:
             raise ValueError("must not be empty")
         return v
 
-    @field_validator("asr_device", "asr_compute_type", mode="before")
+    @field_validator("asr_device", "asr_compute_type", "llm_effort", mode="before")
     @classmethod
     def _lower_asr_choice(cls, v: object) -> object:
         return v.strip().lower() if isinstance(v, str) else v
@@ -174,9 +190,9 @@ class Settings(BaseSettings):
             raise ValueError("must not contain a query or fragment")
         return v.rstrip("/")
 
-    @field_validator("asr_api_key")
+    @field_validator("asr_api_key", "llm_api_key")
     @classmethod
-    def _check_asr_api_key(cls, v: SecretStr | None) -> SecretStr | None:
+    def _check_api_key(cls, v: SecretStr | None) -> SecretStr | None:
         if v is None:
             return None
         stripped = v.get_secret_value().strip()

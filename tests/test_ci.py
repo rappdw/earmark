@@ -389,6 +389,7 @@ def test_network_workflow_is_not_the_gate() -> None:
     expression = addopts[addopts.index("-m") + 1]
     assert "not network" in expression
     assert "not slow" in expression
+    assert "not llm" in expression
 
 
 # --- slow job (step 08) --------------------------------------------------------------------
@@ -437,3 +438,56 @@ def test_slow_job_caches_test_assets() -> None:
     [cache] = [s for s in _steps(job) if _action(s) == CACHE_ACTION]
     assert cache["with"]["path"] == "~/" + DEFAULT_CACHE_DIR.relative_to(Path.home()).as_posix()
     assert "hashFiles('tests/slow_assets.py')" in cache["with"]["key"]
+
+
+# --- llm workflow (step 10) ----------------------------------------------------------------
+
+LLM_WORKFLOW = WORKFLOWS_DIR / "llm.yml"
+LLM_COMMANDS = ["uv sync --locked", "uv run --locked pytest -m llm -v -rs"]
+
+
+def _llm() -> dict[Any, Any]:
+    return _load_yaml(LLM_WORKFLOW)
+
+
+def test_llm_workflow_triggers() -> None:
+    assert set(_triggers(_llm())) == {"workflow_dispatch"}
+
+
+def test_llm_workflow_job() -> None:
+    jobs = _jobs(_llm())
+    assert set(jobs) == {"llm"}
+    job = jobs["llm"]
+    assert job["runs-on"] == ARM64_RUNNER
+    timeout = job["timeout-minutes"]
+    assert type(timeout) is int
+    assert 1 <= timeout <= 30
+    assert job["environment"] == "llm"
+    assert job["if"] == "github.event_name == 'workflow_dispatch'"
+    steps = _steps(job)
+    assert [_action(s) for s in steps] == [CHECKOUT, SETUP_UV, "", ""]
+    assert [s["run"].strip() for s in steps if "run" in s] == LLM_COMMANDS
+    assert _job_remote_uses(job) == _remote_uses(_ci())
+    [llm_uv] = [s for s in steps if _action(s) == SETUP_UV]
+    assert llm_uv["with"] == _ci_step(SETUP_UV)["with"]
+
+
+def test_llm_workflow_secret_scope() -> None:
+    workflow = _llm()
+    assert workflow["permissions"] == {"contents": "read"}
+    assert "env" not in workflow
+    job = _jobs(workflow)["llm"]
+    assert "permissions" not in job
+    assert "env" not in job
+    steps = _steps(job)
+    assert all("env" not in s for s in steps[:-1])
+    assert steps[-1]["env"] == {"ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}"}
+    assert LLM_WORKFLOW.read_text().count("secrets.") == 1
+    [checkout] = [s for s in steps if _action(s) == CHECKOUT]
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_only_llm_workflow_references_secrets() -> None:
+    for path in _workflow_files():
+        if path != LLM_WORKFLOW:
+            assert re.search(r"\bsecrets\b", path.read_text()) is None, path.name

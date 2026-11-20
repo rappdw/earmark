@@ -385,3 +385,15 @@ def test_ingest_normalised_round_trip() -> None:
     req = IngestRequest(url=" u ", prompt="  padded \n", timestamp=T0)
     assert IngestRequest.model_validate_json(req.model_dump_json()) == req
     assert req.prompt == "padded"
+
+
+def test_normalize_prompt() -> None:
+    from earmark.models import normalize_prompt
+
+    assert normalize_prompt(None) is None
+    assert normalize_prompt("  \n ") is None
+    assert normalize_prompt("  a b \n") == "a b"
+    assert normalize_prompt("x" * MAX_PROMPT_CHARS) == "x" * MAX_PROMPT_CHARS
+    with pytest.raises(ValueError, match="at most 4000 characters") as info:
+        normalize_prompt("x" * (MAX_PROMPT_CHARS + 1))
+    assert str(info.value) == f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)"

@@ -17,10 +17,23 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @pytest.fixture(autouse=True)
-def _isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _isolate_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> None:
     for key in list(os.environ):
         if key.startswith("EARMARK_"):
             monkeypatch.delenv(key)
+    if request.node.get_closest_marker("llm") is None:
+        # A developer's real key, profile, or base URL must never reach a default test.
+        for key in list(os.environ):
+            if key.startswith("ANTHROPIC_"):
+                monkeypatch.delenv(key)
+        # Not under tmp_path: many tests assert that tmp_path stays empty.
+        config_dir = tmp_path_factory.mktemp("anthropic-config")
+        monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(config_dir))
     monkeypatch.chdir(tmp_path)
 
 

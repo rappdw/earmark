@@ -120,3 +120,32 @@ def test_ruff_lint_groups() -> None:
 def test_required_environments_include_aarch64() -> None:
     envs = _pyproject()["tool"]["uv"]["required-environments"]
     assert any("aarch64" in e and "linux" in e for e in envs)
+
+
+_INNER_ENV = """
+import os
+from pathlib import Path
+import pytest
+
+def test_plain():
+    assert "ANTHROPIC_API_KEY" not in os.environ
+    assert "ANTHROPIC_BASE_URL" not in os.environ
+    directory = Path(os.environ["ANTHROPIC_CONFIG_DIR"])
+    assert directory.is_dir()
+    assert list(directory.iterdir()) == []
+
+@pytest.mark.llm
+def test_llm():
+    assert os.environ["ANTHROPIC_API_KEY"] == "outer-secret-key"
+    assert os.environ["ANTHROPIC_BASE_URL"] == "https://outer.example"
+"""
+
+
+def test_anthropic_env_isolated(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_inner(pytester, _INNER_ENV)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "outer-secret-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://outer.example")
+    plain = pytester.runpytest_subprocess()
+    plain.assert_outcomes(passed=1, deselected=1)
+    live = pytester.runpytest_subprocess("-m", "llm")
+    live.assert_outcomes(passed=1, deselected=1)

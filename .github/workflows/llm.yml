@@ -1,0 +1,44 @@
+# Opt-in live test of the analysis model, run by hand only. It spends API credit.
+# Setup (once, in the repository settings): create the environment "llm", add the
+# secret ANTHROPIC_API_KEY to it, and restrict its deployment branches to main and
+# impl. GitHub offers workflow_dispatch only for workflow files on the default branch.
+# Never triggered by pushes, schedules, or pull requests.
+name: LLM test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  llm:
+    name: pytest -m llm (linux/arm64)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    environment: llm
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # Same minor as the uv_build bound in pyproject.toml; bump both together.
+          version: ">=0.13.9,<0.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          prune-cache: true
+          cache-python: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: LLM tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: uv run --locked pytest -m llm -v -rs

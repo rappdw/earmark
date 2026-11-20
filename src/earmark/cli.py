@@ -306,3 +306,66 @@ def transcribe_command(
         return
     for line in transcript.to_text().splitlines():
         typer.echo(_clean(line))
+
+
+@app.command("analyze")
+def analyze_command(
+    episode_key: Annotated[str, typer.Argument(help="Episode key (see data/episodes/).")],
+    prompt: Annotated[str | None, typer.Option("--prompt", help="Analysis prompt.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the Analysis as JSON.")] = False,
+) -> None:
+    """Analyze an episode's stored transcript and print the analysis.
+
+    Writes `analyses/<hash>.json` (or reuses it); does not update the vault note.
+    """
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from earmark.analyze.analyzer import LlmAnalyzer
+    from earmark.analyze.render import render_analysis
+    from earmark.artifacts import ArtifactStore
+    from earmark.errors import PermanentError, TransientError
+    from earmark.models import is_episode_key, normalize_prompt
+    from earmark.pipeline.factory import build_analyzer
+
+    if not is_episode_key(episode_key):
+        typer.echo(f"earmark analyze: not an episode key: {_clean(episode_key)}", err=True)
+        raise typer.Exit(code=2)
+    try:
+        normalised = normalize_prompt(prompt)
+    except ValueError as exc:
+        typer.echo(f"earmark analyze: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        analyzer = build_analyzer(settings)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        artifacts = ArtifactStore(settings.data_dir)
+        episode = artifacts.read_episode(episode_key)
+        transcript = artifacts.read_transcript(episode_key)
+        if episode is None or transcript is None:
+            what = "episode" if episode is None else "transcript"
+            typer.echo(
+                f"earmark analyze: no {what} for {episode_key} under EARMARK_DATA_DIR; "
+                "share the episode first",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        analysis = analyzer.analyze(episode, transcript, normalised)
+    except TransientError as exc:
+        typer.echo(f"earmark analyze: {_clean(exc.message)} (temporary; try again later)", err=True)
+        raise typer.Exit(code=1) from None
+    except PermanentError as exc:
+        typer.echo(f"earmark analyze: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=1) from None
+    finally:
+        if isinstance(analyzer, LlmAnalyzer):
+            analyzer.close()
+    for warning in analysis.warnings:
+        typer.echo(f"earmark analyze: warning: {_clean(warning)}", err=True)
+    if as_json:
+        typer.echo(analysis.model_dump_json(indent=2))
+        return
+    for line in render_analysis(analysis).splitlines():
+        typer.echo(_clean(line))

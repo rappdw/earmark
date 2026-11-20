@@ -84,7 +84,19 @@ def test_http_client_loggers_do_not_log_urls_at_info() -> None:
         logging.getLogger("httpx2").info("HTTP Request: GET https://x.example/secret/path?sid=1")
         logging.getLogger("httpx2").warning("kept")
     finally:
-        for name in ("httpx2", "httpcore2"):
+        for name in ("httpx2", "httpcore2", "anthropic"):
             logging.getLogger(name).setLevel(logging.NOTSET)
     assert "secret/path" not in stream.getvalue()
+    assert "kept" in stream.getvalue()
+
+
+def test_anthropic_debug_suppressed() -> None:
+    stream = io.StringIO()
+    configure_logging("DEBUG", stream=stream)
+    try:
+        logging.getLogger("anthropic._base_client").debug("Request options: %s", "TRANSCRIPT-TEXT")
+        logging.getLogger("anthropic._base_client").warning("kept")
+    finally:
+        logging.getLogger("anthropic").setLevel(logging.NOTSET)
+    assert "TRANSCRIPT-TEXT" not in stream.getvalue()
     assert "kept" in stream.getvalue()

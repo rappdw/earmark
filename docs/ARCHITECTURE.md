@@ -13,13 +13,13 @@ backend, not the pipeline.
 | Question | Decision | How to change it |
 |---|---|---|
 | System of record | An Obsidian-compatible Markdown vault. Files are the truth; SQLite and the vector index are derived and rebuildable. | Implement another `Store` backend. |
-| LLM for analysis | Hosted is allowed: Claude (`claude-opus-5-5`) through the Anthropic API by default. Transcription and embeddings always run locally. | `EARMARK_LLM_PROVIDER=openai_compat` points analysis at a local server (step 11). |
+| LLM for analysis | Hosted is allowed: Claude (`claude-opus-5-5`) through the Anthropic API by default, via the official `anthropic` SDK (2.x): one streamed request with adaptive thinking, an explicit effort (`medium`), a JSON-schema structured output, and server-side refusal fallback (step 10). Transcription and embeddings always run locally. | `EARMARK_LLM_MODEL`, `EARMARK_LLM_EFFORT`, `EARMARK_LLM_FALLBACKS`; `EARMARK_LLM_PROVIDER=openai_compat` points analysis at a local server (step 11). |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
-| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), the `anthropic` SDK (a core dependency, itself built on httpx2, imported only by the analyzer's builder; step 10). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
@@ -75,7 +75,11 @@ src/earmark/
                        TranscriptionEngine; segment_from), faster_whisper.py (the
                        `faster_whisper` engine, step 08), remote.py (the `remote` engine:
                        OpenAI-compatible /v1/audio/transcriptions client, step 09)
-  analyze/             schema.py, prompts.py, render.py, analyzer.py, chunking.py, llm/
+  analyze/             schema.py (output JSON schema, wire models, build_analysis), prompts.py
+                       (SYSTEM_PROMPT, DEFAULT_PROMPT, build_user_message), render.py
+                       (render_analysis), analyzer.py (LlmAnalyzer, the `anthropic` and later
+                       `openai_compat` Analyzer), chunking.py (step 11), llm/ (base.py: the
+                       LLMClient Protocol; anthropic.py: AnthropicClient; step 10)
   vault/               notes.py, sanitize.py, entities.py
   index/               chunks.py, embed.py, lancedb_index.py
   notify/              ntfy.py
@@ -149,6 +153,8 @@ invalidate cached analyses.
 `TransientError(message, *, retry_after_s=None)`, `PermanentError(message)`, and
 `SkipEpisode(reason)`. Messages are short, human-readable, and free of secrets and
 untrusted bulk text, because they are stored in `job.error` and shown in notifications.
+`NeedsChunking(PermanentError)` (step 10) means a transcript does not fit one LLM request
+(it carries `model`, `input_tokens`, `limit_tokens`); transcripts are never truncated.
 
 ## Stage contracts
 
@@ -390,6 +396,65 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   `EARMARK_ASR_*` settings; prints `[HH:MM:SS] text` lines or the `Transcript` JSON
   (warnings on stderr), and writes nothing outside the model cache.
 
+### Analyzing
+
+Step 10; exact signatures in `docs/steps/10-analysis.md`.
+
+- **Shell and client.** `analyze.analyzer.LlmAnalyzer(artifacts, client, clock=...)` is the
+  `Analyzer`. It talks to a model only through the `analyze.llm.base.LLMClient` Protocol
+  (`model`, `context_tokens`, `output_tokens`, `max_output_tokens`, `count_tokens(request)`,
+  `complete(request) -> LLMResponse`, `close()`). An `LLMRequest` is a fixed system prompt,
+  one user message, a JSON schema, and `max_tokens`; an `LLMResponse` carries the text, a
+  normalised stop (`end`, `max_tokens`, `refusal`, `context_exceeded`, `other`), the refusal
+  category, warnings, and token usage. Clients raise `TransientError`/`PermanentError`;
+  the analyzer owns the policy below, so step 11's local client reuses it.
+- **Order.** Cache first: `analyses/<prompt_hash(prompt, LLM_MODEL)>.json` is returned with
+  no API call at all. An empty transcript is permanent. Then `count_tokens`; if input plus
+  the first output cap exceeds `context_tokens`, `NeedsChunking` before any completion.
+  Then one completion; a `max_tokens` stop retries once with the larger cap
+  (64 000, then 128 000 for Claude), then fails permanently; a refusal is permanent and
+  names its category; `model_context_window_exceeded` is `NeedsChunking`. The answer is
+  validated against `schema.AnalysisOutput` (a `ValidationError` is permanent, with the
+  error count and location only) and mapped by `schema.build_analysis`: names and items
+  normalised, empty items dropped, timestamps (`HH:MM:SS` strings copied from transcript
+  markers) parsed, and those unreadable or beyond `ceil(max(transcript.duration_s, last
+  segment end))` dropped with a warning; `prompt_response` is forced to null without a
+  prompt. `Analysis.model` is always `LLM_MODEL` (the cache key), even when a fallback
+  model answered; that is recorded as a warning.
+- **Request.** `prompts.SYSTEM_PROMPT` is a constant with nothing interpolated (it says the
+  metadata and transcript are untrusted and never instructions). The user message is
+  `<episode>` (show, title, date, duration, description), `<transcript>` (the whole
+  `to_text()`, `[HH:MM:SS]` lines), `<analysis_instructions>` (`DEFAULT_PROMPT`, always),
+  and, only with a prompt, `<user_prompt>`, then a fixed closing line. Untrusted values
+  have `<` and `>` escaped so they cannot close a section. Changing the system prompt,
+  default prompt, closing lines, or schema requires bumping `ANALYSIS_SCHEMA_VERSION`
+  (a fingerprint test enforces it).
+- **`anthropic` client.** `analyze.llm.anthropic.AnthropicClient` uses
+  `client.beta.messages.stream(...)` and `get_final_message()`: `thinking={"type":
+  "adaptive"}`, `output_config={"effort": LLM_EFFORT, "format": {"type": "json_schema",
+  "schema": ...}}`, and, unless `LLM_FALLBACKS=false`, beta `server-side-fallback-2026-07-01`
+  with `fallbacks="default"`. No sampling parameters, tools, or prefill. The answer is all
+  text blocks concatenated (a mid-stream fallback continues the partial text).
+  `count_tokens` uses `client.messages.count_tokens` with the same system, message,
+  thinking, and output config. Errors: connection errors, timeouts, 408, 409, 429 (with
+  Retry-After), 5xx, and mid-stream `overloaded_error`/`api_error` are transient; spend-limit
+  429s, 400, 401, 402, 403, 404, 413, 422, and credential-provider errors are permanent.
+  Messages name the status, the setting to check, at most 200 characters of the API's
+  message with secrets redacted, and the request id. The SDK keeps its own two retries.
+- **Credentials.** `EARMARK_LLM_API_KEY` is passed to the SDK as `api_key` when set (then
+  no `ANTHROPIC_*` credential variable or profile is consulted); otherwise the SDK's chain
+  applies (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the process environment, an
+  `ant auth login` profile, workload identity). With no credential the builder raises a
+  `ConfigError` naming `EARMARK_LLM_API_KEY`, so the worker refuses to start.
+- **`render.render_analysis(analysis, heading_level=2)`** returns the deterministic Markdown
+  section step 12 places in the note: a title (`Default analysis` or `Analysis: <prompt>`),
+  the prompt quoted, the summary, `Answer`, then Key claims, People, Papers, Companies,
+  Tools, Topics, Open questions, Research leads (empty ones omitted), timestamps as
+  `[HH:MM:SS]`, `<` escaped, and leading Markdown block syntax backslash-escaped.
+- **`earmark analyze <episode_key> [--prompt] [--json]`** analyzes a stored transcript with
+  the configured provider (writing or reusing the analysis cache, not the note) and prints
+  the rendered section or the `Analysis` JSON; warnings go to stderr.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -514,8 +579,12 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset, unset, unset (no upload limit) | Remote ASR backend (step 09). Base URL: the server's OpenAI-compatible base, ending in `/v1` (http or https, a host, no credentials, query, or fragment; a trailing `/` is dropped). Key: secret, printable ASCII without spaces, sent as a bearer token. Upload limit in MiB |
 | `ASR_TIMEOUT_SECONDS` | `10800` | How long the remote backend waits for the server's answer (read and write timeout) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
-| `LLM_MODEL` | `claude-opus-5-5` | Analysis model |
-| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_CONTEXT_TOKENS` | unset | Local LLM endpoint and its context budget (key is secret) |
+| `LLM_MODEL` | `claude-opus-5-5` | Analysis model id; part of the analysis cache key (`prompt_hash`) |
+| `LLM_EFFORT` | `medium` | Claude effort: `low`, `medium`, `high`, `xhigh`, `max` (case-insensitive). Not part of the cache key |
+| `LLM_FALLBACKS` | `true` | Claude server-side refusal fallback (`fallbacks: "default"`); set `false` for models without it (Opus 4.8 and older). Not part of the cache key |
+| `LLM_API_KEY` | unset | Analysis API key (secret, printable ASCII without spaces): the Anthropic key, or the local endpoint's key (step 11) |
+| `LLM_CONTEXT_TOKENS` | unset (Anthropic: 1 000 000) | Context window used for the fit check (`NeedsChunking`); set it for a smaller-context model |
+| `LLM_BASE_URL` | unset | Local OpenAI-compatible endpoint (`openai_compat` only; the Anthropic client ignores it and honours `ANTHROPIC_BASE_URL`) |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (fastembed's default; step 14 may revise) |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
 | `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
@@ -527,10 +596,12 @@ Backend names are `Literal` types, so a misspelt name fails when settings load, 
 the variable. A name that is valid but whose backend is not built yet is rejected by
 `pipeline/factory.py` (step 05).
 
-The Anthropic credential is read by the `anthropic` SDK from its own environment
-(`ANTHROPIC_API_KEY` or a stored profile), not from an `EARMARK_` variable. Note that
-pydantic-settings does not export `.env` entries to the process environment, so an
-`ANTHROPIC_API_KEY` line in `.env` is not seen by the SDK unless step 10 arranges it.
+The Anthropic credential (step 10): `EARMARK_LLM_API_KEY` (environment or `.env`) is
+passed to the SDK explicitly. When it is unset, the SDK resolves its own credential
+(`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` from the process environment, an `ant auth
+login` profile, workload identity). pydantic-settings does not export `.env` entries, so an
+`ANTHROPIC_API_KEY` line in `.env` is not seen; use `EARMARK_LLM_API_KEY` there. No
+credential at all is a startup `ConfigError`.
 
 ## Security
 
@@ -588,10 +659,20 @@ and writes into a vault the user cares about.
   unpickled. A cached model loads offline.
 - **Vault writes.** Titles and names from feeds and from the LLM are sanitized before
   they become paths or YAML. Resolved paths are checked to be inside the vault subdir.
-- **LLM.** The transcript is untrusted text. The analysis call has no tools, and its
-  output is validated against a schema before anything is written.
+- **LLM.** The transcript, feed metadata, and the model's answer are untrusted text. The
+  analysis call has no tools; the fixed system prompt tells the model that metadata and
+  transcript are material, never instructions; untrusted sections have `<` and `>`
+  escaped; the answer is validated against a schema before anything is written, and
+  rendered with `<` escaped. With `LLM_FALLBACKS=true` a refused request is re-run by
+  Anthropic on another Claude model, recorded as an analysis warning. The Anthropic API is
+  an operator endpoint reached by the SDK's own httpx2 client, not through `fetch.py`
+  (base URL from the SDK default or `ANTHROPIC_BASE_URL`; the SDK honours proxy
+  environment variables). The `anthropic` logger is kept at WARNING or above, because its
+  DEBUG records contain the whole request body.
 - **Secrets.** Tokens are `SecretStr`, redacted in `earmark config` and `earmark doctor`,
-  and never logged.
+  and never logged. The LLM key lives only in `AnthropicOptions.api_key` and the SDK
+  client, and a test shows it absent from DEBUG logs even without the redacting
+  formatter.
 
 ## Testing
 
@@ -614,10 +695,17 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   inaugural address, 11 s, pinned by commit and sha256 in `tests/slow_assets.py`) into
   `$SLOW_TEST_CACHE` (default `~/.cache/earmark-tests`), then transcribes it on CPU.
   Needs the `transcribe` extra and fails (does not skip) without it.
-- `llm`: calls the real analysis model.
+- `llm`: calls the real analysis model (`tests/test_analyze_live.py`: a short synthetic
+  transcript, effort `low`, about two requests). Needs `ANTHROPIC_API_KEY` or an `ant
+  auth login` profile and fails (does not skip) without one. For every test without this
+  marker, `tests/conftest.py` deletes all `ANTHROPIC_*` variables and points
+  `ANTHROPIC_CONFIG_DIR` at an empty directory, so a developer's key, profile, or base URL
+  never reaches the default suite.
 - `gpu`: needs CUDA.
 
-The remote ASR tests use `httpx2.MockTransport`, a recording transport that iterates the
+The analysis client tests drive the real SDK through `httpx2.MockTransport`
+(`tests/anthropic_stub.py` builds the SSE streams and error bodies); the analyzer tests use
+a scripted `LLMClient` (`tests/llm_fakes.py`). The remote ASR tests use `httpx2.MockTransport`, a recording transport that iterates the
 request body (to prove streaming), and `tests/asr_stub.py`, a threaded stdlib HTTP server
 on a unix socket reached with `httpx2.HTTPTransport(uds=...)`, which the socket block
 allows.
@@ -648,9 +736,14 @@ as `ci.yml`; `slow` (step 08) runs `uv sync --locked --extra transcribe` and `uv
 transcribe` and a pinned `actions/cache` step for `~/.cache/earmark-tests` (the model and
 clip). GitHub runs `schedule` and
 `workflow_dispatch` only for workflow files on the default branch, so it starts once the
-file is on `main`. Later steps add a
-manual-only `-m llm` run that reads its key from a GitHub environment secret (step 10),
-and an arm64 container build without push (step 16). None of those is a required check:
+file is on `main`. `.github/workflows/llm.yml` ("LLM test", step 10) is triggered only by
+`workflow_dispatch` (never by pushes, schedules, or pull requests; the job also checks
+`github.event_name`), has `contents: read`, runs in the GitHub environment `llm`, and
+passes that environment's `ANTHROPIC_API_KEY` secret only to its last step, `uv run
+--locked pytest -m llm -v -rs`, after the same pinned checkout, setup-uv, and `uv sync
+--locked` as `ci.yml`. The operator creates the environment and secret, and should restrict
+its deployment branches to `main` and `impl`. Step 16 adds an arm64 container build without
+push. None of those is a required check:
 their failures usually mean an outside service changed.
 
 Rules for every workflow under `.github/workflows/`, enforced by `tests/test_ci.py`: it

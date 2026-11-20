@@ -10,7 +10,8 @@ from earmark.config import REDACTED
 HANDLER_NAME: Final = "earmark"
 # HTTP client loggers print every request URL at INFO, including paths and query strings
 # that can carry session ids. Earmark logs hosts only (see docs/ARCHITECTURE.md, Security).
-QUIET_LOGGERS: Final = ("httpx2", "httpcore2")
+# The anthropic SDK logs whole request bodies (the transcript) at DEBUG.
+QUIET_LOGGERS: Final = ("httpx2", "httpcore2", "anthropic")
 LOG_FORMAT: Final = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 

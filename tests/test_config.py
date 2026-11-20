@@ -32,6 +32,8 @@ def test_defaults() -> None:
     assert s.asr_max_upload_mb is None
     assert s.keep_audio is False
     assert s.llm_model == "claude-opus-5-5"
+    assert s.llm_effort == "medium"
+    assert s.llm_fallbacks is True
     assert s.llm_base_url is None
     assert s.llm_api_key is None
     assert s.llm_context_tokens is None
@@ -260,3 +262,40 @@ def test_asr_model_dir_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert load_settings(env_file=None).asr_model_dir is None
     monkeypatch.setenv("EARMARK_ASR_MODEL_DIR", "/models")
     assert load_settings(env_file=None).asr_model_dir == Path("/models")
+
+
+def test_llm_settings_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_LLM_EFFORT", " HIGH ")
+    monkeypatch.setenv("EARMARK_LLM_MODEL", " claude-x ")
+    monkeypatch.setenv("EARMARK_LLM_API_KEY", " sk-x\n")
+    monkeypatch.setenv("EARMARK_LLM_FALLBACKS", "false")
+    s = load_settings(env_file=None)
+    assert (s.llm_effort, s.llm_model, s.llm_fallbacks) == ("high", "claude-x", False)
+    assert s.llm_api_key is not None
+    assert s.llm_api_key.get_secret_value() == "sk-x"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("EARMARK_LLM_EFFORT", "extreme-sentinel"),
+        ("EARMARK_LLM_MODEL", "   "),
+        ("EARMARK_LLM_API_KEY", "a b-sentinel"),
+    ],
+)
+def test_llm_settings_rejected(monkeypatch: pytest.MonkeyPatch, name: str, value: str) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    [line] = info.value.errors
+    assert line.startswith(f"{name}: ")
+    assert "sentinel" not in str(info.value)
+    if name == "EARMARK_LLM_API_KEY":
+        assert "printable ASCII without spaces" in line
+
+
+def test_llm_api_key_blank_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_LLM_API_KEY", "   ")
+    s = load_settings(env_file=None)
+    assert s.llm_api_key is None
+    assert s.secret_values() == []

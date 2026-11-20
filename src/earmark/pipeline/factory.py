@@ -73,6 +73,12 @@ def _remote_transcriber(ctx: BuildContext) -> Transcriber:
     return build_remote_transcriber(ctx.settings, ctx.artifacts)
 
 
+def _anthropic_analyzer(ctx: BuildContext) -> Analyzer:
+    from earmark.analyze.llm.anthropic import build_anthropic_analyzer
+
+    return build_anthropic_analyzer(ctx.settings, ctx.artifacts, clock=ctx.clock)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -87,6 +93,7 @@ TRANSCRIBERS: Final[Mapping[str, Builder[Transcriber]]] = {
     "remote": _remote_transcriber,
 }
 ANALYZERS: Final[Mapping[str, Builder[Analyzer]]] = {
+    "anthropic": _anthropic_analyzer,
     "fake": lambda ctx: FakeAnalyzer(ctx.artifacts, clock=ctx.clock),
 }
 STORES: Final[Mapping[str, Builder[Store]]] = {
@@ -153,6 +160,16 @@ def build_resolver(settings: Settings, *, clock: Clock = utc_now) -> Resolver:
     """Build only the resolver (for ``earmark resolve``); no other backend is built or checked."""
     problems: list[str] = []
     builder = _lookup(RESOLVERS, "resolver_backend", settings.resolver_backend, problems)
+    if builder is None:
+        raise ConfigError(problems)
+    ctx = BuildContext(settings=settings, artifacts=ArtifactStore(settings.data_dir), clock=clock)
+    return builder(ctx)
+
+
+def build_analyzer(settings: Settings, *, clock: Clock = utc_now) -> Analyzer:
+    """Build only the analyzer (for ``earmark analyze``); no other backend is built or checked."""
+    problems: list[str] = []
+    builder = _lookup(ANALYZERS, "llm_provider", settings.llm_provider, problems)
     if builder is None:
         raise ConfigError(problems)
     ctx = BuildContext(settings=settings, artifacts=ArtifactStore(settings.data_dir), clock=clock)

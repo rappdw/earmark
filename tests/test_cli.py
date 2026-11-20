@@ -23,7 +23,7 @@ from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from earmark.transcribe import faster_whisper as fw
-from tests.factories import make_episode
+from tests.factories import make_analysis, make_episode, make_transcript
 from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
 
 runner = CliRunner()
@@ -682,3 +682,166 @@ def test_worker_remote_without_url_exits_2(fake_env: Path, monkeypatch: pytest.M
     assert result.exit_code == 2
     assert "EARMARK_ASR_BASE_URL" in result.stderr
     assert not (fake_env / "data").exists()
+
+
+# -- analyze ------------------------------------------------------------------------------
+
+ANALYZE_SENTINEL = "sk-ant-cli-sentinel-91ab"
+
+
+def _stored_episode(root: Path) -> Episode:
+    from earmark.artifacts import ArtifactStore
+
+    store = ArtifactStore(root / "data")
+    episode = make_episode()
+    store.write_episode(episode)
+    store.write_transcript(make_transcript())
+    return episode
+
+
+def _analyze_env(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch, provider: str = "fake"
+) -> Episode:
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
+    monkeypatch.setenv("EARMARK_LLM_PROVIDER", provider)
+    return _stored_episode(fake_env)
+
+
+def test_analyze_prints_rendered_analysis(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.analyze.render import render_analysis
+    from earmark.artifacts import ArtifactStore
+    from earmark.models import prompt_hash
+
+    episode = _analyze_env(fake_env, monkeypatch)
+    result = runner.invoke(app, ["analyze", episode.key])
+    assert result.exit_code == 0, result.stderr
+    store = ArtifactStore(fake_env / "data")
+    analysis = store.read_analysis(episode.key, prompt_hash(None, "fake-llm"))
+    assert analysis is not None
+    assert result.stdout.splitlines() == render_analysis(analysis).splitlines()
+    assert result.stdout.startswith("## Default analysis")
+
+
+def test_analyze_json(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    episode = _analyze_env(fake_env, monkeypatch)
+    result = runner.invoke(app, ["analyze", episode.key, "--json"])
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(result.stdout)["episode_key"] == episode.key
+
+
+def test_analyze_reuses_cache(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.artifacts import ArtifactStore
+    from earmark.models import prompt_hash
+
+    episode = _analyze_env(fake_env, monkeypatch)
+    assert runner.invoke(app, ["analyze", episode.key]).exit_code == 0
+    path = ArtifactStore(fake_env / "data").analysis_path(
+        episode.key, prompt_hash(None, "fake-llm")
+    )
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    assert runner.invoke(app, ["analyze", episode.key]).exit_code == 0
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+
+def test_analyze_prompt(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.artifacts import ArtifactStore
+    from earmark.models import prompt_hash
+
+    episode = _analyze_env(fake_env, monkeypatch)
+    result = runner.invoke(app, ["analyze", episode.key, "--prompt", "  Why?  "])
+    assert result.exit_code == 0, result.stderr
+    store = ArtifactStore(fake_env / "data")
+    analysis = store.read_analysis(episode.key, prompt_hash("Why?", "fake-llm"))
+    assert analysis is not None
+    assert analysis.prompt == "Why?"
+
+
+def test_analyze_bad_key(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _analyze_env(fake_env, monkeypatch)
+    result = runner.invoke(app, ["analyze", "nothex"])
+    assert result.exit_code == 2
+    assert "earmark analyze: not an episode key: nothex" in result.stderr
+
+
+def test_analyze_prompt_too_long(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    episode = _analyze_env(fake_env, monkeypatch)
+    result = runner.invoke(app, ["analyze", episode.key, "--prompt", "x" * (MAX_PROMPT_CHARS + 1)])
+    assert result.exit_code == 2
+    assert "prompt is too long" in result.stderr
+
+
+def test_analyze_missing_transcript(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
+    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "fake")
+    key = make_episode().key
+    result = runner.invoke(app, ["analyze", key])
+    assert result.exit_code == 1
+    assert key in result.stderr
+    assert "share the episode first" in result.stderr
+
+
+def test_analyze_anthropic_without_credentials(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from earmark.analyze.llm.anthropic import NO_CREDENTIALS
+
+    episode = _analyze_env(fake_env, monkeypatch, provider="anthropic")
+    result = runner.invoke(app, ["analyze", episode.key])
+    assert result.exit_code == 2
+    assert NO_CREDENTIALS in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("error", "exit_code", "temporary"),
+    [(TransientError("api is down"), 1, True), (PermanentError("api said no"), 1, False)],
+)
+def test_analyze_transient_and_permanent(
+    fake_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    exit_code: int,
+    temporary: bool,
+) -> None:
+    from earmark.analyze.llm.anthropic import AnthropicClient
+    from earmark.analyze.llm.base import LLMRequest
+
+    def boom(self: AnthropicClient, request: LLMRequest, /) -> int:
+        raise error
+
+    monkeypatch.setattr(AnthropicClient, "count_tokens", boom)
+    monkeypatch.setenv("EARMARK_LLM_API_KEY", ANALYZE_SENTINEL)
+    episode = _analyze_env(fake_env, monkeypatch, provider="anthropic")
+    result = runner.invoke(app, ["analyze", episode.key])
+    assert result.exit_code == exit_code
+    assert f"earmark analyze: {error}" in result.stderr
+    assert ("(temporary; try again later)" in result.stderr) is temporary
+    assert ANALYZE_SENTINEL not in result.stdout + result.stderr
+
+
+def test_analyze_never_prints_key(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_LLM_API_KEY", ANALYZE_SENTINEL)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+    episode = _analyze_env(fake_env, monkeypatch, provider="anthropic")
+    monkeypatch.setenv("EARMARK_LOG_LEVEL", "DEBUG")
+    result = runner.invoke(app, ["analyze", episode.key])
+    assert result.exit_code == 1
+    assert "could not reach the Anthropic API" in result.stderr
+    assert ANALYZE_SENTINEL not in result.stdout + result.stderr
+
+
+def test_analyze_warnings_on_stderr(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.artifacts import ArtifactStore
+    from earmark.models import prompt_hash
+
+    episode = _analyze_env(fake_env, monkeypatch)
+    store = ArtifactStore(fake_env / "data")
+    warned = make_analysis(prompt=None, model="fake-llm")
+    warned = warned.model_copy(
+        update={"episode_key": episode.key, "warnings": ("something\x07odd happened",)}
+    )
+    assert warned.prompt_hash == prompt_hash(None, "fake-llm")
+    store.write_analysis(warned)
+    result = runner.invoke(app, ["analyze", episode.key])
+    assert result.exit_code == 0, result.stderr
+    assert "earmark analyze: warning: something?odd happened" in result.stderr
+    assert "warning" not in result.stdout

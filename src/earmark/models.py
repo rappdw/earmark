@@ -102,6 +102,18 @@ def _check_relative_posix(path: str) -> str:
     return path
 
 
+def normalize_prompt(value: str | None) -> str | None:
+    """Strip; blank -> None; raise ValueError if longer than MAX_PROMPT_CHARS."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > MAX_PROMPT_CHARS:
+        raise ValueError(f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)")
+    return value
+
+
 class Model(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -126,16 +138,10 @@ class IngestRequest(Model):
     @field_validator("prompt", mode="after")
     @classmethod
     def _normalise_prompt(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        v = v.strip()
-        if not v:
-            return None
-        if len(v) > MAX_PROMPT_CHARS:
-            raise PydanticCustomError(
-                "prompt_too_long", f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)"
-            )
-        return v
+        try:
+            return normalize_prompt(v)
+        except ValueError as exc:
+            raise PydanticCustomError("prompt_too_long", str(exc)) from None
 
     @field_validator("timestamp", mode="after")
     @classmethod

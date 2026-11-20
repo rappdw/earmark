@@ -4,6 +4,7 @@ import typing
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from earmark import config
 from earmark.artifacts import ArtifactStore
@@ -63,7 +64,7 @@ def test_unbuilt_backend_names_setting(tmp_path: Path, field: str) -> None:
     assert repr(name) in line
     choices = ", ".join(sorted(registry))
     assert line.endswith(f"(choose one of: {choices})")
-    assert "choose one of: fake" in line
+    assert "choose one of: " in line
 
 
 def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
@@ -71,11 +72,11 @@ def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
     expected = {
         field for field, (_, registry) in FIELDS.items() if getattr(settings, field) not in registry
     }
-    assert expected == {"llm_provider", "store_backend", "index_backend", "notify_backend"}
+    assert expected == {"store_backend", "index_backend", "notify_backend"}
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     errors = info.value.errors
-    assert len(errors) == len(expected) == 4
+    assert len(errors) == len(expected) == 3
     for field in FIELDS:
         count = 1 if field in expected else 0
         assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == count
@@ -136,6 +137,66 @@ def test_build_worker_config_error_touches_nothing(tmp_path: Path) -> None:
     [line] = info.value.errors
     assert line.startswith("EARMARK_ASR_BASE_URL: required when EARMARK_ASR_BACKEND=remote")
     assert not (tmp_path / "data").exists()
+
+
+def test_anthropic_analyzer_built(tmp_path: Path) -> None:
+    from earmark.analyze.analyzer import LlmAnalyzer
+    from earmark.analyze.llm.anthropic import AnthropicClient
+
+    settings = _fake_settings(
+        tmp_path,
+        llm_provider="anthropic",
+        llm_api_key=SecretStr("sk-x"),
+        llm_model="claude-x",
+        llm_effort="low",
+        llm_fallbacks=False,
+    )
+    analyzer = factory.build_analyzer(settings, clock=MutableClock())
+    assert isinstance(analyzer, LlmAnalyzer)
+    client = analyzer.client
+    assert isinstance(client, AnthropicClient)
+    try:
+        assert (client.model, client.options.effort, client.options.fallbacks) == (
+            "claude-x",
+            "low",
+            False,
+        )
+        assert client.context_tokens == 1_000_000
+    finally:
+        analyzer.close()
+    small = factory.build_analyzer(
+        _fake_settings(
+            tmp_path,
+            llm_provider="anthropic",
+            llm_api_key=SecretStr("sk-x"),
+            llm_context_tokens=200_000,
+        )
+    )
+    assert isinstance(small, LlmAnalyzer)
+    try:
+        assert small.client.context_tokens == 200_000
+    finally:
+        small.close()
+
+
+def test_anthropic_without_credentials_touches_nothing(tmp_path: Path) -> None:
+    settings = _fake_settings(tmp_path, llm_provider="anthropic")
+    with pytest.raises(ConfigError) as info:
+        factory.build_worker(settings)
+    from earmark.analyze.llm.anthropic import NO_CREDENTIALS
+
+    assert info.value.errors == [NO_CREDENTIALS]
+    assert not (tmp_path / "data").exists()
+
+
+def test_build_analyzer_only(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data", llm_provider="fake")
+    analyzer = factory.build_analyzer(settings)
+    assert isinstance(analyzer, FakeAnalyzer)
+    unbuilt = Settings(_env_file=None, data_dir=tmp_path / "data", llm_provider="openai_compat")
+    with pytest.raises(ConfigError) as info:
+        factory.build_analyzer(unbuilt)
+    assert info.value.errors[0].startswith("EARMARK_LLM_PROVIDER: ")
 
 
 def test_pipeline_modules_import_light() -> None:
