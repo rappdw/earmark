@@ -117,6 +117,12 @@ The job runs in the background. If ntfy is set up
 failure notification carries the reason. To follow progress, call `GET /jobs/{id}` with
 the same `Authorization` header. If nothing works, run `earmark doctor` on the server.
 
+**Asking another question.** Share the same episode again and type the new question.
+Earmark does not download or transcribe it again, and the note gains a section. From a
+computer, `earmark reanalyze <key> --prompt "…"` (keys from `earmark episodes`) or `POST
+/episodes/{key}/analyze` does the same without contacting Apple; see
+[the README](../README.md).
+
 ## 6. What the share sheet sends (unverified)
 
 **Not captured yet.** The earmark build had no iPhone, so the exact input the Podcasts

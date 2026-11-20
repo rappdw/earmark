@@ -6,6 +6,7 @@ import traceback
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final
 
@@ -13,7 +14,15 @@ from earmark.artifacts import ArtifactStore
 from earmark.errors import EarmarkError, PermanentError, SkipEpisode, TransientError
 from earmark.jobs import Claim, JobStore, LeaseLostError
 from earmark.log import redact
-from earmark.models import Analysis, Episode, Job, JobResult, StoreResult, scrub_surrogates
+from earmark.models import (
+    Analysis,
+    Episode,
+    Job,
+    JobResult,
+    StoreResult,
+    Transcript,
+    scrub_surrogates,
+)
 from earmark.pipeline.stages import Backends
 
 logger = logging.getLogger(__name__)
@@ -162,11 +171,20 @@ class Pipeline:
             self._jobs.add_warning(job_id, warning)
 
     def _stage_work(self, claim: Claim, state: _RunState) -> tuple[Analysis, StoreResult]:
+        if claim.job.kind == "reanalyze":
+            episode, transcript, shared_at = self._stored_inputs(claim, state)
+        else:
+            episode, transcript, shared_at = self._ingest_inputs(claim, state)
+        return self._analyze_store_index(claim, episode, transcript, shared_at)
+
+    def _ingest_inputs(
+        self, claim: Claim, state: _RunState
+    ) -> tuple[Episode, Transcript, datetime]:
         job = claim.job
         jobs = self._jobs
         b = self._b
-        if job.kind != "ingest" or job.url is None:
-            raise PermanentError("reanalyze jobs are not supported yet")
+        if job.url is None:
+            raise PermanentError("ingest job without a url")
 
         jobs.set_stage(claim, "resolve")
         episode = b.resolver.resolve(job.url)
@@ -185,9 +203,37 @@ class Pipeline:
             logger.info("job %s: transcript for %s is cached", job.id, episode.key)
         if transcript.episode_key != episode.key:
             raise PermanentError("transcriber returned a transcript for another episode")
+        jobs.set_stage(claim, "analyze")
+        return episode, transcript, shared_at
+
+    def _stored_inputs(
+        self, claim: Claim, state: _RunState
+    ) -> tuple[Episode, Transcript, datetime]:
+        job = claim.job
+        key = job.episode_key
+        if key is None:
+            raise PermanentError("reanalyze job without an episode key")
+        self._jobs.set_stage(claim, "analyze")
+        episode = self._artifacts.read_episode(key)
+        if episode is None:
+            raise PermanentError(f"episode {key} is not stored; share it again")
+        state.episode = episode
+        transcript = self._artifacts.read_transcript(key)
+        if transcript is None:
+            raise PermanentError(
+                f"episode {key} has no transcript; share it again to transcribe it"
+            )
+        shared_at = self._artifacts.record_share(key, job.shared_at)
+        return episode, transcript, shared_at
+
+    def _analyze_store_index(
+        self, claim: Claim, episode: Episode, transcript: Transcript, shared_at: datetime
+    ) -> tuple[Analysis, StoreResult]:
+        job = claim.job
+        jobs = self._jobs
+        b = self._b
         self._warn(job.id, transcript.warnings)
 
-        jobs.set_stage(claim, "analyze")
         analysis = b.analyzer.analyze(episode, transcript, job.prompt)
         if analysis.episode_key != episode.key:
             raise PermanentError("analyzer returned an analysis for another episode")

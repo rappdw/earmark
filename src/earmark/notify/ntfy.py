@@ -54,6 +54,12 @@ TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
     "failed": "Failed",
     "skipped": "Skipped",
 }
+REANALYZE_TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
+    "done": "Analysis ready",
+    "failed": "Analysis failed",
+    "skipped": "Analysis skipped",
+}
+DEFAULT_ANALYSIS_LINE: Final = "Default analysis"
 UNKNOWN_EPISODE: Final = "podcast episode"
 UNKNOWN_SHOW: Final = "Apple Podcasts episode"
 _JOINERS: Final = frozenset({"‌", "‍"})
@@ -136,17 +142,23 @@ def compose(
         return clean_field(redact(text, secrets), limit)
 
     name = field(episode.title, NAME_MAX_BYTES) if episode is not None else ""
-    title = fit_bytes(f"{TITLE_PREFIX[status]}: {name or UNKNOWN_EPISODE}", TITLE_MAX_BYTES)
+    reanalyze = job.kind == "reanalyze"
+    prefix = REANALYZE_TITLE_PREFIX[status] if reanalyze else TITLE_PREFIX[status]
+    title = fit_bytes(f"{prefix}: {name or UNKNOWN_EPISODE}", TITLE_MAX_BYTES)
     show = field(episode.show_title, LINE_MAX_BYTES) if episode is not None else ""
+
+    def prompt_line() -> str | None:
+        if job.prompt:
+            prompt = field(job.prompt, PROMPT_MAX_BYTES)
+            return f"Prompt: {prompt}" if prompt else None
+        return DEFAULT_ANALYSIS_LINE if reanalyze else None
 
     lines: list[str] = []
     click: str | None = None
     if status == "done":
         lines.append(show or UNKNOWN_SHOW)
-        if job.prompt:
-            prompt = field(job.prompt, PROMPT_MAX_BYTES)
-            if prompt:
-                lines.append(f"Prompt: {prompt}")
+        if (line := prompt_line()) is not None:
+            lines.append(line)
         if job.warnings:
             first = field(job.warnings[0], LINE_MAX_BYTES)
             count = len(job.warnings)
@@ -158,7 +170,12 @@ def compose(
             if click is None:
                 lines.append(f"Note: {field(note_path, LINE_MAX_BYTES)}")
     else:
-        lines.append(show or field(job.url or "", LINE_MAX_BYTES) or UNKNOWN_SHOW)
+        if reanalyze:
+            lines.append(show or f"Episode {job.episode_key}")
+            if (line := prompt_line()) is not None:
+                lines.append(line)
+        else:
+            lines.append(show or field(job.url or "", LINE_MAX_BYTES) or UNKNOWN_SHOW)
         if status == "failed" and job.stage:
             lines.append(f"Stage: {field(job.stage, LINE_MAX_BYTES)}")
         reason = field(job.error or "", LINE_MAX_BYTES)

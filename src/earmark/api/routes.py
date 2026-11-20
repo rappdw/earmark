@@ -5,17 +5,28 @@ from typing import Annotated, Final
 from fastapi import APIRouter, HTTPException, Query, Response
 
 from earmark.api.schemas import Health, IngestResponse, JobList, SearchResponse
+from earmark.artifacts import ArtifactStore
+from earmark.episodes import (
+    EPISODES_LIMIT_DEFAULT,
+    EPISODES_LIMIT_MAX,
+    EPISODES_OFFSET_MAX,
+    EpisodeNotFoundError,
+    EpisodePage,
+    TranscriptMissingError,
+    enqueue_reanalyze,
+    list_episodes,
+)
 from earmark.index.search import DEFAULT_SEARCH_LIMIT, Searcher, parse_query
 from earmark.ingest import enqueue_ingest
 from earmark.jobs import LIST_LIMIT_MAX, JobStore
-from earmark.models import IngestRequest, Job, JobStatus
+from earmark.models import IngestRequest, Job, JobStatus, ReanalyzeRequest
 from earmark.resolve.apple import UnsupportedUrlError
 
 # 4000 prompt chars at up to 12 bytes each, 2048 URL chars at up to 6, and a timestamp.
 MAX_BODY_BYTES: Final = 64 * 1024
 
 
-def build_router(store: JobStore, searcher: Searcher) -> APIRouter:
+def build_router(store: JobStore, searcher: Searcher, artifacts: ArtifactStore) -> APIRouter:
     router = APIRouter()
 
     @router.post("/ingest", status_code=202, max_body_size=MAX_BODY_BYTES)
@@ -24,6 +35,25 @@ def build_router(store: JobStore, searcher: Searcher) -> APIRouter:
             enqueued = enqueue_ingest(store, body)
         except UnsupportedUrlError as exc:
             raise HTTPException(status_code=422, detail=exc.message) from None
+        job = enqueued.job
+        response.headers["Location"] = f"/jobs/{job.id}"
+        return IngestResponse(job_id=job.id, status=job.status, created=enqueued.created)
+
+    @router.get("/episodes")
+    def list_stored_episodes(
+        limit: Annotated[int, Query(ge=1, le=EPISODES_LIMIT_MAX)] = EPISODES_LIMIT_DEFAULT,
+        offset: Annotated[int, Query(ge=0, le=EPISODES_OFFSET_MAX)] = 0,
+    ) -> EpisodePage:
+        return list_episodes(artifacts, limit=limit, offset=offset)
+
+    @router.post("/episodes/{key}/analyze", status_code=202, max_body_size=MAX_BODY_BYTES)
+    def reanalyze(key: str, body: ReanalyzeRequest, response: Response) -> IngestResponse:
+        try:
+            enqueued = enqueue_reanalyze(store, artifacts, key, body)
+        except EpisodeNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=exc.message) from None
+        except TranscriptMissingError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
         job = enqueued.job
         response.headers["Location"] = f"/jobs/{job.id}"
         return IngestResponse(job_id=job.id, status=job.status, created=enqueued.created)

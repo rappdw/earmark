@@ -553,3 +553,52 @@ def test_compose_reason_redacts_bare_topic_from_settings() -> None:
     assert result is not None
     assert "Reason: HTTP 403 for **********" in result.message
     assert "sentinel-topic-404x" not in result.message
+
+
+# -- reanalyze notifications ------------------------------------------------------------
+
+
+def _reanalyze_job(status: str = "done", **overrides: Any) -> Job:
+    values: dict[str, Any] = {"kind": "reanalyze", "url": None, "prompt": "Who is cited?"}
+    values.update(overrides)
+    return _job(status, **values)
+
+
+def test_compose_reanalyze_done() -> None:
+    n = _compose(_reanalyze_job("done", stage="index"))
+    assert n.title == "Analysis ready: Épisode 1: «Tests»"
+    assert n.message.splitlines()[:2] == ["Le Podcast ☕", "Prompt: Who is cited?"]
+    assert n.click == _compose(_job("done")).click
+    assert n.click is not None
+
+
+def test_compose_reanalyze_default_prompt() -> None:
+    n = _compose(_reanalyze_job("done", prompt=None))
+    assert n.message.splitlines()[:2] == ["Le Podcast ☕", "Default analysis"]
+
+
+def test_compose_reanalyze_failed_without_episode() -> None:
+    key = make_episode().key
+    n = _compose(_reanalyze_job("failed", stage="analyze", prompt=None), episode=False)
+    assert n.title == "Analysis failed: podcast episode"
+    assert n.message.splitlines() == [
+        f"Episode {key}",
+        "Default analysis",
+        "Stage: analyze",
+        "Reason: asr server said no",
+        "Gave up after 4 attempts.",
+    ]
+    with_prompt = _compose(_reanalyze_job("failed", stage="analyze"), episode=False)
+    assert with_prompt.message.splitlines()[:2] == [f"Episode {key}", "Prompt: Who is cited?"]
+
+
+def test_compose_ingest_unchanged_for_kind() -> None:
+    done = _compose(_job("done", prompt="p?"), vault=None)
+    assert done.title == "Note ready: Épisode 1: «Tests»"
+    assert done.message == f"Le Podcast ☕\nPrompt: p?\nNote: {NOTE}"
+    failed = _compose(_job("failed"), episode=False)
+    assert failed.title == "Failed: podcast episode"
+    assert failed.message == (
+        "https://podcasts.apple.com/us/podcast/x/id1?i=2\n"
+        "Stage: transcribe\nReason: asr server said no\nGave up after 4 attempts."
+    )

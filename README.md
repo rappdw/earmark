@@ -28,6 +28,16 @@ Every stage is a protocol with a real backend and a fake, chosen by configuratio
 - **index**: `lancedb` with local embeddings, for `earmark search` and `GET /search`.
 - **notify**: `ntfy` sends a push notification when a job finishes or fails.
 
+**Asking again.** `POST /episodes/{key}/analyze` or `earmark reanalyze <key> --prompt "…"`
+runs a new prompt on an episode that is already transcribed. It downloads and transcribes
+nothing, contacts neither Apple nor the feed, and adds a section to the note, with the
+entity notes and the search index updated. `GET /episodes` or `earmark episodes` lists the
+stored episodes with their keys and the prompts already run. A prompt already run with the
+same `EARMARK_LLM_MODEL` makes no LLM call, and the job only regenerates the note (a note
+whose managed region you edited by hand is backed up to `Backups/` first, as for any
+store). Sharing the episode again from the Shortcut with a new question also works; it
+looks the episode up again but does not re-download it.
+
 The Markdown vault is the system of record. SQLite and the search index are derived and
 can be rebuilt from the files on disk. Earmark writes only inside
 `<vault>/<EARMARK_VAULT_SUBDIR>/`:
@@ -43,8 +53,7 @@ Earmark/
 
 See "Data layout" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Planned: re-running a prompt on a stored episode, and a weekly digest
-([docs/PLAN.md](docs/PLAN.md)).
+Planned: a weekly digest ([docs/PLAN.md](docs/PLAN.md)).
 
 ## Quickstart (fake backends)
 
@@ -74,6 +83,10 @@ curl -s http://127.0.0.1:8787/ingest \
   -d '{"url": "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981", "prompt": "Which papers are mentioned?"}'
 uv run earmark worker --once
 uv run earmark jobs
+uv run earmark episodes
+uv run earmark reanalyze "$(ls "$demo/data/episodes")" --prompt "Who is interviewed?"
+uv run earmark worker --once
+curl -s http://127.0.0.1:8787/episodes -H "Authorization: Bearer $EARMARK_API_TOKEN"
 cat "$demo"/vault/Earmark/Podcasts/*.md
 kill %1
 wait
@@ -86,7 +99,10 @@ What you see:
 - `{"status":"ok"}` from the health check, then
   `{"job_id": …, "status": "queued", "created": true}` for the ingest.
 - `job <id> done` from `worker --once`, and the job listed as `done` by `earmark jobs`.
-- The fake note's Markdown.
+- `earmark episodes` lists the fake episode with its prompt.
+- The reanalyze prints a second job id, and `worker --once` prints it as `done`.
+- `GET /episodes` shows both prompts.
+- The fake note's Markdown, with a section for each prompt.
 
 The episode URL is never fetched, because the resolver is fake. `kill %1` stops the
 server, and `wait` lets it finish shutting down. Everything lives in a temporary
@@ -120,6 +136,8 @@ Run them as `uv run earmark <command>`.
 | `resolve <url>` | Resolve an episode URL to its feed, GUID, and audio URL. |
 | `transcribe <file> [--json]` | Transcribe a local audio file and print the result. |
 | `analyze <key> [--prompt] [--json]` | Analyze an episode's stored transcript and print the analysis. |
+| `episodes [--limit] [--offset] [--json]` | List stored episodes, newest share first, with the prompts already run. |
+| `reanalyze <key> [--prompt]` | Run a prompt on a stored episode: enqueue a job that starts at analysis. |
 | `entities rebuild [--prune]` | Rebuild the entity notes from the stored analyses. |
 | `search QUERY [--limit] [--kind] [--episode] [--json]` | Search transcripts and analyses of processed episodes. |
 | `reindex [--episode KEY]` | Rebuild the search index from the episode files and the vault's notes. |
@@ -127,9 +145,12 @@ Run them as `uv run earmark <command>`.
 | `config` | Show the effective configuration with secrets redacted. |
 | `--version` | Print the version. |
 
-The HTTP API is `POST /ingest`, `GET /jobs/{id}`, `GET /jobs`, `GET /search`, and
-`GET|HEAD /healthz`. Everything except `/healthz` needs `Authorization: Bearer
-$EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+`analyze` prints an analysis and writes no note. `reanalyze` is a job: it updates the
+note, the entities, and the index, and notifies.
+
+The HTTP API is `POST /ingest`, `GET /jobs/{id}`, `GET /jobs`, `GET /search`,
+`GET /episodes`, `POST /episodes/{key}/analyze`, and `GET|HEAD /healthz`. Everything
+except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 

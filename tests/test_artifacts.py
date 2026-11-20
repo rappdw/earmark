@@ -361,3 +361,30 @@ def test_analysis_parts_paths(tmp_path: Path) -> None:
     s.clear_analysis_parts(KEY, digest)
     assert not s.analysis_parts_dir(KEY, digest).exists()
     assert s.read_analysis(KEY, digest) == analysis
+
+
+def test_has_episode(tmp_path: Path) -> None:
+    s = ArtifactStore(tmp_path)
+    assert not s.has_episode(KEY)
+    s.episode_dir(KEY).mkdir(parents=True)
+    assert not s.has_episode(KEY)
+    s.write_episode(make_episode())
+    assert s.has_episode(KEY)
+    with pytest.raises(ValueError, match="episode key"):
+        s.has_episode("../etc")
+
+
+def test_list_analysis_hashes(tmp_path: Path) -> None:
+    s = ArtifactStore(tmp_path)
+    assert s.list_analysis_hashes(KEY) == []
+    a = make_analysis(prompt="a")
+    b = make_analysis(prompt="b")
+    s.write_analysis(a)
+    s.write_analysis(b)
+    s.write_analysis_part(KEY, a.prompt_hash, "0" * 16, b"{}")
+    d = s.analyses_dir(KEY)
+    (d / "notes.json").write_text("{}")
+    (d / f".{a.prompt_hash}.json.abc.tmp").write_text("junk")
+    corrupt = "f" * 16
+    (d / f"{corrupt}.json").write_text("not json")
+    assert s.list_analysis_hashes(KEY) == sorted([a.prompt_hash, b.prompt_hash, corrupt])

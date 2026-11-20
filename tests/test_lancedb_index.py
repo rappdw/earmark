@@ -43,7 +43,7 @@ from earmark.index.lancedb_index import (
 from earmark.index.rebuild import reindex
 from earmark.index.search import IndexMismatchError, parse_query
 from earmark.jobs import JobStore
-from earmark.models import Segment, StoreResult
+from earmark.models import Segment, StoreResult, prompt_hash
 from earmark.vault.fs import vault_lock
 from tests.factories import T0, MutableClock
 from tests.index_helpers import (
@@ -500,6 +500,33 @@ def test_reshare_embeds_nothing(tmp_path: Path, runtime: LanceRuntime) -> None:
     assert second.status == "done"
     assert env.embedder.documents == embedded
     assert env.table().version() == version
+
+
+def test_reanalyze_adds_rows_for_new_prompt(tmp_path: Path, runtime: LanceRuntime) -> None:
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    env = Env(tmp_path / "idx", runtime)
+    pipeline_env = make_env(
+        tmp_path, backends=dataclasses.replace(fakes.backends(), indexer=env.index), fakes=fakes
+    )
+    pipeline_env.jobs.enqueue(CANON)
+    first = pipeline_env.worker.run_once()
+    assert first is not None
+    assert first.episode_key is not None
+    before = {str(r["id"]): r for r in env.rows()}
+    new_hash = prompt_hash("Who is interviewed?", "fake-llm")
+    assert not any(r["prompt_hash"] == new_hash for r in before.values())
+    pipeline_env.jobs.enqueue_reanalyze(first.episode_key, prompt="Who is interviewed?")
+    second = pipeline_env.worker.run_once()
+    assert second is not None
+    assert second.status == "done"
+    assert not second.warnings
+    after = {str(r["id"]): r for r in env.rows()}
+    added = {k: r for k, r in after.items() if r["prompt_hash"] == new_hash}
+    assert {"summary", "answer"} <= {str(r["kind"]) for r in added.values()}
+    transcript_ids = {k for k, r in before.items() if r["kind"] == "transcript"}
+    assert transcript_ids
+    assert transcript_ids <= set(after)
+    assert set(before) <= set(after)
 
 
 # -- A6: reindex ------------------------------------------------------------------------------

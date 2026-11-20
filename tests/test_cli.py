@@ -1259,3 +1259,158 @@ def test_doctor_online_cli_unreachable(doctor_env: Path, monkeypatch: pytest.Mon
     assert "FAIL  ntfy server" in result.stdout
     assert "Traceback" not in result.stdout + result.stderr
     assert "sentinel-topic-12" not in result.stdout + result.stderr
+
+
+# -- reanalyze and episodes --------------------------------------------------------------
+
+
+def _ingest_one(prompt: str | None = None) -> str:
+    args = [SHARE] if prompt is None else [SHARE, "--prompt", prompt]
+    _submit(*args)
+    assert runner.invoke(app, ["worker", "--once"]).exit_code == 0
+    keys = ArtifactStore(Path("data")).list_episode_keys()
+    assert len(keys) == 1
+    return keys[0]
+
+
+def test_reanalyze_then_worker_once(fake_env: Path) -> None:
+    key = _ingest_one()
+    result = runner.invoke(app, ["reanalyze", key, "--prompt", "q2"])
+    assert result.exit_code == 0, result.stderr
+    match = re.fullmatch(r"([0-9a-f]{32}) queued\n", result.stdout)
+    assert match
+    worked = runner.invoke(app, ["worker", "--once"])
+    assert worked.stdout == f"job {match.group(1)} done\n"
+    assert len(ArtifactStore(Path("data")).list_analyses(key)) == 2
+    [note] = (fake_env / "vault" / "Earmark" / "Podcasts").glob("*.md")
+    assert note.read_text().count("\n## ") == 2
+
+
+def test_reanalyze_existing_job(fake_env: Path) -> None:
+    key = _ingest_one()
+    first = runner.invoke(app, ["reanalyze", key]).stdout.split()[0]
+    assert runner.invoke(app, ["reanalyze", key]).stdout == f"{first} queued (existing job)\n"
+
+
+def test_reanalyze_bad_key_exits_2(fake_env: Path) -> None:
+    result = runner.invoke(app, ["reanalyze", "nothex\x1b"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert result.stderr == "earmark reanalyze: not an episode key: nothex?\n"
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_reanalyze_prompt_too_long_exits_2(fake_env: Path) -> None:
+    key = _ingest_one()
+    result = runner.invoke(app, ["reanalyze", key, "--prompt", "x" * (MAX_PROMPT_CHARS + 1)])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)" in result.stderr
+    assert "queued" not in runner.invoke(app, ["jobs"]).stdout
+
+
+def test_reanalyze_unknown_episode_exits_1(fake_env: Path) -> None:
+    result = runner.invoke(app, ["reanalyze", "0" * 20])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        f"earmark reanalyze: no episode {'0' * 20} under EARMARK_DATA_DIR; see `earmark episodes`\n"
+    )
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_reanalyze_no_transcript_exits_1(fake_env: Path) -> None:
+    ArtifactStore(Path("data")).write_episode(make_episode())
+    key = make_episode().key
+    result = runner.invoke(app, ["reanalyze", key])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        f"earmark reanalyze: episode {key}: this episode has no transcript yet; "
+        "share it again, or wait for its job to finish\n"
+    )
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_reanalyze_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key = _ingest_one()
+    blocker = fake_env / "file"
+    blocker.write_text("x")
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(blocker))
+    result = runner.invoke(app, ["reanalyze", key])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+
+
+def test_episodes_text(fake_env: Path) -> None:
+    key = _ingest_one()
+    runner.invoke(app, ["reanalyze", key, "--prompt", "  who\n is   here? "])
+    runner.invoke(app, ["worker", "--once"])
+    other = ArtifactStore(Path("data"))
+    bare = make_episode(guid="urn:bare", title="Bare")
+    other.write_episode(bare)
+    other.record_share(bare.key, make_analysis().created_at.replace(year=2020))
+    out = runner.invoke(app, ["episodes"])
+    assert out.exit_code == 0
+    lines = out.stdout.splitlines()
+    assert re.fullmatch(rf"{key}  \d{{4}}-\d\d-\d\d  .+ — .+", lines[0])
+    assert sum(ln.endswith("  fake-llm  (default analysis)") for ln in lines[1:3]) == 1
+    assert any(ln.endswith("  fake-llm  who is here?") for ln in lines)
+    assert lines[-2].startswith(bare.key)
+    assert lines[-1] == "  no transcript yet"
+    paged = runner.invoke(app, ["episodes", "--limit", "1"]).stdout.splitlines()
+    assert paged[-1] == "showing 1-1 of 2; next: --offset 1"
+    last = runner.invoke(app, ["episodes", "--limit", "1", "--offset", "1"]).stdout.splitlines()
+    assert last[-1] == "showing 2-2 of 2"
+    assert (
+        runner.invoke(app, ["episodes", "--offset", "5"]).stdout
+        == "no episodes at offset 5 (total 2)\n"
+    )
+
+
+def test_episodes_json(fake_env: Path) -> None:
+    from earmark.episodes import list_episodes
+
+    _ingest_one("p")
+    result = runner.invoke(app, ["episodes", "--json"])
+    expected = list_episodes(ArtifactStore(Path("data"))).model_dump_json()
+    assert result.stdout == expected + "\n"
+
+
+def test_episodes_empty(fake_env: Path) -> None:
+    result = runner.invoke(app, ["episodes"])
+    assert result.stdout == "no episodes\n"
+    assert not Path("data/episodes").exists()
+
+
+def test_episodes_cleans_control_chars(fake_env: Path) -> None:
+    ArtifactStore(Path("data")).write_episode(make_episode(title="red \x1b[31mtext"))
+    out = runner.invoke(app, ["episodes"]).stdout
+    assert "\x1b" not in out
+    assert "red ?[31mtext" in out
+
+
+@pytest.mark.parametrize("limit", ["0", "201"])
+def test_episodes_bad_limit_exits_2(fake_env: Path, limit: str) -> None:
+    assert runner.invoke(app, ["episodes", "--limit", limit]).exit_code == 2
+
+
+def test_episodes_unreadable_root_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(self: ArtifactStore) -> list[str]:
+        raise PermissionError("no")
+
+    monkeypatch.setattr(ArtifactStore, "list_episode_keys", boom)
+    result = runner.invoke(app, ["episodes"])
+    assert result.exit_code == 1
+    assert result.stderr.startswith("earmark episodes: the episode files")
+    assert result.stderr.endswith("(temporary; try again later)\n")
+
+
+def test_episodes_module_is_light() -> None:
+    code = (
+        "import sys, earmark.episodes\n"
+        "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2', 'anthropic'}\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"

@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -15,6 +15,9 @@ from earmark.db import DatabaseSetupError
 from earmark.jobs import LIST_LIMIT_MAX
 from earmark.log import configure_logging
 from earmark.models import Job, JobStatus
+
+if TYPE_CHECKING:
+    from earmark.episodes import EpisodeInfo
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +197,124 @@ def submit_command(
         raise typer.Exit(code=1) from None
     suffix = "" if enqueued.created else " (existing job)"
     typer.echo(f"{enqueued.job.id} {enqueued.job.status}{suffix}")
+
+
+@app.command("reanalyze")
+def reanalyze_command(
+    episode_key: Annotated[str, typer.Argument(help="Episode key; see `earmark episodes`.")],
+    prompt: Annotated[str | None, typer.Option("--prompt", help="Analysis prompt.")] = None,
+) -> None:
+    """Run a prompt on a stored episode: enqueue a job that starts at analysis."""
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from pydantic import ValidationError
+
+    from earmark.artifacts import ArtifactStore
+    from earmark.episodes import (
+        EpisodeNotFoundError,
+        TranscriptMissingError,
+        enqueue_reanalyze,
+    )
+    from earmark.jobs import open_job_store
+    from earmark.models import ReanalyzeRequest, is_episode_key
+
+    if not is_episode_key(episode_key):
+        typer.echo(f"earmark reanalyze: not an episode key: {_clean(episode_key)}", err=True)
+        raise typer.Exit(code=2)
+    try:
+        request = ReanalyzeRequest(prompt=prompt)
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_url=False)
+        typer.echo("earmark reanalyze: " + "; ".join(str(e["msg"]) for e in errors), err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        store = open_job_store(settings)
+        enqueued = enqueue_reanalyze(store, ArtifactStore(settings.data_dir), episode_key, request)
+    except EpisodeNotFoundError:
+        typer.echo(
+            f"earmark reanalyze: no episode {episode_key} under EARMARK_DATA_DIR; "
+            "see `earmark episodes`",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+    except TranscriptMissingError as exc:
+        typer.echo(f"earmark reanalyze: episode {episode_key}: {exc.message}", err=True)
+        raise typer.Exit(code=1) from None
+    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
+        typer.echo(f"earmark reanalyze: cannot open the job store: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    suffix = "" if enqueued.created else " (existing job)"
+    typer.echo(f"{enqueued.job.id} {enqueued.job.status}{suffix}")
+
+
+PROMPT_SHOWN_CHARS = 200
+
+
+def _episode_lines(info: "EpisodeInfo", settings: Settings) -> list[str]:
+    from zoneinfo import ZoneInfo
+
+    if info.published_at is None:
+        date = "-"
+    else:
+        tz = ZoneInfo(settings.tz) if settings.tz else None
+        date = info.published_at.astimezone(tz).strftime("%Y-%m-%d")
+    lines = [_clean(f"{info.key}  {date}  {info.show} \u2014 {info.title}")]
+    for a in info.analyses:
+        if a.prompt is None:
+            shown = "(default analysis)"
+        else:
+            shown = " ".join(a.prompt.split())
+            if len(shown) > PROMPT_SHOWN_CHARS:
+                shown = shown[: PROMPT_SHOWN_CHARS - 1] + "\u2026"
+        lines.append(_clean(f"  {a.prompt_hash}  {a.model}  {shown}"))
+    if not info.has_transcript:
+        lines.append("  no transcript yet")
+    return lines
+
+
+@app.command("episodes")
+def episodes_command(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=200, help="How many episodes to show."),
+    ] = 50,
+    offset: Annotated[int, typer.Option("--offset", min=0, help="Skip this many.")] = 0,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
+) -> None:
+    """List stored episodes, newest share first, with the prompts already run."""
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from earmark.artifacts import ArtifactStore
+    from earmark.episodes import EPISODES_OFFSET_MAX, list_episodes
+    from earmark.errors import TransientError
+
+    if offset > EPISODES_OFFSET_MAX:
+        typer.echo(f"earmark episodes: --offset must be at most {EPISODES_OFFSET_MAX}", err=True)
+        raise typer.Exit(code=2)
+    try:
+        page = list_episodes(ArtifactStore(settings.data_dir), limit=limit, offset=offset)
+    except TransientError as exc:
+        typer.echo(
+            f"earmark episodes: {_clean(exc.message)} (temporary; try again later)", err=True
+        )
+        raise typer.Exit(code=1) from None
+    if as_json:
+        typer.echo(page.model_dump_json())
+        return
+    if page.total == 0:
+        typer.echo("no episodes")
+        return
+    if not page.episodes:
+        typer.echo(f"no episodes at offset {offset} (total {page.total})")
+        return
+    for info in page.episodes:
+        for line in _episode_lines(info, settings):
+            typer.echo(line)
+    if offset > 0 or page.next_offset is not None:
+        footer = f"showing {offset + 1}-{offset + len(page.episodes)} of {page.total}"
+        if page.next_offset is not None:
+            footer += f"; next: --offset {page.next_offset}"
+        typer.echo(footer)
 
 
 def _clean(value: object) -> str:

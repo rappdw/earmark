@@ -28,7 +28,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 14 | Vector index and search | 05 | done |
 | 15 | Notifications and doctor | 05 | done |
 | 16 | Deployment and Shortcut docs | 06–15 | done |
-| 17 | Extension: re-run a prompt | 10, 12 | todo |
+| 17 | Extension: re-run a prompt | 10, 12 | done |
 | 18 | Extension: weekly digest | 10, 12 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline

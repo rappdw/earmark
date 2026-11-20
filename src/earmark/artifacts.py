@@ -191,6 +191,9 @@ class ArtifactStore:
     def write_episode(self, episode: Episode) -> Path:
         return self._write_json(self.episode_path(episode.key), episode)
 
+    def has_episode(self, key: str) -> bool:
+        return self.episode_path(key).is_file()
+
     def read_episode(self, key: str) -> Episode | None:
         path = self.episode_path(key)
         episode = self._read_json(path, Episode)
@@ -246,16 +249,21 @@ class ArtifactStore:
             raise _corrupt(path)
         return analysis
 
-    def list_analyses(self, key: str) -> list[Analysis]:
+    def list_analysis_hashes(self, key: str) -> list[str]:
+        """Sorted prompt hashes of the ``analyses/<hash>.json`` files; parses nothing."""
         directory = self.analyses_dir(key)
         if not directory.is_dir():
             return []
+        return sorted(
+            p.stem for p in directory.iterdir() if _ANALYSIS_NAME.fullmatch(p.name) and p.is_file()
+        )
+
+    def list_analyses(self, key: str) -> list[Analysis]:
         found: list[Analysis] = []
-        for p in directory.iterdir():
-            if _ANALYSIS_NAME.fullmatch(p.name) and p.is_file():
-                analysis = self.read_analysis(key, p.stem)
-                if analysis is not None:
-                    found.append(analysis)
+        for prompt_hash in self.list_analysis_hashes(key):
+            analysis = self.read_analysis(key, prompt_hash)
+            if analysis is not None:
+                found.append(analysis)
         return sorted(found, key=lambda a: (a.created_at, a.prompt_hash))
 
     def list_episode_keys(self) -> list[str]:

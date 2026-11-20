@@ -297,3 +297,70 @@ def test_share_capture_checker_reports_problems() -> None:
     show = "https://podcasts.apple.com/us/podcast/id1200361736"
     show_link = {**_synthetic_entry(), "url": show, "shortcut_input": show}
     assert any("not accepted" in p for p in check_share_capture(show_link))
+
+
+# --- README command table and route list ---------------------------------------------------
+
+
+def _command_words(cell: str) -> str:
+    words: list[str] = []
+    for word in cell.split():
+        if word.startswith(("<", "[")) or word.isupper():
+            break
+        words.append(word)
+    return " ".join(words)
+
+
+def test_readme_commands_cover_cli() -> None:
+    from earmark.cli import app
+
+    rows = [
+        line
+        for line in read_doc("README.md").splitlines()
+        if line.startswith("| `") and not line.startswith("| `EARMARK_")
+    ]
+    listed: set[str] = set()
+    for row in rows:
+        match = re.match(r"\| `([^`]+)`", row)
+        assert match
+        listed.add(_command_words(match[1]))
+    assert "" not in listed
+    registered = {c.name for c in app.registered_commands if c.name}
+    for group in app.registered_groups:
+        assert group.typer_instance is not None
+        registered |= {
+            f"{group.name} {c.name}" for c in group.typer_instance.registered_commands if c.name
+        }
+    registered.add("--version")
+    assert listed == registered
+
+
+def _readme_routes() -> set[tuple[str, str]]:
+    text = read_doc("README.md")
+    paragraph = next(p for p in text.split("\n\n") if p.startswith("The HTTP API is"))
+    paragraph = " ".join(paragraph.split())
+    found: set[tuple[str, str]] = set()
+    for span in re.findall(r"`([A-Z|]+ /[^`]*)`", paragraph):
+        methods, path = span.split(" ", 1)
+        for method in methods.split("|"):
+            found.add((method, re.sub(r"\{[^}]*\}", "{}", path)))
+    return found
+
+
+def test_readme_http_api_lists_every_route(tmp_path: Path) -> None:
+    from fastapi.routing import APIRoute
+
+    from earmark.api.routes import build_router
+    from earmark.artifacts import ArtifactStore
+    from earmark.fakes import FakeSearcher
+
+    store = JobStore(open_database(tmp_path / "earmark.db"))
+    router = build_router(store, FakeSearcher(), ArtifactStore(tmp_path / "data"))
+    actual = {
+        (method, re.sub(r"\{[^}]*\}", "{}", route.path))
+        for route in router.routes
+        if isinstance(route, APIRoute)
+        for method in (route.methods or ())
+    }
+    assert actual
+    assert _readme_routes() == actual

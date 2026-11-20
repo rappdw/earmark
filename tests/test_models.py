@@ -22,6 +22,7 @@ from earmark.models import (
     Job,
     JobResult,
     Model,
+    ReanalyzeRequest,
     ResearchLead,
     Segment,
     ShareRecord,
@@ -69,6 +70,8 @@ def _minimal_episode() -> Episode:
 
 
 CASES: list[Model] = [
+    ReanalyzeRequest(),
+    ReanalyzeRequest(prompt="p"),
     IngestRequest(url="u"),
     IngestRequest(url="u", prompt="p", timestamp=T0),
     EpisodeRef(source="apple_podcasts", show_id="1", episode_id="2", country="us", url="u"),
@@ -458,3 +461,18 @@ def test_scrub_keeps_valid_text_identical() -> None:
     text = "emoji \U0001f600 pair and caf\u00e9"
     assert scrub_surrogates(text) is text
     assert scrub_surrogates("x\ud800") == "x\ufffd"
+
+
+def test_reanalyze_request_prompt_rules() -> None:
+    assert ReanalyzeRequest().prompt is None
+    assert ReanalyzeRequest.model_validate_json("{}").prompt is None
+    assert ReanalyzeRequest(prompt="  \n").prompt is None
+    assert ReanalyzeRequest(prompt=" why? ").prompt == "why?"
+    ok = "x" * MAX_PROMPT_CHARS
+    assert ReanalyzeRequest(prompt=f" {ok}\n").prompt == ok
+    with pytest.raises(ValidationError) as exc:
+        ReanalyzeRequest(prompt=ok + "x")
+    assert _error_types(exc) == {"prompt_too_long"}
+    with pytest.raises(ValidationError) as extra:
+        ReanalyzeRequest.model_validate_json('{"promt": "x"}')
+    assert _error_types(extra) == {"extra_forbidden"}

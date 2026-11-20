@@ -61,6 +61,9 @@ src/earmark/
                        pinned-address network backend (step 06)
   audio.py             HttpAudioFetcher, the `http` AudioFetcher backend (step 06)
   ingest.py            enqueue_ingest: IngestRequest → canonical URL → JobStore (API and CLI)
+  episodes.py          stored episodes: list_episodes (GET /episodes, `earmark episodes`),
+                       require_transcript and enqueue_reanalyze (POST /episodes/{key}/analyze,
+                       `earmark reanalyze`); reads artifacts only (step 17)
   fakes.py             fake backend for every stage (tests and smoke runs)
   cli.py               `earmark` entry point
   api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
@@ -128,6 +131,9 @@ the model's answer and `runner.describe_error` to job text.
   `MAX_URL_CHARS` (2048); `prompt` stripped, blank or whitespace-only becomes `None`,
   at most `MAX_PROMPT_CHARS` (4000) after stripping; `timestamp` must convert to UTC
   (its offset is kept). Step 04.
+- `ReanalyzeRequest`: `prompt: str | None`, with exactly `IngestRequest`'s prompt rules and
+  unknown keys rejected. The `POST /episodes/{key}/analyze` body; `{}` is the default
+  analysis. Step 17.
 - `EpisodeRef`: `source` (`"apple_podcasts"`), `show_id`, `episode_id`, `country`, `url`.
   Returned by `resolve.apple.parse_apple_url`; `url` is the canonical
   `https://podcasts.apple.com/{country}/podcast/id{show_id}?i={episode_id}` (country
@@ -297,6 +303,14 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   index (if configured) → `complete` with a `JobResult` → notify. Stages are called
   positionally. Each stage sets `job.stage` before it runs; a failed job keeps the
   stage it failed in, and `notify` is never set as a stage.
+- **Reanalyze order** (step 17). A `reanalyze` job enters at `analyze`: it reads
+  `episode.json` and `transcript.json` for `job.episode_key` (either missing is a
+  `PermanentError`), takes the share time from `record_share` (which keeps the stored first
+  share), and then runs the same analyze → store → index → complete → notify tail. It
+  never calls the resolver, fetcher, or transcriber, and never writes `episode.json`.
+  Stages entered: `analyze`, `store`, `index`. With several workers, an ingest and a
+  reanalyze of one episode can each store without the other's analysis; the next store of
+  that episode repairs the note. One worker, the default, cannot hit this.
 - **Outcomes.** `SkipEpisode` → `skipped`; `PermanentError` → `failed`;
   `TransientError` → requeued with backoff (honouring `retry_after_s`) until attempts
   run out; any other `Exception` → transient, with the traceback logged at ERROR and a
@@ -669,6 +683,10 @@ Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
   - The message starts with the show (or the canonical Apple URL). Done adds the prompt,
     the warning count and first warning, and the note path when there is no link. Failed
     adds the stage, `Reason: <job.error>`, and the attempts. Skipped adds the reason.
+  - Reanalyze jobs (step 17) are titled `Analysis ready: <episode>`, `Analysis failed:
+    <episode>`, and `Analysis skipped: <episode>`. Every one of their messages names the
+    prompt (`Prompt: …`, or `Default analysis`), and the show line falls back to `Episode
+    <key>`. Ingest notifications are unchanged.
   - Every value is cleaned: NFC; control, format (except ZWJ/ZWNJ), private-use,
     unassigned, and line or paragraph separator characters removed; whitespace collapsed;
     `=?` defused, because ntfy RFC-2047-decodes titles even in JSON mode; secrets
@@ -727,6 +745,33 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
   `endpoint.error_detail`. Every line is passed through `log.redact` with all `Settings`
   secrets and cleaned of non-printable characters.
 
+### Re-running a prompt
+
+Step 17; exact rules in `docs/steps/17-reanalyze.md` section 5.
+
+- **Enqueue.** `episodes.enqueue_reanalyze(jobs, artifacts, key, request)` is shared by
+  `POST /episodes/{key}/analyze` and `earmark reanalyze`. It checks the key
+  (`is_episode_key`) before building a path, then only stats files: no `episode.json` is
+  "not found" (404, CLI exit 1); `episode.json` without `transcript.json` is "no transcript
+  yet" (409, CLI exit 1). It parses nothing and writes nothing under `DATA_DIR`. Dedupe is
+  the job store's: the same key and normalised prompt while a job is active returns it.
+- **Already run.** There is no shortcut: the job always runs. A cached prompt (same
+  prompt, `LLM_MODEL`, and schema version) makes no LLM call; the store regenerates the
+  note (restoring it if it was deleted, writing nothing if it is intact), and the index
+  skips an unchanged digest.
+- **Listing.** `episodes.list_episodes(artifacts, limit=, offset=)` reads
+  `episodes/*/episode.json` and `shared.json` for every episode, to sort by first share
+  time, newest first, with episodes that have no share record last. Then it reads the
+  analyses of the page only, one file at a time. Unreadable files are logged and left
+  out. It never opens SQLite, scans the vault, or parses a transcript (`has_transcript` is
+  a stat), so it is the same before and after `earmark entities rebuild` and with any
+  store backend. Offset pagination: `limit` 1–200 (default 50), `offset` 0–1 000 000;
+  `total` and `next_offset` in the response.
+- **`earmark reanalyze KEY [--prompt]`** prints `<job_id> <status>` (plus ` (existing
+  job)`), like `earmark submit`. **`earmark episodes [--limit] [--offset] [--json]`**
+  prints one line per episode (key, date in `TZ`, show — title), one per analysis (hash,
+  model, prompt), and a paging footer, or the `EpisodePage` JSON.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -760,7 +805,9 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
 - **Dedupe.** Enqueueing the same `(kind, url or episode_key, prompt)` while an
   identical job is `queued` or `running` returns the existing job (`Enqueued.created`
   is `False`). A partial unique index on a `dedupe_key` column enforces one active job
-  per request. A double-tapped share creates one job.
+  per request. A double-tapped share creates one job. Prompts are normalised before the
+  key is computed (stripped, blank is `None`), so `{}` and `{"prompt": " "}` are one
+  reanalyze job. Ingest and reanalyze jobs never dedupe with each other.
 - **Warnings.** `add_warning(job_id, message)` appends unless the same text is already
   there, and works on terminal jobs (notifier failures are recorded after `done`).
 - **Time.** Clocks are injected so tests control time. Timestamps are stored as
@@ -916,7 +963,8 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 | `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [Job, …]}`, newest first. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
 | `GET /search?q=` | Vector search (step 14). `q` (1–500 characters after collapsing whitespace), `limit` (1–50, default 10), repeatable `kind` (`transcript`, `summary`, `claim`, `lead`, `question`, `answer`), `episode` (an episode key). 200 `{"hits": [SearchHit, …]}` ranked by score (`{"hits": []}` before the first index write). 422 invalid parameters (never echoed). 409 the index was built with another embedding model or dimension (run `earmark reindex`). 503 search unavailable in this process (extra missing, `INDEX_BACKEND=none`), model not downloaded yet, or index read failure (`Retry-After` for transient ones). |
-| `GET /episodes`, `POST /episodes/{key}/analyze` | Re-run a prompt on a stored episode (step 17). |
+| `GET /episodes` | Stored episodes, by first share time, newest first (step 17). `limit` (1–200, default 50), `offset` (0–1 000 000). 200 `{"episodes": [{key, show, title, published_at, shared_at, url, has_transcript, analyses: [{prompt, prompt_hash, model, created_at}, …] newest first}, …], "total", "offset", "limit", "next_offset"}`. Read from the artifacts on disk, never from SQLite. 422 invalid parameters. 503 the episodes directory cannot be read. |
+| `POST /episodes/{key}/analyze` | Run a prompt on a stored episode (step 17). Body `{prompt?}` (`ReanalyzeRequest`, JSON, at most 64 KiB, else 413; `{}` is the default analysis). 202 `{job_id, status, created}` with `Location: /jobs/{id}`, as `/ingest`; `created` is `false` for an active identical job. 404 unknown or malformed key. 409 the episode has no transcript yet. 422 invalid body, naming the allowed field `prompt`. |
 
 ## Configuration
 
@@ -1214,6 +1262,8 @@ Documents are tested against the code (step 16).
     accepted by `POST /ingest`, and the example response matches the route.
   - The Shortcut's actions appear in a fixed order.
   - Relative links resolve.
+  - The README's command table names every CLI command, and its HTTP API sentence names
+    every route of `build_router` (step 17).
   - Real share-sheet captures in `tests/fixtures/share_sheet.json` canonicalise as
     recorded.
 - **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,

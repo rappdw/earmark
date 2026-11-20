@@ -432,14 +432,160 @@ def test_analysis_not_written_still_stored(tmp_path: Path) -> None:
     assert fakes.artifacts.list_analyses(call.episode.key) == []
 
 
-def test_reanalyze_job_fails_permanently(tmp_path: Path) -> None:
+# -- reanalyze --------------------------------------------------------------------------
+
+
+class Exploding:
+    """Stands in for a stage a reanalyze job must never call."""
+
+    def resolve(self, url: str, /) -> Episode:
+        raise AssertionError("must not be called")
+
+    def fetch(self, episode: Episode, /) -> Path:
+        raise AssertionError("must not be called")
+
+    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
+        raise AssertionError("must not be called")
+
+
+def _seed(env: PipelineEnv, *, transcript: bool = True, share: bool = True) -> Episode:
+    artifacts = env.fakes.artifacts
+    episode = make_episode()
+    artifacts.write_episode(episode)
+    if share:
+        artifacts.record_share(episode.key, T0 - timedelta(days=3))
+    if transcript:
+        artifacts.write_transcript(make_transcript())
+    return episode
+
+
+def _reanalyze(env: PipelineEnv, key: str, prompt: str | None = None) -> Job:
+    env.jobs.enqueue_reanalyze(key, prompt=prompt)
+    return _run(env)
+
+
+def test_reanalyze_never_calls_input_stages(tmp_path: Path) -> None:
+    exploding = Exploding()
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    backends = replace(
+        fakes.backends(), resolver=exploding, fetcher=exploding, transcriber=exploding
+    )
+    env = make_env(tmp_path, fakes=fakes, backends=backends, store_type=CountingJobStore)
+    episode = _seed(env)
+    fakes.analyzer.analyze(episode, make_transcript(), None)
+    job = _reanalyze(env, episode.key, "Who is quoted?")
+    assert job.status == "done"
+    assert counting_store(env).stages == ["analyze", "store", "index"]
+    assert job.stage == "index"
+    assert fakes.analyzer.calls[-1].prompt == "Who is quoted?"
+
+
+def test_reanalyze_after_ingest_uses_artifacts(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    env.jobs.enqueue_reanalyze(make_episode().key)
-    job = _run(env)
+    first = _enqueue_and_run(env, None)
+    assert first.episode_key is not None
+    f = env.fakes
+    counts = (f.resolver.call_count, f.fetcher.call_count, f.transcriber.call_count)
+    job = _reanalyze(env, first.episode_key, "Any numbers?")
+    assert job.status == "done"
+    assert (f.resolver.call_count, f.fetcher.call_count, f.transcriber.call_count) == counts
+    assert f.analyzer.call_count == 2
+    assert f.analyzer.calls[-1].prompt == "Any numbers?"
+    assert f.analyzer.computed == 2
+    assert job.result is not None
+    assert job.result.analysis_hash == prompt_hash("Any numbers?", "fake-llm")
+
+
+def test_reanalyze_store_and_index_get_all_analyses(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    first = _enqueue_and_run(env, None)
+    assert first.episode_key is not None
+    job = _reanalyze(env, first.episode_key, "q2")
+    f = env.fakes
+    store_call, index_call = f.store.calls[-1], f.indexer.calls[-1]
+    assert len(store_call.analyses) == 2
+    assert index_call.analyses == store_call.analyses
+    assert list(store_call.analyses) == sorted(
+        store_call.analyses, key=lambda a: (a.created_at, a.prompt_hash)
+    )
+    assert job.result is not None
+    assert job.result.note_path == index_call.stored.note_path
+
+
+def test_reanalyze_missing_episode_fails(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    key = make_episode().key
+    job = _reanalyze(env, key)
     assert job.status == "failed"
-    assert job.error == "reanalyze jobs are not supported yet"
-    assert job.stage is None
-    assert env.fakes.resolver.call_count == 0
+    assert job.error == f"episode {key} is not stored; share it again"
+    assert job.stage == "analyze"
+    assert [(c.job.id, c.episode) for c in env.fakes.notifier.calls] == [(job.id, None)]
+    f = env.fakes
+    assert f.resolver.call_count == f.transcriber.call_count == f.analyzer.call_count == 0
+
+
+def test_reanalyze_missing_transcript_fails(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    episode = _seed(env, transcript=False)
+    job = _reanalyze(env, episode.key)
+    assert job.status == "failed"
+    assert job.error == f"episode {episode.key} has no transcript; share it again to transcribe it"
+    assert [c.episode for c in env.fakes.notifier.calls] == [episode]
+    assert env.fakes.analyzer.call_count == 0
+
+
+def test_reanalyze_transient_analyzer_error_requeues(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    episode = _seed(env)
+    env.fakes.analyzer.fail_next(TransientError("llm busy"))
+    job = _reanalyze(env, episode.key, "p")
+    assert job.status == "queued"
+    assert env.fakes.notifier.call_count == 0
+    env.clock.advance(60)
+    assert _run(env).status == "done"
+
+
+def test_reanalyze_same_prompt_is_cache_hit(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    first = _enqueue_and_run(env, "p")
+    assert first.episode_key is not None
+    f = env.fakes
+    job = _reanalyze(env, first.episode_key, "p")
+    assert job.status == "done"
+    assert f.analyzer.computed == 1
+    assert f.store.call_count == 2
+    assert f.indexer.call_count == 2
+    assert len(f.store.calls[-1].analyses) == 1
+    assert job.result is not None
+    assert job.result.analysis_hash == prompt_hash("p", "fake-llm")
+
+
+def test_reanalyze_keeps_first_share_time(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    episode = _seed(env)
+    share_path = env.fakes.artifacts.share_path(episode.key)
+    before = share_path.read_bytes()
+    _reanalyze(env, episode.key)
+    assert env.fakes.store.calls[-1].shared_at == T0 - timedelta(days=3)
+    assert share_path.read_bytes() == before
+
+
+def test_reanalyze_without_share_record_writes_one(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    episode = _seed(env, share=False)
+    job = _reanalyze(env, episode.key)
+    assert env.fakes.store.calls[-1].shared_at == job.shared_at
+    share = env.fakes.artifacts.read_share(episode.key)
+    assert share is not None
+    assert share.first_shared_at == job.shared_at
+
+
+def test_reanalyze_copies_warnings(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    episode = _seed(env)
+    env.fakes.analyzer.warnings = ("an analysis warning",)
+    job = _reanalyze(env, episode.key, "p")
+    assert job.warnings == ("a transcript warning", "an analysis warning")
 
 
 def test_describe_error_scrubs_surrogates() -> None:

@@ -199,6 +199,18 @@ class IngestRequest(Model):
         return v
 
 
+class ReanalyzeRequest(Model):
+    prompt: str | None = None
+
+    @field_validator("prompt", mode="after")
+    @classmethod
+    def _normalise_prompt(cls, v: str | None) -> str | None:
+        try:
+            return normalize_prompt(v)
+        except ValueError as exc:
+            raise PydanticCustomError("prompt_too_long", str(exc)) from None
+
+
 class EpisodeRef(Model):
     source: Source
     show_id: str
