@@ -19,7 +19,7 @@ backend, not the pipeline.
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process, with a remote OpenAI-compatible ASR endpoint as the alternative (step 09). | `EARMARK_ASR_BACKEND`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
-| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`), typer, stdlib `sqlite3`. Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`. Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
@@ -56,7 +56,9 @@ src/earmark/
   artifacts.py         ArtifactStore: per-episode cache paths, atomic writes
   db.py                SQLite connection and migrations (PRAGMA user_version)
   jobs.py              JobStore
-  fetch.py             guarded HTTP fetch and streaming download
+  fetch.py             GuardedFetcher: guarded GET and streaming download, address policy,
+                       pinned-address network backend (step 06)
+  audio.py             HttpAudioFetcher, the `http` AudioFetcher backend (step 06)
   ingest.py            enqueue_ingest: IngestRequest → canonical URL → JobStore (API and CLI)
   fakes.py             fake backend for every stage (tests and smoke runs)
   cli.py               `earmark` entry point
@@ -264,6 +266,33 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   `earmark worker --once` processes at most one job; `earmark submit` enqueues through
   `ingest.enqueue_ingest`, like `POST /ingest`.
 
+### Fetching
+
+Step 06; exact signatures in `docs/steps/06-fetch.md`.
+
+- **One client.** `fetch.GuardedFetcher` is the only code that requests third-party
+  URLs. `get(url, *, max_bytes, purpose, accept, params)` returns a `Document` (final
+  URL, decoded bytes, media type, redirect count) for feeds and lookups;
+  `download(url, destination, *, max_bytes, ...)` streams media to
+  `destination(ext)` through `atomic_writer(..., temp_suffix=".part")` and returns a
+  `Downloaded`. `fetch.guarded_fetcher(settings)` builds one from `Settings`. It is
+  not thread-safe; each process builds its own. The httpx2 client is created on first
+  use.
+- **Errors.** `PermanentFetchError(PermanentError)` and
+  `TransientFetchError(TransientError)` carry `host` and `status`;
+  `BlockedAddressError` is a `PermanentFetchError`. 200 and 203 succeed; 408, 429, and
+  5xx are transient (with `Retry-After` as `retry_after_s`); other 4xx and unexpected
+  statuses are permanent. Timeouts, connection and protocol errors, DNS failures, a
+  truncated or empty download, and the whole-call deadline (2 min for `get`, 1 h for
+  `download`) are transient. A size cap, a refused scheme or address, an invalid URL or
+  redirect, more than 20 redirects, and a textual content type on a download are
+  permanent. Messages name the host, never the URL path or query.
+- **`http` AudioFetcher.** `audio.HttpAudioFetcher` returns `find_audio(key)` without a
+  request when it exists; otherwise it removes `.part` files older than 2 h, downloads
+  `episode.audio_url` with `MAX_AUDIO_MB`, and names the file `audio.<ext>`: the
+  extension of the final URL's path, else the `Content-Type`'s, else the original URL
+  path's, else `bin`.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -313,6 +342,7 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
     episode.json                written by the runner after resolve
     shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
     audio.<ext>                 deleted after transcription unless EARMARK_KEEP_AUDIO
+    .audio.<ext>.<random>.part  download in progress; renamed to audio.<ext> when complete
     transcript.json             written last; its existence marks the transcript cached
     transcript.txt              Transcript.to_text()
     analyses/<prompt_hash>.json   16 hex chars over prompt + model + schema version
@@ -388,7 +418,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_CONTEXT_TOKENS` | unset | Local LLM endpoint and its context budget (key is secret) |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (fastembed's default; step 14 may revise) |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
-| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits |
+| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024). `ALLOW_PRIVATE_FETCH` turns off the address check only |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
 | `TZ` | unset (system) | IANA zone for note dates and digests, validated at load |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive) |
@@ -413,9 +443,26 @@ and writes into a vault the user cares about.
   the client's string, so re-shares dedupe and no client-controlled URL reaches the
   resolver. The handler does no outbound I/O.
 - **Outbound fetches.** Feed and enclosure URLs come from podcast publishers. Every such
-  fetch goes through `fetch.py`: http/https only, hosts resolving to loopback, private,
-  link-local, or metadata addresses are refused on every redirect hop, redirects are
-  capped, and size caps apply to both `Content-Length` and the bytes actually read.
+  fetch goes through `fetch.py`:
+  - http and https only, checked on the first URL and on every redirect target; URLs
+    with credentials are refused. At most 20 redirects.
+  - Addresses are checked when a connection opens, inside a custom httpcore2
+    `NetworkBackend`: it resolves the host once, refuses the connection if **any**
+    address is not public, and connects to the exact address it checked (TLS still
+    verifies the hostname). So every redirect hop is checked, and DNS rebinding cannot
+    change the address between check and connect. "Public" means `is_global` and not
+    multicast or site-local, with IPv4-mapped and NAT64 addresses judged by their
+    embedded IPv4 address and the IPv4-compatible and IPv4-translated ranges refused.
+    That excludes loopback, RFC 1918, link-local (cloud metadata), CGNAT and tailnet
+    `100.64.0.0/10`, ULA, documentation, and reserved ranges. Numeric shorthand hosts
+    (`0x7f000001`, `127.1`) are caught because the resolved address is checked.
+    `ALLOW_PRIVATE_FETCH=true` skips the check (the host is then resolved by the
+    socket layer as usual). The guard trusts the system resolver's answer.
+  - Size caps apply to `Content-Length` and to the bytes actually read (decoded bytes
+    for documents, so a gzip bomb stops at the cap).
+  - No proxies from the environment, no cookies kept between fetches, and a generic
+    `User-Agent: earmark/<version>`. URL paths and queries (which can carry session
+    ids) are not logged or put in job errors.
 - **XML.** Feed parsing must be safe against entity expansion and external entities.
 - **Vault writes.** Titles and names from feeds and from the LLM are sanitized before
   they become paths or YAML. Resolved paths are checked to be inside the vault subdir.
@@ -495,3 +542,13 @@ Step planners should check these against current documentation instead of assumi
    `requires-python` carries an upper bound. See `docs/steps/01-scaffold.md`.
 4. **Container and GPU paths cannot be exercised in the dev sandbox.** They are reviewed
    statically and verified on the homelab.
+5. **The dev sandbox intercepts DNS.** Found in step 06 (2026-11-20): every name,
+   including `.invalid` ones, resolves to `10.200.9.2`, so the address guard refuses
+   every real fetch there. That is correct behaviour; `network` tests detect it and run
+   their transfer checks with `allow_private=True`. The guard against real public DNS
+   is exercised on CI's scheduled network run and on the homelab.
+6. **Filtering resolvers.** A Pi-hole-style resolver that answers `0.0.0.0` for
+   tracker domains (podcast enclosures usually start at one, such as
+   `dts.podtrac.com`) makes the download fail as a refused non-public address. The job
+   error names the host and `EARMARK_ALLOW_PRIVATE_FETCH`; allow-listing the tracker
+   in the resolver is the better fix.

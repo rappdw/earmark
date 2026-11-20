@@ -17,7 +17,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 03 | Job store | 02 | done |
 | 04 | Ingest API | 03 | done |
 | 05 | Pipeline runner and worker | 04 | done |
-| 06 | Guarded fetch and audio download | 05 | todo |
+| 06 | Guarded fetch and audio download | 05 | done |
 | 07 | Resolver: Apple → iTunes → RSS | 06 | todo |
 | 08 | Transcription: faster-whisper | 05 | todo |
 | 09 | Transcription: remote ASR backend | 08 | todo |
@@ -65,7 +65,9 @@ Each step runs three agents with separate contexts. `/step NN` runs this for one
    two failed rounds, stop and bring the findings to the user; the plan is probably
    wrong and needs replanning.
 5. **On PASS**, the orchestrator updates the status table and commits the step as one
-   commit on the `impl` branch (`step NN: <title>`). Nothing is pushed.
+   commit on the `impl` branch (`step NN: <title>`), pushes it, and waits for CI. On
+   green it moves on to the next `todo` step whose dependencies are done. A red CI run,
+   a product decision from the planner, or two failed verify rounds stops the loop.
 
 The orchestrator relays the verifier's non-blocking notes and anything unverifiable in
 the sandbox (GPU, Docker, live credentials) to the user after each step.

@@ -43,10 +43,18 @@ def _fake_settings(tmp_path: Path, **overrides: str) -> Settings:
     )
 
 
-@pytest.mark.parametrize("field", list(FIELDS))
-def test_unbuilt_backend_names_setting(tmp_path: Path, field: str) -> None:
+def _unbuilt_names(field: str) -> list[str]:
     literal, registry = FIELDS[field]
-    name = next(v for v in typing.get_args(literal) if v not in registry)
+    return [v for v in typing.get_args(literal) if v not in registry]
+
+
+UNBUILT_FIELDS = [field for field in FIELDS if _unbuilt_names(field)]
+
+
+@pytest.mark.parametrize("field", UNBUILT_FIELDS)
+def test_unbuilt_backend_names_setting(tmp_path: Path, field: str) -> None:
+    _, registry = FIELDS[field]
+    name = _unbuilt_names(field)[0]
     settings = _fake_settings(tmp_path, **{field: name})
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
@@ -63,9 +71,11 @@ def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     errors = info.value.errors
-    assert len(errors) == 7
+    assert len(errors) == len(UNBUILT_FIELDS) == 6
     for field in FIELDS:
-        assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == 1
+        expected = 1 if field in UNBUILT_FIELDS else 0
+        assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == expected
+    assert not any(line.startswith("EARMARK_FETCH_BACKEND") for line in errors)
 
 
 def test_all_fake_builds_fakes(tmp_path: Path) -> None:
@@ -127,6 +137,17 @@ def test_pipeline_modules_import_light() -> None:
         "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2', 'anthropic',\n"
         "         'faster_whisper', 'lancedb', 'fastembed'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"
+
+
+def test_fetch_module_not_imported_by_factory() -> None:
+    code = (
+        "import sys\n"
+        "import earmark.pipeline.factory\n"
+        "print(sorted(m for m in ('httpx2', 'httpcore2', 'earmark.fetch', 'earmark.audio')\n"
+        "             if m in sys.modules))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"

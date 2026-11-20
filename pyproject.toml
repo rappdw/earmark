@@ -10,6 +10,7 @@ dependencies = [
   "pydantic>=2.14.4",
   "pydantic-settings>=2.16.3",
   "httpx2>=2.16.2",
+  "httpcore2>=2.16.2",
   "typer>=0.29.2",
   "tzdata>=2026.6",
 ]

@@ -22,8 +22,10 @@ not work yet.
 
 Each step runs as plan → implement → verify, with a separate agent per role:
 `step-planner` (Opus), `step-implementer` (Sonnet), `step-verifier` (Sonnet), defined in
-`.claude/agents/`. `/step NN` runs one loop; the protocol is in `docs/PLAN.md`. One commit
-per verified step on the `impl` branch. Never push without being asked.
+`.claude/agents/`. `/step NN` runs the loop from step NN onward (`--one` for a single
+step); the protocol is in `docs/PLAN.md`. One commit per verified step on the `impl`
+branch, pushed by `/step` once verified, with CI green before the next step starts. Do
+not push otherwise without being asked.
 
 ## Commands
 

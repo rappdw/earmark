@@ -48,11 +48,19 @@ class BuildContext:
 
 type Builder[T] = Callable[[BuildContext], T]
 
+
+def _http_fetcher(ctx: BuildContext) -> AudioFetcher:
+    from earmark.audio import build_http_fetcher
+
+    return build_http_fetcher(ctx.settings, ctx.artifacts)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "fake": lambda ctx: FakeResolver(),
 }
 FETCHERS: Final[Mapping[str, Builder[AudioFetcher]]] = {
     "fake": lambda ctx: FakeAudioFetcher(ctx.artifacts),
+    "http": _http_fetcher,
 }
 TRANSCRIBERS: Final[Mapping[str, Builder[Transcriber]]] = {
     "fake": lambda ctx: FakeTranscriber(ctx.artifacts),
