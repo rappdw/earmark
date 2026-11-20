@@ -15,7 +15,7 @@ import yaml
 from earmark.analyze.render import render_analysis
 from earmark.errors import PermanentError, TransientError
 from earmark.fakes import make_fake_backends
-from earmark.models import Analysis, Episode, StoreResult, Transcript
+from earmark.models import Analysis, Entity, Episode, StoreResult, Transcript
 from earmark.vault import notes
 from earmark.vault.document import begin_marker, region_digest, split_note
 from earmark.vault.fs import SymlinkRefused, vault_lock
@@ -35,6 +35,19 @@ TR_NAME = "2026-01-02 Épisode 1 - «Tests» (transcript).md"
 EP_PATH = f"Earmark/Podcasts/{SHOW}/{EP_NAME}"
 TR_PATH = f"Earmark/Podcasts/{SHOW}/transcripts/{TR_NAME}"
 KEY = make_episode().key
+
+
+_FOLDERS = {
+    "people": "People",
+    "papers": "Papers",
+    "companies": "Companies",
+    "tools": "Tools",
+    "topics": "Topics",
+}
+
+
+def zoe_linker(field: str, entity: Entity) -> str | None:
+    return notes.note_link(f"Earmark/Entities/{_FOLDERS[field]}/{entity.name}.md", entity.name)
 
 
 def make_store(tmp_path: Path, **kw: Any) -> tuple[VaultStore, Path]:
@@ -329,7 +342,10 @@ def test_sections_newest_first(tmp_path: Path) -> None:
     result = store_once(store, analyses=[default, a, b])
     text = (vault / result.note_path).read_text()
     reg = region(text)
-    positions = [reg.index(render_analysis(x).removesuffix("\n")) for x in (b, a, default)]
+    positions = [
+        reg.index(render_analysis(x, entity_link=zoe_linker).removesuffix("\n"))
+        for x in (b, a, default)
+    ]
     assert positions == sorted(positions)
     assert "> Prompt A\n" in reg
     assert "## Default analysis" in reg
@@ -378,23 +394,23 @@ Résumé ☕
 
 ### People
 
-- **Zoë**: Cité en exemple [00:00:01] [00:00:02]
+- **[[Earmark/Entities/People/Zoë|Zoë]]**: Cité en exemple [00:00:01] [00:00:02]
 
 ### Papers
 
-- **Zoë**: Cité en exemple [00:00:01] [00:00:02]
+- **[[Earmark/Entities/Papers/Zoë|Zoë]]**: Cité en exemple [00:00:01] [00:00:02]
 
 ### Companies
 
-- **Zoë**: Cité en exemple [00:00:01] [00:00:02]
+- **[[Earmark/Entities/Companies/Zoë|Zoë]]**: Cité en exemple [00:00:01] [00:00:02]
 
 ### Tools
 
-- **Zoë**: Cité en exemple [00:00:01] [00:00:02]
+- **[[Earmark/Entities/Tools/Zoë|Zoë]]**: Cité en exemple [00:00:01] [00:00:02]
 
 ### Topics
 
-- **Zoë**: Cité en exemple [00:00:01] [00:00:02]
+- **[[Earmark/Entities/Topics/Zoë|Zoë]]**: Cité en exemple [00:00:01] [00:00:02]
 
 ### Open questions
 
@@ -417,7 +433,12 @@ def test_episode_region_exact(tmp_path: Path) -> None:
     assert region((vault / result.note_path).read_text()) == EXACT_REGION
     assert (
         notes.render_episode_region(
-            make_episode(), make_transcript(), [make_analysis(prompt=None)], TR_PATH, UTC
+            make_episode(),
+            make_transcript(),
+            [make_analysis(prompt=None)],
+            TR_PATH,
+            UTC,
+            entity_link=zoe_linker,
         )
         == EXACT_REGION
     )
@@ -605,7 +626,7 @@ def test_two_vaults_identical(tmp_path: Path) -> None:
         store_once(store, analyses=analyses)
         trees.append(tree(vault))
     assert trees[0] == trees[1]
-    assert len(trees[0]) == 2
+    assert len([p for p in trees[0] if "/Entities/" not in p]) == 2
 
 
 def test_store_after_user_edit_outside_is_stable(tmp_path: Path) -> None:
@@ -723,7 +744,7 @@ def test_vault_dir_itself_may_be_a_symlink(tmp_path: Path) -> None:
 
 def test_vault_modules_import_light() -> None:
     code = (
-        "import sys, earmark.vault.notes\n"
+        "import sys, earmark.vault.notes, earmark.vault.entities, earmark.vault.aliases\n"
         "heavy = ('fastapi', 'httpx2', 'anthropic', 'yaml', 'faster_whisper', 'lancedb')\n"
         "print(sorted(m for m in heavy if m in sys.modules))\n"
     )

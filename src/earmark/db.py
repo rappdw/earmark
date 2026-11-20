@@ -68,6 +68,60 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             "CREATE INDEX jobs_by_status ON jobs (status, created_at, seq)",
         ),
     ),
+    Migration(
+        "0002_entities",
+        (
+            """
+            CREATE TABLE episodes (
+                episode_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                show_title TEXT NOT NULL,
+                published_at TEXT,
+                first_shared_at TEXT NOT NULL,
+                analyses TEXT NOT NULL CHECK (json_valid(analyses)),
+                note_path TEXT,
+                transcript_note_path TEXT,
+                links_digest TEXT
+            ) STRICT
+            """,
+            """
+            CREATE TABLE mentions (
+                episode_key TEXT NOT NULL REFERENCES episodes (episode_key) ON DELETE CASCADE,
+                prompt_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('person', 'paper', 'company', 'tool', 'topic')),
+                name_key TEXT NOT NULL CHECK (name_key <> ''),
+                position INTEGER NOT NULL CHECK (position >= 0),
+                name TEXT NOT NULL,
+                context TEXT NOT NULL,
+                timestamps TEXT NOT NULL CHECK (json_valid(timestamps)),
+                PRIMARY KEY (episode_key, prompt_hash, kind, name_key)
+            ) STRICT
+            """,
+            "CREATE INDEX mentions_by_name ON mentions (kind, name_key)",
+            """
+            CREATE TABLE aliases (
+                kind TEXT NOT NULL CHECK (kind IN ('person', 'paper', 'company', 'tool', 'topic')),
+                alias_key TEXT NOT NULL CHECK (alias_key <> ''),
+                canonical_key TEXT NOT NULL CHECK (canonical_key <> ''),
+                canonical_name TEXT NOT NULL,
+                PRIMARY KEY (kind, alias_key)
+            ) STRICT
+            """,
+            """
+            CREATE TABLE entities (
+                entity_id TEXT PRIMARY KEY,
+                kind TEXT CHECK (
+                    kind IS NULL OR kind IN ('person', 'paper', 'company', 'tool', 'topic')
+                ),
+                entity_key TEXT,
+                name TEXT,
+                note_path TEXT NOT NULL,
+                content_digest TEXT NOT NULL
+            ) STRICT
+            """,
+        ),
+    ),
 )
 SCHEMA_VERSION: Final = len(MIGRATIONS)
 

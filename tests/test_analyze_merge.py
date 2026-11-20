@@ -22,7 +22,7 @@ def test_entity_key() -> None:
     assert entity_key("Dr. Mara  Ellison") == "dr mara ellison"
     assert entity_key("ADA LOVELACE") == entity_key("Ada Lovelace,") == "ada lovelace"
     assert entity_key("\uff21\uff44\uff41\u3000Lovelace") == "ada lovelace"
-    assert entity_key("C++ & Rust") == "c rust"
+    assert entity_key("C++ & Rust") == "c++ rust"
     assert entity_key("!!!") == ""
 
 

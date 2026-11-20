@@ -12,6 +12,7 @@ from earmark.analyze.llm.base import LLMClient, LLMRequest, LLMResponse
 from earmark.analyze.prompts import REPAIR_SYSTEM_PROMPT, build_repair_message
 from earmark.analyze.schema import AnalysisOutput, plural
 from earmark.errors import PermanentError
+from earmark.models import scrub_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ class ModelCaller:
         request; otherwise (or if that fails too) the error is permanent. No message
         contains model text."""
         try:
-            return AnalysisOutput.model_validate_json(response.text)
+            return AnalysisOutput.model_validate_json(scrub_surrogates(response.text))
         except ValidationError as exc:
             problems = _problems(exc) or [("(root)", "invalid")]
         if not self._repair:
@@ -140,7 +141,7 @@ class ModelCaller:
         if repaired.stop != "end":
             raise PermanentError(self._mismatch(what, problems) + " after one repair attempt")
         try:
-            output = AnalysisOutput.model_validate_json(repaired.text)
+            output = AnalysisOutput.model_validate_json(scrub_surrogates(repaired.text))
         except ValidationError as exc:
             again = _problems(exc) or [("(root)", "invalid")]
             raise PermanentError(self._mismatch(what, again, " after one repair attempt")) from None

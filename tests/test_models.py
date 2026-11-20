@@ -397,3 +397,64 @@ def test_normalize_prompt() -> None:
     with pytest.raises(ValueError, match="at most 4000 characters") as info:
         normalize_prompt("x" * (MAX_PROMPT_CHARS + 1))
     assert str(info.value) == f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)"
+
+
+def test_entity_key() -> None:
+    from earmark.models import entity_key
+
+    assert entity_key("C++") == "c++"
+    assert entity_key("C#") == "c#"
+    assert entity_key("C") == "c"
+    assert len({entity_key("C"), entity_key("C++"), entity_key("C#")}) == 3
+    assert entity_key("F#") == "f#"
+    assert entity_key("#MeToo") == "metoo"
+    assert entity_key("C++ & Rust") == "c++ rust"
+    assert entity_key("AT&T") == "at t"
+    assert entity_key("GPT-4") == entity_key("GPT 4") == "gpt 4"
+    assert entity_key("!!!") == ""
+    assert entity_key("\uff21\uff22\uff23") == "abc"  # full-width, NFKC
+    assert entity_key("Ada  LOVELACE.") == "ada lovelace"
+    assert entity_key("+x") == "x"
+
+
+def test_entity_id_golden() -> None:
+    from earmark.vault.entities import entity_id
+
+    assert entity_id("person", "ada lovelace") == "82a355902603f38e"
+    assert entity_id("person", "zoë") == "ebd1f8ca95b62ffe"
+    assert entity_id("tool", "c++") == "bcbf1db2e4124478"
+
+
+def test_lone_surrogates_replaced() -> None:
+    bad = "a\ud800b\udfff"
+    good = "a\ufffdb\ufffd"
+    episode = make_episode(title=bad)
+    assert episode.title == good
+    assert Segment(start=0, end=1, text=bad).text == good
+    assert Entity(name=bad, context=bad, timestamps_s=()).name == good
+    analysis = make_analysis().model_copy()
+    rebuilt = Analysis.model_validate(
+        {
+            **analysis.model_dump(),
+            "summary": bad,
+            "open_questions": (bad, "ok"),
+            "key_claims": ({"text": bad},),
+        }
+    )
+    assert rebuilt.summary == good
+    assert rebuilt.open_questions == (good, "ok")
+    assert rebuilt.key_claims[0].text == good
+    job = make_job()
+    job2 = Job.model_validate({**job.model_dump(), "warnings": (bad,)})
+    assert job2.warnings == (good,)
+    for model in (episode, rebuilt, job2):
+        dumped = model.model_dump_json()
+        assert type(model).model_validate_json(dumped) == model
+
+
+def test_scrub_keeps_valid_text_identical() -> None:
+    from earmark.models import scrub_surrogates
+
+    text = "emoji \U0001f600 pair and caf\u00e9"
+    assert scrub_surrogates(text) is text
+    assert scrub_surrogates("x\ud800") == "x\ufffd"

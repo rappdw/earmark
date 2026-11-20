@@ -187,3 +187,51 @@ def test_update_note_without_frontmatter() -> None:
     out = update_note("intro\n" + body, OWNED, SEEDS, REGION)
     assert out.text.startswith("---\nearmark")
     assert out.text.endswith("---\nintro\n" + body)
+
+
+ENTITY_ID = "0123456789abcdef"
+
+
+def test_entity_identity() -> None:
+    text = new_note([("earmark", "entity"), ("entity_id", ENTITY_ID), ("name", "N")], SEEDS, REGION)
+    assert note_identity(text) == ("entity", ENTITY_ID)
+    # an entity note needs an entity_id, an episode note an episode_key
+    assert note_identity(f'---\nearmark: "entity"\nepisode_key: "{KEY}"\n---\n') is None
+    assert note_identity(f'---\nearmark: "episode"\nentity_id: "{ENTITY_ID}"\n---\n') is None
+    assert note_identity('---\nearmark: "entity"\nentity_id: "XYZ"\n---\n') is None
+
+
+def test_unlinked() -> None:
+    from earmark.vault.document import unlinked
+
+    assert unlinked("a [[x/y|Label]] b [[z]] c") == "a [[|Label]] b [[]] c"
+    assert unlinked("[t](a/b%20c.md) and [u](x)") == "[t]() and [u]()"
+    assert unlinked("l1\r\nl2") == "l1\nl2"
+    assert unlinked("[[a]]") == unlinked("[[b]]")
+
+
+def test_link_only_change_is_not_edited() -> None:
+    first = new_note(OWNED, SEEDS, "# T\n\n- [[Old/Path|Name]]\n")
+    hand = first.replace("[[Old/Path|Name]]", "[[Short|Name]]")  # Obsidian rewrote the target
+    updated = update_note(hand, OWNED, SEEDS, "# T\n\n- [[New/Path|Name]]\n")
+    assert not updated.edited
+    assert "[[New/Path|Name]]" in updated.text
+    # a text edit is still an edit
+    typed = first.replace("- [[Old/Path|Name]]", "- changed [[Old/Path|Name]]")
+    assert update_note(typed, OWNED, SEEDS, "# T\n\n- [[New/Path|Name]]\n").edited
+    # a changed label is an edit as well
+    relabel = first.replace("|Name]]", "|Other]]")
+    assert update_note(relabel, OWNED, SEEDS, "# T\n\n- [[New/Path|Name]]\n").edited
+
+
+def test_region_surrogates_scrubbed() -> None:
+    from earmark.vault.document import content_digest
+
+    bad = "# T\n\nx\ud800y\n"
+    text = new_note(OWNED, SEEDS, bad)
+    text.encode("utf-8")
+    assert "x\ufffdy" in text
+    updated = update_note(text, OWNED, SEEDS, bad)
+    updated.text.encode("utf-8")
+    assert not updated.edited
+    assert content_digest(OWNED, bad) == content_digest(OWNED, "# T\n\nx\ufffdy\n")

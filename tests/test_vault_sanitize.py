@@ -232,3 +232,21 @@ def test_yaml_quote_lone_surrogate_and_escapes() -> None:
     assert yaml.safe_load("k: " + yaml_quote("a\ud800b")) == {"k": "a�b"}
     assert yaml_quote("\x00\x85") == '"\\u0000\\u0085"'
     assert yaml_quote('a"b\\') == '"a\\"b\\\\"'
+
+
+def test_wikilink_label() -> None:
+    from earmark.vault.sanitize import wikilink_label
+
+    assert wikilink_label("a  [b]|c\\d <e>\n f") == "a (b)-c/d &lt;e> f"
+    assert wikilink_label("x %%%% y") == "x % y"
+    for hostile in ("]]", "a]]b", "| |", "\n\n", "[[x]]"):
+        out = wikilink_label(hostile)
+        assert "]]" not in out
+        assert "|" not in out
+        assert "\n" not in out
+    assert wikilink_label("a\ud800") == "a\ufffd"
+
+
+def test_escape_markdown_cleans_surrogates() -> None:
+    assert escape_markdown("a\ud800b") == "a\ufffdb"
+    assert escape_markdown("e\u0301") == "\u00e9"

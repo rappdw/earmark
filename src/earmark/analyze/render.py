@@ -1,11 +1,13 @@
 """Deterministic Markdown rendering of an ``Analysis``."""
 
 import re
+from collections.abc import Callable
 from typing import Final
 
 from earmark.models import Analysis, Entity, format_hms
 
 MAX_HEADING_CHARS: Final = 80
+type EntityLinker = Callable[[str, Entity], str | None]  # (field, entity) -> name markup
 _BLOCK_SYNTAX = re.compile(r"^(?:[#>\-+*=](?: |$)|\d+[.)] |(?:-{3,}|\*{3,}|_{3,}|={3,})$)")
 _PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
 
@@ -39,8 +41,9 @@ def _hms(seconds: float | None) -> str | None:
     return None if seconds is None else f"[{format_hms(seconds)}]"
 
 
-def _entity_line(e: Entity) -> str:
-    line = f"- **{_collapse(e.name)}**"
+def _entity_line(field: str, e: Entity, entity_link: EntityLinker | None) -> str:
+    linked = entity_link(field, e) if entity_link is not None else None
+    line = f"- **{linked if linked is not None else _collapse(e.name)}**"
     context = _collapse(e.context)
     if context:
         line += f": {context}"
@@ -49,7 +52,9 @@ def _entity_line(e: Entity) -> str:
     return line
 
 
-def render_analysis(analysis: Analysis, *, heading_level: int = 2) -> str:
+def render_analysis(
+    analysis: Analysis, *, heading_level: int = 2, entity_link: EntityLinker | None = None
+) -> str:
     if not 1 <= heading_level <= 5:
         raise ValueError("heading_level must be between 1 and 5")
     h = "#" * heading_level
@@ -85,11 +90,11 @@ def render_analysis(analysis: Analysis, *, heading_level: int = 2) -> str:
     section(
         "Key claims", [with_time(c.timestamp_s, _collapse(c.text)) for c in analysis.key_claims]
     )
-    section("People", [_entity_line(e) for e in analysis.people])
-    section("Papers", [_entity_line(e) for e in analysis.papers])
-    section("Companies", [_entity_line(e) for e in analysis.companies])
-    section("Tools", [_entity_line(e) for e in analysis.tools])
-    section("Topics", [_entity_line(e) for e in analysis.topics])
+    section("People", [_entity_line("people", e, entity_link) for e in analysis.people])
+    section("Papers", [_entity_line("papers", e, entity_link) for e in analysis.papers])
+    section("Companies", [_entity_line("companies", e, entity_link) for e in analysis.companies])
+    section("Tools", [_entity_line("tools", e, entity_link) for e in analysis.tools])
+    section("Topics", [_entity_line("topics", e, entity_link) for e in analysis.topics])
     section("Open questions", [f"- {_collapse(q)}" for q in analysis.open_questions])
     leads: list[str] = []
     for lead in analysis.research_leads:

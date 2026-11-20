@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -114,8 +115,50 @@ def normalize_prompt(value: str | None) -> str | None:
     return value
 
 
+_LONE_SURROGATE: Final = re.compile("[\ud800-\udfff]")
+
+
+def scrub_surrogates(text: str) -> str:
+    """Each lone surrogate (U+D800-U+DFFF) becomes U+FFFD; otherwise unchanged."""
+    if _LONE_SURROGATE.search(text) is None:
+        return text
+    return _LONE_SURROGATE.sub("\ufffd", text)
+
+
+def entity_key(name: str) -> str:
+    """NFKC, casefold; '+'/'#' kept right after a letter, digit, or kept '+'/'#'; every
+    other punctuation (P*) or symbol (S*) character becomes a space; whitespace collapsed."""
+    text = unicodedata.normalize("NFKC", name).casefold()
+    out: list[str] = []
+    for c in text:
+        prev = out[-1] if out else ""
+        if c in "+#" and (prev.isalnum() or prev in {"+", "#"}):
+            out.append(c)
+        elif unicodedata.category(c)[0] in "PS":
+            out.append(" ")
+        else:
+            out.append(c)
+    return " ".join("".join(out).split())
+
+
+def _scrub_value(value: object) -> object:
+    if isinstance(value, str):
+        return scrub_surrogates(value)
+    if isinstance(value, tuple | list):
+        cleaned = [_scrub_value(v) for v in value]
+        if all(a is b for a, b in zip(cleaned, value, strict=True)):
+            return value
+        return type(value)(cleaned)
+    return value
+
+
 class Model(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _scrub(cls, value: object) -> object:
+        return _scrub_value(value)
 
 
 class IngestRequest(Model):

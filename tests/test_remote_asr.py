@@ -949,3 +949,17 @@ def test_no_private_address_guard_in_transcribe() -> None:
     root = Path(__file__).resolve().parent.parent / "src" / "earmark" / "transcribe"
     for path in root.glob("*.py"):
         assert "allow_private" not in path.read_text()
+
+
+def test_lone_surrogate_in_segment_text(tmp_path: Path) -> None:
+    body = THREE.replace(b" third", b" a\\ud800")  # the JSON escape of a lone surrogate
+    assert b"\\ud800" in body
+    server = Server(httpx2.Response(200, content=body))
+    with _cached(tmp_path, server) as (transcriber, artifacts, _):
+        transcript = transcriber.transcribe(
+            CANON_EPISODE, artifacts.audio_path(CANON_EPISODE.key, "mp3")
+        )
+    assert transcript.segments[-1].text == "a\ufffd"
+    stored = artifacts.read_transcript(CANON_EPISODE.key)
+    assert stored == transcript
+    artifacts.transcript_text_path(CANON_EPISODE.key).read_bytes().decode("utf-8")

@@ -138,7 +138,7 @@ def test_newer_schema_refused(tmp_path: Path) -> None:
     db = open_database(path)
     with db.transaction() as conn:
         conn.execute("PRAGMA user_version = 99")
-    with pytest.raises(DatabaseSetupError, match=r"99.*\(1\)"):
+    with pytest.raises(DatabaseSetupError, match=rf"99.*\({SCHEMA_VERSION}\)"):
         db.migrate()
 
 
@@ -270,3 +270,30 @@ def test_killed_writer_leaves_no_trace(tmp_path: Path) -> None:
     store = JobStore(db, clock=MutableClock())
     assert store.claim_next() is None
     assert store.list_recent() == []
+
+
+def test_entities_migration_tables(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "x.db")
+    assert db.schema_version() == SCHEMA_VERSION >= 2
+    with db.connect() as conn:
+        names = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
+        }
+        assert {"episodes", "mentions", "aliases", "entities", "mentions_by_name"} <= names
+        conn.execute(
+            "INSERT INTO episodes (episode_key, title, show_title, first_shared_at, analyses) "
+            "VALUES ('k', 't', 's', 'x', '[]')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO mentions VALUES ('k', 'h', 'c', 'robot', 'n', 0, 'N', '', '[]')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO mentions VALUES ('k', 'h', 'c', 'person', '', 0, 'N', '', '[]')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO aliases VALUES ('robot', 'a', 'b', 'B')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO aliases VALUES ('person', '', 'b', 'B')")

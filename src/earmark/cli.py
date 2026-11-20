@@ -23,6 +23,10 @@ app = typer.Typer(
 )
 
 
+entities_app = typer.Typer(no_args_is_help=True, help="The entity registry.")
+app.add_typer(entities_app, name="entities")
+
+
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"earmark {__version__}")
@@ -369,3 +373,53 @@ def analyze_command(
         return
     for line in render_analysis(analysis).splitlines():
         typer.echo(_clean(line))
+
+
+@entities_app.command("rebuild")
+def entities_rebuild_command(
+    prune: Annotated[
+        bool,
+        typer.Option(
+            "--prune",
+            help="Proceed even when episode notes have no files under EARMARK_DATA_DIR.",
+        ),
+    ] = False,
+) -> None:
+    """Rebuild the entity registry from the stored analyses and regenerate every note."""
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from earmark.errors import PermanentError, TransientError
+    from earmark.vault.aliases import AliasFileError
+    from earmark.vault.notes import build_vault_store
+
+    try:
+        store = build_vault_store(settings)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        report = store.rebuild(prune=prune)
+    except AliasFileError as exc:
+        typer.echo(f"earmark entities rebuild: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=1) from None
+    except TransientError as exc:
+        typer.echo(
+            f"earmark entities rebuild: {_clean(exc.message)} (temporary; try again later)",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+    except PermanentError as exc:
+        typer.echo(f"earmark entities rebuild: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=1) from None
+    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
+        typer.echo(f"cannot open the entity registry: {_clean(exc)}", err=True)
+        raise typer.Exit(code=1) from None
+    for warning in report.warnings:
+        typer.echo(f"earmark entities rebuild: warning: {_clean(warning)}", err=True)
+    line = (
+        f"rebuilt the entity registry: {report.episodes} episodes, {report.entities} entities; "
+        f"{report.written} notes written"
+    )
+    if report.skipped:
+        line += f"; skipped {report.skipped} incomplete episodes"
+    typer.echo(_clean(line))

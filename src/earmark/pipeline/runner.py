@@ -13,7 +13,7 @@ from earmark.artifacts import ArtifactStore
 from earmark.errors import EarmarkError, PermanentError, SkipEpisode, TransientError
 from earmark.jobs import Claim, JobStore, LeaseLostError
 from earmark.log import redact
-from earmark.models import Analysis, Episode, Job, JobResult, StoreResult
+from earmark.models import Analysis, Episode, Job, JobResult, StoreResult, scrub_surrogates
 from earmark.pipeline.stages import Backends
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ def describe_error(exc: BaseException, secrets: Iterable[str] = ()) -> str:
         if frames:
             last = frames[-1]
             text += f" (at {Path(last.filename).name}:{last.lineno} in {last.name})"
-    text = _WHITESPACE.sub(" ", text).strip()
+    text = _WHITESPACE.sub(" ", scrub_surrogates(text)).strip()
     text = redact(text, secrets)
     if len(text) > MAX_ERROR_CHARS:
         text = text[: MAX_ERROR_CHARS - 1] + "…"

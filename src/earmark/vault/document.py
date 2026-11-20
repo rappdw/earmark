@@ -10,11 +10,13 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Final
+from typing import Final, Literal
 
+from earmark.models import scrub_surrogates
 from earmark.vault.sanitize import yaml_quote
 
 type YamlValue = str | date | datetime | tuple[str, ...] | None  # datetime is naive local
+type NoteKind = Literal["episode", "transcript", "entity"]
 
 BEGIN_MARKER: Final = re.compile(r"<!-- earmark:begin(?: hash=([0-9a-f]{16}))? -->")
 END_MARKER: Final = "<!-- earmark:end -->"
@@ -22,6 +24,8 @@ _KEY_NAME: Final = re.compile(r"[a-z][a-z0-9_]*")
 _KEY_LINE: Final = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:(?:[ \t]|\r?$)")
 _BOM: Final = "\ufeff"
 _LINE_END: Final = "\r\n \t"
+_WIKILINK: Final = re.compile(r"\[\[([^\[\]|\n]*)(\|[^\[\]\n]*)?\]\]")
+_MD_LINK_DEST: Final = re.compile(r"\]\(([^()\s]*)\)")
 
 
 def begin_marker(digest: str) -> str:
@@ -93,25 +97,50 @@ def _unquote(value: str) -> str:
     return value
 
 
-def note_identity(text: str) -> tuple[str, str] | None:
-    """``(kind, episode_key)`` from the frontmatter, or None."""
+def note_identity(text: str) -> tuple[NoteKind, str] | None:
+    """``(kind, key)`` from the frontmatter, or None. The key is the ``episode_key`` of an
+    episode or transcript note, or the ``entity_id`` of an entity note."""
     frontmatter = split_note(text).frontmatter
     if frontmatter is None:
         return None
-    kind: str | None = None
-    key: str | None = None
+    kind: NoteKind | None = None
+    episode_key: str | None = None
+    entity_id: str | None = None
     for line in frontmatter:
         m = _KEY_LINE.match(line)
         if m is None:
             continue
         value = _unquote(line[line.index(":") + 1 :])
-        if m.group(1) == "earmark" and kind is None and value in {"episode", "transcript"}:
-            kind = value
-        elif m.group(1) == "episode_key" and key is None and re.fullmatch("[0-9a-f]{20}", value):
-            key = value
-    if kind is None or key is None:
+        name = m.group(1)
+        if name == "earmark" and kind is None:
+            if value == "episode":
+                kind = "episode"
+            elif value == "transcript":
+                kind = "transcript"
+            elif value == "entity":
+                kind = "entity"
+        elif name == "episode_key" and episode_key is None and re.fullmatch("[0-9a-f]{20}", value):
+            episode_key = value
+        elif name == "entity_id" and entity_id is None and re.fullmatch("[0-9a-f]{16}", value):
+            entity_id = value
+    if kind == "entity":
+        return None if entity_id is None else (kind, entity_id)
+    if kind is None or episode_key is None:
         return None
-    return kind, key
+    return kind, episode_key
+
+
+def content_digest(owned: Sequence[tuple[str, YamlValue]], region: str) -> str:
+    """Digest of what earmark would write: its own frontmatter plus the region."""
+    return region_digest("".join(emit_frontmatter(owned)) + scrub_surrogates(region))
+
+
+def unlinked(region: str) -> str:
+    """The region with LF endings and every link destination blanked, to compare two regions
+    while ignoring where their links point (Obsidian rewrites targets on a rename)."""
+    text = region.replace("\r\n", "\n")
+    text = _WIKILINK.sub(lambda m: "[[" + (m.group(2) or "") + "]]", text)
+    return _MD_LINK_DEST.sub("]()", text)
 
 
 class DamagedNote(Exception):  # noqa: N818  # name fixed by the plan
@@ -145,6 +174,7 @@ def new_note(
     seeds: Sequence[tuple[str, YamlValue]],
     region: str,
 ) -> str:
+    region = scrub_surrogates(region)
     _check_region(region)
     front = "".join(emit_frontmatter(owned) + emit_frontmatter(seeds))
     return "---\n" + front + "---\n" + _managed_block(region)
@@ -201,6 +231,7 @@ def update_note(
     seeds: Sequence[tuple[str, YamlValue]],
     region: str,
 ) -> Updated:
+    region = scrub_surrogates(region)
     _check_region(region)
     note = split_note(existing)
     begin, end = _find_markers(note.body)
@@ -208,9 +239,7 @@ def update_note(
     stamped = match.group(1) if match else None
     old_region = "".join(note.body[begin + 1 : end])
     old_digest = region_digest(old_region)
-    edited = (stamped is None or stamped != old_digest) and old_region.replace(
-        "\r\n", "\n"
-    ) != region
+    edited = (stamped is None or stamped != old_digest) and unlinked(old_region) != unlinked(region)
     front = _merge_frontmatter(note.frontmatter or (), owned, seeds)
     text = (
         note.bom

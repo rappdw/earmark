@@ -439,3 +439,12 @@ def test_reanalyze_job_fails_permanently(tmp_path: Path) -> None:
     assert job.error == "reanalyze jobs are not supported yet"
     assert job.stage is None
     assert env.fakes.resolver.call_count == 0
+
+
+def test_describe_error_scrubs_surrogates() -> None:
+    text = describe_error(PermanentError("bad \ud800 text"))
+    assert text == "bad \ufffd text"
+    text.encode("utf-8")
+    text = describe_error(_raised(ValueError("oops \udfff")))
+    assert "\ufffd" in text
+    text.encode("utf-8")

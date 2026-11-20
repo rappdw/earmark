@@ -19,7 +19,7 @@ backend, not the pipeline.
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
-| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), the `anthropic` SDK (a core dependency, itself built on httpx2, imported only by the analyzer's builder; step 10). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), PyYAML for the user-edited `aliases.yaml` only (step 13: `yaml.compose` node walk, no object construction, YAML aliases refused, imported lazily), the `anthropic` SDK (a core dependency, itself built on httpx2, imported only by the analyzer's builder; step 10). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
@@ -89,7 +89,9 @@ src/earmark/
   vault/               sanitize.py (file names, fold keys, Markdown and YAML escaping), fs.py
                        (Vault, VaultDir: fd-based symlink-refusing I/O, vault_lock), document.py
                        (frontmatter emit/merge/identity, managed regions), notes.py
-                       (VaultStore, the `vault` Store; step 12), entities.py (step 13)
+                       (VaultStore, the `vault` Store; step 12), entities.py (kinds,
+                       entity ids, mentions, EntityRegistry over SQLite, entity note
+                       rendering; step 13), aliases.py (aliases.yaml parsing; step 13)
   index/               chunks.py, embed.py, lancedb_index.py
   notify/              ntfy.py
 tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS
@@ -101,7 +103,12 @@ Defined in `models.py` (step 02; exact types and validators in
 `docs/steps/02-contracts.md`). Steps may add fields, with defaults so existing artifacts
 still load. All models are pydantic, frozen, and `extra="forbid"`; sequences are tuples
 (pass `tuple(...)`: mypy rejects a list for a tuple field); datetimes are timezone-aware;
-seconds are finite and non-negative.
+seconds are finite and non-negative. The shared `Model` base replaces every lone UTF-16
+surrogate (U+D800–U+DFFF) in any string field, including inside tuples, with U+FFFD before
+validation (step 13): JSON decoders hand them over, plain `str` fields would accept them,
+and then the artifact JSON, SQLite, and vault writes would fail with a `ValueError` that the
+runner retries. `models.scrub_surrogates` is the helper; `analyze/calls.py` applies it to
+the model's answer and `runner.describe_error` to job text.
 
 - `IngestRequest`: `url`, `prompt: str | None`, `timestamp: datetime | None`. The
   `POST /ingest` body; unknown keys are rejected (a typo such as `promt` must not
@@ -150,6 +157,12 @@ because feeds move and show ids do not. The key names the cache directory, so th
 episode shared twice is transcribed once. Parts are not normalised (the resolver strips
 the GUID); `source` and `show_id` may not contain `:`. Keys are checked with
 `re.fullmatch("[0-9a-f]{20}")` wherever they reach the filesystem.
+
+**Entity key.** `models.entity_key(name)`: NFKC, casefold, `+` and `#` kept right after a
+letter, digit, or kept `+`/`#` (so `C`, `C++`, `C#` differ), every other punctuation or
+symbol character a space, whitespace collapsed. It is the only name normaliser: map-reduce
+merging (step 11) and the entity registry (step 13) both use it. `entity_id(kind, key)` is
+`sha256("{kind}:{key}")[:16]`.
 
 **Prompt hash.** `models.prompt_hash(prompt, model, schema_version)`: sha256 of the
 UTF-8 canonical JSON `{"model":…,"prompt":…,"schema_version":…}` (sorted keys, no
@@ -545,6 +558,23 @@ Step 12; exact rules in `docs/steps/12-vault-writer.md` section 5.
   transient. `EACCES`, `EPERM`, `EROFS`, `ENAMETOOLONG`, symlinks, and an exhausted
   collision suffix are permanent. Messages name vault-relative paths and errno names
   only.
+- **Entities** (step 13; exact rules in `docs/steps/13-entities.md` section 5). Each
+  `store` also updates the entity registry and the entity notes, under the same lock. It
+  scans every note identity (`earmark: episode|transcript|entity`), reads `aliases.yaml`,
+  replaces the episode's mentions in SQLite, and resolves entities through the aliases. It
+  writes the transcript note, then every entity note whose content digest changed, then
+  the notes of other episodes whose links went stale (a renamed or moved entity or episode
+  note), and the episode note last. Then it records paths and digests. Links are full
+  vault-relative paths regenerated from the paths on disk, so they resolve after renames
+  and moves. A store with unchanged inputs and vault writes nothing. Registry errors:
+  `sqlite3.OperationalError` and other `sqlite3.Error` are transient; a database newer than
+  the code is permanent. Alias problems and failed relinks are warnings.
+- **`earmark entities rebuild [--prune]`** holds the lock, empties the registry, refills
+  it from `episodes/*/{episode,transcript,shared}.json` and `analyses/*.json`, and
+  regenerates every earmark note. On an intact vault that writes nothing. It refuses (exit
+  1) when `aliases.yaml` is unreadable, or when episode notes in the vault have no
+  artifacts, unless `--prune`. Run it once after upgrading from step 12, and after
+  changing `TZ`.
 - **Frontmatter** is written by a constrained emitter (`vault.document`), not by a YAML
   library: fixed keys, every string a one-line double-quoted scalar with `\uXXXX`
   escapes, unquoted dates, and naive local date-times. Existing frontmatter is never
@@ -594,7 +624,9 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
 
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
-  earmark.db                    jobs (step 03), entity registry (step 13); WAL mode
+  earmark.db                    jobs (step 03); entity registry tables episodes, mentions,
+                                aliases, entities (step 13, derived: `earmark entities
+                                rebuild`); WAL mode
   vault.lock                    flock held while a process writes the vault (step 12)
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
@@ -614,9 +646,11 @@ $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in 
   Podcasts/<Show>/transcripts/<YYYY-MM-DD> <Title> (transcript).md
   Backups/<note stem> (<region digest>).md   a note's previous version, before hand edits
                                 inside its markers were replaced (step 12)
-  Entities/{People,Papers,Companies,Tools,Topics}/<Name>.md
+  Entities/{People,Papers,Companies,Tools,Topics}/<Name>.md   one note per entity (step 13);
+                                a taken name gets ` (<entity_id[:8]>)`, then ` (<entity_id>)`
   Digests/<ISO-year>-W<week>.md
-  aliases.yaml                  optional, user-maintained entity merges
+  aliases.yaml                  optional, user-maintained entity merges (step 13); earmark
+                                reads it and never writes it
 ```
 
 **Names.** `<Show>` and `<Title>` come from untrusted feed text through
@@ -674,14 +708,42 @@ and CRLF included. If the region was edited by hand (the hash does not match and
 content differs from the new one), the previous file is copied to `Backups/` and the
 region is replaced, with a job warning. If the markers are missing, duplicated, or out
 of order, the note is not touched and a warning says how to restore or regenerate it.
+Edits that only change link targets (Obsidian rewrites links when a note is renamed) are
+not hand edits (step 13): regions are compared with wikilink and Markdown link
+destinations removed. Generated regions have lone surrogates replaced, and
+`escape_markdown` NFC-normalises its input.
 That is also how a user takes a note over. Steps 13 and 18 use the same region and
 frontmatter functions.
 
-**Entities.** People, papers, companies, tools, and topics are normalized (NFKC,
-casefold, collapsed whitespace, stripped punctuation), recorded in SQLite (`entities`,
-`aliases`, `mentions`), and linked from episode notes with wikilinks. Each entity note
-lists the episodes that mention it, so recurring names accumulate. The registry is
-rebuildable from `analyses/*.json`.
+**Entities** (step 13). People, papers, companies, tools, and topics are kinds `person`,
+`paper`, `company`, `tool`, `topic`, never merged with each other. An entity is `(kind,
+canonical key)`, where the key is `entity_key(name)` mapped through `aliases.yaml`. Its
+display name is the alias entry's name, else the name of its earliest mention. Names with
+an empty key (`???`) are not registered and stay unlinked. Mentions (one per episode,
+analysis, kind, and key) are recorded in SQLite (`episodes`, `mentions`, `aliases`,
+`entities`; derived and rebuildable from the artifacts, `aliases.yaml`, and the vault scan).
+
+- Every entity line of an analysis section is a wikilink `[[<full path>|<name as the
+  analysis wrote it>]]`.
+- An entity note has owned keys `earmark: entity`, `entity_id`, `kind`, `name`, and the
+  seeded `tags`. Its region holds a heading, the kind and episode count, the other names
+  seen, and one line per episode whose note exists, newest first: date, episode link,
+  show, context, timestamps.
+- Entity notes are found by `entity_id`, so the user may rename or move them.
+- A note whose entity no longer has mentions (merged away by an alias) becomes a stub,
+  "Merged into …" or "No episode mentions this entity any more.", with its frontmatter
+  kept. It is never deleted.
+- Names become file names through `file_component` (120 bytes, fallback `Unnamed`), and
+  a collision with any entry in the kind folder, a user note included, gets the id
+  suffix.
+- **`aliases.yaml`**: a mapping of kinds (`people`, `papers`, `companies`, `tools`,
+  `topics`), each a mapping of display name to a name or a list of other names. A null
+  value only pins the display name. Each name appears once per kind (first wins; no
+  chains).
+- It is parsed with `yaml.compose`, so every name is its raw text and nothing is
+  constructed. YAML aliases, more than one document, over 256 KiB, non-UTF-8, and
+  symlinks are whole-file errors: a store warns and keeps the aliases loaded before, and
+  `rebuild` refuses. Bad entries are skipped with a warning naming the line.
 
 ## HTTP API
 
@@ -823,7 +885,10 @@ and writes into a vault the user cares about.
   neither symlinks nor hard links can redirect a write. earmark writes only inside
   `<VAULT_DIR>/<VAULT_SUBDIR>/`: its own notes, its managed regions and owned
   frontmatter keys in them, and `Backups/`. It deletes nothing but its own stale temp
-  files.
+  files. Entity names from the LLM get the same treatment as titles (step 13), and wikilink
+  labels are cleaned of `[ ] |`, backslashes, newlines, and `<`. `aliases.yaml` is user
+  input: it is read through the same fd-based, symlink-refusing reader, capped at 256 KiB,
+  and parsed into a PyYAML node tree without constructing objects or expanding aliases.
 - **LLM.** The transcript, feed metadata, and the model's answer are untrusted text. The
   analysis call has no tools; the fixed system prompt tells the model that metadata and
   transcript are material, never instructions; untrusted sections have `<` and `>`
@@ -999,3 +1064,7 @@ Step planners should check these against current documentation instead of assumi
    (or `num_ctx`) must be at least `EARMARK_LLM_CONTEXT_TOKENS`. earmark cannot detect it.
    None of the four servers was run in the sandbox. See `docs/llm.md` and
    `docs/steps/11-local-llm-map-reduce.md` section 2.
+9. **Duplicate basenames in Obsidian** (step 13, unverified). earmark's links are full paths,
+   but once `Earmark/Entities/People/Ada Lovelace.md` exists, a user's own short link
+   `[[Ada Lovelace]]` elsewhere in the vault may become ambiguous. Obsidian's help pages do
+   not document which file it then picks. earmark does not scan outside its subdir.

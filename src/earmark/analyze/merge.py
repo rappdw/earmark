@@ -5,22 +5,24 @@ timestamps), before the reduce request and again on its answer.
 """
 
 import math
-import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
 from earmark.analyze.schema import AnalysisOutput, WireClaim, WireEntity, WireLead, parse_timestamp
-from earmark.models import format_hms
+from earmark.models import entity_key, format_hms
+
+__all__ = [
+    "ENTITY_FIELDS",
+    "PartNote",
+    "entity_key",
+    "finalize_entities",
+    "merge_entities",
+    "merged_part_entities",
+    "restrict_timestamps",
+]
 
 ENTITY_FIELDS: Final = ("people", "papers", "companies", "tools", "topics")
-
-
-def entity_key(name: str) -> str:
-    """NFKC, casefold, punctuation (P*) and symbols (S*) removed, whitespace collapsed."""
-    text = unicodedata.normalize("NFKC", name).casefold()
-    text = "".join(" " if unicodedata.category(c)[0] in "PS" else c for c in text)
-    return " ".join(text.split())
 
 
 def _union_timestamps(groups: Sequence[Sequence[str]]) -> list[str]:

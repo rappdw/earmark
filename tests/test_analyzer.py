@@ -417,3 +417,29 @@ def test_warnings_reach_the_job(tmp_path: Path) -> None:
     assert job is not None
     assert job.status == "done"
     assert any("beyond the episode's duration" in w for w in job.warnings)
+
+
+def test_lone_surrogate_in_answer(tmp_path: Path) -> None:
+    raw = valid_wire_json(
+        summary="sum\ud800mary", people=[{"name": "Ma\ud800ra", "context": "", "timestamps": []}]
+    )
+    # json.dumps escapes the lone surrogate; put the raw character in the text instead
+    raw = raw.replace("\\ud800", "\ud800")
+    assert "\ud800" in raw
+    analyzer, _, artifacts = make_analyzer(tmp_path, ScriptedLLMClient([end(raw)]))
+    episode = sample_episode()
+    analysis = analyzer.analyze(episode, sample_transcript(), None)
+    assert analysis.summary == "sum\ufffdmary"
+    assert analysis.people[0].name == "Ma\ufffdra"
+    path = artifacts.analysis_path(episode.key, analysis.prompt_hash)
+    path.read_bytes().decode("utf-8")  # written, and valid UTF-8
+
+
+def test_escaped_lone_surrogate_is_schema_error(tmp_path: Path) -> None:
+    raw = valid_wire_json(summary="a\ud800b")  # json.dumps writes the \\ud800 escape
+    assert "\\ud800" in raw
+    client = ScriptedLLMClient([end(raw)])
+    analyzer, _, _ = make_analyzer(tmp_path, client)
+    with pytest.raises(PermanentError, match="does not match the analysis schema"):
+        analyzer.analyze(sample_episode(), sample_transcript(), None)
+    assert client.complete_calls == 1  # no repair for a client without repair

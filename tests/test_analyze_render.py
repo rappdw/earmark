@@ -164,3 +164,35 @@ def test_output_ends_with_one_newline() -> None:
     out = render_analysis(make())
     assert out.endswith("\n")
     assert not out.endswith("\n\n")
+
+
+def _sample() -> Analysis:
+    return Analysis(
+        episode_key=KEY,
+        prompt=None,
+        prompt_hash=prompt_hash(None, "m"),
+        model="m",
+        schema_version=ANALYSIS_SCHEMA_VERSION,
+        created_at=T0,
+        summary="S.",
+        people=(Entity(name="Ada", context="ctx", timestamps_s=(5.0,)),),
+        topics=(Entity(name="Memory"),),
+    )
+
+
+def test_entity_link_hook() -> None:
+    calls: list[tuple[str, str]] = []
+
+    def linker(field: str, entity: Entity) -> str | None:
+        calls.append((field, entity.name))
+        return f"[[P/{entity.name}|{entity.name}]]" if field == "people" else None
+
+    text = render_analysis(_sample(), entity_link=linker)
+    assert "- **[[P/Ada|Ada]]**: ctx [00:00:05]" in text
+    assert "- **Memory**\n" in text
+    assert calls == [("people", "Ada"), ("topics", "Memory")]
+
+
+def test_no_linker_unchanged() -> None:
+    assert render_analysis(_sample()) == render_analysis(_sample(), entity_link=None)
+    assert "- **Ada**: ctx [00:00:05]" in render_analysis(_sample())

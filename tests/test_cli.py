@@ -855,3 +855,50 @@ def test_analyze_warnings_on_stderr(fake_env: Path, monkeypatch: pytest.MonkeyPa
     assert result.exit_code == 0, result.stderr
     assert "earmark analyze: warning: something?odd happened" in result.stderr
     assert "warning" not in result.stdout
+
+
+def _vault_share(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    vault = fake_env / "vault"
+    vault.mkdir(exist_ok=True)
+    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
+    _submit(SHARE)
+    assert runner.invoke(app, ["worker", "--once"]).exit_code == 0
+    return vault
+
+
+def test_entities_rebuild(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    vault = _vault_share(fake_env, monkeypatch)
+    (vault / "Earmark" / "aliases.yaml").write_text("foods: {}\n")
+    result = runner.invoke(app, ["entities", "rebuild"])
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "rebuilt the entity registry: 1 episodes, 5 entities; 0 notes written\n"
+    assert result.stderr.startswith(
+        "earmark entities rebuild: warning: aliases.yaml line 1: unknown kind"
+    )
+
+
+def test_entities_rebuild_needs_vault_dir(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EARMARK_VAULT_DIR")
+    result = runner.invoke(app, ["entities", "rebuild"])
+    assert result.exit_code == 2
+    assert "EARMARK_VAULT_DIR" in result.stderr
+
+
+def test_entities_rebuild_bad_aliases(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    vault = _vault_share(fake_env, monkeypatch)
+    (vault / "Earmark" / "aliases.yaml").write_text("people: [oops\n")
+    result = runner.invoke(app, ["entities", "rebuild"])
+    assert result.exit_code == 1
+    assert "earmark entities rebuild: aliases.yaml is not valid YAML at line 2" in result.stderr
+
+
+def test_entities_rebuild_refused(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import shutil
+
+    _vault_share(fake_env, monkeypatch)
+    shutil.rmtree(fake_env / "data" / "episodes")
+    result = runner.invoke(app, ["entities", "rebuild"])
+    assert result.exit_code == 1
+    assert "--prune" in result.stderr
+    assert runner.invoke(app, ["entities", "rebuild", "--prune"]).exit_code == 0

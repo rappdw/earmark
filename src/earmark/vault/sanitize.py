@@ -153,7 +153,7 @@ def fold_key(name: str) -> str:
 def escape_markdown(text: str) -> str:
     """Whitespace-collapse and Markdown-escape untrusted inline text."""
     out: list[str] = []
-    for ch in " ".join(text.split()):
+    for ch in " ".join(clean_unicode(text).split()):
         if ch == "\\":
             out.append("\\\\")
         elif ch in _MD_SPECIAL:
@@ -163,6 +163,14 @@ def escape_markdown(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def wikilink_label(text: str) -> str:
+    """Text safe inside the display part of ``[[target|label]]``."""
+    label = " ".join(clean_unicode(text).split())
+    for ch, repl in (("[", "("), ("]", ")"), ("|", "-"), ("\\", "/"), ("<", "&lt;")):
+        label = label.replace(ch, repl)
+    return re.sub(r"%{2,}", "%", label)
 
 
 def yaml_quote(text: str) -> str:
