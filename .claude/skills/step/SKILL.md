@@ -37,8 +37,9 @@ For each step:
    with a fresh verifier. After two failed rounds, stop the loop and bring the findings
    to the user.
 5. **On `VERDICT: PASS`,** set the step to `done` in the status table and commit
-   everything as one commit titled `step NN: <title>`. Then push `impl` and wait for the
-   CI run for that commit (`gh run watch <id> --exit-status`). If CI fails, stop the loop
+   everything as one commit titled `step NN: <title>`. Then push `impl` and wait for every
+   workflow run triggered by that commit (`gh run list --commit <sha>`, then
+   `gh run watch <id> --exit-status` for each), not only the required one. If CI fails, stop the loop
    and bring the failure to the user; do not start the next step on a red build. On
    green, fast-forward `main` to that commit with `git push origin <sha>:main` (never
    force; if it is not a fast-forward, stop and ask).

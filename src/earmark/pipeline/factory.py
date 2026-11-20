@@ -18,9 +18,12 @@ from earmark.fakes import (
     FakeIndexer,
     FakeNotifier,
     FakeResolver,
+    FakeSearcher,
     FakeStore,
     FakeTranscriber,
 )
+from earmark.index.rebuild import NoteLocator
+from earmark.index.search import Searcher
 from earmark.jobs import JobStore, open_job_store
 from earmark.models import Clock, utc_now
 from earmark.pipeline.runner import Pipeline
@@ -91,6 +94,18 @@ def _vault_store(ctx: BuildContext) -> Store:
     return build_vault_store(ctx.settings)
 
 
+def _lancedb_indexer(ctx: BuildContext) -> Indexer:
+    from earmark.index.lancedb_index import build_lancedb_index
+
+    return build_lancedb_index(ctx.settings, allow_download=True)
+
+
+def _lancedb_searcher(settings: Settings) -> Searcher:
+    from earmark.index.lancedb_index import build_lancedb_index
+
+    return build_lancedb_index(settings, allow_download=False)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -115,7 +130,13 @@ STORES: Final[Mapping[str, Builder[Store]]] = {
 }
 INDEXERS: Final[Mapping[str, Builder[Indexer | None]]] = {
     "fake": lambda ctx: FakeIndexer(),
+    "lancedb": _lancedb_indexer,
     "none": lambda ctx: None,
+}
+SEARCHERS: Final[Mapping[str, Callable[[Settings], Searcher | None]]] = {
+    "fake": lambda settings: FakeSearcher(),
+    "lancedb": _lancedb_searcher,
+    "none": lambda settings: None,
 }
 NOTIFIERS: Final[Mapping[str, Builder[Notifier | None]]] = {
     "fake": lambda ctx: FakeNotifier(),
@@ -188,6 +209,37 @@ def build_analyzer(settings: Settings, *, clock: Clock = utc_now) -> Analyzer:
         raise ConfigError(problems)
     ctx = BuildContext(settings=settings, artifacts=ArtifactStore(settings.data_dir), clock=clock)
     return builder(ctx)
+
+
+def build_searcher(settings: Settings) -> Searcher | None:
+    """Build only the searcher (for ``earmark search`` and ``serve``); it never downloads a model.
+
+    ``None`` when ``EARMARK_INDEX_BACKEND=none``. Raises ``ConfigError`` for an unbuilt
+    backend, a missing extra, or an unknown embedding model.
+    """
+    builder = SEARCHERS.get(settings.index_backend)
+    if builder is None:
+        choices = ", ".join(sorted(SEARCHERS))
+        raise ConfigError(
+            [
+                f"{env_var('index_backend')}: backend {settings.index_backend!r} is not built "
+                f"into this version of earmark (choose one of: {choices})"
+            ]
+        )
+    return builder(settings)
+
+
+def build_note_locator(settings: Settings) -> NoteLocator:
+    """Find existing note paths for episode keys, without writing, for ``earmark reindex``."""
+    if settings.store_backend == "vault":
+        from earmark.vault.notes import build_vault_store
+
+        return build_vault_store(settings).locate_notes
+    if settings.store_backend == "fake":
+        return FakeStore(settings.vault_dir, settings.vault_subdir).locate_notes
+    raise ConfigError(
+        [f"{env_var('store_backend')}: backend {settings.store_backend!r} is not built"]
+    )
 
 
 def build_worker(

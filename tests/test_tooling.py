@@ -40,7 +40,7 @@ def test_unix_socketpair_allowed() -> None:
 
 def test_live_markers_registered(pytestconfig: pytest.Config) -> None:
     markers = pytestconfig.getini("markers")
-    for name in ("network", "slow", "llm", "gpu"):
+    for name in ("network", "slow", "llm", "gpu", "index"):
         assert any(m.startswith(f"{name}:") for m in markers), name
 
 
@@ -74,19 +74,40 @@ def test_llm():
 @pytest.mark.gpu
 def test_gpu():
     pass
+
+@pytest.mark.index
+def test_index():
+    pass
 """
 
 
 def test_live_markers_deselected_by_default(pytester: pytest.Pytester) -> None:
     _make_inner(pytester, _INNER_MARKERS)
     result = pytester.runpytest_subprocess()
-    result.assert_outcomes(passed=1, deselected=4)
+    result.assert_outcomes(passed=1, deselected=5)
 
 
 def test_network_opt_in_reenables_sockets(pytester: pytest.Pytester) -> None:
     _make_inner(pytester, _INNER_MARKERS)
     result = pytester.runpytest_subprocess("-m", "network")
-    result.assert_outcomes(passed=1, deselected=4)
+    result.assert_outcomes(passed=1, deselected=5)
+
+
+_INNER_INDEX = """
+import socket
+import pytest
+
+@pytest.mark.index
+def test_index_opens_socket():
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+"""
+
+
+def test_index_marker_keeps_sockets_blocked(pytester: pytest.Pytester) -> None:
+    _make_inner(pytester, _INNER_INDEX)
+    result = pytester.runpytest_subprocess("-m", "index")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*SocketBlockedError*"])
 
 
 def test_unregistered_marker_fails(pytester: pytest.Pytester) -> None:

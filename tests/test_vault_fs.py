@@ -259,3 +259,38 @@ def test_vault_lock(tmp_path: Path) -> None:
         pytest.fail("the lock must not be granted twice")
     with vault_lock(lock, timeout_s=0.1):
         pass
+
+
+def test_vault_lock_busy_message(tmp_path: Path) -> None:
+    lock = tmp_path / "index.lock"
+    with (
+        vault_lock(lock, timeout_s=1, busy_message="the search index is busy"),
+        pytest.raises(TransientError, match="the search index is busy"),
+        vault_lock(lock, timeout_s=0.1, busy_message="the search index is busy"),
+    ):
+        pytest.fail("the lock must not be granted twice")
+
+
+def test_open_existing_subdir_creates_nothing(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    assert Vault(vault, "A/B").open_existing_subdir() is None  # no vault at all
+    vault.mkdir()
+    assert Vault(vault, "A/B").open_existing_subdir() is None
+    assert list(vault.iterdir()) == []
+    (vault / "A").mkdir()
+    assert Vault(vault, "A/B").open_existing_subdir() is None
+    assert list((vault / "A").iterdir()) == []
+    (vault / "A" / "B").mkdir()
+    opened = Vault(vault, "A/B").open_existing_subdir()
+    assert opened is not None
+    with opened:
+        assert opened.entries() == []
+
+
+def test_open_existing_subdir_refuses_symlinks(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (vault / "A").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(SymlinkRefused):
+        Vault(vault, "A").open_existing_subdir()

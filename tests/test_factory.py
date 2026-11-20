@@ -15,6 +15,7 @@ from earmark.fakes import (
     FakeIndexer,
     FakeNotifier,
     FakeResolver,
+    FakeSearcher,
     FakeStore,
     FakeTranscriber,
 )
@@ -22,6 +23,7 @@ from earmark.ingest import enqueue_ingest
 from earmark.models import IngestRequest
 from earmark.pipeline import factory
 from tests.factories import MutableClock
+from tests.index_helpers import stub_extra_missing
 
 SHARE = "https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981&uo=4"
 
@@ -72,11 +74,11 @@ def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
     expected = {
         field for field, (_, registry) in FIELDS.items() if getattr(settings, field) not in registry
     }
-    assert expected == {"index_backend", "notify_backend"}
+    assert expected == {"notify_backend"}
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     errors = info.value.errors
-    assert len(errors) == len(expected) == 2
+    assert len(errors) == len(expected) == 1
     for field in FIELDS:
         count = 1 if field in expected else 0
         assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == count
@@ -260,11 +262,91 @@ def test_pipeline_modules_import_light() -> None:
         "import sys\n"
         "import earmark.pipeline.runner, earmark.pipeline.worker, earmark.pipeline.factory\n"
         "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2', 'anthropic',\n"
-        "         'faster_whisper', 'lancedb', 'fastembed'}\n"
+        "         'faster_whisper', 'lancedb', 'fastembed', 'pyarrow', 'onnxruntime', 'numpy',\n"
+        "         'loguru'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
+
+
+def test_lancedb_indexer_without_extra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for missing in ("lancedb", "fastembed"):
+        with monkeypatch.context() as m:
+            stub_extra_missing(m, missing)
+            settings = _fake_settings(tmp_path, index_backend="lancedb")
+            with pytest.raises(ConfigError) as info:
+                factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+            [line] = info.value.errors
+            assert line.startswith("EARMARK_INDEX_BACKEND: ")
+            assert "uv sync --extra index" in line
+    assert not (tmp_path / "data").exists()
+
+
+def _stub_lance(monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.index.lancedb_index import LanceRuntime
+
+    def connect(path: Path) -> typing.NoReturn:
+        raise AssertionError("building must not connect")
+
+    monkeypatch.setattr(
+        "earmark.index.lancedb_index.load_lance_runtime", lambda: LanceRuntime(connect)
+    )
+
+
+def test_lancedb_indexer_downloads_and_searcher_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from earmark.fakes import FakeEmbedder
+    from earmark.index.lancedb_index import LanceIndex
+
+    seen: list[bool] = []
+
+    def fake_build(settings: Settings, *, allow_download: bool) -> FakeEmbedder:
+        seen.append(allow_download)
+        return FakeEmbedder()
+
+    monkeypatch.setattr("earmark.index.embed.build_embedder", fake_build)
+    _stub_lance(monkeypatch)
+    settings = _fake_settings(tmp_path, index_backend="lancedb")
+    b = factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    assert isinstance(b.indexer, LanceIndex)
+    searcher = factory.build_searcher(settings)
+    assert isinstance(searcher, LanceIndex)
+    assert seen == [True, False]
+    assert not (tmp_path / "data").exists()
+
+
+def test_searchers_match_indexers() -> None:
+    assert set(factory.SEARCHERS) == set(factory.INDEXERS)
+    assert set(factory.SEARCHERS) == set(typing.get_args(config.IndexBackend))
+
+
+def test_build_searcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert isinstance(factory.build_searcher(_fake_settings(tmp_path)), FakeSearcher)
+    assert factory.build_searcher(_fake_settings(tmp_path, index_backend="none")) is None
+    monkeypatch.setattr(factory, "SEARCHERS", {"fake": factory.SEARCHERS["fake"]})
+    with pytest.raises(ConfigError, match="EARMARK_INDEX_BACKEND"):
+        factory.build_searcher(_fake_settings(tmp_path, index_backend="lancedb"))
+
+
+def test_build_searcher_without_extra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_extra_missing(monkeypatch, "lancedb")
+    with pytest.raises(ConfigError, match="uv sync --extra index"):
+        factory.build_searcher(_fake_settings(tmp_path, index_backend="lancedb"))
+    assert not (tmp_path / "data").exists()
+
+
+def test_build_note_locator(tmp_path: Path) -> None:
+    fake = factory.build_note_locator(_fake_settings(tmp_path))
+    assert fake(["a" * 20])["a" * 20].note_path == f"Earmark/Podcasts/{'a' * 20}.md"
+    (tmp_path / "vault").mkdir()
+    vault = factory.build_note_locator(_fake_settings(tmp_path, store_backend="vault"))
+    assert vault(["a" * 20]) == {}
+    with pytest.raises(ConfigError, match="EARMARK_VAULT_DIR"):
+        factory.build_note_locator(
+            Settings(_env_file=None, data_dir=tmp_path / "d", store_backend="vault")
+        )
 
 
 def test_fetch_module_not_imported_by_factory() -> None:

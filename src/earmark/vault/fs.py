@@ -309,9 +309,36 @@ class Vault:
             raise
         return VaultDir(fd, PurePosixPath(), PurePosixPath(*self._parts))
 
+    def open_existing_subdir(self) -> VaultDir | None:
+        """Like ``open_subdir``, but creates nothing; ``None`` if the vault or a part is absent."""
+        try:
+            fd = os.open(self._vault_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        rel = PurePosixPath()
+        try:
+            for part in self._parts:
+                rel = rel / part
+                child = _open_dir_at(fd, part, rel, create=False)
+                os.close(fd)
+                fd = -1
+                if child is None:
+                    return None
+                fd = child
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            raise
+        return VaultDir(fd, PurePosixPath(), PurePosixPath(*self._parts))
+
 
 @contextmanager
-def vault_lock(path: Path, *, timeout_s: float) -> Iterator[None]:
+def vault_lock(
+    path: Path,
+    *,
+    timeout_s: float,
+    busy_message: str = "another earmark process is writing to the vault; try again later",
+) -> Iterator[None]:
     """Hold an exclusive ``flock`` on ``path``; wait up to ``timeout_s`` for it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
@@ -323,9 +350,7 @@ def vault_lock(path: Path, *, timeout_s: float) -> Iterator[None]:
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise TransientError(
-                        "another earmark process is writing to the vault; try again later"
-                    ) from None
+                    raise TransientError(busy_message) from None
                 time.sleep(0.05)
         try:
             yield

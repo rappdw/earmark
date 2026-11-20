@@ -125,7 +125,10 @@ class Settings(BaseSettings):
             "openai_compat JSON request: json_schema (constrained) or json_object (JSON mode)."
         ),
     )
-    embed_model: str = Field("BAAI/bge-small-en-v1.5", description="Embedding model.")
+    embed_model: str = Field("BAAI/bge-small-en-v1.5", description="Embedding model (fastembed).")
+    embed_model_dir: Path | None = Field(
+        None, description="Where embedding models are downloaded (default: DATA_DIR/models/embed)."
+    )
     ntfy_url: str | None = Field(None, description="ntfy topic URL.")
     ntfy_token: SecretStr | None = Field(None, description="ntfy access token.")
     max_audio_mb: int = Field(1024, gt=0, description="Audio download size cap.")
@@ -160,7 +163,7 @@ class Settings(BaseSettings):
     def _upper_log_level(cls, v: object) -> object:
         return v.upper() if isinstance(v, str) else v
 
-    @field_validator("asr_model", "llm_model")
+    @field_validator("asr_model", "llm_model", "embed_model")
     @classmethod
     def _check_model_name(cls, v: str) -> str:
         v = v.strip()

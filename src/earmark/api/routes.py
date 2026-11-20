@@ -4,7 +4,8 @@ from typing import Annotated, Final
 
 from fastapi import APIRouter, HTTPException, Query, Response
 
-from earmark.api.schemas import Health, IngestResponse, JobList
+from earmark.api.schemas import Health, IngestResponse, JobList, SearchResponse
+from earmark.index.search import DEFAULT_SEARCH_LIMIT, Searcher, parse_query
 from earmark.ingest import enqueue_ingest
 from earmark.jobs import LIST_LIMIT_MAX, JobStore
 from earmark.models import IngestRequest, Job, JobStatus
@@ -14,7 +15,7 @@ from earmark.resolve.apple import UnsupportedUrlError
 MAX_BODY_BYTES: Final = 64 * 1024
 
 
-def build_router(store: JobStore) -> APIRouter:
+def build_router(store: JobStore, searcher: Searcher) -> APIRouter:
     router = APIRouter()
 
     @router.post("/ingest", status_code=202, max_body_size=MAX_BODY_BYTES)
@@ -40,6 +41,16 @@ def build_router(store: JobStore) -> APIRouter:
         status: JobStatus | None = None,
     ) -> JobList:
         return JobList(jobs=tuple(store.list_recent(limit, status=status)))
+
+    @router.get("/search")
+    def search(
+        q: str,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+        kind: Annotated[list[str] | None, Query()] = None,
+        episode: str | None = None,
+    ) -> SearchResponse:
+        query = parse_query(q, limit=limit, kinds=kind or (), episode_key=episode)
+        return SearchResponse(hits=searcher.search(query).hits)
 
     @router.api_route("/healthz", methods=["GET", "HEAD"])
     def healthz() -> Health:

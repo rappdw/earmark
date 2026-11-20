@@ -5,6 +5,8 @@ the stage Protocols is structural and is checked in ``tests/test_stages.py``.
 """
 
 import hashlib
+import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +15,8 @@ from typing import Final
 
 from earmark.artifacts import ArtifactStore, atomic_write_bytes, atomic_write_text
 from earmark.errors import PermanentError
+from earmark.index.chunks import NotePaths
+from earmark.index.search import SearchHit, SearchQuery, SearchResults
 from earmark.models import (
     ANALYSIS_SCHEMA_VERSION,
     Analysis,
@@ -290,6 +294,10 @@ class FakeStore(FakeStage[StoreCall]):
             atomic_write_text(self.vault_dir / result.note_path, "".join(parts))
         return result
 
+    def locate_notes(self, keys: Sequence[str], /) -> dict[str, NotePaths]:
+        """The paths ``store`` returns, for every key."""
+        return {k: NotePaths(f"{self.subdir}/Podcasts/{k}.md", None) for k in keys}
+
 
 class FakeIndexer(FakeStage[IndexCall]):
     def __init__(self) -> None:
@@ -305,6 +313,78 @@ class FakeIndexer(FakeStage[IndexCall]):
     ) -> None:
         self._enter(IndexCall(episode, transcript, tuple(analyses), stored))
         self.rows[episode.key] = 1 + len(analyses)
+
+
+class FakeEmbedder:
+    """Deterministic embeddings that rank by shared words. Satisfies ``Embedder``.
+
+    Each token (``\\w+``, casefolded) adds +-1 at an index derived from its sha256; the
+    vector is L2-normalised, and a text with no tokens is the unit vector on index 0.
+    """
+
+    def __init__(
+        self, *, model: str = "fake-embed-v1", dim: int = 64, max_chars: int = 1000
+    ) -> None:
+        if dim < 1:
+            raise ValueError("dim must be >= 1")
+        self._model = model
+        self._dim = dim
+        self._max_chars = max_chars
+        self.documents: list[str] = []  # every text embed_documents received
+        self.queries: list[str] = []
+        self._failures: list[Exception] = []
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def fail_next(self, exc: Exception, times: int = 1) -> None:
+        if times < 1:
+            raise ValueError("times must be >= 1")
+        self._failures.extend([exc] * times)
+
+    def fits(self, text: str, /) -> bool:
+        return len(text) <= self._max_chars
+
+    def _vector(self, text: str) -> list[float]:
+        values = [0.0] * self._dim
+        for token in re.findall(r"\w+", text.casefold()):
+            digest = hashlib.sha256(token.encode()).digest()
+            values[int.from_bytes(digest[:4]) % self._dim] += 1.0 if digest[4] & 1 == 0 else -1.0
+        norm = math.sqrt(sum(v * v for v in values))
+        if norm == 0.0:
+            values[0] = 1.0
+            return values
+        return [v / norm for v in values]
+
+    def _maybe_fail(self) -> None:
+        if self._failures:
+            raise self._failures.pop(0)
+
+    def embed_documents(self, texts: Sequence[str], /) -> list[list[float]]:
+        self._maybe_fail()
+        self.documents.extend(texts)
+        return [self._vector(t) for t in texts]
+
+    def embed_query(self, text: str, /) -> list[float]:
+        self._maybe_fail()
+        self.queries.append(text)
+        return self._vector(text)
+
+
+class FakeSearcher(FakeStage[SearchQuery]):
+    def __init__(self, hits: Sequence[SearchHit] = (), *, index_exists: bool = True) -> None:
+        super().__init__()
+        self._hits = tuple(hits)
+        self._index_exists = index_exists
+
+    def search(self, query: SearchQuery, /) -> SearchResults:
+        self._enter(query)
+        return SearchResults(hits=self._hits[: query.limit], index_exists=self._index_exists)
 
 
 class FakeNotifier(FakeStage[NotifyCall]):

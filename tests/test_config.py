@@ -40,6 +40,7 @@ def test_defaults() -> None:
     assert s.llm_timeout_seconds == 3600.0
     assert s.llm_response_format == "json_schema"
     assert s.embed_model == "BAAI/bge-small-en-v1.5"
+    assert s.embed_model_dir is None
     assert s.ntfy_url is None
     assert s.ntfy_token is None
     assert s.max_audio_mb == 1024
@@ -331,3 +332,17 @@ def test_llm_base_url_validated(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_llm_response_format_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EARMARK_LLM_RESPONSE_FORMAT", " JSON_OBJECT ")
     assert load_settings(env_file=None).llm_response_format == "json_object"
+
+
+def test_embed_model_stripped_and_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_EMBED_MODEL", "  BAAI/bge-base-en-v1.5 ")
+    assert load_settings(env_file=None).embed_model == "BAAI/bge-base-en-v1.5"
+    monkeypatch.setenv("EARMARK_EMBED_MODEL", "\t")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    assert "EARMARK_EMBED_MODEL" in str(info.value)
+
+
+def test_embed_model_dir_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_EMBED_MODEL_DIR", "/models/embed")
+    assert load_settings(env_file=None).embed_model_dir == Path("/models/embed")

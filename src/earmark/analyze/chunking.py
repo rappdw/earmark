@@ -135,6 +135,9 @@ def _split_text(text: str, fits: Callable[[str], bool]) -> list[str]:
     return _pack(_SENTENCE_END.split(text), fits, by_words)
 
 
+split_text = _split_text  # public name for other modules (the search index chunker)
+
+
 def _pieces_of(index: int, segment: Segment, budget_tokens: int) -> list[Piece]:
     text = " ".join(segment.text.split())
     whole = Piece(index, segment.start, text)

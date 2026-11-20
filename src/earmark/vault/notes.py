@@ -29,6 +29,7 @@ from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
 from earmark.db import Database, DatabaseSetupError, database_path, open_database
 from earmark.errors import EarmarkError, PermanentError, TransientError
+from earmark.index.chunks import NotePaths
 from earmark.models import (
     Analysis,
     Entity,
@@ -435,6 +436,35 @@ class VaultStore:
         """Empty the registry, rebuild it from the artifacts, and regenerate every note."""
         run = _Run()
         return self._guard(run, lambda: self._rebuild(run, prune=prune))
+
+    def locate_notes(self, keys: Sequence[str], /) -> dict[str, NotePaths]:
+        """Vault-relative note paths of the given episodes. Read-only: no lock, nothing created.
+
+        Keys with neither an episode nor a transcript note are omitted; with duplicates the
+        smallest path wins.
+        """
+        wanted = set(keys)
+        try:
+            root = self._vault.open_existing_subdir()
+            if root is None:
+                return {}
+            with root:
+                snapshot = self._scan(root)
+        except EarmarkError:
+            raise
+        except OSError as exc:
+            raise self._map_oserror(exc, _Run()) from exc
+
+        def smallest(kind: NoteKind, key: str) -> str | None:
+            paths = snapshot.get((kind, key))
+            return self._path(min(paths, key="/".join)) if paths else None
+
+        found: dict[str, NotePaths] = {}
+        for key in sorted(wanted):
+            note, transcript = smallest("episode", key), smallest("transcript", key)
+            if note is not None or transcript is not None:
+                found[key] = NotePaths(note, transcript)
+        return found
 
     # -- errors ---------------------------------------------------------------------------
 

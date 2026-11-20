@@ -16,7 +16,7 @@ backend, not the pipeline.
 | LLM for analysis | Hosted is allowed: Claude (`claude-opus-5-5`) through the Anthropic API by default, via the official `anthropic` SDK (2.x): one streamed request with adaptive thinking, an explicit effort (`medium`), a JSON-schema structured output, and server-side refusal fallback (step 10). Transcription and embeddings always run locally. | `EARMARK_LLM_MODEL`, `EARMARK_LLM_EFFORT`, `EARMARK_LLM_FALLBACKS`; `EARMARK_LLM_PROVIDER=openai_compat` with `EARMARK_LLM_BASE_URL`, `EARMARK_LLM_MODEL`, `EARMARK_LLM_CONTEXT_TOKENS` points analysis at a self-hosted OpenAI-compatible server (vLLM, llama.cpp, Ollama, LM Studio; step 11, `docs/llm.md`). Transcripts longer than one request are map-reduced on either provider (step 11). |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
-| Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
+| Vector store | LanceDB (`lancedb` 0.41), embedded, no server: one `chunks` table under `DATA_DIR/lancedb`, exact (exhaustive) cosine search, no ANN index. Embeddings run locally with fastembed (ONNX on CPU), `BAAI/bge-small-en-v1.5` by default. Both are the `index` extra (step 14). | `EARMARK_INDEX_BACKEND`, `EARMARK_EMBED_MODEL` (then `earmark reindex`); swap the `Indexer` and `Searcher` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), PyYAML for the user-edited `aliases.yaml` only (step 13: `yaml.compose` node walk, no object construction, YAML aliases refused, imported lazily), the `anthropic` SDK (a core dependency, itself built on httpx2, imported only by the analyzer's builder; step 10). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
@@ -92,7 +92,11 @@ src/earmark/
                        (VaultStore, the `vault` Store; step 12), entities.py (kinds,
                        entity ids, mentions, EntityRegistry over SQLite, entity note
                        rendering; step 13), aliases.py (aliases.yaml parsing; step 13)
-  index/               chunks.py, embed.py, lancedb_index.py
+  index/               search.py (SearchQuery, SearchHit, SearchResults, the Searcher Protocol,
+                       search errors, snippets), chunks.py (index rows: transcript chunks and
+                       analysis items, digest; pure), embed.py (Embedder Protocol,
+                       FastEmbedEmbedder, build_embedder), lancedb_index.py (LanceIndex: the
+                       `lancedb` Indexer and Searcher), rebuild.py (reindex); step 14
   notify/              ntfy.py
 tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS
 ```
@@ -239,7 +243,9 @@ raise (`fail_next(exc, times)`), and, for the cache-aware stages (fetch, transcr
 analyze), counts the calls that did real work (`computed`). The cache-aware fakes write
 real artifacts through `ArtifactStore`. `make_fake_backends(data_dir, vault_dir=...)`
 builds the whole set, and `FakeBackends.backends()` turns it into the `Backends` the
-runner takes.
+runner takes. Step 14 adds `FakeEmbedder` (deterministic hashed bag of words, so shared
+words rank higher) and `FakeSearcher` (returns configured hits); `FakeIndexer` only
+records calls.
 
 Rules every backend follows:
 
@@ -579,6 +585,63 @@ Step 12; exact rules in `docs/steps/12-vault-writer.md` section 5.
   library: fixed keys, every string a one-line double-quoted scalar with `\uXXXX`
   escapes, unquoted dates, and naive local date-times. Existing frontmatter is never
   parsed as YAML; it is split into lines and top-level keys.
+- **`VaultStore.locate_notes(keys)`** (step 14) scans the subdir read-only (no lock, no
+  registry, nothing created, through `Vault.open_existing_subdir`) and returns each
+  episode's episode-note and transcript-note paths, the smallest path among duplicates.
+  `earmark reindex` uses it.
+
+### Indexing and search
+
+Step 14; exact rules in `docs/steps/14-vector-index.md` sections 4 and 5.
+
+- **Extra and imports.** `lancedb` (with pyarrow) and `fastembed` (with onnxruntime) are the
+  `index` extra, imported only through `importlib` in `lancedb_index.load_lance_runtime()`
+  and `embed.load_fastembed_runtime()`. A missing extra is a `ConfigError` naming
+  `EARMARK_INDEX_BACKEND` and `uv sync --extra index`: the worker refuses to start, while
+  `earmark serve` starts and answers `/search` with 503 and that reason.
+- **Rows.** `index.chunks.build_rows` turns an episode into rows with a `kind`:
+  `transcript` chunks (runs of whole segments, at most 1000 characters and 120 s, start =
+  first segment start, end = largest segment end; a segment too long for one row is split
+  at sentence, then word, boundaries and every piece keeps the segment's times), and per
+  analysis `summary`, `claim`, `lead` (text and rationale), `question`, and `answer` (the
+  prompt response). Claims and leads carry their timestamp. Every row text must pass the
+  embedder's `fits` (no tokenizer truncation: bge-small stops at 512 tokens, other models
+  at 128), so nothing is silently cut. Rows carry the episode's show, title, date, URL,
+  prompt hash, prompt (200 characters), and note paths. Ids are
+  `<key>:<kind>:<prompt_hash or ->:<ordinal>`; a `source_digest` over all rows, the model,
+  and the dimension is stored in each.
+- **Embedder.** `embed.FastEmbedEmbedder` validates `EMBED_MODEL` against fastembed's model
+  list at build time (no I/O) and constructs the model on first use (fastembed looks up or
+  downloads the model in its constructor). The worker and `earmark reindex` may download it
+  into `EMBED_MODEL_DIR` (default `<DATA_DIR>/models/embed`); the API and `earmark search`
+  never download, and answer 503 / exit 1 until the model is there.
+- **Table.** One LanceDB table, `chunks`, under `<DATA_DIR>/lancedb`. Its schema metadata
+  records `earmark.index_version` (1), `earmark.embed_model`, and `earmark.embed_dim`. A
+  table whose metadata or vector size differs is refused on write and on search with
+  `IndexMismatchError`, whose message names both models and says to run `earmark reindex`;
+  the check runs before the model is loaded.
+- **Writes.** `LanceIndex.index` (the `Indexer`) builds the rows, skips everything when the
+  stored digest is unchanged (a re-share embeds nothing), else embeds and replaces the
+  episode's rows in one `merge_insert` commit (update, insert, delete-by-source for that
+  episode). Writers hold `<DATA_DIR>/index.lock` (`flock`, 300 s, transient on timeout) for
+  one episode at a time. Every 20th table version is followed by `optimize` with a one-hour
+  cleanup window. LanceDB failures are transient with short messages; on the worker every
+  failure is an `index failed: …` warning.
+- **Search.** `LanceIndex.search(SearchQuery)` (the `Searcher`) never creates files (a
+  missing directory or table is an empty result with `index_exists=False`), checks the
+  metadata, embeds the query, and runs an exact cosine search with an optional prefilter
+  on `kind` and `episode_key`, built only from validated values. Hits are ranked by
+  distance, scored as cosine similarity, and carry the episode, show, kind, timestamp
+  (`HH:MM:SS`), a 300-character snippet, the note paths, and the Apple URL. Queries are
+  1–500 characters (whitespace collapsed); limits 1–50, default 10.
+- **Reindex.** `earmark reindex` drops and recreates the table, then re-indexes every
+  episode under `data/episodes/` that has a transcript and at least one analysis, reading
+  its artifacts inside the lock, with note paths from `locate_notes`; then optimizes.
+  Search returns fewer hits while it runs (LanceDB OSS has no `rename_table`, so there is
+  no swap). `--episode KEY` re-indexes one episode without the drop. Rows equal what the
+  worker writes for the same note paths.
+- **`earmark search QUERY [--limit] [--kind ...] [--episode] [--json]`** prints ranked hits
+  (cleaned of control characters) or `SearchResults` JSON.
 
 ## Jobs
 
@@ -639,7 +702,11 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
     analyses/<prompt_hash>.json   16 hex chars over prompt + model + schema version
     analyses/<prompt_hash>.parts/<part_id>.json   map answers of an unfinished map-reduce
                                 (step 11); removed when the analysis is written
-  lancedb/
+  index.lock                    flock held while a process writes the search index (step 14)
+  lancedb/chunks.lance/         the search index (step 14, derived: `earmark reindex`);
+                                created by the first index write, never by a search
+  models/embed/                 fastembed model cache (Hugging Face layout) unless
+                                EARMARK_EMBED_MODEL_DIR is set; created on first model load
 
 $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in the vault
   Podcasts/<Show>/<YYYY-MM-DD> <Title>.md                     where a new episode note goes
@@ -762,7 +829,7 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 | `GET /jobs/{id}` | The `Job` as JSON: status, stage, error, warnings, result (note path). 404 if unknown. |
 | `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [Job, …]}`, newest first. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
-| `GET /search?q=` | Vector search (step 14). |
+| `GET /search?q=` | Vector search (step 14). `q` (1–500 characters after collapsing whitespace), `limit` (1–50, default 10), repeatable `kind` (`transcript`, `summary`, `claim`, `lead`, `question`, `answer`), `episode` (an episode key). 200 `{"hits": [SearchHit, …]}` ranked by score (`{"hits": []}` before the first index write). 422 invalid parameters (never echoed). 409 the index was built with another embedding model or dimension (run `earmark reindex`). 503 search unavailable in this process (extra missing, `INDEX_BACKEND=none`), model not downloaded yet, or index read failure (`Retry-After` for transient ones). |
 | `GET /episodes`, `POST /episodes/{key}/analyze` | Re-run a prompt on a stored episode (step 17). |
 
 ## Configuration
@@ -800,7 +867,8 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `LLM_BASE_URL` | unset | Local OpenAI-compatible base URL ending in `/v1`, validated like `ASR_BASE_URL` (`openai_compat` only, required there; the Anthropic client ignores it and honours `ANTHROPIC_BASE_URL`) |
 | `LLM_TIMEOUT_SECONDS` | `3600` | How long `openai_compat` waits for one answer (read and write timeout) |
 | `LLM_RESPONSE_FORMAT` | `json_schema` | `openai_compat` JSON request: `json_schema` (schema-constrained) or `json_object` (JSON mode, schema in the prompt). Not part of the cache key |
-| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (fastembed's default; step 14 may revise) |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model: a name from fastembed's `TextEmbedding.list_supported_models()` (case-insensitive; checked when the index backend is built). Recorded in the index; changing it needs `earmark reindex`. For non-English shows, `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (step 14) |
+| `EMBED_MODEL_DIR` | unset (`<DATA_DIR>/models/embed`) | Where fastembed downloads embedding models (step 14). fastembed's own default, the system temp directory, is not used |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
 | `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
@@ -874,7 +942,16 @@ and writes into a vault the user cares about.
   `huggingface_hub`, not through `fetch.py`: the repository is chosen by the operator
   (`ASR_MODEL`), not by a third party, and it honours the usual `HF_*` and proxy
   environment variables. Weights are CTranslate2 binaries plus JSON and text; nothing is
-  unpickled. A cached model loads offline.
+  unpickled. A cached model loads offline. The embedding model (step 14) is fetched the
+  same way by fastembed (`huggingface_hub`, operator-chosen `EMBED_MODEL`, ONNX graph plus
+  tokenizer JSON, `HF_*` variables honoured), only by the worker and `earmark reindex`;
+  fastembed's loguru output is disabled so its messages cannot bypass the log redaction.
+- **Search** (step 14). `GET /search` is behind the bearer middleware like every route but
+  `/healthz`. The query only reaches the embedder: it is never logged, never put in a
+  filter string, and never echoed in an error. LanceDB filter strings are built only from
+  `kind` literals and episode keys matched against `[0-9a-f]{20}`. Query length (500
+  characters) and result count (50) are capped. Hits carry untrusted transcript and model
+  text as JSON strings; the CLI strips control characters before printing.
 - **Vault writes.** Titles and names from feeds and from the LLM are sanitized before
   they become paths (`vault.sanitize.file_component`: no separators, no leading dot,
   NFC, byte-capped), and are always double-quoted and escaped in YAML. Containment is
@@ -935,6 +1012,15 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   `ANTHROPIC_CONFIG_DIR` at an empty directory, so a developer's key, profile, or base URL
   never reaches the default suite.
 - `gpu`: needs CUDA.
+- `index` (step 14): needs the `index` extra and runs a real LanceDB in a temp directory
+  with `FakeEmbedder`. Sockets stay blocked (the marker does not re-enable them), so these
+  tests also prove the index makes no network call. Fails (does not skip) without the
+  extra. `tests/test_index_slow.py` is `slow` instead: it downloads `BAAI/bge-small-en-v1.5`
+  into `$SLOW_TEST_CACHE/fastembed` and checks semantic ranking with the real model.
+
+For every test without `network`, `slow`, or `llm`, `tests/conftest.py` also sets
+`HF_HUB_OFFLINE=1` and points `FASTEMBED_CACHE_PATH` at an empty directory, so no default
+test can download a model even if the extra is installed.
 
 The analysis client tests drive the real SDK through `httpx2.MockTransport`
 (`tests/anthropic_stub.py` builds the SSE streams and error bodies); the analyzer tests use
@@ -961,15 +1047,22 @@ then runs exactly `uv sync --locked` and `make check`. Python comes from
 cancels the run in progress, and the job times out after 15 minutes.
 
 CI runs the default suite only. It does **not** run the opt-in markers (`network`,
-`slow`, `llm`, `gpu`), does not install the `transcribe` or `index` extras, never runs
-on a GPU, and does not build or run the container. Separate workflows:
+`slow`, `llm`, `gpu`, `index`), does not install the `transcribe` or `index` extras, never
+runs on a GPU, and does not build or run the container. Separate workflows:
+`.github/workflows/index.yml` ("Index tests", step 14) runs on the same pushes and pull
+requests as `ci.yml`, with the same pinned checkout and setup-uv (plus `cache-suffix:
+index`), `contents: read`, and no secrets, in one job `index` that runs `uv sync --locked
+--extra index` and `uv run --locked --extra index pytest -m index -v -rs`. It is not a
+required check unless the operator adds `pytest -m index (linux/arm64)` to `main`'s
+protection.
 `.github/workflows/network.yml` ("Live tests") runs every Monday at 05:23 UTC and on
 `workflow_dispatch`, with `contents: read` and no secrets, in two jobs: `network` (step
 07) runs `uv run --locked pytest -m network -v -rs` with the same pinned actions and setup
-as `ci.yml`; `slow` (step 08) runs `uv sync --locked --extra transcribe` and `uv run
---locked --extra transcribe pytest -m slow -v -rs`, with setup-uv's `cache-suffix:
-transcribe` and a pinned `actions/cache` step for `~/.cache/earmark-tests` (the model and
-clip). GitHub runs `schedule` and
+as `ci.yml`; `slow` (step 08; both extras since step 14) runs `uv sync --locked --extra
+transcribe --extra index` and `uv run --locked --extra transcribe --extra index pytest -m
+slow -v -rs`, with setup-uv's `cache-suffix: slow` and a pinned `actions/cache` step for
+`~/.cache/earmark-tests` (the Whisper and embedding models and the clip). GitHub runs
+`schedule` and
 `workflow_dispatch` only for workflow files on the default branch, so it starts once the
 file is on `main`. `.github/workflows/llm.yml` ("LLM test", step 10) is triggered only by
 `workflow_dispatch` (never by pushes, schedules, or pull requests; the job also checks
@@ -1037,7 +1130,13 @@ Step planners should check these against current documentation instead of assumi
    fastembed. Resolved in step 01 (2026-11-19): all have cp313 (or abi3/pure) manylinux
    aarch64 wheels, install with `--only-binary :all:`, and import on this sandbox. Python
    is pinned to 3.13. onnxruntime 1.32 has no cp315 wheels, which is why
-   `requires-python` carries an upper bound. See `docs/steps/01-scaffold.md`.
+   `requires-python` carries an upper bound. See `docs/steps/01-scaffold.md`. Step 14
+   (2026-11-20) used them: lancedb 0.41.0 and fastembed 0.9.1 (onnxruntime 1.32.0,
+   pyarrow 26.0.1) install from wheels, and create, merge, search, optimize, and drop a
+   table and embed with `BAAI/bge-small-en-v1.5` here, with sockets blocked once the model
+   is cached. The extra adds about 440 MB installed (lancedb 160 MB, pyarrow 151 MB,
+   onnxruntime 59 MB, numpy 54 MB), plus 65 MB for the model. See
+   `docs/steps/14-vector-index.md` section 2.
 4. **Container and GPU paths cannot be exercised in the dev sandbox.** They are reviewed
    statically and verified on the homelab.
 5. **The dev sandbox intercepts DNS.** Found in step 06 (2026-11-20): every name,
@@ -1068,3 +1167,10 @@ Step planners should check these against current documentation instead of assumi
    but once `Earmark/Entities/People/Ada Lovelace.md` exists, a user's own short link
    `[[Ada Lovelace]]` elsewhere in the vault may become ambiguous. Obsidian's help pages do
    not document which file it then picks. earmark does not scan outside its subdir.
+10. **fastembed pins huggingface-hub below 2.0** (step 14, 2026-11-20). The universal lock
+   therefore gives the `transcribe` extra huggingface-hub 1.33.0 instead of 2.4.0.
+   faster-whisper 1.2.1 imports with it and uses only `snapshot_download`; a full
+   transcription with 1.33 is exercised by the weekly `slow` job, not in the sandbox. When
+   fastembed allows hub 2.x, the lock moves back on its own. Also from step 14: with
+   lancedb imported, `os.fork` warns of a possible deadlock (earmark never forks), and
+   LanceDB keeps old table versions until `optimize` cleans them up (one-hour window).

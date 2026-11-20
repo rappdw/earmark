@@ -13,6 +13,8 @@ from earmark import __version__
 from earmark.api.auth import BearerAuthMiddleware, require_api_token
 from earmark.api.routes import build_router
 from earmark.config import Settings
+from earmark.errors import EarmarkError, TransientError
+from earmark.index.search import IndexMismatchError, InvalidQuery, Searcher, UnavailableSearcher
 from earmark.jobs import JobStore, open_job_store
 from earmark.models import INGEST_ERROR_TYPES, IngestRequest
 
@@ -70,8 +72,31 @@ async def _on_store_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-def create_app(settings: Settings, *, store: JobStore | None = None) -> FastAPI:
+async def _on_invalid_query(request: Request, exc: Exception) -> JSONResponse:
+    if not isinstance(exc, InvalidQuery):
+        raise TypeError("unexpected exception type")
+    return JSONResponse({"detail": str(exc)}, status_code=422)
+
+
+async def _on_index_mismatch(request: Request, exc: Exception) -> JSONResponse:
+    if not isinstance(exc, IndexMismatchError):
+        raise TypeError("unexpected exception type")
+    return JSONResponse({"detail": exc.message}, status_code=409)
+
+
+async def _on_search_error(request: Request, exc: Exception) -> JSONResponse:
+    if not isinstance(exc, EarmarkError):
+        raise TypeError("unexpected exception type")
+    headers = {"Retry-After": "5"} if isinstance(exc, TransientError) else None
+    return JSONResponse({"detail": exc.message}, status_code=503, headers=headers)
+
+
+def create_app(
+    settings: Settings, *, store: JobStore | None = None, searcher: Searcher | None = None
+) -> FastAPI:
     token = require_api_token(settings)
+    if searcher is None:
+        searcher = UnavailableSearcher("search is not configured in this process")
     store = store if store is not None else open_job_store(settings)
     app = FastAPI(
         title="earmark",
@@ -88,8 +113,11 @@ def create_app(settings: Settings, *, store: JobStore | None = None) -> FastAPI:
             "auto_configure": False,
         },
     )
-    app.include_router(build_router(store))
+    app.include_router(build_router(store, searcher))
     app.add_exception_handler(RequestValidationError, _on_validation_error)
     app.add_exception_handler(sqlite3.Error, _on_store_error)
+    app.add_exception_handler(InvalidQuery, _on_invalid_query)
+    app.add_exception_handler(IndexMismatchError, _on_index_mismatch)
+    app.add_exception_handler(EarmarkError, _on_search_error)
     app.add_middleware(BearerAuthMiddleware, token=token)
     return app

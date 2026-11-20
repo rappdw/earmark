@@ -1,0 +1,40 @@
+# The real-LanceDB tests (pytest -m index) need the `index` extra, which the required
+# `make check` job does not install. Not a required check (yet); see docs/ARCHITECTURE.md.
+name: Index tests
+
+on:
+  push:
+    branches: [main, impl]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  index:
+    name: pytest -m index (linux/arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # Same minor as the uv_build bound in pyproject.toml; bump both together.
+          version: ">=0.13.9,<0.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          prune-cache: true
+          cache-python: true
+          cache-suffix: index
+      - name: Install dependencies with the index extra
+        run: uv sync --locked --extra index
+      - name: Index tests
+        run: uv run --locked --extra index pytest -m index -v -rs

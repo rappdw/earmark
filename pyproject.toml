@@ -25,7 +25,10 @@ transcribe = [
   # bound once a faster-whisper release after 1.2.1 ships the fix. See docs/steps/08-transcribe.md 2.2.
   "av>=18.1,<19",
 ]
-index = []        # step 14: lancedb, fastembed
+index = [
+  "lancedb>=0.41.0",
+  "fastembed>=0.9.1",
+]
 
 [project.scripts]
 earmark = "earmark.cli:app"
@@ -59,14 +62,15 @@ addopts = [
   "--disable-socket",
   "--allow-unix-socket",          # asyncio/TestClient need an AF_UNIX socketpair
   # NOTE: a command-line -m REPLACES this expression (last -m wins). `-m network` runs only
-  # network tests, but `-m "not slow"` would also include network, llm, and gpu tests.
-  "-m", "not network and not slow and not llm and not gpu",
+  # network tests, but `-m "not slow"` would also include network, llm, gpu, and index tests.
+  "-m", "not network and not slow and not llm and not gpu and not index",
 ]
 markers = [
   "network: hits real external endpoints (Apple, podcast feeds)",
   "slow: downloads a model or does CPU-heavy work",
   "llm: calls the real analysis model",
   "gpu: needs CUDA",
+  "index: needs the index extra; real LanceDB in a temp directory, no network",
 ]
 filterwarnings = [
   "error",

@@ -34,6 +34,11 @@ def _isolate_environment(
         # Not under tmp_path: many tests assert that tmp_path stays empty.
         config_dir = tmp_path_factory.mktemp("anthropic-config")
         monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(config_dir))
+    if not any(request.node.get_closest_marker(m) for m in _SOCKET_MARKERS):
+        # Defence in depth: sockets are blocked anyway, but nothing may reach for a model.
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        cache = tmp_path_factory.mktemp("fastembed-cache")
+        monkeypatch.setenv("FASTEMBED_CACHE_PATH", str(cache))
     monkeypatch.chdir(tmp_path)
 
 

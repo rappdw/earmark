@@ -11,19 +11,25 @@ import httpx2
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import earmark
+from earmark.artifacts import ArtifactStore
 from earmark.cli import app
-from earmark.config import Settings, env_var
+from earmark.config import ConfigError, Settings, env_var
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import FakeResolver
+from earmark.fakes import FakeResolver, FakeSearcher
+from earmark.index.embed import IndexExtraMissing
+from earmark.index.search import IndexMismatchError, SearchQuery
 from earmark.jobs import open_job_store
 from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from earmark.transcribe import faster_whisper as fw
 from tests.factories import make_analysis, make_episode, make_transcript
+from tests.index_helpers import RecordingTarget, make_docs, stub_extra_missing
+from tests.test_index_search import make_hit
 from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
 
 runner = CliRunner()
@@ -109,7 +115,8 @@ def test_import_earmark_is_light() -> None:
     code = (
         "import sys, earmark\n"
         "heavy = {'pydantic', 'pydantic_settings', 'typer', 'fastapi', 'uvicorn', 'httpx2',\n"
-        "         'faster_whisper', 'ctranslate2', 'lancedb', 'fastembed', 'anthropic'}\n"
+        "         'faster_whisper', 'ctranslate2', 'lancedb', 'fastembed', 'anthropic',\n"
+        "         'pyarrow', 'onnxruntime', 'numpy', 'loguru'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
@@ -902,3 +909,257 @@ def test_entities_rebuild_refused(fake_env: Path, monkeypatch: pytest.MonkeyPatc
     assert result.exit_code == 1
     assert "--prune" in result.stderr
     assert runner.invoke(app, ["entities", "rebuild", "--prune"]).exit_code == 0
+
+
+# -- search, reindex, and serve's searcher ------------------------------------------------
+
+KEY = "a" * 20
+
+
+def _patch_searcher(monkeypatch: pytest.MonkeyPatch, searcher: FakeSearcher | None) -> None:
+    monkeypatch.setattr("earmark.pipeline.factory.build_searcher", lambda settings: searcher)
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_prints_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    searcher = FakeSearcher(
+        [
+            make_hit(1),
+            make_hit(2, kind="summary", start_s=None, timestamp=None, note_path=None),
+        ]
+    )
+    _patch_searcher(monkeypatch, searcher)
+    result = runner.invoke(app, ["search", "fake claim", "--limit", "5", "--kind", "claim"])
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "1. 0.8312  Fake Show \u2014 Fake episode  [00:01:05]  claim",
+        "   The fake episode makes a claim.",
+        "   Earmark/Podcasts/x.md",
+        "2. 0.8312  Fake Show \u2014 Fake episode  summary",
+        "   The fake episode makes a claim.",
+    ]
+    assert searcher.calls == [SearchQuery("fake claim", 5, ("claim",), None)]
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    searcher = FakeSearcher([make_hit(1)])
+    _patch_searcher(monkeypatch, searcher)
+    result = runner.invoke(app, ["search", "x", "--json", "--episode", KEY])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["index_exists"] is True
+    assert data["hits"][0]["timestamp"] == "00:01:05"
+    assert searcher.calls[0].episode_key == KEY
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_no_results_and_empty_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_searcher(monkeypatch, FakeSearcher())
+    assert runner.invoke(app, ["search", "x"]).stdout == "no results\n"
+    _patch_searcher(monkeypatch, FakeSearcher(index_exists=False))
+    out = runner.invoke(app, ["search", "x"]).stdout
+    assert out.startswith("the search index is empty")
+    assert "`earmark reindex`" in out
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_cleans_terminal_escapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_searcher(
+        monkeypatch, FakeSearcher([make_hit(1, snippet="evil \x1b[31mred", show_title="a\x07b")])
+    )
+    result = runner.invoke(app, ["search", "x"])
+    assert "\x1b" not in result.stdout
+    assert "\x07" not in result.stdout
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_mismatch_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    searcher = FakeSearcher()
+    searcher.fail_next(IndexMismatchError("built with another model; run `earmark reindex`"))
+    _patch_searcher(monkeypatch, searcher)
+    result = runner.invoke(app, ["search", "x"])
+    assert result.exit_code == 1
+    assert "earmark reindex" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_transient_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    searcher = FakeSearcher()
+    searcher.fail_next(TransientError("the embedding model is not downloaded yet"))
+    _patch_searcher(monkeypatch, searcher)
+    result = runner.invoke(app, ["search", "x"])
+    assert result.exit_code == 1
+    assert "temporary; try again later" in result.stderr
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+@pytest.mark.parametrize(
+    "args", [["  "], ["x", "--limit", "0"], ["x", "--kind", "entity"], ["x", "--episode", "ZZ"]]
+)
+def test_search_invalid_input_exits_2(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> None:
+    searcher = FakeSearcher()
+    _patch_searcher(monkeypatch, searcher)
+    result = runner.invoke(app, ["search", *args])
+    assert result.exit_code == 2
+    assert searcher.calls == []
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_off_and_config_errors_exit_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_searcher(monkeypatch, None)
+    off = runner.invoke(app, ["search", "x"])
+    assert (off.exit_code, "EARMARK_INDEX_BACKEND=none" in off.stderr) == (2, True)
+
+    def boom(settings: Settings) -> None:
+        raise ConfigError(["EARMARK_EMBED_MODEL: 'x' is not a fastembed text embedding model"])
+
+    monkeypatch.setattr("earmark.pipeline.factory.build_searcher", boom)
+    bad = runner.invoke(app, ["search", "x"])
+    assert bad.exit_code == 2
+    assert "EARMARK_EMBED_MODEL" in bad.stderr
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_search_without_extra_exits_2_and_creates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stub_extra_missing(monkeypatch, "lancedb")
+    result = runner.invoke(app, ["search", "x"])
+    assert result.exit_code == 2
+    assert "uv sync --extra index" in result.stderr
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.fixture
+def reindex_env(monkeypatch: pytest.MonkeyPatch, fake_env: Path) -> RecordingTarget:
+    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "lancedb")
+    target = RecordingTarget()
+    monkeypatch.setattr(
+        "earmark.index.lancedb_index.build_lancedb_index",
+        lambda settings, *, allow_download=True, embedder=None: target,
+    )
+    return target
+
+
+def test_reindex_requires_lancedb(fake_env: Path) -> None:
+    result = runner.invoke(app, ["reindex"])
+    assert result.exit_code == 2
+    assert "EARMARK_INDEX_BACKEND is 'fake'" in result.stderr
+
+
+def test_reindex_reports(
+    reindex_env: RecordingTarget, fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
+    (fake_env / "vault").mkdir()  # empty: no note is found for either episode
+    store = ArtifactStore(fake_env / "data")
+    for guid in ("urn:c:1", "urn:c:2"):
+        docs = make_docs(guid=guid)
+        store.write_episode(docs.episode)
+        store.write_transcript(docs.transcript)
+        store.write_analysis(docs.analyses[0])
+    incomplete = make_docs(guid="urn:c:3")
+    store.write_episode(incomplete.episode)
+    result = runner.invoke(app, ["reindex"])
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "reindexed 2 episodes (6 rows); skipped 1 incomplete episodes\n"
+    assert result.stderr.count("earmark reindex: warning: ") == 2
+    assert reindex_env.calls[0] == "reset"
+    assert reindex_env.calls[-1] == "optimize"
+
+
+def test_reindex_bad_episode_exits_2(reindex_env: RecordingTarget) -> None:
+    result = runner.invoke(app, ["reindex", "--episode", "nope"])
+    assert result.exit_code == 2
+    assert "--episode" in result.stderr
+
+
+def test_reindex_missing_episode_exits_1(reindex_env: RecordingTarget) -> None:
+    result = runner.invoke(app, ["reindex", "--episode", KEY])
+    assert result.exit_code == 1
+    assert "has no transcript or analyses" in result.stderr
+
+
+def test_reindex_errors(
+    reindex_env: RecordingTarget, fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ArtifactStore(fake_env / "data")
+    docs = make_docs()
+    store.write_episode(docs.episode)
+    store.write_transcript(docs.transcript)
+    store.write_analysis(docs.analyses[0])
+    key = docs.episode.key
+    reindex_env.fail_on[key] = TransientError("the search index disk is full")
+    transient = runner.invoke(app, ["reindex", "--episode", key])
+    assert transient.exit_code == 1
+    assert "(temporary; try again later)" in transient.stderr
+    reindex_env.fail_on[key] = IndexMismatchError(
+        "the search index was built with x; run `earmark reindex` to rebuild it"
+    )
+    mismatch = runner.invoke(app, ["reindex", "--episode", key])
+    assert mismatch.exit_code == 1
+    assert "`earmark reindex` (without --episode) to rebuild it" in mismatch.stderr
+    reindex_env.fail_on[key] = OSError("disk exploded")
+    assert runner.invoke(app, ["reindex", "--episode", key]).exit_code == 1
+
+
+def test_reindex_without_vault_exits_2(
+    reindex_env: RecordingTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
+    monkeypatch.delenv("EARMARK_VAULT_DIR")
+    result = runner.invoke(app, ["reindex"])
+    assert result.exit_code == 2
+    assert "EARMARK_VAULT_DIR" in result.stderr
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_serve_starts_when_search_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_uvicorn: _UvicornCalls,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def missing(settings: Settings) -> None:
+        raise IndexExtraMissing(["EARMARK_INDEX_BACKEND: needs the 'index' extra"])
+
+    monkeypatch.setattr("earmark.pipeline.factory.build_searcher", missing)
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    result = runner.invoke(app, ["serve"])
+    assert result.exit_code == 0, result.stderr
+    assert len(fake_uvicorn.calls) == 1
+    assert any("search is unavailable" in r.getMessage() for r in caplog.records)
+    api = fake_uvicorn.calls[0][0][0]
+    with TestClient(api, headers={"Authorization": f"Bearer {SERVE_TOKEN}"}) as client:
+        response = client.get("/search", params={"q": "x"})
+    assert response.status_code == 503
+    assert "needs the 'index' extra" in response.json()["detail"]
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_serve_with_index_none(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls
+) -> None:
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "none")
+    assert runner.invoke(app, ["serve"]).exit_code == 0
+    with TestClient(
+        fake_uvicorn.calls[0][0][0], headers={"Authorization": f"Bearer {SERVE_TOKEN}"}
+    ) as client:
+        response = client.get("/search", params={"q": "x"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "search is turned off (EARMARK_INDEX_BACKEND=none)"}
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_serve_wires_the_searcher(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls
+) -> None:
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "fake")
+    assert runner.invoke(app, ["serve"]).exit_code == 0
+    with TestClient(
+        fake_uvicorn.calls[0][0][0], headers={"Authorization": f"Bearer {SERVE_TOKEN}"}
+    ) as client:
+        assert client.get("/search", params={"q": "x"}).json() == {"hits": []}

@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from earmark.index.search import SearchHit
 from earmark.models import Job, JobId, JobStatus
 
 
@@ -23,3 +24,7 @@ class JobList(ApiModel):
 
 class Health(ApiModel):
     status: Literal["ok"]
+
+
+class SearchResponse(ApiModel):
+    hits: tuple[SearchHit, ...]
