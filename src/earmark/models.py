@@ -1,0 +1,265 @@
+"""Shared vocabulary: frozen pydantic models, key and hash functions, and type aliases.
+
+Imports only the standard library and pydantic. Sequences are tuples (so models are
+hashable and really immutable), datetimes are timezone-aware, and floats are finite.
+"""
+
+import hashlib
+import json
+import math
+import re
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import PurePosixPath
+from typing import Annotated, Final, Literal, Self
+
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
+
+Source = Literal["apple_podcasts"]
+JobKind = Literal["ingest", "reanalyze"]
+JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
+Stage = Literal["resolve", "fetch", "transcribe", "analyze", "store", "index", "notify"]
+Clock = Callable[[], datetime]
+
+TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset({"done", "failed", "skipped"})
+ANALYSIS_SCHEMA_VERSION: Final = 1
+EPISODE_KEY_LENGTH: Final = 20
+PROMPT_HASH_LENGTH: Final = 16
+
+EpisodeKey = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{20}$")]
+PromptHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{16}$")]
+JobId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+Seconds = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+
+
+def utc_now() -> datetime:
+    """The default Clock."""
+    return datetime.now(UTC)
+
+
+def episode_key(source: str, show_id: str, guid: str) -> str:
+    """Stable 20-hex-character key for an episode. The parts are not normalised."""
+    if not source or not show_id or not guid:
+        raise ValueError("source, show_id and guid must not be empty")
+    if ":" in source or ":" in show_id:
+        raise ValueError("source and show_id must not contain ':'")
+    digest = hashlib.sha256(f"{source}:{show_id}:{guid}".encode()).hexdigest()
+    return digest[:EPISODE_KEY_LENGTH]
+
+
+def prompt_hash(
+    prompt: str | None, model: str, schema_version: int = ANALYSIS_SCHEMA_VERSION
+) -> str:
+    """16-hex-character cache key of an analysis. ``None`` (default prompt) differs from ``""``."""
+    if not model:
+        raise ValueError("model must not be empty")
+    if schema_version < 1:
+        raise ValueError("schema_version must be >= 1")
+    payload = json.dumps(
+        {"model": model, "prompt": prompt, "schema_version": schema_version},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:PROMPT_HASH_LENGTH]
+
+
+def is_episode_key(value: str) -> bool:
+    return re.fullmatch("[0-9a-f]{20}", value) is not None
+
+
+def is_prompt_hash(value: str) -> bool:
+    return re.fullmatch("[0-9a-f]{16}", value) is not None
+
+
+def format_hms(seconds: float) -> str:
+    """``HH:MM:SS`` with the fraction floored and hours unbounded."""
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("seconds must be finite and non-negative")
+    s = int(seconds)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def _check_relative_posix(path: str) -> str:
+    pure = PurePosixPath(path)
+    if not path or pure.is_absolute() or "\\" in path or ".." in pure.parts:
+        raise ValueError("path must be a non-empty relative POSIX path without '..'")
+    return path
+
+
+class Model(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class IngestRequest(Model):
+    url: str
+    prompt: str | None = None
+    timestamp: AwareDatetime | None = None
+
+
+class EpisodeRef(Model):
+    source: Source
+    show_id: str
+    episode_id: str
+    country: str
+    url: str
+
+
+class Episode(Model):
+    key: EpisodeKey
+    source: Source
+    show_id: Annotated[str, Field(min_length=1)]
+    episode_id: str
+    guid: Annotated[str, Field(min_length=1)]
+    title: str
+    show_title: str
+    published_at: AwareDatetime | None
+    duration_s: Seconds | None
+    audio_url: str
+    feed_url: str | None
+    url: str
+    description: str = ""
+
+    @field_validator("show_id")
+    @classmethod
+    def _no_colon(cls, value: str) -> str:
+        if ":" in value:
+            raise ValueError("show_id must not contain ':'")
+        return value
+
+    @model_validator(mode="after")
+    def _key_matches(self) -> Self:
+        if self.key != episode_key(self.source, self.show_id, self.guid):
+            raise ValueError("key does not match source, show_id and guid")
+        return self
+
+
+class Segment(Model):
+    start: Seconds
+    end: Seconds
+    text: str
+    speaker: str | None = None
+
+    @model_validator(mode="after")
+    def _ordered(self) -> Self:
+        if self.end < self.start:
+            raise ValueError("end must be >= start")
+        return self
+
+
+class Transcript(Model):
+    episode_key: EpisodeKey
+    language: str | None
+    duration_s: Seconds
+    model: str
+    segments: tuple[Segment, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    def to_text(self) -> str:
+        """One ``[HH:MM:SS] text`` line per segment; the content of ``transcript.txt``."""
+        lines: list[str] = []
+        for seg in self.segments:
+            text = " ".join(seg.text.split())
+            marker = f"[{format_hms(seg.start)}]"
+            lines.append(f"{marker} {text}" if text else marker)
+        return "".join(line + "\n" for line in lines)
+
+
+class Claim(Model):
+    text: str
+    timestamp_s: Seconds | None = None
+
+
+class Entity(Model):
+    name: Annotated[str, Field(min_length=1)]
+    context: str = ""
+    timestamps_s: tuple[Seconds, ...] = ()
+
+
+class ResearchLead(Model):
+    text: str
+    rationale: str = ""
+    timestamp_s: Seconds | None = None
+
+
+class Analysis(Model):
+    episode_key: EpisodeKey
+    prompt: str | None
+    prompt_hash: PromptHash
+    model: str
+    schema_version: Annotated[int, Field(ge=1)]
+    created_at: AwareDatetime
+    summary: str
+    key_claims: tuple[Claim, ...] = ()
+    people: tuple[Entity, ...] = ()
+    papers: tuple[Entity, ...] = ()
+    companies: tuple[Entity, ...] = ()
+    tools: tuple[Entity, ...] = ()
+    topics: tuple[Entity, ...] = ()
+    open_questions: tuple[str, ...] = ()
+    research_leads: tuple[ResearchLead, ...] = ()
+    prompt_response: str | None = None
+    warnings: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _hash_matches(self) -> Self:
+        if self.prompt_hash != prompt_hash(self.prompt, self.model, self.schema_version):
+            raise ValueError("prompt_hash does not match prompt, model and schema_version")
+        return self
+
+
+class StoreResult(Model):
+    note_path: str
+    transcript_note_path: str | None = None
+    warnings: tuple[str, ...] = ()
+
+    @field_validator("note_path", "transcript_note_path")
+    @classmethod
+    def _relative(cls, value: str | None) -> str | None:
+        return None if value is None else _check_relative_posix(value)
+
+
+class JobResult(Model):
+    note_path: str | None = None
+    transcript_note_path: str | None = None
+    analysis_hash: PromptHash | None = None
+
+    @field_validator("note_path", "transcript_note_path")
+    @classmethod
+    def _relative(cls, value: str | None) -> str | None:
+        return None if value is None else _check_relative_posix(value)
+
+
+class Job(Model):
+    id: JobId
+    kind: JobKind
+    status: JobStatus
+    stage: Stage | None = None
+    url: str | None
+    prompt: str | None
+    episode_key: EpisodeKey | None = None
+    attempts: int = Field(0, ge=0)
+    run_after: AwareDatetime
+    error: str | None = None
+    warnings: tuple[str, ...] = ()
+    result: JobResult | None = None
+    shared_at: AwareDatetime
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    heartbeat_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _kind_requirements(self) -> Self:
+        if self.kind == "ingest" and self.url is None:
+            raise ValueError("an ingest job requires url")
+        if self.kind == "reanalyze" and self.episode_key is None:
+            raise ValueError("a reanalyze job requires episode_key")
+        return self

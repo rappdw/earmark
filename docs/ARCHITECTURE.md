@@ -76,79 +76,146 @@ tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS
 
 ## Domain models
 
-Field lists are the minimum; steps may add fields.
+Defined in `models.py` (step 02; exact types and validators in
+`docs/steps/02-contracts.md`). Steps may add fields, with defaults so existing artifacts
+still load. All models are pydantic, frozen, and `extra="forbid"`; sequences are tuples
+(pass `tuple(...)`: mypy rejects a list for a tuple field); datetimes are timezone-aware;
+seconds are finite and non-negative.
 
 - `IngestRequest`: `url`, `prompt: str | None`, `timestamp: datetime | None`.
 - `EpisodeRef`: `source` (`"apple_podcasts"`), `show_id`, `episode_id`, `country`, `url`.
 - `Episode`: `key`, `source`, `show_id`, `episode_id`, `guid`, `title`, `show_title`,
-  `published_at`, `duration_s`, `audio_url`, `feed_url`, `url`, `description`.
+  `published_at | None`, `duration_s | None`, `audio_url`, `feed_url | None`, `url`,
+  `description`. A validator requires `key == episode_key(source, show_id, guid)`.
 - `Segment`: `start`, `end`, `text`, `speaker: str | None`.
-- `Transcript`: `episode_key`, `language`, `duration_s`, `model`, `segments`.
-  `to_text()` renders one `[HH:MM:SS] text` line per segment.
-- `Analysis`: `episode_key`, `prompt`, `prompt_hash`, `model`, `created_at`, and the
-  result: `summary`, `key_claims`, `people`, `papers`, `companies`, `tools`, `topics`,
-  `open_questions`, `research_leads`, `prompt_response`. Claims and leads carry
-  timestamps in seconds. Entity items carry `name`, `context`, and timestamps.
-- `Job`: `id`, `kind` (`ingest`, later `reanalyze`), `status`, `stage`, `url`, `prompt`,
-  `episode_key`, `attempts`, `run_after`, `error`, `warnings`, `result`, `shared_at`,
-  `created_at`, `updated_at`, `heartbeat_at`.
+- `Transcript`: `episode_key`, `language | None`, `duration_s`, `model`, `segments`,
+  `warnings`. `to_text()` renders one `[HH:MM:SS] text` line per segment (whitespace
+  collapsed, hours unbounded, trailing newline); it is the content of `transcript.txt`.
+- `Analysis`: `episode_key`, `prompt` (`None` = default), `prompt_hash`, `model`,
+  `schema_version`, `created_at`, and the result: `summary`, `key_claims: Claim`,
+  `people`, `papers`, `companies`, `tools`, `topics` (all `Entity`), `open_questions:
+  str`, `research_leads: ResearchLead`, `prompt_response | None`, and `warnings`.
+  `Claim` is `text`, `timestamp_s | None`. `Entity` is `name`, `context`,
+  `timestamps_s`. `ResearchLead` is `text`, `rationale`, `timestamp_s | None`.
+- `StoreResult`: `note_path`, `transcript_note_path | None`, `warnings`. Paths are POSIX,
+  relative to `VAULT_DIR` (so they start with `VAULT_SUBDIR`), usable directly as the
+  `file=` of an `obsidian://open` link.
+- `JobResult`: `note_path`, `transcript_note_path`, `analysis_hash`, all optional.
+- `Job`: `id` (`uuid4().hex`), `kind` (`ingest`, `reanalyze`), `status`, `stage`,
+  `url | None` (required for `ingest`), `prompt`, `episode_key | None` (required for
+  `reanalyze`), `attempts`, `run_after`, `error` (failure message or skip reason),
+  `warnings`, `result: JobResult | None`, `shared_at`, `created_at`, `updated_at`,
+  `heartbeat_at`.
 
-**Episode key.** `sha256("{source}:{show_id}:{guid}")`, first 20 hex characters. The
-Apple show id is used instead of the feed URL because feeds move and show ids do not.
-The key names the cache directory, so the same episode shared twice is transcribed once.
+**Episode key.** `sha256("{source}:{show_id}:{guid}")` over UTF-8, first 20 hex
+characters, from `models.episode_key`. The Apple show id is used instead of the feed URL
+because feeds move and show ids do not. The key names the cache directory, so the same
+episode shared twice is transcribed once. Parts are not normalised (the resolver strips
+the GUID); `source` and `show_id` may not contain `:`. Keys are checked with
+`re.fullmatch("[0-9a-f]{20}")` wherever they reach the filesystem.
+
+**Prompt hash.** `models.prompt_hash(prompt, model, schema_version)`: sha256 of the
+UTF-8 canonical JSON `{"model":…,"prompt":…,"schema_version":…}` (sorted keys, no
+spaces, `ensure_ascii=False`), first 16 hex characters. `None` (the default prompt) and
+`""` differ. `ANALYSIS_SCHEMA_VERSION` in `models.py` is bumped whenever the output
+schema, the standing system prompt, or the default prompt changes in a way that should
+invalidate cached analyses.
+
+**Errors.** `errors.py` defines `EarmarkError` and three sibling subclasses:
+`TransientError(message, *, retry_after_s=None)`, `PermanentError(message)`, and
+`SkipEpisode(reason)`. Messages are short, human-readable, and free of secrets and
+untrusted bulk text, because they are stored in `job.error` and shown in notifications.
 
 ## Stage contracts
 
-Defined as `typing.Protocol` in `pipeline/stages.py`. Signatures are indicative; step 02
-fixes them.
+Defined as `typing.Protocol` in `pipeline/stages.py`, fixed in step 02. Parameters are
+positional-only, because mypy does not check parameter names when matching a Protocol;
+the runner calls stages positionally and implementations may name parameters freely.
 
 ```python
 class Resolver(Protocol):
-    def resolve(self, url: str) -> Episode: ...  # raises SkipEpisode if no public feed
+    def resolve(self, url: str, /) -> Episode: ...  # raises SkipEpisode if no public feed
 
 
 class AudioFetcher(Protocol):
-    def fetch(self, episode: Episode) -> Path: ...
+    def fetch(self, episode: Episode, /) -> Path: ...
 
 
 class Transcriber(Protocol):
-    def transcribe(self, episode: Episode, audio: Path) -> Transcript: ...
+    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript: ...
 
 
 class Analyzer(Protocol):
-    def analyze(self, episode: Episode, transcript: Transcript, prompt: str | None) -> Analysis: ...
+    def analyze(
+        self, episode: Episode, transcript: Transcript, prompt: str | None, /
+    ) -> Analysis: ...
 
 
 class Store(Protocol):
     def store(
-        self, episode: Episode, transcript: Transcript, analyses: list[Analysis]
+        self,
+        episode: Episode,
+        transcript: Transcript,
+        analyses: Sequence[Analysis],
+        shared_at: datetime,
+        /,
     ) -> StoreResult: ...
 
 
 class Indexer(Protocol):
-    def index(self, episode: Episode, transcript: Transcript, analyses: list[Analysis]) -> None: ...
+    def index(
+        self,
+        episode: Episode,
+        transcript: Transcript,
+        analyses: Sequence[Analysis],
+        stored: StoreResult,
+        /,
+    ) -> None: ...
 
 
 class Notifier(Protocol):
-    def notify(self, job: Job, episode: Episode | None) -> None: ...
+    def notify(self, job: Job, episode: Episode | None, /) -> None: ...
 ```
+
+`Store` receives every analysis of the episode (`ArtifactStore.list_analyses`), so the
+note is regenerated whole. `Indexer` receives the `StoreResult` so search hits can carry
+the note path. `Notifier` receives the job in its terminal state.
+
+Every stage has a fake in `fakes.py` that records each call (`calls`), can be told to
+raise (`fail_next(exc, times)`), and, for the cache-aware stages (fetch, transcribe,
+analyze), counts the calls that did real work (`computed`). The cache-aware fakes write
+real artifacts through `ArtifactStore`. `make_fake_backends(data_dir, vault_dir=...)`
+builds the whole set.
 
 Rules every backend follows:
 
 1. **Idempotent and cache-aware.** If the output artifact exists, return it without
    doing the work. The runner does not track per-stage checkpoints in the database; it
    calls every stage and relies on this. `job.stage` exists for observability only.
-2. **Atomic writes.** Write to a temp file in the same directory, then rename.
+   One exception: audio is deleted after transcription, so when `transcript.json`
+   exists the runner skips `fetch` and `transcribe` and reads the transcript from
+   `ArtifactStore`. The resolver is not cached; the runner writes `episode.json` after
+   it returns.
+2. **Atomic writes.** Write to a temp file in the same directory, then rename. Use
+   `artifacts.atomic_writer` / `atomic_write_bytes` / `atomic_write_text` (temp files
+   are `.<name>.<random>.tmp`, or another suffix such as `.part`; final files are mode
+   `0o644`).
 3. **Retry intent in the exception.** `TransientError` requeues with backoff until
    `max_attempts`. `PermanentError` fails the job immediately. `SkipEpisode` ends the job
    as `skipped` with a reason. Any other exception is treated as transient and its
    traceback is recorded.
 4. **Index and notify failures never fail the job.** They are recorded in
    `job.warnings`. The note is the product.
+5. **Non-fatal problems travel as data.** A stage that succeeds with a caveat (a
+   transcript without segments, dropped out-of-range timestamps) puts a message in the
+   `warnings` of the `Transcript`, `Analysis`, or `StoreResult` it returns. The runner
+   copies those into `job.warnings`. They are stored in the artifact, so a cache hit
+   reports them again.
 
 ## Jobs
 
-States: `queued → running → done | failed | skipped`.
+States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
+they cannot be guessed or enumerated through `GET /jobs/{id}`.
 
 - `claim_next` is a single atomic `UPDATE … RETURNING` on the oldest `queued` row whose
   `run_after` has passed.
@@ -163,12 +230,12 @@ States: `queued → running → done | failed | skipped`.
 ```
 $EARMARK_DATA_DIR/
   earmark.db
-  episodes/<episode_key>/
-    episode.json
+  episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
+    episode.json                written by the runner after resolve
     audio.<ext>                 deleted after transcription unless EARMARK_KEEP_AUDIO
-    transcript.json
-    transcript.txt
-    analyses/<prompt_hash>.json   hash covers prompt + model + schema version
+    transcript.json             written last; its existence marks the transcript cached
+    transcript.txt              Transcript.to_text()
+    analyses/<prompt_hash>.json   16 hex chars over prompt + model + schema version
   lancedb/
 
 $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in the vault
