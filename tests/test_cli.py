@@ -1654,5 +1654,7 @@ def test_digest_notify_failure_is_warning_exit_0(
 def test_digest_registered_in_help() -> None:
     result = runner.invoke(app, ["digest", "--help"])
     assert result.exit_code == 0
+    # Rich may colour the help (GITHUB_ACTIONS forces a terminal) and split option names.
+    plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout)
     for option in ("--week", "--since", "--refresh", "--no-notify"):
-        assert option in result.stdout
+        assert option in plain
