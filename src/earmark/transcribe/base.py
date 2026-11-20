@@ -5,12 +5,13 @@ everything around it, so a second engine (the remote backend) reuses it unchange
 """
 
 import logging
+import math
 from pathlib import Path
 from typing import Protocol
 
 from earmark.artifacts import ArtifactStore
 from earmark.errors import PermanentError
-from earmark.models import Episode, Transcript
+from earmark.models import Episode, Segment, Transcript
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,30 @@ class TranscriptionEngine(Protocol):
     def transcribe_file(self, audio: Path, episode_key: str, /) -> Transcript:
         """Transcribe ``audio``; write and delete nothing."""
         ...
+
+
+class SegmentLike(Protocol):
+    @property
+    def start(self) -> float: ...
+
+    @property
+    def end(self) -> float: ...
+
+    @property
+    def text(self) -> str: ...
+
+
+def segment_from(raw: SegmentLike, *, previous_start: float, duration_s: float) -> Segment | None:
+    """Map a raw segment to a ``Segment`` with start >= previous start, end >= start, in range."""
+    text = " ".join(raw.text.split())
+    if not text:
+        return None
+    limit = duration_s if duration_s > 0 else math.inf
+    start = raw.start if math.isfinite(raw.start) else previous_start
+    start = min(max(start, previous_start, 0.0), limit)
+    end = raw.end if math.isfinite(raw.end) else start
+    end = min(max(end, start), limit)
+    return Segment(start=start, end=end, text=text)
 
 
 class UnusableAudioError(PermanentError):

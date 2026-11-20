@@ -78,9 +78,16 @@ class Settings(BaseSettings):
     asr_model_dir: Path | None = Field(
         None, description="Where Whisper models are downloaded (default: the Hugging Face cache)."
     )
-    asr_base_url: str | None = Field(None, description="Remote ASR endpoint.")
+    asr_base_url: str | None = Field(
+        None, description="OpenAI-compatible ASR base URL, ending in /v1."
+    )
     asr_api_key: SecretStr | None = Field(None, description="Remote ASR API key.")
-    asr_max_upload_mb: int | None = Field(None, gt=0, description="Remote ASR upload cap.")
+    asr_max_upload_mb: int | None = Field(
+        None, gt=0, description="Refuse remote uploads larger than this (MiB)."
+    )
+    asr_timeout_seconds: float = Field(
+        10800.0, gt=0, description="How long to wait for the remote ASR server's answer."
+    )
     keep_audio: bool = Field(False, description="Keep audio after transcription.")
     llm_model: str = Field("claude-opus-5-5", description="Analysis model id.")
     llm_base_url: str | None = Field(None, description="OpenAI-compatible endpoint.")
@@ -145,6 +152,39 @@ class Settings(BaseSettings):
         if not re.fullmatch("[a-z]{2,3}", v):
             raise ValueError("must be a language code such as 'en', or 'auto'")
         return v
+
+    @field_validator("asr_base_url")
+    @classmethod
+    def _check_asr_base_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        shape = "must be an http(s) URL with a host, such as http://gpu-box:8000/v1"
+        try:
+            parts = urlsplit(v)
+            hostname = parts.hostname
+            _ = parts.port
+        except ValueError:
+            raise ValueError(shape) from None
+        if parts.scheme.lower() not in ("http", "https") or not hostname:
+            raise ValueError(shape)
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("must not contain credentials; use EARMARK_ASR_API_KEY")
+        if parts.query or parts.fragment:
+            raise ValueError("must not contain a query or fragment")
+        return v.rstrip("/")
+
+    @field_validator("asr_api_key")
+    @classmethod
+    def _check_asr_api_key(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None:
+            return None
+        stripped = v.get_secret_value().strip()
+        if not stripped:
+            return None
+        if not all("!" <= c <= "~" for c in stripped):
+            raise ValueError("must be printable ASCII without spaces")
+        return SecretStr(stripped)
 
     def secret_values(self) -> list[str]:
         values: list[str] = []

@@ -20,7 +20,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 06 | Guarded fetch and audio download | 05 | done |
 | 07 | Resolver: Apple → iTunes → RSS | 06 | done |
 | 08 | Transcription: faster-whisper | 05 | done |
-| 09 | Transcription: remote ASR backend | 08 | todo |
+| 09 | Transcription: remote ASR backend | 08 | done |
 | 10 | Analysis I: schema, prompts, Claude, one-shot | 05 | todo |
 | 11 | Analysis II: local LLM backend, map-reduce | 10 | todo |
 | 12 | Vault writer | 05 | todo |

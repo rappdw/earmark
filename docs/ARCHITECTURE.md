@@ -17,7 +17,7 @@ backend, not the pipeline.
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
-| Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means step 09's remote server or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`. |
+| Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
@@ -72,8 +72,9 @@ src/earmark/
                        (episode page JSON), rss.py (feed parsing, matching), text.py,
                        resolver.py (AppleResolver, the `apple` backend; step 07)
   transcribe/          base.py (CachedTranscriber: cache, transcript files, audio deletion;
-                       TranscriptionEngine), faster_whisper.py (the `faster_whisper`
-                       engine, step 08), remote.py (step 09)
+                       TranscriptionEngine; segment_from), faster_whisper.py (the
+                       `faster_whisper` engine, step 08), remote.py (the `remote` engine:
+                       OpenAI-compatible /v1/audio/transcriptions client, step 09)
   analyze/             schema.py, prompts.py, render.py, analyzer.py, chunking.py, llm/
   vault/               notes.py, sanitize.py, entities.py
   index/               chunks.py, embed.py, lancedb_index.py
@@ -350,7 +351,8 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   atomic), and the episode's `audio.*` is deleted unless `EARMARK_KEEP_AUDIO`. On any
   failure the audio is kept, except `UnusableAudioError` (a `PermanentError`:
   undecodable, empty, or no speech), which deletes it unless `KEEP_AUDIO` so a re-share
-  downloads it again. Step 09's remote engine plugs into the same shell.
+  downloads it again. `base.segment_from` is the shared monotonic mapping (starts never
+  decrease, `end >= start`, all within the duration; blank segments dropped).
 - **`faster_whisper` engine.** `transcribe.faster_whisper.FasterWhisperEngine` imports
   `faster_whisper` and `ctranslate2` only through `load_runtime()`
   (`importlib.import_module`), which the factory's builder calls; without the extra the
@@ -367,9 +369,26 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   `OSError`s while loading (download failures) → `TransientError`. `ASR_DEVICE=cuda` with
   no CUDA device visible to CTranslate2 is a startup `ConfigError`. Messages carry file
   base names and setting names, never full paths, URLs, or library error text.
-- **`earmark transcribe <file> [--json]`** runs the local engine on any file with the
-  `EARMARK_ASR_*` settings, prints `[HH:MM:SS] text` lines or the `Transcript` JSON, and
-  writes nothing outside the model cache.
+- **`remote` engine** (step 09; exact signatures in `docs/steps/09-remote-asr.md`).
+  `transcribe.remote.RemoteAsrEngine` POSTs the audio as streamed `multipart/form-data`
+  (64 KiB chunks, `Content-Length` from the file) to `{ASR_BASE_URL}/audio/transcriptions`
+  with `file=audio.<ext>`, `model=ASR_MODEL`, `response_format=verbose_json`,
+  `timestamp_granularities[]=segment`, `language` when `ASR_LANGUAGE` is set, and
+  `Authorization: Bearer ASR_API_KEY` only when the key is set. `Transcript.model` is
+  `remote:<ASR_MODEL>`. Segments map through `segment_from`; a response with text but no
+  segment timestamps (no segments, or none with an end above 0) becomes one segment with
+  the warning "the ASR server returned no segment timestamps; …". Errors: file larger
+  than `ASR_MAX_UPLOAD_MB` → `PermanentError` before any request (audio kept); empty file
+  or no text → `UnusableAudioError`; 408, 429, 5xx, timeouts, connection and protocol
+  errors → transient (`Retry-After` honoured); 3xx (never followed), other 4xx, and an
+  unreadable or oversized (64 MiB) response → permanent. Messages name the host and the
+  setting to check, and carry at most 200 characters of the server's error message with
+  the key redacted. Read and write timeouts are `ASR_TIMEOUT_SECONDS`. Needs no extra;
+  `ASR_BACKEND=remote` without `ASR_BASE_URL` is a startup `ConfigError`.
+- **`earmark transcribe <file> [--json]`** runs the remote engine when
+  `EARMARK_ASR_BACKEND=remote`, otherwise the local faster-whisper engine with the
+  `EARMARK_ASR_*` settings; prints `[HH:MM:SS] text` lines or the `Transcript` JSON
+  (warnings on stderr), and writes nothing outside the model cache.
 
 ## Jobs
 
@@ -490,9 +509,10 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `STORE_BACKEND` | `vault` | `vault`, `fake` |
 | `INDEX_BACKEND` | `lancedb` | `lancedb`, `fake`, `none` |
 | `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing |
-| `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options (step 08). Model: a size such as `tiny`, `small`, `large-v3`, `distil-large-v3`, `large-v3-turbo`, a Hugging Face repo id, or a local directory. Device: `auto`, `cpu`, `cuda`. Compute type: `auto`, `default`, `int8`, `int8_float32`, `int8_float16`, `int8_bfloat16`, `int16`, `float16`, `bfloat16`, `float32` (device and compute type case-insensitive). Language: a lower-case code such as `en`; `auto` means detect |
+| `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options (step 08); `remote` also uses `ASR_MODEL` (sent as the server's model id, e.g. `openai/whisper-large-v3`) and `ASR_LANGUAGE`. Model: a size such as `tiny`, `small`, `large-v3`, `distil-large-v3`, `large-v3-turbo`, a Hugging Face repo id, or a local directory. Device: `auto`, `cpu`, `cuda`. Compute type: `auto`, `default`, `int8`, `int8_float32`, `int8_float16`, `int8_bfloat16`, `int16`, `float16`, `bfloat16`, `float32` (device and compute type case-insensitive). Language: a lower-case code such as `en`; `auto` means detect |
 | `ASR_MODEL_DIR` | unset (the Hugging Face cache, `$HF_HOME/hub` or `~/.cache/huggingface/hub`) | Where faster-whisper downloads models |
-| `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset (no upload limit) | Remote ASR backend (key is secret) |
+| `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset, unset, unset (no upload limit) | Remote ASR backend (step 09). Base URL: the server's OpenAI-compatible base, ending in `/v1` (http or https, a host, no credentials, query, or fragment; a trailing `/` is dropped). Key: secret, printable ASCII without spaces, sent as a bearer token. Upload limit in MiB |
+| `ASR_TIMEOUT_SECONDS` | `10800` | How long the remote backend waits for the server's answer (read and write timeout) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
 | `LLM_MODEL` | `claude-opus-5-5` | Analysis model |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_CONTEXT_TOKENS` | unset | Local LLM endpoint and its context budget (key is secret) |
@@ -551,6 +571,16 @@ and writes into a vault the user cares about.
   episode page is read with the stdlib `html.parser` and `json`, nothing executed.
 - **Resolver requests.** The lookup and episode-page URLs are built from the parsed ids
   and country; the feed URL comes from Apple's lookup. All three go through `fetch.py`.
+- **Operator-configured endpoints.** The remote ASR server (step 09) is reached by its
+  own httpx2 client in `transcribe/remote.py`, not through `fetch.py`, and without the
+  address guard: its URL comes only from `EARMARK_ASR_BASE_URL`, and it is expected to
+  be on the LAN or tailnet, which the guard refuses. Routing it through `fetch.py` would
+  force `ALLOW_PRIVATE_FETCH=true` and so disable the guard for every feed;
+  `ALLOW_PRIVATE_FETCH` does not affect the ASR client. The client keeps the other
+  rules: http(s) only and no credentials in the URL (checked at settings load), no
+  redirects followed, no proxies from the environment, cookies cleared per request,
+  responses capped (64 MiB), host-only messages, the API key only in the per-request
+  `Authorization` header. The response is untrusted text, validated before use.
 - **Model downloads.** faster-whisper fetches models from Hugging Face with
   `huggingface_hub`, not through `fetch.py`: the repository is chosen by the operator
   (`ASR_MODEL`), not by a third party, and it honours the usual `HF_*` and proxy
@@ -576,12 +606,21 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
 - `network`: hits real Apple and feed endpoints. These tests call
   `tests/http_helpers.dns_intercepted()` and pass `allow_private=True` when the local
   DNS answers non-public addresses (the dev sandbox, Known risk 5).
+  `tests/test_remote_asr_live.py` is also `network`: it transcribes the `slow` tests' clip
+  on a real ASR server and is skipped unless `ASR_TEST_BASE_URL` (with `ASR_TEST_MODEL`,
+  optional `ASR_TEST_API_KEY`) is set, so CI skips it and the operator runs it on the
+  homelab.
 - `slow`: downloads the `tiny` Whisper model and a public-domain clip (JFK's 1961
   inaugural address, 11 s, pinned by commit and sha256 in `tests/slow_assets.py`) into
   `$SLOW_TEST_CACHE` (default `~/.cache/earmark-tests`), then transcribes it on CPU.
   Needs the `transcribe` extra and fails (does not skip) without it.
 - `llm`: calls the real analysis model.
 - `gpu`: needs CUDA.
+
+The remote ASR tests use `httpx2.MockTransport`, a recording transport that iterates the
+request body (to prove streaming), and `tests/asr_stub.py`, a threaded stdlib HTTP server
+on a unix socket reached with `httpx2.HTTPTransport(uds=...)`, which the socket block
+allows.
 
 With every backend set to `fake`, the whole service runs in the sandbox:
 `earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears (the fake
@@ -647,7 +686,15 @@ Step planners should check these against current documentation instead of assumi
    #1933, open); field reports show source builds working on GB10. So on the Spark this
    backend runs on CPU unless the image builds CTranslate2 with CUDA (step 16), and step 09
    is the supported GPU path. `large-v3` on CPU is slow for long episodes; a smaller
-   `ASR_MODEL` is the stopgap. See `docs/steps/08-transcribe.md` section 2.1.
+   `ASR_MODEL` is the stopgap. See `docs/steps/08-transcribe.md` section 2.1. Step 09
+   (2026-11-20) surveyed servers: vLLM (NVIDIA's arm64 CUDA 13 container) serves Whisper
+   with `verbose_json` segments and absolute timestamps across its 30 s chunks, but its
+   default upload and decode limits (25 MB, 600 s, 256 MiB PCM) must be raised for
+   podcasts; whisper.cpp's server has segments but needs a source build for sm_121 and
+   has no auth; LocalAI ships CUDA 13 arm64 builds of whisper.cpp and Parakeet
+   (`parakeet-cpp`); speaches' arm64 CUDA image is CPU-only (speaches#620); NVIDIA's
+   Parakeet NIM HTTP API returns no timestamps and takes no MP3. None was run in the
+   sandbox. See `docs/asr.md` and `docs/steps/09-remote-asr.md` section 2.2.
 2. **iTunes Lookup window.** Verified on 2026-11-19 and 2026-11-20:
    `lookup?id=<show>&entity=podcastEpisode` returns the show record with `feedUrl`, then
    episode records with `trackId` (the `?i=` value), `episodeGuid`, `episodeUrl`,

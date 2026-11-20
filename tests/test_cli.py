@@ -3,9 +3,11 @@ import json
 import re
 import subprocess
 import sys
+import typing
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
 import uvicorn
 from fastapi import FastAPI
@@ -276,10 +278,21 @@ def test_worker_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.usefixtures("restore_root_logging")
 def test_worker_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
+    from tests.test_factory import FIELDS
+
+    unbuilt = [
+        (field, name)
+        for field, (literal, registry) in FIELDS.items()
+        for name in typing.get_args(literal)
+        if name not in registry
+    ]
+    if not unbuilt:
+        pytest.skip("every backend is built")
+    field, name = unbuilt[0]
+    monkeypatch.setenv(env_var(field), name)
     result = runner.invoke(app, ["worker", "--once"])
     assert result.exit_code == 2
-    assert "EARMARK_ASR_BACKEND" in result.stderr
+    assert env_var(field) in result.stderr
     assert not (fake_env / "data").exists()
 
 
@@ -577,3 +590,95 @@ def test_transcribe_cuda_without_device_exits_2(
     result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
     assert result.exit_code == 2
     assert "EARMARK_ASR_DEVICE" in result.stderr
+
+
+# -- transcribe with the remote engine (step 09) -----------------------------------------
+
+
+class RemoteServer:
+    def __init__(self) -> None:
+        self.requests: list[httpx2.Request] = []
+        self.reply = httpx2.Response(
+            200,
+            json={
+                "text": "Hello there second",
+                "duration": 70.0,
+                "segments": [
+                    {"start": 0.0, "end": 4.0, "text": " Hello there"},
+                    {"start": 65.0, "end": 70.0, "text": "second"},
+                ],
+            },
+        )
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        return self.reply
+
+
+@pytest.fixture
+def remote_server(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> RemoteServer:
+    from earmark.transcribe import remote
+
+    server = RemoteServer()
+
+    class MockedEngine(remote.RemoteAsrEngine):
+        def __init__(self, options: remote.RemoteOptions) -> None:
+            super().__init__(options, transport=httpx2.MockTransport(server))
+
+    monkeypatch.setattr(remote, "RemoteAsrEngine", MockedEngine)
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
+    monkeypatch.setenv("EARMARK_ASR_BASE_URL", "http://asr.test:8000/v1")
+    monkeypatch.setenv("EARMARK_ASR_MODEL", "whisper-x")
+    return server
+
+
+def test_cli_transcribe_remote_prints_lines(fake_env: Path, remote_server: RemoteServer) -> None:
+    clip = _clip(fake_env)
+    result = runner.invoke(app, ["transcribe", str(clip)])
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "[00:00:00] Hello there\n[00:01:05] second\n"
+    assert clip.read_bytes() == b"audio bytes"
+    assert not (fake_env / "data").exists()
+    assert len(remote_server.requests) == 1
+    assert str(remote_server.requests[0].url) == "http://asr.test:8000/v1/audio/transcriptions"
+
+
+def test_cli_transcribe_remote_warning_on_stderr(
+    fake_env: Path, remote_server: RemoteServer
+) -> None:
+    remote_server.reply = httpx2.Response(200, json={"text": "just text"})
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 0, result.stderr
+    assert "warning: the ASR server returned no segment timestamps" in result.stderr
+    assert result.stdout == "[00:00:00] just text\n"
+
+
+def test_cli_transcribe_remote_errors(fake_env: Path, remote_server: RemoteServer) -> None:
+    remote_server.reply = httpx2.Response(503)
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 1
+    assert "(temporary; try again later)" in result.stderr
+    remote_server.reply = httpx2.Response(404)
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 1
+    assert "HTTP 404" in result.stderr
+    assert "temporary" not in result.stderr
+
+
+def test_cli_transcribe_remote_without_url_exits_2(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 2
+    assert "EARMARK_ASR_BASE_URL" in result.stderr
+    assert not (fake_env / "data").exists()
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_worker_remote_without_url_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
+    result = runner.invoke(app, ["worker", "--once"])
+    assert result.exit_code == 2
+    assert "EARMARK_ASR_BASE_URL" in result.stderr
+    assert not (fake_env / "data").exists()

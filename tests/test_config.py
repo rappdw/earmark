@@ -142,6 +142,13 @@ def test_secret_values_lists_only_set_secrets(monkeypatch: pytest.MonkeyPatch) -
         ("EARMARK_ASR_COMPUTE_TYPE", "float8-sentinel", True),
         ("EARMARK_ASR_LANGUAGE", "english-sentinel", True),
         ("EARMARK_ASR_MODEL", " ", False),
+        ("EARMARK_ASR_BASE_URL", "ftp://sentinel-host/v1", True),
+        ("EARMARK_ASR_BASE_URL", "sentinel-nohost", True),
+        ("EARMARK_ASR_BASE_URL", "http://user:sentinel-pw@h/v1", True),
+        ("EARMARK_ASR_BASE_URL", "http://h/v1?k=sentinel-q", True),
+        ("EARMARK_ASR_BASE_URL", "http://h:99999/v1", False),
+        ("EARMARK_ASR_API_KEY", "sentinel key", True),
+        ("EARMARK_ASR_TIMEOUT_SECONDS", "0", False),
     ],
 )
 def test_invalid_values_rejected(

@@ -201,3 +201,9 @@ def test_transcript_files_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert text_path.stat().st_mode & 0o777 == 0o644
     assert json_path.stat().st_mode & 0o777 == 0o644
     assert not [p for p in text_path.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_segment_from_lives_in_base() -> None:
+    from earmark.transcribe import base, faster_whisper
+
+    assert faster_whisper.segment_from is base.segment_from

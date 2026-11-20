@@ -131,8 +131,10 @@ def test_build_worker_runs_a_job(tmp_path: Path) -> None:
 
 def test_build_worker_config_error_touches_nothing(tmp_path: Path) -> None:
     settings = _fake_settings(tmp_path, asr_backend="remote")
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError) as info:
         factory.build_worker(settings)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_ASR_BASE_URL: required when EARMARK_ASR_BACKEND=remote")
     assert not (tmp_path / "data").exists()
 
 

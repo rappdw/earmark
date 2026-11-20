@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -257,27 +258,36 @@ def transcribe_command(
     ],
     as_json: Annotated[bool, typer.Option("--json", help="Print the Transcript as JSON.")] = False,
 ) -> None:
-    """Transcribe a local audio file with the faster-whisper engine and print the result.
+    """Transcribe a local audio file and print the result.
 
-    Always uses the local engine and the EARMARK_ASR_* settings; writes nothing under
-    EARMARK_DATA_DIR and leaves the input file alone.
+    Uses the remote ASR server when EARMARK_ASR_BACKEND=remote, otherwise the local
+    faster-whisper engine; writes nothing under EARMARK_DATA_DIR and leaves the input
+    file alone.
     """
     settings = _load_or_exit()
     configure_logging(settings.log_level, settings.secret_values())
     from earmark.errors import PermanentError, TransientError
     from earmark.transcribe import faster_whisper as fw
+    from earmark.transcribe.base import TranscriptionEngine
 
+    engine: TranscriptionEngine
+    close: Callable[[], None] | None = None
     try:
-        options = fw.WhisperOptions.from_settings(settings)
-        runtime = fw.load_runtime()
-        fw.check_device(options, runtime)
+        if settings.asr_backend == "remote":
+            from earmark.transcribe import remote
+
+            remote_engine = remote.RemoteAsrEngine(remote.RemoteOptions.from_settings(settings))
+            engine, close = remote_engine, remote_engine.close
+        else:
+            options = fw.WhisperOptions.from_settings(settings)
+            runtime = fw.load_runtime()
+            fw.check_device(options, runtime)
+            engine = fw.FasterWhisperEngine(options, runtime)
     except ConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from None
     try:
-        transcript = fw.FasterWhisperEngine(options, runtime).transcribe_file(
-            audio, fw.file_key(audio)
-        )
+        transcript = engine.transcribe_file(audio, fw.file_key(audio))
     except TransientError as exc:
         typer.echo(
             f"earmark transcribe: {_clean(exc.message)} (temporary; try again later)", err=True
@@ -286,6 +296,11 @@ def transcribe_command(
     except PermanentError as exc:
         typer.echo(f"earmark transcribe: {_clean(exc.message)}", err=True)
         raise typer.Exit(code=1) from None
+    finally:
+        if close is not None:
+            close()
+    for warning in transcript.warnings:
+        typer.echo(f"earmark transcribe: warning: {_clean(warning)}", err=True)
     if as_json:
         typer.echo(transcript.model_dump_json(indent=2))
         return

@@ -20,7 +20,16 @@ from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
 from earmark.errors import PermanentError, TransientError
 from earmark.models import Segment, Transcript, episode_key, format_hms
-from earmark.transcribe.base import CachedTranscriber, UnusableAudioError
+from earmark.transcribe.base import (
+    CachedTranscriber,
+    UnusableAudioError,
+)
+from earmark.transcribe.base import (
+    SegmentLike as SegmentLike,
+)
+from earmark.transcribe.base import (
+    segment_from as segment_from,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +51,6 @@ type Monotonic = Callable[[], float]
 
 class MissingExtraError(ConfigError):
     """faster-whisper (the `transcribe` extra) is not installed or does not import."""
-
-
-class SegmentLike(Protocol):
-    @property
-    def start(self) -> float: ...
-
-    @property
-    def end(self) -> float: ...
-
-    @property
-    def text(self) -> str: ...
 
 
 class InfoLike(Protocol):
@@ -156,19 +154,6 @@ def check_device(options: WhisperOptions, runtime: WhisperRuntime) -> None:
 
 def _collapse(text: str, limit: int = MAX_DETAIL_CHARS) -> str:
     return " ".join(text.split())[:limit]
-
-
-def segment_from(raw: SegmentLike, *, previous_start: float, duration_s: float) -> Segment | None:
-    """Map a raw segment to a ``Segment`` with start >= previous start, end >= start, in range."""
-    text = " ".join(raw.text.split())
-    if not text:
-        return None
-    limit = duration_s if duration_s > 0 else math.inf
-    start = raw.start if math.isfinite(raw.start) else previous_start
-    start = min(max(start, previous_start, 0.0), limit)
-    end = raw.end if math.isfinite(raw.end) else start
-    end = min(max(end, start), limit)
-    return Segment(start=start, end=end, text=text)
 
 
 def _decode_detail(exc: Exception) -> str:
