@@ -713,3 +713,56 @@ def test_transcript_validates_back(tmp_path: Path) -> None:
         == result
     )
     assert FakeResolver().resolve(CANON).key  # fakes are importable alongside
+
+
+# -- model_cache_status (doctor) ------------------------------------------------------------
+
+
+def _stub_utils(
+    monkeypatch: pytest.MonkeyPatch, behaviour: Any
+) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    utils = types.ModuleType("faster_whisper.utils")
+
+    def download_model(*args: Any, **kwargs: Any) -> str:
+        calls.append((args, kwargs))
+        if isinstance(behaviour, Exception):
+            raise behaviour
+        return str(behaviour)
+
+    utils.download_model = download_model  # type: ignore[attr-defined]  # a stub module
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.ModuleType("faster_whisper"))
+    monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
+    return calls
+
+
+def test_model_cache_status_cached_is_offline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _stub_utils(monkeypatch, "/cache/snapshot")
+    options = _options(model="small", model_dir=tmp_path)
+    assert fw.model_cache_status(options) == "cached"
+    assert calls == [(("small",), {"local_files_only": True, "cache_dir": str(tmp_path)})]
+
+
+def test_model_cache_status_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_utils(monkeypatch, FileNotFoundError("not cached"))
+    assert fw.model_cache_status(_options(model="small")) == "missing"
+    assert calls[0][1] == {"local_files_only": True, "cache_dir": None}
+
+
+def test_model_cache_status_unknown_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_utils(monkeypatch, ValueError("Invalid model size"))
+    with pytest.raises(ConfigError) as info:
+        fw.model_cache_status(_options(model="nope\x1b"))
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_ASR_MODEL: 'nope?'")
+
+
+def test_model_cache_status_local_directory(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    with pytest.raises(ConfigError, match=r"no model\.bin"):
+        fw.model_cache_status(_options(model=str(model)))
+    (model / "model.bin").write_bytes(b"x")
+    assert fw.model_cache_status(_options(model=str(model))) == "local"

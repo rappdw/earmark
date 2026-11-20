@@ -671,3 +671,22 @@ def test_unreadable_table_is_transient(env: Env) -> None:
         fresh.search(parse_query("x"))
     assert str(env.tmp_path) not in info.value.message
     assert os.fspath(env.db_dir) not in info.value.message
+
+
+def test_check_existing_creates_nothing_and_embeds_nothing(env: Env) -> None:
+    assert env.index.check_existing() is False
+    assert not env.db_dir.exists()
+    assert env.embedder.documents == []
+    assert env.embedder.queries == []
+
+
+def test_check_existing_true_after_a_write(env: Env) -> None:
+    put(env, telephone_docs())
+    assert env.index.check_existing() is True
+    assert env.embedder.queries == []
+
+
+def test_check_existing_mismatch(env: Env) -> None:
+    put(env, telephone_docs())
+    with pytest.raises(IndexMismatchError, match="earmark reindex"):
+        env.make_index(FakeEmbedder(model="fake-b")).check_existing()

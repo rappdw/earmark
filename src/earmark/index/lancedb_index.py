@@ -329,6 +329,18 @@ class LanceIndex:
         with _lance(what):
             return db.open_table() if db.has_table() else None
 
+    def check_existing(self) -> bool:
+        """False when there is no index yet; True when it matches this embedder.
+
+        Raises IndexMismatchError or TransientError. Creates nothing, embeds nothing.
+        """
+        table = self._existing_table(what="read")
+        if table is None:
+            return False
+        with _lance("read"):
+            self._check(table)
+        return True
+
     # -- writing --------------------------------------------------------------------------
 
     def index(

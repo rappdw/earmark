@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,9 @@ from earmark.index.embed import (
     ModelInfo,
     build_embedder,
     default_model_dir,
+    find_model,
     load_fastembed_runtime,
+    model_cached,
 )
 from tests.index_helpers import BGE, StubFastEmbed, stub_extra_missing, stub_fastembed_runtime
 
@@ -177,3 +181,75 @@ def test_default_model_dir(tmp_path: Path) -> None:
     assert default_model_dir(settings(tmp_path)) == tmp_path / "data" / "models" / "embed"
     custom = settings(tmp_path, embed_model_dir=tmp_path / "m")
     assert default_model_dir(custom) == tmp_path / "m"
+
+
+# -- find_model and model_cached (doctor) -----------------------------------------------------
+
+
+def test_find_model_is_case_insensitive_and_names_the_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    info = ModelInfo(BGE, 384, "Qdrant/bge-small-en-v1.5-onnx-Q", "model_optimized.onnx")
+    stub = stub_fastembed_runtime(monkeypatch, [info])
+    runtime = stub.runtime([info])
+    assert find_model(settings(tmp_path, embed_model=BGE.upper()), runtime) == info
+    with pytest.raises(ConfigError) as err:
+        find_model(settings(tmp_path, embed_model="nope\x1b"), runtime)
+    assert err.value.errors[0].startswith("EARMARK_EMBED_MODEL: 'nope?'")
+
+
+def test_model_cached_looks_in_the_cache_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    answers: list[object] = [None, "/cache/models--x/snapshots/abc/model.onnx"]
+    hub = types.ModuleType("huggingface_hub")
+
+    def try_to_load_from_cache(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return answers.pop(0)
+
+    hub.try_to_load_from_cache = try_to_load_from_cache  # type: ignore[attr-defined]  # stub
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    info = ModelInfo(BGE, 384, "Qdrant/x", "model.onnx")
+    assert model_cached(info, tmp_path) is False
+    assert model_cached(info, tmp_path) is True
+    assert calls[0] == (("Qdrant/x", "model.onnx"), {"cache_dir": str(tmp_path)})
+
+
+def test_model_cached_cannot_tell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert model_cached(ModelInfo(BGE, 384), tmp_path) is None  # no repo or file known
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    assert model_cached(ModelInfo(BGE, 384, "Qdrant/x", "model.onnx"), tmp_path) is None
+
+
+def test_supported_fills_hf_repo_and_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeTextEmbedding:
+        @staticmethod
+        def list_supported_models() -> list[dict[str, object]]:
+            return [
+                {
+                    "model": BGE,
+                    "dim": 384,
+                    "sources": {"hf": "Qdrant/bge-small-en-v1.5-onnx-Q"},
+                    "model_file": "model_optimized.onnx",
+                },
+                {"model": "odd", "dim": 8, "sources": {"url": "x"}},
+            ]
+
+    fastembed = types.ModuleType("fastembed")
+    fastembed.TextEmbedding = FakeTextEmbedding  # type: ignore[attr-defined]  # stub module
+    loguru = types.ModuleType("loguru")
+
+    class _Logger:
+        def disable(self, name: str) -> None:
+            return None
+
+    loguru.logger = _Logger()  # type: ignore[attr-defined]  # stub module
+    monkeypatch.setitem(sys.modules, "fastembed", fastembed)
+    monkeypatch.setitem(sys.modules, "loguru", loguru)
+    found = load_fastembed_runtime().supported()
+    assert found[0] == ModelInfo(
+        BGE, 384, "Qdrant/bge-small-en-v1.5-onnx-Q", "model_optimized.onnx"
+    )
+    assert found[1] == ModelInfo("odd", 8, None, None)

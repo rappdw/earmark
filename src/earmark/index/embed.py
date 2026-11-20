@@ -63,6 +63,8 @@ class TextModelLike(Protocol):  # what FastEmbedEmbedder needs from fastembed.Te
 class ModelInfo:
     name: str  # canonical, as fastembed lists it
     dim: int
+    hf_repo: str | None = None  # the Hugging Face repo fastembed downloads from
+    model_file: str | None = None  # the ONNX file inside it
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +147,17 @@ def load_fastembed_runtime() -> FastEmbedRuntime:
         for entry in listed:
             name, dim = entry.get("model"), entry.get("dim")
             if isinstance(name, str) and isinstance(dim, int):
-                found.append(ModelInfo(name, dim))
+                sources = entry.get("sources")
+                repo = sources.get("hf") if isinstance(sources, dict) else None
+                model_file = entry.get("model_file")
+                found.append(
+                    ModelInfo(
+                        name,
+                        dim,
+                        repo if isinstance(repo, str) else None,
+                        model_file if isinstance(model_file, str) else None,
+                    )
+                )
         return found
 
     def load(name: str, cache_dir: Path, allow_download: bool) -> TextModelLike:
@@ -235,9 +247,8 @@ class FastEmbedEmbedder:
             return self._model().query_embed(text)
 
 
-def build_embedder(settings: Settings, *, allow_download: bool) -> Embedder:
-    """Look the model up in fastembed's list. Constructs no model and creates no directory."""
-    runtime = load_fastembed_runtime()
+def find_model(settings: Settings, runtime: FastEmbedRuntime) -> ModelInfo:
+    """EMBED_MODEL looked up case-insensitively; ConfigError if fastembed does not list it."""
     wanted = settings.embed_model.casefold()
     info = next((m for m in runtime.supported() if m.name.casefold() == wanted), None)
     if info is None:
@@ -247,6 +258,25 @@ def build_embedder(settings: Settings, *, allow_download: bool) -> Embedder:
                 f"text embedding model (see {SUPPORTED_MODELS_URL})"
             ]
         )
+    return info
+
+
+def model_cached(info: ModelInfo, cache_dir: Path) -> bool | None:
+    """try_to_load_from_cache(hf_repo, model_file, cache_dir=...); None if it cannot tell."""
+    if info.hf_repo is None or info.model_file is None:
+        return None
+    try:
+        hub = importlib.import_module("huggingface_hub")
+    except ImportError:
+        return None
+    found = hub.try_to_load_from_cache(info.hf_repo, info.model_file, cache_dir=str(cache_dir))
+    return isinstance(found, str)
+
+
+def build_embedder(settings: Settings, *, allow_download: bool) -> Embedder:
+    """Look the model up in fastembed's list. Constructs no model and creates no directory."""
+    runtime = load_fastembed_runtime()
+    info = find_model(settings, runtime)
     return FastEmbedEmbedder(
         runtime, info, default_model_dir(settings), allow_download=allow_download
     )

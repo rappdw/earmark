@@ -100,6 +100,12 @@ def _lancedb_indexer(ctx: BuildContext) -> Indexer:
     return build_lancedb_index(ctx.settings, allow_download=True)
 
 
+def _ntfy_notifier(ctx: BuildContext) -> Notifier | None:
+    from earmark.notify.ntfy import build_ntfy_notifier
+
+    return build_ntfy_notifier(ctx.settings)
+
+
 def _lancedb_searcher(settings: Settings) -> Searcher:
     from earmark.index.lancedb_index import build_lancedb_index
 
@@ -141,6 +147,7 @@ SEARCHERS: Final[Mapping[str, Callable[[Settings], Searcher | None]]] = {
 NOTIFIERS: Final[Mapping[str, Builder[Notifier | None]]] = {
     "fake": lambda ctx: FakeNotifier(),
     "none": lambda ctx: None,
+    "ntfy": _ntfy_notifier,
 }
 
 

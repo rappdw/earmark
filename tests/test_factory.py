@@ -46,45 +46,45 @@ def _fake_settings(tmp_path: Path, **overrides: typing.Any) -> Settings:
     )
 
 
-def _unbuilt_names(field: str) -> list[str]:
-    literal, registry = FIELDS[field]
-    return [v for v in typing.get_args(literal) if v not in registry]
-
-
-UNBUILT_FIELDS = [field for field in FIELDS if _unbuilt_names(field)]
-
-
-@pytest.mark.parametrize("field", UNBUILT_FIELDS)
-def test_unbuilt_backend_names_setting(tmp_path: Path, field: str) -> None:
-    _, registry = FIELDS[field]
-    name = _unbuilt_names(field)[0]
-    settings = _fake_settings(tmp_path, **{field: name})
+def test_unbuilt_backend_name_names_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name that is a valid setting but has no builder fails with a ConfigError that says so."""
+    without_ntfy = {k: v for k, v in factory.NOTIFIERS.items() if k != "ntfy"}
+    monkeypatch.setattr(factory, "NOTIFIERS", without_ntfy)
+    settings = _fake_settings(tmp_path, notify_backend="ntfy")
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     [line] = info.value.errors
-    assert line.startswith(f"{env_var(field)}: ")
-    assert repr(name) in line
-    choices = ", ".join(sorted(registry))
-    assert line.endswith(f"(choose one of: {choices})")
-    assert "choose one of: " in line
+    assert line.startswith(f"{env_var('notify_backend')}: ")
+    assert repr("ntfy") in line
+    assert line.endswith(f"(choose one of: {', '.join(sorted(without_ntfy))})")
 
 
-def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
+def test_every_default_backend_is_built(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, data_dir=tmp_path / "data")
     expected = {
         field for field, (_, registry) in FIELDS.items() if getattr(settings, field) not in registry
     }
-    assert expected == {"notify_backend"}
-    with pytest.raises(ConfigError) as info:
-        factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
-    errors = info.value.errors
-    assert len(errors) == len(expected) == 1
-    for field in FIELDS:
-        count = 1 if field in expected else 0
-        assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == count
-    assert not any(line.startswith("EARMARK_FETCH_BACKEND") for line in errors)
-    assert not any(line.startswith("EARMARK_RESOLVER_BACKEND") for line in errors)
-    assert not any(line.startswith("EARMARK_ASR_BACKEND") for line in errors)
+    assert expected == set()
+    for literal, registry in FIELDS.values():
+        assert set(registry) == set(typing.get_args(literal))
+
+
+def test_ntfy_without_url_builds_none(tmp_path: Path) -> None:
+    settings = _fake_settings(tmp_path, notify_backend="ntfy")
+    backends = factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    assert backends.notifier is None
+
+
+def test_ntfy_with_url_builds_notifier(tmp_path: Path) -> None:
+    from earmark.notify.ntfy import NtfyNotifier
+
+    settings = _fake_settings(
+        tmp_path, notify_backend="ntfy", ntfy_url=SecretStr("https://ntfy.test/sentinel-topic")
+    )
+    backends = factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    assert isinstance(backends.notifier, NtfyNotifier)  # built without a request: sockets blocked
 
 
 def test_all_fake_builds_fakes(tmp_path: Path) -> None:

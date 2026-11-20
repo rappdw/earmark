@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol, Self
+from typing import Final, Literal, Protocol, Self
 
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
@@ -150,6 +150,44 @@ def check_device(options: WhisperOptions, runtime: WhisperRuntime) -> None:
                 "or EARMARK_ASR_BACKEND=remote"
             ]
         )
+
+
+type WhisperCacheStatus = Literal["local", "cached", "missing"]
+
+
+def model_cache_status(options: WhisperOptions) -> WhisperCacheStatus:
+    """Offline: a directory with model.bin, a cached snapshot, or missing.
+
+    ConfigError naming EARMARK_ASR_MODEL for an unknown size or a directory without
+    model.bin. Loads no model and makes no network call.
+    """
+    shown = "".join(c if c.isprintable() else "?" for c in options.model)[:MAX_MODEL_CHARS]
+    if Path(options.model).is_dir():
+        if (Path(options.model) / "model.bin").is_file():
+            return "local"
+        raise ConfigError(
+            [
+                f"EARMARK_ASR_MODEL: the directory '{shown}' has no model.bin "
+                "(not a CTranslate2 model)"
+            ]
+        )
+    utils = importlib.import_module("faster_whisper.utils")
+    try:
+        utils.download_model(
+            options.model,
+            local_files_only=True,
+            cache_dir=None if options.model_dir is None else str(options.model_dir),
+        )
+    except FileNotFoundError:
+        return "missing"
+    except ValueError:
+        raise ConfigError(
+            [
+                f"EARMARK_ASR_MODEL: '{shown}' is not a faster-whisper model size "
+                "(tiny, base, small, medium, large-v3, …), a Hugging Face repo id, or a directory"
+            ]
+        ) from None
+    return "cached"
 
 
 def _collapse(text: str, limit: int = MAX_DETAIL_CHARS) -> str:

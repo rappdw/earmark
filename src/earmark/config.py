@@ -1,6 +1,7 @@
 """Settings: EARMARK_* environment variables, then .env, then defaults."""
 
 import re
+import unicodedata
 import zoneinfo
 from pathlib import Path, PurePosixPath
 from typing import Final, Literal
@@ -35,6 +36,8 @@ AsrComputeType = Literal[
 
 ENV_PREFIX: Final = "EARMARK_"
 REDACTED: Final = "**********"
+NTFY_TOPIC_PATTERN: Final = re.compile(r"[-_A-Za-z0-9]{1,64}")
+OBSIDIAN_NAME_MAX: Final = 200
 
 
 class ConfigError(Exception):
@@ -129,7 +132,7 @@ class Settings(BaseSettings):
     embed_model_dir: Path | None = Field(
         None, description="Where embedding models are downloaded (default: DATA_DIR/models/embed)."
     )
-    ntfy_url: str | None = Field(None, description="ntfy topic URL.")
+    ntfy_url: SecretStr | None = Field(None, description="ntfy topic URL (secret).")
     ntfy_token: SecretStr | None = Field(None, description="ntfy access token.")
     max_audio_mb: int = Field(1024, gt=0, description="Audio download size cap.")
     max_feed_mb: int = Field(20, gt=0, description="Feed download size cap.")
@@ -212,7 +215,51 @@ class Settings(BaseSettings):
             raise ValueError("must not contain a query or fragment")
         return v.rstrip("/")
 
-    @field_validator("asr_api_key", "llm_api_key")
+    @field_validator("ntfy_url")
+    @classmethod
+    def _check_ntfy_url(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None:
+            return None
+        url = v.get_secret_value().strip()
+        if not url:
+            return None
+        shape = "must be an http(s) topic URL such as https://ntfy.sh/my-topic"
+        try:
+            parts = urlsplit(url)
+            hostname = parts.hostname
+            _ = parts.port
+        except ValueError:
+            raise ValueError(shape) from None
+        if parts.scheme.lower() not in ("http", "https") or not hostname:
+            raise ValueError(shape)
+        if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+            raise ValueError("must not contain credentials; use EARMARK_NTFY_TOKEN")
+        if parts.query or parts.fragment or "?" in url or "#" in url:
+            raise ValueError("must not contain a query or fragment")
+        path = parts.path[:-1] if parts.path.endswith("/") else parts.path
+        topic = path.rpartition("/")[2]
+        if not NTFY_TOPIC_PATTERN.fullmatch(topic):
+            raise ValueError(
+                "must end in the topic name (letters, digits, '-' and '_', at most 64 "
+                "characters), such as https://ntfy.sh/my-topic"
+            )
+        return SecretStr(url[:-1] if url.endswith("/") else url)
+
+    @field_validator("obsidian_vault_name")
+    @classmethod
+    def _check_obsidian_vault_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if any(unicodedata.category(c) in ("Cc", "Cf") for c in v):
+            raise ValueError("must not contain control characters")
+        if len(v) > OBSIDIAN_NAME_MAX:
+            raise ValueError(f"must be at most {OBSIDIAN_NAME_MAX} characters")
+        return v
+
+    @field_validator("asr_api_key", "llm_api_key", "ntfy_token")
     @classmethod
     def _check_api_key(cls, v: SecretStr | None) -> SecretStr | None:
         if v is None:

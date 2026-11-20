@@ -14,7 +14,7 @@ backend, not the pipeline.
 |---|---|---|
 | System of record | An Obsidian-compatible Markdown vault. Files are the truth; SQLite and the vector index are derived and rebuildable. | Implement another `Store` backend. |
 | LLM for analysis | Hosted is allowed: Claude (`claude-opus-5-5`) through the Anthropic API by default, via the official `anthropic` SDK (2.x): one streamed request with adaptive thinking, an explicit effort (`medium`), a JSON-schema structured output, and server-side refusal fallback (step 10). Transcription and embeddings always run locally. | `EARMARK_LLM_MODEL`, `EARMARK_LLM_EFFORT`, `EARMARK_LLM_FALLBACKS`; `EARMARK_LLM_PROVIDER=openai_compat` with `EARMARK_LLM_BASE_URL`, `EARMARK_LLM_MODEL`, `EARMARK_LLM_CONTEXT_TOKENS` points analysis at a self-hosted OpenAI-compatible server (vLLM, llama.cpp, Ollama, LM Studio; step 11, `docs/llm.md`). Transcripts longer than one request are map-reduced on either provider (step 11). |
-| Notification | ntfy, off unless `EARMARK_NTFY_URL` is set. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
+| Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with an `obsidian://` link to the note when `EARMARK_OBSIDIAN_VAULT_NAME` is set (step 15). Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Vector store | LanceDB (`lancedb` 0.41), embedded, no server: one `chunks` table under `DATA_DIR/lancedb`, exact (exhaustive) cosine search, no ANN index. Embeddings run locally with fastembed (ONNX on CPU), `BAAI/bge-small-en-v1.5` by default. Both are the `index` extra (step 14). | `EARMARK_INDEX_BACKEND`, `EARMARK_EMBED_MODEL` (then `earmark reindex`); swap the `Indexer` and `Searcher` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
@@ -76,7 +76,7 @@ src/earmark/
                        `faster_whisper` engine, step 08), remote.py (the `remote` engine:
                        OpenAI-compatible /v1/audio/transcriptions client, step 09)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
-                       (remote ASR, local LLM; step 11)
+                       (remote ASR, local LLM, ntfy; step 11)
   analyze/             schema.py (output JSON schema, wire models, build_analysis), prompts.py
                        (one-shot, map, reduce, and repair prompts and message builders),
                        render.py (render_analysis), analyzer.py (LlmAnalyzer, the `anthropic`
@@ -97,7 +97,11 @@ src/earmark/
                        analysis items, digest; pure), embed.py (Embedder Protocol,
                        FastEmbedEmbedder, build_embedder), lancedb_index.py (LanceIndex: the
                        `lancedb` Indexer and Searcher), rebuild.py (reindex); step 14
-  notify/              ntfy.py
+  notify/              ntfy.py (split_topic_url, obsidian_url, compose, NtfyClient, NtfyNotifier:
+                       the `ntfy` Notifier; step 15)
+  doctor/              report.py (CheckResult, render, exit code), checks.py (offline checks),
+                       online.py (--online reachability checks), __init__.py (run_doctor,
+                       Probes); `earmark doctor` (step 15)
 tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS
 ```
 
@@ -643,6 +647,82 @@ Step 14; exact rules in `docs/steps/14-vector-index.md` sections 4 and 5.
 - **`earmark search QUERY [--limit] [--kind ...] [--episode] [--json]`** prints ranked hits
   (cleaned of control characters) or `SearchResults` JSON.
 
+### Notifying
+
+Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
+
+- **`ntfy` Notifier.** `notify.ntfy.NtfyNotifier` is built by `build_ntfy_notifier(settings)`.
+  It is `None` (nothing sent, worker starts) when `EARMARK_NTFY_URL` is unset, and the build
+  makes no request. For each job that ends `done`, `failed`, or `skipped` it sends one
+  `POST` of JSON to the server root: the topic URL minus its last segment. The body is
+  `topic`, `title`, `message`, `tags`, `priority`, and an optional `click`. The only headers
+  are fixed, plus `Authorization: Bearer EARMARK_NTFY_TOKEN` when a token is set. No
+  untrusted text goes into a header, the URL, or a query string. `markdown` is never set.
+- **Content.**
+  - Titles are `Note ready: <episode>`, `Failed: <episode>`, and `Skipped: <episode>`
+    (`podcast episode` when unknown). Tags are `white_check_mark`, `x`, and
+    `fast_forward`; priority is 4 for failed and 3 otherwise.
+  - The message starts with the show (or the canonical Apple URL). Done adds the prompt,
+    the warning count and first warning, and the note path when there is no link. Failed
+    adds the stage, `Reason: <job.error>`, and the attempts. Skipped adds the reason.
+  - Every value is cleaned: NFC; control, format (except ZWJ/ZWNJ), private-use,
+    unassigned, and line or paragraph separator characters removed; whitespace collapsed;
+    `=?` defused, because ntfy RFC-2047-decodes titles even in JSON mode; secrets
+    redacted. It is then cut at a safe boundary: title 250 bytes, message 2000 bytes, so
+    the message is never turned into an attachment.
+- **Link.** Done notifications with `EARMARK_OBSIDIAN_VAULT_NAME` and a note path carry
+  `click = obsidian://open?vault=<quote(name, safe="")>&file=<quote(note_path, safe="")>`.
+  Everything but `A–Z a–z 0–9 _ . - ~` is percent-encoded (`/` as `%2F`, space as `%20`),
+  the `.md` is kept, and neither value is normalised. The link is omitted when the path
+  contains `#` (Obsidian reads it as a heading) or the URL exceeds 2000 characters.
+- **Errors.** 3xx (never followed), 401, 403, 404, and other 4xx are permanent; 408, 429
+  (`Retry-After`), 5xx, timeouts (connect 5 s, read, write, and pool 10 s), and transport
+  errors are transient. Messages name the host and the setting to check, never the topic or
+  token. There is one attempt, with no retry. The notifier raises; `Pipeline.notify` logs
+  the failure and records `notify failed: …` as a job warning, so a notification problem
+  never changes a job's status or escapes the worker.
+
+### Doctor
+
+Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
+
+- **`earmark doctor`** prints one line per check (`ok`, `warn`, `FAIL`, `skip`) and a
+  summary. It exits 0 when nothing failed (warnings allowed), 1 when a check failed, and 2
+  when settings do not load.
+- **Offline checks.**
+  - The API token.
+  - `DATA_DIR` and the vault subdir writability, by creating and removing one random
+    temp file each. The vault probe goes inside the subdir only, through `vault.fs`; when
+    the subdir does not exist yet, `os.access` is used on `VAULT_DIR`.
+  - The database: schema version, journal mode, `quick_check`, and job counts, read
+    without migrating. A missing file is never created.
+  - The `obsidian://` vault name.
+  - Each selected backend, built through the same factory registry as the worker. That
+    imports its extra, runs the CUDA check, and checks credentials (the Anthropic SDK
+    constructor finds the credential chain).
+  - Whether the Whisper and embedding models are in the cache: faster-whisper's
+    `download_model(local_files_only=True)` and `huggingface_hub.try_to_load_from_cache`.
+  - Whether an existing index matches `EMBED_MODEL`.
+
+  Offline doctor makes no network call, loads no model, downloads nothing, and creates no
+  directory or database. Fake backends are warnings.
+- **`--online` checks.** Each has a 10 s timeout (connect 5 s), follows no redirects,
+  ignores proxy variables, and spends nothing:
+  - the iTunes lookup (`?id=1&entity=podcast`) through `fetch.py`, so the address guard
+    applies;
+  - `GET {ASR_BASE_URL}/models` and `GET {LLM_BASE_URL}/models` (the configured model
+    listed?);
+  - Anthropic `GET /v1/models/{LLM_MODEL}` through the SDK with `max_retries=0`. It is a
+    free metadata read; the model's lifecycle, deprecated or retired, is reported. No
+    completion or token-count request is sent.
+  - ntfy `GET /v1/health` and, with a token, `GET /v1/account`.
+
+  Doctor never publishes a notification.
+- **Redaction.** Details never contain secret values, their prefixes, or their lengths.
+  Endpoints appear as host labels only, and server error text goes through
+  `endpoint.error_detail`. Every line is passed through `log.redact` with all `Settings`
+  secrets and cleaned of non-printable characters.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -846,14 +926,14 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | API bind address |
 | `DATA_DIR` | `./data` | Database, artifacts, index |
 | `VAULT_DIR`, `VAULT_SUBDIR` | unset (required for the vault store), `Earmark` | Where notes go. `VAULT_DIR` is the Obsidian vault root and must exist (it may be a symlink); the subdir is a relative path without `..`, created if missing, and must not be a symlink |
-| `OBSIDIAN_VAULT_NAME` | unset | Enables `obsidian://` links in notifications |
+| `OBSIDIAN_VAULT_NAME` | unset | Enables `obsidian://open` links to the note in done notifications (step 15). The vault's name as Obsidian shows it on the phone, normally the vault folder's name; at most 200 characters, no control characters |
 | `RESOLVER_BACKEND` | `apple` | `apple`, `fake` |
 | `FETCH_BACKEND` | `http` | `http`, `fake` |
 | `ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, `fake` |
 | `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai_compat`, `fake` |
 | `STORE_BACKEND` | `vault` | `vault`, `fake` |
 | `INDEX_BACKEND` | `lancedb` | `lancedb`, `fake`, `none` |
-| `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing |
+| `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing (the worker still starts) |
 | `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options (step 08); `remote` also uses `ASR_MODEL` (sent as the server's model id, e.g. `openai/whisper-large-v3`) and `ASR_LANGUAGE`. Model: a size such as `tiny`, `small`, `large-v3`, `distil-large-v3`, `large-v3-turbo`, a Hugging Face repo id, or a local directory. Device: `auto`, `cpu`, `cuda`. Compute type: `auto`, `default`, `int8`, `int8_float32`, `int8_float16`, `int8_bfloat16`, `int16`, `float16`, `bfloat16`, `float32` (device and compute type case-insensitive). Language: a lower-case code such as `en`; `auto` means detect |
 | `ASR_MODEL_DIR` | unset (the Hugging Face cache, `$HF_HOME/hub` or `~/.cache/huggingface/hub`) | Where faster-whisper downloads models |
 | `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset, unset, unset (no upload limit) | Remote ASR backend (step 09). Base URL: the server's OpenAI-compatible base, ending in `/v1` (http or https, a host, no credentials, query, or fragment; a trailing `/` is dropped). Key: secret, printable ASCII without spaces, sent as a bearer token. Upload limit in MiB |
@@ -869,7 +949,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `LLM_RESPONSE_FORMAT` | `json_schema` | `openai_compat` JSON request: `json_schema` (schema-constrained) or `json_object` (JSON mode, schema in the prompt). Not part of the cache key |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model: a name from fastembed's `TextEmbedding.list_supported_models()` (case-insensitive; checked when the index backend is built). Recorded in the index; changing it needs `earmark reindex`. For non-English shows, `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (step 14) |
 | `EMBED_MODEL_DIR` | unset (`<DATA_DIR>/models/embed`) | Where fastembed downloads embedding models (step 14). fastembed's own default, the system temp directory, is not used |
-| `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
+| `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional access token (both secret; step 15). URL: http(s), a host, optional path prefix, ending in the topic (`[-_A-Za-z0-9]{1,64}`), such as `https://ntfy.sh/my-earmark-topic` or `http://ntfy.tailnet-name.ts.net/earmark`; no credentials, query, or fragment. On public ntfy.sh the topic name is the only protection unless the topic is reserved, so pick a long random one. Token: printable ASCII without spaces (`tk_…`), sent as a bearer token |
 | `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
 | `TZ` | unset (system) | IANA zone for note dates and digests, validated at load. Note file names, `date`, `shared_at`, and analysis times use it (step 12) |
@@ -937,7 +1017,21 @@ and writes into a vault the user cares about.
   `Authorization` header. The response is untrusted text, validated before use. The local
   LLM server (step 11, `EARMARK_LLM_BASE_URL`) is reached the same way by its own httpx2
   client in `analyze/llm/openai_compat.py`, with the same rules (responses capped at
-  16 MiB). Both share `endpoint.error_detail` and `endpoint.host_label`.
+  16 MiB). Both share `endpoint.error_detail` and `endpoint.host_label`. The ntfy server
+  (step 15, `EARMARK_NTFY_URL`) is the third operator endpoint, reached by its own httpx2
+  client in `notify/ntfy.py` under the same rules (responses capped at 64 KiB), because it
+  may be public ntfy.sh or a self-hosted server on a private address. `earmark doctor
+  --online` reaches the ASR, LLM, and ntfy servers the same way, read-only. It reaches the
+  iTunes lookup through `fetch.py`, guard included.
+- **Notifications** (step 15). Episode and show titles come from feeds, and `job.error` and
+  warnings can quote them.
+  - Every value is cleaned before it is sent (control, format, and separator characters
+    removed, whitespace collapsed, RFC 2047 `=?` defused, byte-capped) and redacted.
+  - Values travel only in the JSON body, never in a header, the URL, or a query string,
+    so there is no header injection.
+  - Notifications carry no transcript or analysis text, and no secret, topic, or URL path.
+  - The `click` link is built only from the configured vault name and the note path, both
+    percent-encoded.
 - **Model downloads.** faster-whisper fetches models from Hugging Face with
   `huggingface_hub`, not through `fetch.py`: the repository is chosen by the operator
   (`ASR_MODEL`), not by a third party, and it honours the usual `HF_*` and proxy
@@ -977,7 +1071,8 @@ and writes into a vault the user cares about.
   environment variables). The `anthropic` logger is kept at WARNING or above, because its
   DEBUG records contain the whole request body.
 - **Secrets.** Tokens are `SecretStr`, redacted in `earmark config` and `earmark doctor`,
-  and never logged. The LLM key lives only in `AnthropicOptions.api_key` and the SDK
+  and never logged. `EARMARK_NTFY_URL` is a `SecretStr` too (step 15), because on public
+  ntfy.sh the topic is the password. Doctor prints only its host. The LLM key lives only in `AnthropicOptions.api_key` and the SDK
   client, and a test shows it absent from DEBUG logs even without the redacting
   formatter.
 
@@ -1000,7 +1095,9 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   homelab. `tests/test_openai_compat_live.py` (step 11) is `network` too: a one-shot and a
   map-reduce analysis against a real local LLM server, skipped unless `LLM_TEST_BASE_URL`
   (with `LLM_TEST_MODEL`, optional `LLM_TEST_CONTEXT_TOKENS`, `LLM_TEST_API_KEY`,
-  `LLM_TEST_RESPONSE_FORMAT`) is set.
+  `LLM_TEST_RESPONSE_FORMAT`) is set. `tests/test_ntfy_live.py` (step 15) is `network`:
+  it publishes one notification and polls it back, to `NTFY_TEST_URL` (optional
+  `NTFY_TEST_TOKEN`) or else to a fresh random topic on public ntfy.sh.
 - `slow`: downloads the `tiny` Whisper model and a public-domain clip (JFK's 1961
   inaugural address, 11 s, pinned by commit and sha256 in `tests/slow_assets.py`) into
   `$SLOW_TEST_CACHE` (default `~/.cache/earmark-tests`), then transcribes it on CPU.
@@ -1030,6 +1127,12 @@ on a unix socket reached with `httpx2.HTTPTransport(uds=...)`, which the socket 
 allows. The local LLM client (step 11) is tested the same way with `tests/llm_stub.py`, an
 OpenAI-style chat server on a unix socket, and map-reduce with synthetic multi-hour
 transcripts (`tests/long_transcripts.py`) and the scripted `LLMClient`.
+
+The ntfy client (step 15) is tested with `httpx2.MockTransport` and `tests/ntfy_stub.py`,
+a unix-socket ntfy server with recorded ntfy.sh bodies. Doctor is tested through
+`doctor.Probes`: injected transports, an injected `GuardedFetcher`, and an SDK
+`http_client`. Missing extras are simulated with `sys.modules` stubs. A real LanceDB
+doctor test carries the `index` marker.
 
 With every backend set to `fake`, the whole service runs in the sandbox:
 `earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears (the fake

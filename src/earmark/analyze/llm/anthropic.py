@@ -70,6 +70,14 @@ class AnthropicOptions:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ModelCheck:
+    model_id: str
+    display_name: str
+    lifecycle: str  # "active", "deprecated", "retired"
+    retires_at: str | None  # ISO date, if scheduled
+
+
 def _detail(exc: anthropic.APIStatusError, secrets: Sequence[str]) -> str:
     text = ""
     body = exc.body
@@ -210,6 +218,32 @@ class AnthropicClient:
             "effort": self._options.effort,
             "format": {"type": "json_schema", "schema": schema},
         }
+
+    @property
+    def credential_source(self) -> str:
+        """Which credential the SDK will use, by name (never its value)."""
+        if self._options.api_key is not None:
+            return "EARMARK_LLM_API_KEY"
+        if self._sdk.api_key is not None:
+            return "ANTHROPIC_API_KEY"
+        if self._sdk.auth_token is not None:
+            return "ANTHROPIC_AUTH_TOKEN"
+        return "an ant profile or workload identity"
+
+    def check_model(self, *, timeout_s: float) -> ModelCheck:
+        """GET /v1/models/{model} with max_retries=0: a free metadata read, no inference."""
+        try:
+            info = self._sdk.with_options(timeout=timeout_s, max_retries=0).models.retrieve(
+                self._options.model
+            )
+        except anthropic.AnthropicError as exc:
+            raise self._mapped(exc) from exc
+        return ModelCheck(
+            model_id=info.id,
+            display_name=info.display_name,
+            lifecycle=info.lifecycle,
+            retires_at=None if info.retires_at is None else info.retires_at.date().isoformat(),
+        )
 
     def _mapped(self, exc: anthropic.AnthropicError) -> EarmarkError:
         return map_api_error(exc, model=self._options.model, secrets=self._secrets)

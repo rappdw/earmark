@@ -9,6 +9,7 @@ import pytest
 
 from earmark.errors import PermanentError, TransientError
 from earmark.vault.fs import (
+    TEMP_NAME,
     FileStamp,
     NoteChanged,
     SymlinkRefused,
@@ -294,3 +295,52 @@ def test_open_existing_subdir_refuses_symlinks(tmp_path: Path) -> None:
     (vault / "A").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(SymlinkRefused):
         Vault(vault, "A").open_existing_subdir()
+
+
+def test_probe_write_removes_file(tmp_path: Path) -> None:
+    with _open(tmp_path) as vd:
+        before = {p.name for p in (tmp_path / "vault" / "Earmark").iterdir()}
+        vd.probe_write()
+        vd.probe_write()
+        after = {p.name for p in (tmp_path / "vault" / "Earmark").iterdir()}
+    assert before == after == set()
+
+
+def test_probe_write_uses_the_temp_name_pattern(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    real_open = os.open
+
+    def spy(path: str | bytes | os.PathLike[str], flags: int, mode: int = 0o777, **kw: int) -> int:
+        seen.append(str(path))
+        return real_open(path, flags, mode, **kw)
+
+    monkeypatch.setattr(os, "open", spy)
+    with _open(tmp_path) as vd:
+        seen.clear()
+        vd.probe_write()
+    [name] = [n for n in seen if n.startswith(".earmark-")]
+    assert TEMP_NAME.fullmatch(name)
+
+
+def test_probe_write_refuses_symlinked_dir(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (vault / "Earmark").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(SymlinkRefused):
+        Vault(vault, "Earmark").open_existing_subdir()
+    assert list((tmp_path / "elsewhere").iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_probe_write_readonly_dir_raises(tmp_path: Path) -> None:
+    with _open(tmp_path) as vd:
+        target = tmp_path / "vault" / "Earmark"
+        target.chmod(0o500)
+        try:
+            with pytest.raises(PermissionError):
+                vd.probe_write()
+        finally:
+            target.chmod(0o700)

@@ -33,6 +33,7 @@ from tests.anthropic_stub import (
     make_client,
     make_options,
     message_events,
+    model_info_body,
     request_json,
     stream_reply,
 )
@@ -526,3 +527,65 @@ def test_repr_hides_key(client: AnthropicClient) -> None:
     assert KEY not in repr(client.options)
     assert KEY not in repr(client)
     assert KEY not in repr(make_options())
+
+
+# -- doctor support: credential_source and check_model ---------------------------------------
+
+
+def test_credential_source_setting() -> None:
+    client = make_client(AnthropicStub())
+    assert client.credential_source == "EARMARK_LLM_API_KEY"
+
+
+def test_credential_source_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-sentinel")
+    client = make_client(AnthropicStub(), api_key=None)
+    assert client.credential_source == "ANTHROPIC_API_KEY"
+    assert "sk-ant-env-sentinel" not in client.credential_source
+
+
+def test_credential_source_auth_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-env-sentinel")
+    client = make_client(AnthropicStub(), api_key=None)
+    assert client.credential_source == "ANTHROPIC_AUTH_TOKEN"
+
+
+def test_check_model_is_one_get(stub: AnthropicStub, client: AnthropicClient) -> None:
+    stub.model_reply = httpx2.Response(
+        200, json=model_info_body(lifecycle="deprecated", retires_at="2026-12-31T00:00:00Z")
+    )
+    check = client.check_model(timeout_s=10.0)
+    assert (check.model_id, check.display_name) == ("claude-opus-5-5", "Claude Opus 5.5")
+    assert (check.lifecycle, check.retires_at) == ("deprecated", "2026-12-31")
+    [request] = stub.requests
+    assert (request.method, request.url.path) == ("GET", "/v1/models/claude-opus-5-5")
+    assert stub.message_requests() == []
+    assert request.extensions["timeout"]["read"] == 10.0
+
+
+def test_check_model_does_not_retry(stub: AnthropicStub, client: AnthropicClient) -> None:
+    stub.model_reply = error_reply(500, "api_error", "boom")
+    with pytest.raises(TransientError):
+        client.check_model(timeout_s=10.0)
+    assert len(stub.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "kind", "needle"),
+    [
+        (401, "authentication_error", PermanentError, "EARMARK_LLM_API_KEY"),
+        (404, "not_found_error", PermanentError, "EARMARK_LLM_MODEL"),
+    ],
+)
+def test_check_model_errors_are_mapped(
+    stub: AnthropicStub,
+    client: AnthropicClient,
+    status: int,
+    error_type: str,
+    kind: type[Exception],
+    needle: str,
+) -> None:
+    stub.model_reply = error_reply(status, error_type, "nope")
+    with pytest.raises(kind) as info:
+        client.check_model(timeout_s=10.0)
+    assert needle in str(info.value)

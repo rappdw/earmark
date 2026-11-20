@@ -3,7 +3,6 @@ import json
 import re
 import subprocess
 import sys
-import typing
 from pathlib import Path
 from typing import Any
 
@@ -82,12 +81,20 @@ def test_config_never_prints_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 
 @pytest.mark.usefixtures("restore_root_logging")
-def test_config_redacts_url_password(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EARMARK_NTFY_URL", "https://bob:sentinel-pw-1@ntfy.example/t")
+def test_config_redacts_ntfy_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_NTFY_URL", "https://ntfy.example/sentinel-topic-77")
     result = runner.invoke(app, ["config"])
     assert result.exit_code == 0
-    assert "https://bob:****@ntfy.example/t" in result.output
-    assert "sentinel-pw-1" not in result.output
+    assert "EARMARK_NTFY_URL=**********" in result.output.splitlines()
+    assert "sentinel-topic-77" not in result.output
+
+
+def test_config_refuses_ntfy_url_with_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_NTFY_URL", "https://bob:sentinel-pw-1@ntfy.example/t")
+    result = runner.invoke(app, ["config"])
+    assert result.exit_code == 2
+    assert "EARMARK_NTFY_URL" in result.stderr
+    assert "sentinel-pw-1" not in result.stdout + result.stderr
 
 
 def test_config_error_does_not_echo_input(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,21 +292,15 @@ def test_worker_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.usefixtures("restore_root_logging")
 def test_worker_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.test_factory import FIELDS
+    from earmark.pipeline import factory
 
-    unbuilt = [
-        (field, name)
-        for field, (literal, registry) in FIELDS.items()
-        for name in typing.get_args(literal)
-        if name not in registry
-    ]
-    if not unbuilt:
-        pytest.skip("every backend is built")
-    field, name = unbuilt[0]
-    monkeypatch.setenv(env_var(field), name)
+    monkeypatch.setattr(
+        factory, "NOTIFIERS", {k: v for k, v in factory.NOTIFIERS.items() if k != "ntfy"}
+    )
+    monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "ntfy")
     result = runner.invoke(app, ["worker", "--once"])
     assert result.exit_code == 2
-    assert env_var(field) in result.stderr
+    assert "EARMARK_NOTIFY_BACKEND" in result.stderr
     assert not (fake_env / "data").exists()
 
 
@@ -1163,3 +1164,98 @@ def test_serve_wires_the_searcher(
         fake_uvicorn.calls[0][0][0], headers={"Authorization": f"Bearer {SERVE_TOKEN}"}
     ) as client:
         assert client.get("/search", params={"q": "x"}).json() == {"hits": []}
+
+
+# -- doctor ------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def doctor_env(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    (fake_env / "vault").mkdir()
+    monkeypatch.setenv("EARMARK_API_TOKEN", "d" * 40)
+    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "none")
+    monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "none")
+    return fake_env
+
+
+def test_doctor_all_fake_exit_0(doctor_env: Path) -> None:
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[-1].startswith("doctor: all checks passed")
+    assert any(line.startswith("warn  resolver") for line in lines)
+    assert not (doctor_env / "data").exists()
+    assert list((doctor_env / "vault").iterdir()) == []
+
+
+def test_doctor_failure_exit_1(doctor_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EARMARK_API_TOKEN")
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert "FAIL  api token" in result.stdout
+    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 5 warnings"
+
+
+def test_doctor_bad_settings_exit_2_no_echo(
+    doctor_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_PORT", "sentinel-port-x")
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 2
+    assert result.stdout.startswith("FAIL  config         EARMARK_PORT: ")
+    assert "sentinel-port-x" not in result.stdout + result.stderr
+
+
+def test_doctor_never_prints_secrets(doctor_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets = {
+        "EARMARK_API_TOKEN": "sentinel-api-token-" + "a" * 30,
+        "EARMARK_ASR_API_KEY": "sentinel-asr-key-77",
+        "EARMARK_LLM_API_KEY": "sentinel-llm-key-88",
+        "EARMARK_NTFY_TOKEN": "sentinel-ntfy-token-99",
+        "EARMARK_NTFY_URL": "https://ntfy.test/sentinel-topic-91x",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
+    monkeypatch.setenv("EARMARK_ASR_BASE_URL", "http://asr.test:8000/v1")
+    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "openai_compat")
+    monkeypatch.setenv("EARMARK_LLM_BASE_URL", "http://llm.test:8000/v1")
+    monkeypatch.setenv("EARMARK_LLM_MODEL", "qwen")
+    monkeypatch.setenv("EARMARK_LLM_CONTEXT_TOKENS", "32768")
+    monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "ntfy")
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "ntfy at ntfy.test, token set" in result.stdout
+    output = result.stdout + result.stderr
+    for value in secrets.values():
+        assert value not in output
+    assert "sentinel-topic-91x" not in output
+
+    # Online, through run_doctor and render, with servers that echo secrets in their errors.
+    from earmark.config import load_settings
+    from earmark.doctor import Probes, run_doctor
+    from earmark.doctor.report import doctor_secrets, render
+
+    def echo(request: httpx2.Request) -> httpx2.Response:
+        body = {"error": f"denied {request.headers.get('authorization')} for sentinel-topic-91x"}
+        return httpx2.Response(500, json=body)
+
+    settings = load_settings(env_file=None)
+    probes = Probes(http_transport=httpx2.MockTransport(echo))
+    results = run_doctor(settings, online=True, probes=probes)
+    text = "\n".join(render(results, doctor_secrets(settings)))
+    assert "FAIL  asr server" in text
+    for value in secrets.values():
+        assert value not in text
+    assert "sentinel-topic-91x" not in text
+    assert "denied Bearer **********" in text  # the echo reached a detail, redacted
+
+
+def test_doctor_online_cli_unreachable(doctor_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "ntfy")
+    monkeypatch.setenv("EARMARK_NTFY_URL", "https://ntfy.test/sentinel-topic-12")
+    result = runner.invoke(app, ["doctor", "--online"])
+    assert result.exit_code == 1
+    assert "FAIL  ntfy server" in result.stdout
+    assert "Traceback" not in result.stdout + result.stderr
+    assert "sentinel-topic-12" not in result.stdout + result.stderr

@@ -68,6 +68,34 @@ def config_command() -> None:
         typer.echo(f"{name}={display}")
 
 
+@app.command("doctor")
+def doctor_command(
+    online: Annotated[
+        bool, typer.Option("--online", help="Also check that servers are reachable.")
+    ] = False,
+) -> None:
+    """Check the configuration, directories, database, backends, and credentials."""
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        for line in exc.errors:
+            typer.echo(f"FAIL  {'config':<14} {_clean(line)}"[:400])
+        raise typer.Exit(code=2) from None
+    from earmark.doctor.report import doctor_secrets
+
+    secrets = doctor_secrets(settings)
+    # Builders log at INFO; keep that off the doctor's output.
+    configure_logging("ERROR" if settings.log_level == "ERROR" else "WARNING", secrets)
+    from earmark.doctor import run_doctor
+    from earmark.doctor.report import exit_code, render, summary
+
+    results = run_doctor(settings, online=online)
+    for line in render(results, secrets):
+        typer.echo(line)
+    typer.echo(summary(results))
+    raise typer.Exit(code=exit_code(results))
+
+
 @app.command("serve")
 def serve_command() -> None:
     """Run the ingest API on EARMARK_HOST:EARMARK_PORT."""

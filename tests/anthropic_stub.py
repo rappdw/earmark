@@ -140,6 +140,25 @@ def error_reply(
     )
 
 
+def model_info_body(
+    model_id: str = "claude-opus-5-5",
+    *,
+    lifecycle: str = "active",
+    retires_at: str | None = None,
+    display_name: str = "Claude Opus 5.5",
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "type": "model",
+        "id": model_id,
+        "display_name": display_name,
+        "created_at": "2026-05-01T00:00:00Z",
+        "lifecycle": lifecycle,
+    }
+    if retires_at is not None:
+        body["retires_at"] = retires_at
+    return body
+
+
 class AnthropicStub:
     """A callable for ``httpx2.MockTransport`` that records requests and plays scripted replies."""
 
@@ -147,6 +166,7 @@ class AnthropicStub:
         self.requests: list[httpx2.Request] = []
         self.replies: list[httpx2.Response | Exception] = []
         self.count: int | httpx2.Response | Callable[[dict[str, Any]], int] = 1000
+        self.model_reply: httpx2.Response | Exception | None = None  # None: an active model
 
     def _matching(self, path: str) -> list[httpx2.Request]:
         return [r for r in self.requests if r.method == "POST" and r.url.path == path]
@@ -175,6 +195,12 @@ class AnthropicStub:
             if isinstance(reply, Exception):
                 raise reply
             return reply
+        if request.method == "GET" and path.startswith("/v1/models/"):
+            if isinstance(self.model_reply, Exception):
+                raise self.model_reply
+            if self.model_reply is not None:
+                return self.model_reply
+            return httpx2.Response(200, json=model_info_body(path.removeprefix("/v1/models/")))
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
 

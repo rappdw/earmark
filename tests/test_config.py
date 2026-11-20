@@ -346,3 +346,85 @@ def test_embed_model_stripped_and_required(monkeypatch: pytest.MonkeyPatch) -> N
 def test_embed_model_dir_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EARMARK_EMBED_MODEL_DIR", "/models/embed")
     assert load_settings(env_file=None).embed_model_dir == Path("/models/embed")
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://ntfy.sh/topic", "https://ntfy.sh/topic"),
+        ("http://ntfy.tail1234.ts.net:8080/earmark", "http://ntfy.tail1234.ts.net:8080/earmark"),
+        ("https://host/prefix/topic", "https://host/prefix/topic"),
+        ("https://ntfy.sh/topic/", "https://ntfy.sh/topic"),
+        ("  https://ntfy.sh/a_b-C9  ", "https://ntfy.sh/a_b-C9"),
+    ],
+)
+def test_ntfy_url_accepted(monkeypatch: pytest.MonkeyPatch, url: str, expected: str) -> None:
+    monkeypatch.setenv("EARMARK_NTFY_URL", url)
+    s = load_settings(env_file=None)
+    assert s.ntfy_url is not None
+    assert s.ntfy_url.get_secret_value() == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("https://ntfy.sh", "must end in the topic name"),
+        ("https://ntfy.sh/", "must end in the topic name"),
+        ("https://ntfy.sh/sentinel.topic", "must end in the topic name"),
+        ("https://ntfy.sh/" + "s" * 65, "must end in the topic name"),
+        ("https://bob:sentinel-pw@ntfy.sh/topic", "EARMARK_NTFY_TOKEN"),
+        ("https://ntfy.sh/topic?auth=sentinel-q", "query or fragment"),
+        ("https://ntfy.sh/topic#sentinel-f", "query or fragment"),
+        ("ftp://ntfy.sh/sentinel-topic", "http(s) topic URL"),
+        ("sentinel-nohost", "http(s) topic URL"),
+    ],
+)
+def test_ntfy_url_refused(monkeypatch: pytest.MonkeyPatch, url: str, message: str) -> None:
+    monkeypatch.setenv("EARMARK_NTFY_URL", url)
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_NTFY_URL: ")
+    assert message in line
+    assert "sentinel" not in line
+
+
+def test_ntfy_url_is_secretstr(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Settings.model_fields["ntfy_url"].annotation == SecretStr | None
+    monkeypatch.setenv("EARMARK_NTFY_URL", "https://ntfy.sh/sentinel-topic-5")
+    s = load_settings(env_file=None)
+    assert "https://ntfy.sh/sentinel-topic-5" in s.secret_values()
+    assert "sentinel-topic-5" not in repr(s)
+    assert ("EARMARK_NTFY_URL", "**********") in s.redacted_items()
+
+
+def test_ntfy_token_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_NTFY_TOKEN", "  tk_abc123  ")
+    token = load_settings(env_file=None).ntfy_token
+    assert token is not None
+    assert token.get_secret_value() == "tk_abc123"
+    monkeypatch.setenv("EARMARK_NTFY_TOKEN", "sentinel token")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_NTFY_TOKEN: ")
+    assert "printable ASCII without spaces" in line
+    assert "sentinel" not in line
+    monkeypatch.setenv("EARMARK_NTFY_TOKEN", "   ")
+    assert load_settings(env_file=None).ntfy_token is None
+
+
+def test_obsidian_vault_name_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_OBSIDIAN_VAULT_NAME", "  My Vault é ")
+    assert load_settings(env_file=None).obsidian_vault_name == "My Vault é"
+    monkeypatch.setenv("EARMARK_OBSIDIAN_VAULT_NAME", "   ")
+    assert load_settings(env_file=None).obsidian_vault_name is None
+    for bad, message in (("a\nb", "control characters"), ("a‮b", "control characters")):
+        monkeypatch.setenv("EARMARK_OBSIDIAN_VAULT_NAME", bad)
+        with pytest.raises(ConfigError) as info:
+            load_settings(env_file=None)
+        assert message in info.value.errors[0]
+    monkeypatch.setenv("EARMARK_OBSIDIAN_VAULT_NAME", "v" * 201)
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    assert "at most 200 characters" in info.value.errors[0]

@@ -254,6 +254,22 @@ class VaultDir:
         ):
             raise NoteChanged(f"{self._where(name)} changed while it was being updated")
 
+    def probe_write(self) -> None:
+        """Create and remove one .earmark-<16 hex>.tmp (O_EXCL|O_NOFOLLOW); raises OSError."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        for _ in range(_RETRIES):
+            tmp = f".earmark-{secrets.token_hex(8)}.tmp"
+            try:
+                fd = os.open(tmp, flags, 0o600, dir_fd=self._fd)
+            except FileExistsError:
+                continue
+            try:
+                os.close(fd)
+            finally:
+                os.unlink(tmp, dir_fd=self._fd)
+            return
+        raise FileExistsError(errno.EEXIST, "could not pick a free temp file name")
+
     def remove_stale_temps(self, *, now: float, older_than_s: float = 3600.0) -> int:
         removed = 0
         try:
