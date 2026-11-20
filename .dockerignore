@@ -1,0 +1,9 @@
+# Allow-list: only what the image build reads. Keeps .env, data/, .venv/, .git/ out.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!src/
+**/__pycache__
+**/*.pyc

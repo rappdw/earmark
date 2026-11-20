@@ -428,3 +428,24 @@ def test_obsidian_vault_name_validated(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ConfigError) as info:
         load_settings(env_file=None)
     assert "at most 200 characters" in info.value.errors[0]
+
+
+def test_secret_values_include_bare_ntfy_topic() -> None:
+    url = "https://ntfy.sh/sentinel-topic-5"
+    s = Settings(_env_file=None, ntfy_url=SecretStr(url))
+    assert s.secret_values() == [url, "sentinel-topic-5"]
+
+
+def test_secret_values_skip_short_ntfy_topic() -> None:
+    url = "https://ntfy.example/earmark"
+    assert Settings(_env_file=None, ntfy_url=SecretStr(url)).secret_values() == [url]
+    eleven = "https://ntfy.example/abcdefghijk"
+    assert Settings(_env_file=None, ntfy_url=SecretStr(eleven)).secret_values() == [eleven]
+
+
+def test_secret_values_topic_with_path_prefix() -> None:
+    url = "https://host/ntfy/sentinel-topic-77"
+    assert Settings(_env_file=None, ntfy_url=SecretStr(url)).secret_values() == [
+        url,
+        "sentinel-topic-77",
+    ]

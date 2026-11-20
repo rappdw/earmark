@@ -18,7 +18,8 @@ backend, not the pipeline.
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Vector store | LanceDB (`lancedb` 0.41), embedded, no server: one `chunks` table under `DATA_DIR/lancedb`, exact (exhaustive) cosine search, no ANN index. Embeddings run locally with fastembed (ONNX on CPU), `BAAI/bge-small-en-v1.5` by default. Both are the `index` extra (step 14). | `EARMARK_INDEX_BACKEND`, `EARMARK_EMBED_MODEL` (then `earmark reindex`); swap the `Indexer` and `Searcher` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
-| Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
+| Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge; the Cloudflare token lives only with the proxy. Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
+| Deployment | One container image (CPU, extras by build argument) running either `earmark serve` or `earmark worker`; `compose.yaml` with a shared data volume and a vault bind mount; GPU transcription through a vLLM Whisper service in the compose `gpu` profile and the `remote` ASR backend; systemd units for a native install (step 16). | See "Deployment" below and `docs/deploy.md`. |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), PyYAML for the user-edited `aliases.yaml` only (step 13: `yaml.compose` node walk, no object construction, YAML aliases refused, imported lazily), the `anthropic` SDK (a core dependency, itself built on httpx2, imported only by the analyzer's builder; step 10). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
@@ -102,7 +103,10 @@ src/earmark/
   doctor/              report.py (CheckResult, render, exit code), checks.py (offline checks),
                        online.py (--online reachability checks), __init__.py (run_doctor,
                        Probes); `earmark doctor` (step 15)
-tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS
+tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS, and
+                       share_sheet.json (real iOS share-sheet captures, added by hand)
+Dockerfile, .dockerignore, compose.yaml    the container image and services (step 16)
+deploy/systemd/        example units for a native install (step 16)
 ```
 
 ## Domain models
@@ -787,6 +791,8 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
                                 created by the first index write, never by a search
   models/embed/                 fastembed model cache (Hugging Face layout) unless
                                 EARMARK_EMBED_MODEL_DIR is set; created on first model load
+  huggingface/hub/              in the container image only (HF_HOME=/data/huggingface):
+                                faster-whisper's model cache when ASR_MODEL_DIR is unset (step 16)
 
 $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in the vault
   Podcasts/<Show>/<YYYY-MM-DD> <Title>.md                     where a new episode note goes
@@ -966,6 +972,63 @@ login` profile, workload identity). pydantic-settings does not export `.env` ent
 `ANTHROPIC_API_KEY` line in `.env` is not seen; use `EARMARK_LLM_API_KEY` there. No
 credential at all is a startup `ConfigError`.
 
+## Deployment
+
+Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator guide in
+`docs/deploy.md`.
+
+- **Image.** The `Dockerfile` has stages `uv`, `build`, and `runtime`.
+  - Base images: `python:3.13.18-slim-trixie` and `ghcr.io/astral-sh/uv:0.13.9`, pinned
+    by digest. The Python tag follows `.python-version`; the uv minor follows the
+    `uv_build` bound.
+  - Dependencies: `uv sync --locked --no-dev` plus the extras in the build argument
+    `EXTRAS` (default `transcribe index`), with the project installed non-editable into
+    `/app/.venv`.
+  - User: `earmark`, with UID and GID from build arguments (default 1000, 0 refused).
+    `/data` and `/vault` are owned by it.
+  - Environment: `EARMARK_HOST=0.0.0.0`, `EARMARK_DATA_DIR=/data`,
+    `EARMARK_VAULT_DIR=/vault`, `HF_HOME=/data/huggingface` (so Whisper models persist on
+    the volume).
+  - Entrypoint `earmark`, default command `serve`.
+  - It installs `ca-certificates`, and has no `HEALTHCHECK`, no `VOLUME`, and no `.env`.
+  - `.dockerignore` is an allow-list: `pyproject.toml`, `uv.lock`, `.python-version`,
+    `README.md`, `src/`.
+- **Compose.**
+  - `api` (`serve`) and `worker` (`worker`) share the image, a named volume `data` at
+    `/data`, and the vault bind mount `${VAULT_PATH}` at `/vault`.
+  - Settings come from `env_file: .env`. `environment:` forces the in-container
+    `DATA_DIR`, `VAULT_DIR`, `HOST`, `PORT`, and empty (so default) model directories.
+  - Exposure: only `api` publishes a port, `${API_BIND:-127.0.0.1:8787}`.
+  - Hardening: `init: true`, `no-new-privileges`, `cap_drop: ALL`.
+  - The worker gets `stop_grace_period: 2m`; SIGTERM releases the running job.
+  - The `gpu` profile adds `asr`: NVIDIA's arm64 CUDA 13 vLLM container (pinned by digest)
+    serving `EARMARK_ASR_MODEL`, with `VLLM_API_KEY` from `EARMARK_ASR_API_KEY`, raised
+    audio limits, a GPU reservation, and no published port. The worker uses it with
+    `EARMARK_ASR_BACKEND=remote` and `EARMARK_ASR_BASE_URL=http://asr:8000/v1`.
+  - Compose-only variables (`VAULT_PATH`, `API_BIND`, `APP_UID`, `APP_GID`, `EXTRAS`,
+    `ASR_GPU_MEMORY_UTILIZATION`) are unprefixed, so `Settings` ignores them.
+- **Reverse proxy.** It is not part of compose. `deploy/caddy/Caddyfile` is an example
+  for Caddy on the host:
+  - it binds only the private LAN address, on 443, with no port 80;
+  - it gets a certificate through DNS-01 with `dns cloudflare {env.CF_API_TOKEN}` (a
+    Caddy build with `caddy-dns/cloudflare`; the token needs Zone:DNS:Edit and
+    Zone:Zone:Read, limited to the one zone);
+  - it sets `resolvers 1.1.1.1`;
+  - it forwards to `127.0.0.1:8787`.
+
+  The token is never in earmark's `.env`, which compose exports into earmark's
+  containers. Nothing binds the API to a non-loopback host address by default;
+  `EARMARK_HOST=0.0.0.0` exists only inside the container.
+- **Native.** `deploy/systemd/earmark-{api,worker}.service` run
+  `/srv/earmark/.venv/bin/earmark serve|worker` as user `earmark`, with
+  `WorkingDirectory=/srv/earmark` (where `.env` is read), `KillSignal=SIGTERM`,
+  `ProtectSystem=strict`, and `ReadWritePaths` for the data directory (and the vault for
+  the worker).
+- **Not verified.** No container has run in the build sandbox (no Docker). CI builds the
+  image and runs only one-off commands in it. The `gpu` profile has never been built or
+  run. A CUDA build of CTranslate2 in the image is documented in `docs/deploy.md` as an
+  unverified outline, not provided.
+
 ## Security
 
 The service runs on a private network, but it fetches URLs that third parties control
@@ -1072,7 +1135,11 @@ and writes into a vault the user cares about.
   DEBUG records contain the whole request body.
 - **Secrets.** Tokens are `SecretStr`, redacted in `earmark config` and `earmark doctor`,
   and never logged. `EARMARK_NTFY_URL` is a `SecretStr` too (step 15), because on public
-  ntfy.sh the topic is the password. Doctor prints only its host. The LLM key lives only in `AnthropicOptions.api_key` and the SDK
+  ntfy.sh the topic is the password. Doctor prints only its host. `Settings.secret_values()`
+  also returns the bare topic when it is at least 12 characters (step 16), so a job error or
+  log line that quotes only the topic is redacted too. Shorter topics are left alone because
+  masking a common word (`earmark`) would corrupt every log line; doctor redacts the topic
+  at any length. The LLM key lives only in `AnthropicOptions.api_key` and the SDK
   client, and a test shows it absent from DEBUG logs even without the redacting
   formatter.
 
@@ -1134,6 +1201,26 @@ a unix-socket ntfy server with recorded ntfy.sh bodies. Doctor is tested through
 `http_client`. Missing extras are simulated with `sys.modules` stubs. A real LanceDB
 doctor test carries the `index` marker.
 
+Documents are tested against the code (step 16).
+
+- **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
+  (`<!-- name:begin -->` … `<!-- name:end -->`, or a single `<!-- name -->` before a
+  fence) and plain regular expressions; there is no Markdown library.
+- **What `tests/test_docs.py` checks.**
+  - The README's settings reference lists every `Settings` field exactly once, one
+    variable per table row.
+  - The README quickstart sets every backend to `fake`.
+  - `docs/shortcut.md`'s example request body validates against `IngestRequest` and is
+    accepted by `POST /ingest`, and the example response matches the route.
+  - The Shortcut's actions appear in a fixed order.
+  - Relative links resolve.
+  - Real share-sheet captures in `tests/fixtures/share_sheet.json` canonicalise as
+    recorded.
+- **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,
+  `compose.yaml`, and the systemd units.
+- **The gate.** `ruff format --check .` also formats Python code blocks in Markdown, so
+  those must be ruff-clean.
+
 With every backend set to `fake`, the whole service runs in the sandbox:
 `earmark serve`, `curl` an ingest, `earmark worker --once`, and a note appears (the fake
 store writes a minimal note when `EARMARK_VAULT_DIR` is set). Verifiers
@@ -1173,9 +1260,19 @@ file is on `main`. `.github/workflows/llm.yml` ("LLM test", step 10) is triggere
 passes that environment's `ANTHROPIC_API_KEY` secret only to its last step, `uv run
 --locked pytest -m llm -v -rs`, after the same pinned checkout, setup-uv, and `uv sync
 --locked` as `ci.yml`. The operator creates the environment and secret, and should restrict
-its deployment branches to `main` and `impl`. Step 16 adds an arm64 container build without
-push. None of those is a required check:
-their failures usually mean an outside service changed.
+its deployment branches to `main` and `impl`. `.github/workflows/container.yml`
+("Container image", step 16) runs on the same pushes and pull requests as `ci.yml`, with
+`contents: read`, no secrets, and the same pinned checkout as its only action. Its job
+`docker build (linux/arm64)`:
+
+- validates `compose.yaml` with `docker compose config` (with and without `--profile gpu`)
+  against a `.env` copied from `.env.example`;
+- builds the image with plain `docker build` (no push, no login, no Docker actions);
+- runs `earmark --version`, an import of the extras, and an `id -u` check in the image.
+
+It never starts the API or the worker. None of those is a required check: their failures
+usually mean an outside service changed, or, for the container, that the image needs a
+fix.
 
 Rules for every workflow under `.github/workflows/`, enforced by `tests/test_ci.py`: it
 passes `actionlint` (installed by the `actionlint-py` dev dependency and run offline by
@@ -1183,7 +1280,9 @@ the test suite), every `uses:` of a remote action is pinned to a full 40-charact
 SHA followed by a `# vX.Y.Z` comment, it declares a top-level `permissions` block, and it
 never uses `pull_request_target`. `ci.yml` additionally gets only `contents: read` and
 references no secrets. Dependabot (`.github/dependabot.yml`) proposes weekly updates for
-the `uv` and `github-actions` ecosystems; it reads its config from the default branch
+the `uv` and `github-actions` ecosystems, and (step 16) `docker` for the Dockerfile's base
+images, limited to patch and digest updates because Python 3.14 and uv 0.14 need project
+changes. The vLLM tag in `compose.yaml` is bumped by hand. Dependabot reads its config from the default branch
 (`main`) but opens pull requests against `impl` (`target-branch`), so updates pass the
 same gate as a step and `main` stays a fast-forward of `impl`.
 
@@ -1219,6 +1318,14 @@ Step planners should check these against current documentation instead of assumi
    (`parakeet-cpp`); speaches' arm64 CUDA image is CPU-only (speaches#620); NVIDIA's
    Parakeet NIM HTTP API returns no timestamps and takes no MP3. None was run in the
    sandbox. See `docs/asr.md` and `docs/steps/09-remote-asr.md` section 2.2.
+
+   Step 16 (2026-11-20) made the vLLM path the compose `gpu` profile. It pins
+   `nvcr.io/nvidia/vllm:26.10-py3` (vLLM 0.31.0, CUDA 13.4, arm64 manifest present; its
+   `PATH` includes an ffmpeg build). The image itself stays CPU-only. CTranslate2 4.9.0
+   documents an aarch64 CUDA source build (`-DWITH_CUDA=ON -DWITH_CUDNN=ON -DWITH_MKL=OFF
+   -DOPENMP_RUNTIME=COMP`, architecture through `CMAKE_CUDA_ARCHITECTURES`), and
+   `docs/deploy.md` outlines it for sm_121 as unverified. Upstream's CUDA 13 issue #1933 is
+   still open. None of this was run.
 2. **iTunes Lookup window.** Verified on 2026-11-19 and 2026-11-20:
    `lookup?id=<show>&entity=podcastEpisode` returns the show record with `feedUrl`, then
    episode records with `trackId` (the `?i=` value), `episodeGuid`, `episodeUrl`,
@@ -1241,7 +1348,14 @@ Step planners should check these against current documentation instead of assumi
    onnxruntime 59 MB, numpy 54 MB), plus 65 MB for the model. See
    `docs/steps/14-vector-index.md` section 2.
 4. **Container and GPU paths cannot be exercised in the dev sandbox.** They are reviewed
-   statically and verified on the homelab.
+   statically (`tests/test_deploy.py`) and verified on the homelab. Since step 16, CI
+   builds the image on linux/arm64 and runs one-off commands in it (`container.yml`), but
+   no service has ever run in a container, and the `gpu` profile has never been built or
+   run. The reachability setup has not been run either: WireGuard, the DNS-only record,
+   resolvers' DNS rebinding protection, and Caddy's DNS-01 issuance. Only the example
+   Caddyfile was checked, with `caddy validate`. What the iOS share sheet hands a Shortcut
+   is also unverified (no iPhone);
+   `docs/shortcut.md` says how to capture it into `tests/fixtures/share_sheet.json`.
 5. **The dev sandbox intercepts DNS.** Found in step 06 (2026-11-20): every name,
    including `.invalid` ones, resolves to `10.200.9.2`, so the address guard refuses
    every real fetch there. That is correct behaviour; `network` tests detect it and run

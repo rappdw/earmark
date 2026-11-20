@@ -1,0 +1,48 @@
+# earmark: one image for the API (`earmark serve`) and the worker (`earmark worker`).
+# Built and checked by .github/workflows/container.yml on linux/arm64; never run in the
+# build sandbox. See docs/deploy.md.
+
+FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d AS uv
+
+FROM python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS build
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+WORKDIR /src
+# Optional extras, space-separated: "transcribe index" (default), "index", "transcribe", "".
+ARG EXTRAS="transcribe index"
+COPY pyproject.toml uv.lock .python-version README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project \
+      $(for e in $EXTRAS; do printf -- '--extra %s ' "$e"; done)
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable \
+      $(for e in $EXTRAS; do printf -- '--extra %s ' "$e"; done)
+
+FROM python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime
+# The user that owns /data and writes the vault. Match the vault owner on the host.
+ARG UID=1000
+ARG GID=1000
+RUN test "$UID" -ne 0 && test "$GID" -ne 0 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --gid "$GID" --non-unique earmark \
+ && useradd --uid "$UID" --gid "$GID" --non-unique --create-home \
+      --home-dir /home/earmark --shell /usr/sbin/nologin earmark \
+ && install -d -o earmark -g earmark -m 0750 /data /vault
+COPY --from=build /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    EARMARK_HOST=0.0.0.0 \
+    EARMARK_DATA_DIR=/data \
+    EARMARK_VAULT_DIR=/vault \
+    HF_HOME=/data/huggingface
+WORKDIR /home/earmark
+USER earmark:earmark
+EXPOSE 8787
+ENTRYPOINT ["earmark"]
+CMD ["serve"]

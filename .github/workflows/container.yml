@@ -1,0 +1,41 @@
+# Builds the container image on linux/arm64 without pushing it, then runs three one-off
+# checks inside it. It never starts the API or the worker, and does not build the gpu
+# profile's server. Not a required check. See docs/deploy.md.
+name: Container image
+
+on:
+  push:
+    branches: [main, impl]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: docker build (linux/arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate compose.yaml
+        run: |
+          cp .env.example .env
+          printf 'VAULT_PATH=%s\n' "$RUNNER_TEMP/vault" >> .env
+          docker compose config --quiet
+          docker compose --profile gpu config --quiet
+      - name: Build the image
+        run: docker build --tag earmark:ci .
+      - name: Check the image
+        run: |
+          docker run --rm earmark:ci --version
+          docker run --rm --entrypoint python earmark:ci -c "import ctranslate2, faster_whisper, fastembed, lancedb"
+          test "$(docker run --rm --entrypoint id earmark:ci -u)" = 1000
+          docker image ls earmark:ci

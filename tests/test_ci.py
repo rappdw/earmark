@@ -312,7 +312,9 @@ def test_dependabot_config() -> None:
     config = _load_yaml(DEPENDABOT)
     assert config["version"] == 2
     updates = config["updates"]
-    assert Counter(u["package-ecosystem"] for u in updates) == Counter(["uv", "github-actions"])
+    assert Counter(u["package-ecosystem"] for u in updates) == Counter(
+        ["uv", "github-actions", "docker"]
+    )
     for update in updates:
         assert update["directory"] == "/"
         assert update["target-branch"] == "impl"
@@ -546,3 +548,93 @@ def test_index_workflow_read_only_no_secrets() -> None:
 def test_index_workflow_concurrency() -> None:
     assert _index()["concurrency"] == _ci()["concurrency"]
     assert _index()["concurrency"]["cancel-in-progress"] is True
+
+
+# --- dependabot docker (step 16) -----------------------------------------------------------
+
+
+def test_dependabot_docker_ignores_minor_and_major() -> None:
+    [docker] = [u for u in _load_yaml(DEPENDABOT)["updates"] if u["package-ecosystem"] == "docker"]
+    [rule] = docker["ignore"]
+    assert rule["dependency-name"] == "*"
+    assert set(rule["update-types"]) == {
+        "version-update:semver-major",
+        "version-update:semver-minor",
+    }
+
+
+# --- container workflow (step 16) ----------------------------------------------------------
+
+CONTAINER_WORKFLOW = WORKFLOWS_DIR / "container.yml"
+
+
+def _container() -> dict[Any, Any]:
+    return _load_yaml(CONTAINER_WORKFLOW)
+
+
+def _container_runs() -> list[str]:
+    return [s["run"] for s in _steps(_only_job(_container())) if "run" in s]
+
+
+def test_container_workflow_triggers() -> None:
+    triggers = _triggers(_container())
+    assert set(triggers) == {"push", "pull_request"}
+    assert set(triggers["push"]["branches"]) == {"main", "impl"}
+    pr = triggers["pull_request"]
+    assert pr is None or pr == {}
+
+
+def test_container_workflow_job() -> None:
+    job = _only_job(_container())
+    assert job["runs-on"] == ARM64_RUNNER
+    timeout = job["timeout-minutes"]
+    assert type(timeout) is int
+    assert 1 <= timeout <= 30
+    steps = _steps(job)
+    assert [_action(s) for s in steps] == [CHECKOUT, "", "", ""]
+    assert _job_remote_uses(job) == _remote_uses(_ci())[:1]
+    [checkout] = [s for s in steps if _action(s) == CHECKOUT]
+    assert checkout["with"] == _ci_step(CHECKOUT)["with"]
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_container_workflow_builds_without_push() -> None:
+    runs = "\n".join(_container_runs())
+    assert re.search(r"^docker build\b", runs, re.MULTILINE)
+    for forbidden in ("push", "login", "--push", "buildx", "ghcr.io", "docker.io"):
+        assert forbidden not in runs, forbidden
+    assert (
+        re.search(r"\bsecrets\b|docker push|docker login|--push", CONTAINER_WORKFLOW.read_text())
+        is None
+    )
+
+
+def test_container_workflow_checks_image() -> None:
+    runs = "\n".join(_container_runs())
+    assert "--version" in runs
+    for module in ("ctranslate2", "faster_whisper", "fastembed", "lancedb"):
+        assert module in runs
+    assert "--entrypoint id earmark:ci -u" in runs
+    assert "= 1000" in runs
+
+
+def test_container_workflow_validates_compose() -> None:
+    runs = "\n".join(_container_runs())
+    assert "docker compose config" in runs
+    assert "docker compose --profile gpu config" in runs
+    assert "cp .env.example .env" in runs
+    assert "VAULT_PATH" in runs
+
+
+def test_container_workflow_read_only() -> None:
+    workflow = _container()
+    assert workflow["permissions"] == {"contents": "read"}
+    job = _only_job(workflow)
+    assert "permissions" not in job
+    assert "env" not in workflow
+    assert "env" not in job
+    assert all("env" not in s for s in _steps(job))
+
+
+def test_container_workflow_concurrency() -> None:
+    assert _container()["concurrency"] == _ci()["concurrency"]

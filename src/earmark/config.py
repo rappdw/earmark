@@ -38,6 +38,8 @@ ENV_PREFIX: Final = "EARMARK_"
 REDACTED: Final = "**********"
 NTFY_TOPIC_PATTERN: Final = re.compile(r"[-_A-Za-z0-9]{1,64}")
 OBSIDIAN_NAME_MAX: Final = 200
+# A shorter bare topic is not redacted on its own: masking a common word would corrupt logs.
+NTFY_TOPIC_SECRET_MIN_CHARS: Final = 12
 
 
 class ConfigError(Exception):
@@ -272,11 +274,16 @@ class Settings(BaseSettings):
         return SecretStr(stripped)
 
     def secret_values(self) -> list[str]:
+        """Every set secret, plus the bare ntfy topic when it is at least 12 characters."""
         values: list[str] = []
         for name in type(self).model_fields:
             value = getattr(self, name)
             if isinstance(value, SecretStr) and value.get_secret_value():
                 values.append(value.get_secret_value())
+        if self.ntfy_url is not None:
+            topic = urlsplit(self.ntfy_url.get_secret_value()).path.rpartition("/")[2]
+            if len(topic) >= NTFY_TOPIC_SECRET_MIN_CHARS and topic not in values:
+                values.append(topic)
         return values
 
     def redacted_items(self) -> list[tuple[str, str]]:

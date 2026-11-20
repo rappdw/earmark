@@ -542,3 +542,14 @@ def test_secret_url_in_settings_secrets() -> None:
     options = _options()
     assert TOPIC_URL in options.secrets
     assert options.host == "ntfy.test"
+
+
+def test_compose_reason_redacts_bare_topic_from_settings() -> None:
+    settings = _settings(ntfy_url=SecretStr("https://ntfy.test/sentinel-topic-404x"))
+    options = NtfyOptions.from_settings(settings)
+    assert options is not None
+    job = _job("failed", error="HTTP 403 for sentinel-topic-404x")
+    result = compose(job, make_episode(), vault_name=None, secrets=options.secrets)
+    assert result is not None
+    assert "Reason: HTTP 403 for **********" in result.message
+    assert "sentinel-topic-404x" not in result.message

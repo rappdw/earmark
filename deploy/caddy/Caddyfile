@@ -1,0 +1,18 @@
+# Example: TLS for earmark on the LAN interface only, certificate from Let's Encrypt
+# through the DNS-01 challenge. Needs a Caddy build with github.com/caddy-dns/cloudflare.
+{
+	# DNS-01 needs no port 80; do not listen on it at all.
+	auto_https disable_redirects
+}
+
+earmark.example.com {
+	# The LAN (or WireGuard) address the DNS record points to. Never 0.0.0.0.
+	bind 192.168.1.10
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+		# Check the challenge record on public DNS, not a local resolver that may
+		# override or filter the zone.
+		resolvers 1.1.1.1
+	}
+	reverse_proxy 127.0.0.1:8787
+}

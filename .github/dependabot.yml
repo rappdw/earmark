@@ -21,3 +21,18 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    target-branch: impl
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # Python 3.14 and uv 0.14 need project changes (requires-python, uv_build bound).
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    groups:
+      images:
+        patterns: ["*"]

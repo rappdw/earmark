@@ -1,0 +1,90 @@
+# docker compose up -d                   the API and the worker
+# docker compose --profile gpu up -d     also a vLLM Whisper server on the GPU (untested)
+# Settings come from .env (copy .env.example). See docs/deploy.md.
+name: earmark
+
+x-earmark: &earmark
+  image: earmark:local
+  build:
+    context: .
+    args:
+      EXTRAS: ${EXTRAS:-transcribe index}
+      UID: ${APP_UID:-1000}
+      GID: ${APP_GID:-1000}
+  env_file: .env
+  environment:
+    # In-container paths win over host paths that .env may hold for a native install.
+    EARMARK_DATA_DIR: /data
+    EARMARK_VAULT_DIR: /vault
+    EARMARK_HOST: 0.0.0.0
+    EARMARK_PORT: "8787"
+    # Empty means unset: models go to the volume (HF_HOME and DATA_DIR defaults).
+    EARMARK_ASR_MODEL_DIR: ""
+    EARMARK_EMBED_MODEL_DIR: ""
+  volumes:
+    - data:/data
+    - ${VAULT_PATH:?set VAULT_PATH in .env to the vault folder on this host}:/vault
+  init: true
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  api:
+    <<: *earmark
+    command: ["serve"]
+    ports:
+      - ${API_BIND:-127.0.0.1:8787}:8787
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *earmark
+    command: ["worker"]
+    # SIGTERM releases the running job back to the queue; this only covers that.
+    stop_grace_period: 2m
+
+  asr:
+    profiles: ["gpu"]
+    image: nvcr.io/nvidia/vllm:26.10-py3@sha256:0a0de9362545e3e062750bec4ad4f722422a04a81182b5258a7deda4325e9313
+    command:
+      - vllm
+      - serve
+      - ${EARMARK_ASR_MODEL:-openai/whisper-large-v3-turbo}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --gpu-memory-utilization
+      - ${ASR_GPU_MEMORY_UTILIZATION:-0.2}
+    environment:
+      VLLM_API_KEY: ${EARMARK_ASR_API_KEY:-}
+      VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: "1024"
+      VLLM_MAX_AUDIO_DECODE_DURATION_S: "14400"
+      VLLM_MAX_AUDIO_DECODE_BYTES: "4294967296"
+      HF_HOME: /models
+    volumes:
+      - asr-models:/models
+    shm_size: 8gb
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  data:
+  asr-models:

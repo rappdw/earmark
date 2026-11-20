@@ -5,8 +5,9 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
-from earmark.config import REDACTED
+from earmark.config import REDACTED, Settings
 from earmark.errors import PermanentError, SkipEpisode, TransientError
 from earmark.fakes import FakeAnalyzer, FakeTranscriber, make_fake_backends
 from earmark.models import Analysis, Episode, Job, Transcript, prompt_hash
@@ -448,3 +449,10 @@ def test_describe_error_scrubs_surrogates() -> None:
     text = describe_error(_raised(ValueError("oops \udfff")))
     assert "\ufffd" in text
     text.encode("utf-8")
+
+
+def test_describe_error_redacts_bare_ntfy_topic() -> None:
+    settings = Settings(_env_file=None, ntfy_url=SecretStr("https://ntfy.test/sentinel-topic-404x"))
+    text = describe_error(PermanentError("bad topic sentinel-topic-404x"), settings.secret_values())
+    assert "sentinel-topic-404x" not in text
+    assert text == f"bad topic {REDACTED}"

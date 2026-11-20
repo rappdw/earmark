@@ -24,6 +24,7 @@ def doctor_secrets(settings: Settings) -> list[str]:
     """Every secret value to redact: the settings' secrets plus the bare ntfy topic.
 
     The full topic URL is a secret, and a server that echoes only the topic must not leak it.
+    `secret_values()` already covers topics of 12 or more characters; doctor adds shorter ones too.
     """
     values = settings.secret_values()
     if settings.ntfy_url is not None:

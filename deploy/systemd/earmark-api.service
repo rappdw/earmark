@@ -1,0 +1,26 @@
+# Example unit for a native install under /srv/earmark (see docs/deploy.md).
+# Settings: /srv/earmark/.env (mode 0600, owned by earmark), read by earmark itself.
+[Unit]
+Description=earmark ingest API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=earmark
+Group=earmark
+WorkingDirectory=/srv/earmark
+Environment=HF_HOME=/srv/earmark/data/huggingface
+ExecStart=/srv/earmark/.venv/bin/earmark serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/earmark/data
+
+[Install]
+WantedBy=multi-user.target
