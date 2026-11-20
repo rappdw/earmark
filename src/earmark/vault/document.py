@@ -16,12 +16,13 @@ from earmark.models import scrub_surrogates
 from earmark.vault.sanitize import yaml_quote
 
 type YamlValue = str | date | datetime | tuple[str, ...] | None  # datetime is naive local
-type NoteKind = Literal["episode", "transcript", "entity"]
+type NoteKind = Literal["episode", "transcript", "entity", "digest"]
 
 BEGIN_MARKER: Final = re.compile(r"<!-- earmark:begin(?: hash=([0-9a-f]{16}))? -->")
 END_MARKER: Final = "<!-- earmark:end -->"
 _KEY_NAME: Final = re.compile(r"[a-z][a-z0-9_]*")
 _KEY_LINE: Final = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:(?:[ \t]|\r?$)")
+_DIGEST_ID: Final = re.compile(r"\d{4}-W\d{2}|\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}")
 _BOM: Final = "\ufeff"
 _LINE_END: Final = "\r\n \t"
 _WIKILINK: Final = re.compile(r"\[\[([^\[\]|\n]*)(\|[^\[\]\n]*)?\]\]")
@@ -99,13 +100,15 @@ def _unquote(value: str) -> str:
 
 def note_identity(text: str) -> tuple[NoteKind, str] | None:
     """``(kind, key)`` from the frontmatter, or None. The key is the ``episode_key`` of an
-    episode or transcript note, or the ``entity_id`` of an entity note."""
+    episode or transcript note, the ``entity_id`` of an entity note, or the ``digest`` id of a
+    digest note."""
     frontmatter = split_note(text).frontmatter
     if frontmatter is None:
         return None
     kind: NoteKind | None = None
     episode_key: str | None = None
     entity_id: str | None = None
+    digest_id: str | None = None
     for line in frontmatter:
         m = _KEY_LINE.match(line)
         if m is None:
@@ -119,10 +122,16 @@ def note_identity(text: str) -> tuple[NoteKind, str] | None:
                 kind = "transcript"
             elif value == "entity":
                 kind = "entity"
+            elif value == "digest":
+                kind = "digest"
         elif name == "episode_key" and episode_key is None and re.fullmatch("[0-9a-f]{20}", value):
             episode_key = value
         elif name == "entity_id" and entity_id is None and re.fullmatch("[0-9a-f]{16}", value):
             entity_id = value
+        elif name == "digest" and digest_id is None and _DIGEST_ID.fullmatch(value):
+            digest_id = value
+    if kind == "digest":
+        return None if digest_id is None else (kind, digest_id)
     if kind == "entity":
         return None if entity_id is None else (kind, entity_id)
     if kind is None or episode_key is None:

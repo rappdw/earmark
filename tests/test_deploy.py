@@ -369,3 +369,29 @@ def test_proxy_token_stays_out_of_earmark() -> None:
     for path in files:
         text = path.read_text()
         assert re.search(r"\bCF_[A-Z_]*TOKEN|CLOUDFLARE", text, re.IGNORECASE) is None, path
+
+
+def test_digest_service_unit() -> None:
+    unit = _parse_unit(ROOT / "deploy" / "systemd" / "earmark-digest.service")
+    service = unit["Service"]
+    assert service["Type"] == ["oneshot"]
+    [exec_start] = service["ExecStart"]
+    assert exec_start.startswith("/srv/earmark/.venv/bin/earmark ")
+    assert exec_start.endswith(" digest")
+    assert service["User"] == ["earmark"]
+    assert service["ProtectSystem"] == ["strict"]
+    assert service["NoNewPrivileges"] == ["yes"]
+    assert service["WorkingDirectory"] == ["/srv/earmark"]
+    write_paths = " ".join(service["ReadWritePaths"]).split()
+    assert "/srv/earmark/data" in write_paths
+    assert len(write_paths) >= 2  # the vault
+    assert "Install" not in unit  # the timer starts it
+    assert "Restart" not in service
+
+
+def test_digest_timer_unit() -> None:
+    unit = _parse_unit(ROOT / "deploy" / "systemd" / "earmark-digest.timer")
+    [calendar] = unit["Timer"]["OnCalendar"]
+    assert calendar.startswith("Mon ")
+    assert unit["Timer"]["Persistent"] == ["true"]
+    assert unit["Install"]["WantedBy"] == ["timers.target"]

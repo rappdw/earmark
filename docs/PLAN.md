@@ -29,7 +29,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 15 | Notifications and doctor | 05 | done |
 | 16 | Deployment and Shortcut docs | 06–15 | done |
 | 17 | Extension: re-run a prompt | 10, 12 | done |
-| 18 | Extension: weekly digest | 10, 12 | todo |
+| 18 | Extension: weekly digest | 10, 12 | done |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real

@@ -196,3 +196,12 @@ def test_entity_link_hook() -> None:
 def test_no_linker_unchanged() -> None:
     assert render_analysis(_sample()) == render_analysis(_sample(), entity_link=None)
     assert "- **Ada**: ctx [00:00:05]" in render_analysis(_sample())
+
+
+def test_escape_block_start() -> None:
+    from earmark.analyze.render import escape_block_start
+
+    for text in ("- a", "> a", "# a", "1. a", "---", "+ a", "* a", "= ", "2) a"):
+        assert escape_block_start(text) == "\\" + text, text
+    for text in ("plain", "a - b", "-a", "1.5 a", ""):
+        assert escape_block_start(text) == text, text

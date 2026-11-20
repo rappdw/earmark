@@ -47,13 +47,18 @@ Earmark/
   Podcasts/<Show>/<YYYY-MM-DD> <Title>.md
   Podcasts/<Show>/transcripts/<YYYY-MM-DD> <Title> (transcript).md
   Entities/{People,Papers,Companies,Tools,Topics}/<Name>.md
+  Digests/<year>-W<week>.md
   Backups/
   aliases.yaml          optional, yours: entity merges
 ```
 
 See "Data layout" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Planned: a weekly digest ([docs/PLAN.md](docs/PLAN.md)).
+**Weekly digest.** `earmark digest` writes `Digests/<year>-W<week>.md`: the research leads
+of the episodes first shared that week, grouped into themes by the LLM. Each lead links to
+its episode note and to its moment in the transcript note. `--week 2026-W47` picks a week
+and `--since 7d` the last seven days. Running it again with nothing new makes no LLM call
+and changes nothing. Scheduling is in [docs/deploy.md](docs/deploy.md).
 
 ## Quickstart (fake backends)
 
@@ -88,6 +93,9 @@ uv run earmark reanalyze "$(ls "$demo/data/episodes")" --prompt "Who is intervie
 uv run earmark worker --once
 curl -s http://127.0.0.1:8787/episodes -H "Authorization: Bearer $EARMARK_API_TOKEN"
 cat "$demo"/vault/Earmark/Podcasts/*.md
+uv run earmark digest --since 7d
+uv run earmark digest --since 7d
+cat "$demo"/vault/Earmark/Digests/*.md
 kill %1
 wait
 ```
@@ -103,6 +111,8 @@ What you see:
 - The reanalyze prints a second job id, and `worker --once` prints it as `done`.
 - `GET /episodes` shows both prompts.
 - The fake note's Markdown, with a section for each prompt.
+- The first `earmark digest --since 7d` writes the digest note, and the second says it is up
+  to date. The note groups the research leads by show.
 
 The episode URL is never fetched, because the resolver is fake. `kill %1` stops the
 server, and `wait` lets it finish shutting down. Everything lives in a temporary
@@ -138,6 +148,7 @@ Run them as `uv run earmark <command>`.
 | `analyze <key> [--prompt] [--json]` | Analyze an episode's stored transcript and print the analysis. |
 | `episodes [--limit] [--offset] [--json]` | List stored episodes, newest share first, with the prompts already run. |
 | `reanalyze <key> [--prompt]` | Run a prompt on a stored episode: enqueue a job that starts at analysis. |
+| `digest [--week] [--since] [--refresh] [--no-notify]` | Write the digest note for a week (default: the last complete ISO week). |
 | `entities rebuild [--prune]` | Rebuild the entity notes from the stored analyses. |
 | `search QUERY [--limit] [--kind] [--episode] [--json]` | Search transcripts and analyses of processed episodes. |
 | `reindex [--episode KEY]` | Rebuild the search index from the episode files and the vault's notes. |

@@ -8,10 +8,12 @@ builder imports its heavy modules inside the function, never at module top.
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings, env_var
+from earmark.digest.cache import DigestCache
+from earmark.digest.model import DigestWriter, Themer
 from earmark.fakes import (
     FakeAnalyzer,
     FakeAudioFetcher,
@@ -20,6 +22,7 @@ from earmark.fakes import (
     FakeResolver,
     FakeSearcher,
     FakeStore,
+    FakeThemer,
     FakeTranscriber,
 )
 from earmark.index.rebuild import NoteLocator
@@ -38,6 +41,9 @@ from earmark.pipeline.stages import (
     Transcriber,
 )
 from earmark.pipeline.worker import Worker, heartbeat_interval
+
+if TYPE_CHECKING:
+    from earmark.notify.ntfy import NtfyClient
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +118,22 @@ def _lancedb_searcher(settings: Settings) -> Searcher:
     return build_lancedb_index(settings, allow_download=False)
 
 
+def _anthropic_themer(settings: Settings, cache: DigestCache) -> Themer:
+    from earmark.analyze.llm.anthropic import AnthropicClient, AnthropicOptions
+    from earmark.digest.themes import LlmThemer
+
+    client = AnthropicClient(AnthropicOptions.from_settings(settings))
+    return LlmThemer(client, cache, repair_invalid_json=False)
+
+
+def _openai_compat_themer(settings: Settings, cache: DigestCache) -> Themer:
+    from earmark.analyze.llm.openai_compat import OpenAICompatClient, OpenAICompatOptions
+    from earmark.digest.themes import LlmThemer
+
+    client = OpenAICompatClient(OpenAICompatOptions.from_settings(settings))
+    return LlmThemer(client, cache, repair_invalid_json=True)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -148,6 +170,13 @@ NOTIFIERS: Final[Mapping[str, Builder[Notifier | None]]] = {
     "fake": lambda ctx: FakeNotifier(),
     "none": lambda ctx: None,
     "ntfy": _ntfy_notifier,
+}
+
+
+THEMERS: Final[Mapping[str, Callable[[Settings, DigestCache], Themer]]] = {
+    "anthropic": _anthropic_themer,
+    "openai_compat": _openai_compat_themer,
+    "fake": lambda settings, cache: FakeThemer(),
 }
 
 
@@ -216,6 +245,43 @@ def build_analyzer(settings: Settings, *, clock: Clock = utc_now) -> Analyzer:
         raise ConfigError(problems)
     ctx = BuildContext(settings=settings, artifacts=ArtifactStore(settings.data_dir), clock=clock)
     return builder(ctx)
+
+
+def build_themer(settings: Settings, cache: DigestCache) -> Themer:
+    """Build only the digest themer (for ``earmark digest``). Makes no request."""
+    builder = THEMERS.get(settings.llm_provider)
+    if builder is None:
+        choices = ", ".join(sorted(THEMERS))
+        raise ConfigError(
+            [
+                f"{env_var('llm_provider')}: backend {settings.llm_provider!r} is not built "
+                f"into this version of earmark (choose one of: {choices})"
+            ]
+        )
+    return builder(settings, cache)
+
+
+def build_digest_writer(settings: Settings) -> DigestWriter:
+    """The store that writes the digest note: ``vault`` or ``fake``."""
+    if settings.store_backend == "vault":
+        from earmark.vault.notes import build_vault_store
+
+        return build_vault_store(settings)
+    if settings.store_backend == "fake":
+        return FakeStore(settings.vault_dir, settings.vault_subdir)
+    raise ConfigError(
+        [f"{env_var('store_backend')}: backend {settings.store_backend!r} is not built"]
+    )
+
+
+def build_digest_notifier(settings: Settings) -> "NtfyClient | None":
+    """An ntfy client only with ``NOTIFY_BACKEND=ntfy`` and ``NTFY_URL`` set. No request."""
+    if settings.notify_backend != "ntfy":
+        return None
+    from earmark.notify.ntfy import NtfyClient, NtfyOptions
+
+    options = NtfyOptions.from_settings(settings)
+    return None if options is None else NtfyClient(options)
 
 
 def build_searcher(settings: Settings) -> Searcher | None:

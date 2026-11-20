@@ -602,3 +602,57 @@ def test_compose_ingest_unchanged_for_kind() -> None:
         "https://podcasts.apple.com/us/podcast/x/id1?i=2\n"
         "Stage: transcribe\nReason: asr server said no\nGave up after 4 attempts."
     )
+
+
+# -- digest notification ------------------------------------------------------------------
+
+
+def test_compose_digest_title_message_link() -> None:
+    note = ntfy.compose_digest(
+        label="2026-W47",
+        note_path="Earmark/Digests/2026-W47.md",
+        episodes=3,
+        leads=1,
+        themes=2,
+        vault_name="My Vault",
+    )
+    assert note.title == "Digest ready: 2026-W47"
+    assert note.message == "3 episodes · 1 research lead · 2 themes"
+    assert note.tags == ("newspaper",)
+    assert note.priority == 3
+    assert note.click == "obsidian://open?vault=My%20Vault&file=Earmark%2FDigests%2F2026-W47.md"
+
+
+def test_compose_digest_no_vault_name_has_note_line() -> None:
+    note = ntfy.compose_digest(
+        label="2026-11-14 to 2026-11-20",
+        note_path="Earmark/Digests/2026-11-14 to 2026-11-20.md",
+        episodes=1,
+        leads=0,
+        themes=0,
+        vault_name=None,
+    )
+    assert note.click is None
+    assert note.message.splitlines() == [
+        "1 episode · 0 research leads · 0 themes",
+        "Note: Earmark/Digests/2026-11-14 to 2026-11-20.md",
+    ]
+
+
+def test_compose_digest_cleans_and_redacts() -> None:
+    note = ntfy.compose_digest(
+        label=f"=?utf-8?q?x?= {TOKEN}\n\x07",
+        note_path=f"Earmark/{TOKEN}/d.md\r\n",
+        episodes=1,
+        leads=1,
+        themes=1,
+        vault_name=None,
+        secrets=(TOKEN,),
+    )
+    assert TOKEN not in note.title
+    assert TOKEN not in note.message
+    assert "=?" not in note.title
+    assert "\n" not in note.title
+    assert "\r" not in note.message
+    assert len(note.title.encode()) <= ntfy.TITLE_MAX_BYTES
+    assert note.payload("t")["tags"] == ["newspaper"]

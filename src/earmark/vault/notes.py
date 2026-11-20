@@ -20,7 +20,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import date, datetime, tzinfo
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,7 @@ from earmark.analyze.render import EntityLinker, render_analysis
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
 from earmark.db import Database, DatabaseSetupError, database_path, open_database
+from earmark.digest.model import DigestNote, DigestWriteResult
 from earmark.errors import EarmarkError, PermanentError, TransientError
 from earmark.index.chunks import NotePaths
 from earmark.models import (
@@ -97,6 +98,8 @@ LOCK_TIMEOUT_S: Final = 60.0
 SCAN_HEAD_BYTES: Final = 64 * 1024
 BACKUPS_DIR: Final = "Backups"
 PODCASTS_DIR: Final = "Podcasts"
+DIGESTS_DIR: Final = "Digests"
+_DIGEST_FALLBACK_SUFFIX: Final = " (digest)"
 TRANSCRIPTS_DIR: Final = "transcripts"
 _SCAN_DEPTH: Final = 16
 _ATTEMPTS: Final = 3
@@ -466,6 +469,12 @@ class VaultStore:
                 found[key] = NotePaths(note, transcript)
         return found
 
+    def write_digest(self, note: DigestNote, /) -> DigestWriteResult:
+        """Create or update the digest note under the vault lock. Its links come from the
+        paths found by the same scan, so they match the vault it writes into."""
+        run = _Run()
+        return self._guard(run, lambda: self._write_digest(run, note))
+
     # -- errors ---------------------------------------------------------------------------
 
     def _guard[T](self, run: _Run, fn: Callable[[], T]) -> T:
@@ -523,6 +532,67 @@ class VaultStore:
             transcript_note_path=tr_path,
             warnings=tuple(dict.fromkeys(run.warnings)),
         )
+
+    def _write_digest(self, run: _Run, note: DigestNote) -> DigestWriteResult:
+        with ExitStack() as stack:
+            root = stack.enter_context(self._vault.open_subdir())
+            run.where = self._path(())
+            ctx = _Ctx(run, _Dirs(root, stack), self._scan(root))
+
+            def smallest(kind: NoteKind, key: str) -> str | None:
+                found_paths = ctx.snapshot.get((kind, key))
+                return self._path(min(found_paths, key="/".join)) if found_paths else None
+
+            paths: dict[str, NotePaths] = {}
+            for key in note.episode_keys:
+                episode_path, transcript_path = (
+                    smallest("episode", key),
+                    smallest("transcript", key),
+                )
+                if episode_path is not None or transcript_path is not None:
+                    paths[key] = NotePaths(episode_path, transcript_path)
+
+            candidate = (DIGESTS_DIR, f"{note.file_stem}.md")
+            found = ctx.snapshot.get(("digest", note.digest_id), [])
+            picked = self._pick("digest", found, candidate, note.digest_id, run, "digest")
+            loc = None if picked is None else self._verify(ctx, picked, "digest", note.digest_id)
+            existing = loc is not None
+            if loc is None:
+                directory = ctx.dirs.open((DIGESTS_DIR,), create=True)
+                if directory is None:  # pragma: no cover  # create=True never returns None
+                    raise TransientError("the vault changed while it was being written; try again")
+                dir_parts = directory.rel.parts
+                run.where = self._path(dir_parts)
+                used = {fold_key(e.name) for e in directory.entries()}
+                name = next(
+                    (
+                        n
+                        for n in (
+                            f"{note.file_stem}.md",
+                            f"{note.file_stem}{_DIGEST_FALLBACK_SUFFIX}.md",
+                        )
+                        if fold_key(n) not in used and is_safe_component(n)
+                    ),
+                    None,
+                )
+                if name is None:
+                    raise PermanentError(
+                        f"no free note name for digest {note.digest_id} in {self._path(dir_parts)}"
+                    )
+                loc = _Located(directory, dir_parts, name)
+            loc.directory.remove_stale_temps(now=self._now())
+            region = note.render(paths)
+            wrote = self._write_note(
+                ctx, loc, "digest", note.digest_id, note.owned, note.seeds, region, create=True
+            )
+            status: Literal["created", "updated", "unchanged"] = (
+                ("updated" if existing else "created") if wrote else "unchanged"
+            )
+            return DigestWriteResult(
+                note_path=self._path(loc.parts),
+                status=status,
+                warnings=tuple(dict.fromkeys(run.warnings)),
+            )
 
     def _rebuild(self, run: _Run, *, prune: bool) -> RebuildReport:
         registry = self._registry()

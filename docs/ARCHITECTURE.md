@@ -64,7 +64,8 @@ src/earmark/
   episodes.py          stored episodes: list_episodes (GET /episodes, `earmark episodes`),
                        require_transcript and enqueue_reanalyze (POST /episodes/{key}/analyze,
                        `earmark reanalyze`); reads artifacts only (step 17)
-  fakes.py             fake backend for every stage (tests and smoke runs)
+  fakes.py             fake backend for every stage (tests and smoke runs); FakeThemer and
+                       FakeStore.write_digest for digests (step 18)
   cli.py               `earmark` entry point
   api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
   pipeline/
@@ -93,7 +94,8 @@ src/earmark/
   vault/               sanitize.py (file names, fold keys, Markdown and YAML escaping), fs.py
                        (Vault, VaultDir: fd-based symlink-refusing I/O, vault_lock), document.py
                        (frontmatter emit/merge/identity, managed regions), notes.py
-                       (VaultStore, the `vault` Store; step 12), entities.py (kinds,
+                       (VaultStore, the `vault` Store; step 12; write_digest, the `vault`
+                       DigestWriter, step 18), entities.py (kinds,
                        entity ids, mentions, EntityRegistry over SQLite, entity note
                        rendering; step 13), aliases.py (aliases.yaml parsing; step 13)
   index/               search.py (SearchQuery, SearchHit, SearchResults, the Searcher Protocol,
@@ -106,10 +108,18 @@ src/earmark/
   doctor/              report.py (CheckResult, render, exit code), checks.py (offline checks),
                        online.py (--online reachability checks), __init__.py (run_doctor,
                        Probes); `earmark doctor` (step 15)
+  digest/              window.py (DigestWindow, --week/--since parsing, local midnights),
+                       model.py (digest types; the Themer and DigestWriter Protocols),
+                       collect.py (episodes and leads in a window, input hash), prompts.py
+                       (theme prompts and schema, DIGEST_SCHEMA_VERSION), themes.py
+                       (LlmThemer: one request, or batches merged level by level), cache.py
+                       (DigestCache), render.py (the digest note region), run.py
+                       (run_digest); `earmark digest` (step 18)
 tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS, and
                        share_sheet.json (real iOS share-sheet captures, added by hand)
 Dockerfile, .dockerignore, compose.yaml    the container image and services (step 16)
-deploy/systemd/        example units for a native install (step 16)
+deploy/systemd/        example units for a native install (step 16); the digest service and
+                       weekly timer (step 18)
 ```
 
 ## Domain models
@@ -740,6 +750,9 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
   - ntfy `GET /v1/health` and, with a token, `GET /v1/account`.
 
   Doctor never publishes a notification.
+- **Digest notifications** (step 18) come from `earmark digest`, not from the `Notifier`:
+  `compose_digest` builds `Digest ready: <label>` with counts and the note link, cleaned like
+  job notifications, and `NtfyClient.publish` sends it once.
 - **Redaction.** Details never contain secret values, their prefixes, or their lengths.
   Endpoints appear as host labels only, and server error text goes through
   `endpoint.error_detail`. Every line is passed through `log.redact` with all `Settings`
@@ -771,6 +784,86 @@ Step 17; exact rules in `docs/steps/17-reanalyze.md` section 5.
   job)`), like `earmark submit`. **`earmark episodes [--limit] [--offset] [--json]`**
   prints one line per episode (key, date in `TZ`, show — title), one per analysis (hash,
   model, prompt), and a paging footer, or the `EpisodePage` JSON.
+
+### Digest
+
+Step 18; exact rules in `docs/steps/18-digest.md` sections 4 and 5. A CLI command only; the
+worker never runs it.
+
+- **Window.** Episodes are selected by their first share time (`shared.json`), as instants:
+  `start <= first_shared_at < end`, start inclusive, end exclusive. Both bounds are local
+  midnights in `TZ`: the wall-clock 00:00 with `fold=0`, which is the first instant of the
+  day across DST gaps and repeats.
+  - `--week 2026-W47` is that ISO week, Monday to Monday.
+  - No option means the last complete ISO week.
+  - `--since Nd` (1–366) is the N local calendar days ending today, today included:
+    `[midnight(today − N + 1), midnight(today + 1))`.
+- **Leads.** Every readable analysis of each episode in the window contributes, oldest
+  first, its `research_leads`, deduplicated within the episode by `entity_key(text)`.
+  - Episodes are ordered by `(first_shared_at, key)`, and leads get ids `L1…Ln` in that
+    order.
+  - Unreadable files are skipped with a warning.
+  - An episode without analyses is listed and adds no leads.
+- **Themes.** `Themer.themes(ThemeRequest) -> ThemeRecord`. `LlmThemer` runs on the
+  configured `LLMClient` (`anthropic` or `openai_compat`, built by
+  `factory.build_themer`), through `analyze.calls.ModelCaller`, so the fit check, the
+  `max_tokens` retry, refusals, and repair behave as in analysis.
+  - One request carries the constant `DIGEST_SYSTEM_PROMPT`, the leads as escaped
+    `<item id="L…">` sections, and a fixed schema (`themes: [{title, summary, items}]`,
+    no per-request enum).
+  - The answer is validated in code: ids not offered are ignored, an id placed twice
+    stays in its first theme, and unplaced leads go to "Other leads". Each case is counted
+    in a warning.
+  - When the leads do not fit one request, they are packed into batches (estimated, then
+    counted and halved until each fits). The batches' themes are merged by further
+    requests, level by level, until one request holds them.
+  - A level that does not shrink, a single lead too long for a request, or a part budget
+    under 1024 tokens is a `PermanentError`. Nothing is truncated.
+  - `fake` is `FakeThemer`: one theme per show.
+- **Cache.** `DATA_DIR/digests/<input_hash>.json` (`ThemeRecord`) is keyed by
+  `sha256({v: DIGEST_SCHEMA_VERSION, model, leads: [[id, key, text, rationale, show,
+  title], …]})[:16]`. It is read before any model request, so a rerun with the same inputs
+  makes no request at all (not even a token count).
+  - Answers of an unfinished multi-request run are kept under
+    `digests/<input_hash>.calls/` until the record is written.
+  - `--refresh` bypasses both.
+  - The prompts and schema are pinned to `DIGEST_SCHEMA_VERSION` by a fingerprint test.
+- **Note.** `DigestWriter.write_digest(DigestNote)`: the `vault` store's
+  `VaultStore.write_digest`, or `FakeStore.write_digest` for `fake`.
+  - Under `vault.lock` it scans the subdir, takes every episode's episode-note and
+    transcript-note paths from that scan (smallest path among duplicates), and renders
+    the region from them. Every link is code-built from a path that exists.
+  - It then writes `Digests/<file stem>.md` through `_write_note`: owned frontmatter,
+    managed region, backups of hand edits, user text kept.
+  - An existing note is found by identity first. A fold-equal name taken by a non-digest
+    file gets ` (digest)`.
+  - The region has the title, a counts line, one `##` section per theme (escaped title,
+    escaped summary, one line per lead), "Other leads", "Episodes", and a details callout
+    with no run time.
+  - Each lead line links the episode note (`note_link`) and, when the lead has a
+    timestamp, the transcript note labelled `HH:MM:SS`. Episodes without a note found
+    are plain text.
+  - Model text (titles, summaries, lead text) goes through `escape_markdown` (summaries
+    also through `render.escape_block_start`), so it cannot form a link, a block, or a
+    marker.
+- **Empty window.** No episodes means no themer call, no vault access, and no note. No
+  leads means no themer call, and the note lists the episodes.
+- **Notification.** A created or changed digest is published once through
+  `NtfyClient.publish` when ntfy is configured, unless `--no-notify`:
+  - title `Digest ready: <label>`;
+  - counts only;
+  - tag `newspaper`;
+  - the `obsidian://` link.
+
+  A failure is a warning.
+- **`earmark digest [--week YYYY-Www | --since Nd] [--refresh] [--no-notify]`.**
+  - Prints one line: `wrote <path>: …`, `<path> is up to date: …`, or `no episodes were
+    first shared in <label> …; nothing written`. Warnings go to stderr.
+  - Exits 0 on success, including an empty window and damaged markers. Exits 1 on model,
+    vault, or data errors, and 2 on bad options or configuration.
+- **Scheduling.** `deploy/systemd/earmark-digest.timer` (Mondays 07:00, `Persistent=true`)
+  starts the oneshot `earmark-digest.service`. Under compose, a host timer or cron runs
+  `docker compose run --rm --no-deps worker digest` (`docs/deploy.md` section 14).
 
 ## Jobs
 
@@ -833,6 +926,10 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
     analyses/<prompt_hash>.json   16 hex chars over prompt + model + schema version
     analyses/<prompt_hash>.parts/<part_id>.json   map answers of an unfinished map-reduce
                                 (step 11); removed when the analysis is written
+  digests/<input_hash>.json     ThemeRecord: the themes of one digest input (step 18, derived;
+                                safe to delete, the next run asks the model again)
+  digests/<input_hash>.calls/<call_id>.json   answers of an unfinished multi-request digest;
+                                removed when the record is written
   index.lock                    flock held while a process writes the search index (step 14)
   lancedb/chunks.lance/         the search index (step 14, derived: `earmark reindex`);
                                 created by the first index write, never by a search
@@ -848,7 +945,10 @@ $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in 
                                 inside its markers were replaced (step 12)
   Entities/{People,Papers,Companies,Tools,Topics}/<Name>.md   one note per entity (step 13);
                                 a taken name gets ` (<entity_id[:8]>)`, then ` (<entity_id>)`
-  Digests/<ISO-year>-W<week>.md
+  Digests/<ISO-year>-W<week>.md      weekly digest (step 18), e.g. 2026-W47.md; ISO year and
+                                zero-padded week
+  Digests/<YYYY-MM-DD> to <YYYY-MM-DD>.md   a `--since Nd` digest (first and last local day);
+                                a taken name gets ` (digest)`
   aliases.yaml                  optional, user-maintained entity merges (step 13); earmark
                                 reads it and never writes it
 ```
@@ -874,7 +974,9 @@ The transcript note is named after the episode note's actual stem, plus
 in its frontmatter, by scanning the subdir (not `Backups/`, dot entries, or symlinks).
 So a note keeps its first path when the episode is retitled, and the user may rename or
 move it anywhere in the subdir. Duplicates (sync conflict copies) give a warning; the
-candidate-named or smallest path is updated.
+candidate-named or smallest path is updated. Entity notes are found by `earmark: entity` and
+`entity_id` (step 13), and digest notes by `earmark: digest` and `digest`, whose value is
+`YYYY-Www` or `YYYY-MM-DD..YYYY-MM-DD` (step 18; `NoteKind` includes `digest`).
 
 **Notes.** One note per episode, regenerated from artifacts on every store, so storing
 twice produces the same bytes (and writes nothing).
@@ -1071,7 +1173,9 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   `/srv/earmark/.venv/bin/earmark serve|worker` as user `earmark`, with
   `WorkingDirectory=/srv/earmark` (where `.env` is read), `KillSignal=SIGTERM`,
   `ProtectSystem=strict`, and `ReadWritePaths` for the data directory (and the vault for
-  the worker).
+  the worker). `earmark-digest.service` (`Type=oneshot`, `earmark digest`, the worker's
+  hardening and paths, no `[Install]`) is started by `earmark-digest.timer`
+  (`OnCalendar=Mon *-*-* 07:00:00`, `Persistent=true`, `WantedBy=timers.target`; step 18).
 - **Not verified.** No container has run in the build sandbox (no Docker). CI builds the
   image and runs only one-off commands in it. The `gpu` profile has never been built or
   run. A CUDA build of CTranslate2 in the image is documented in `docs/deploy.md` as an
@@ -1175,7 +1279,11 @@ and writes into a vault the user cares about.
   analysis call has no tools; the fixed system prompt tells the model that metadata and
   transcript are material, never instructions; untrusted sections have `<` and `>`
   escaped; the answer is validated against a schema before anything is written, and
-  rendered with `<` escaped. With `LLM_FALLBACKS=true` a refused request is re-run by
+  rendered with `<` escaped. The digest request (step 18) follows the same rules: a constant
+  system prompt, escaped `<item>` sections, a fixed schema, no tools. Its answer can only
+  name lead ids that code offered (others are ignored). Its titles and summaries are
+  Markdown-escaped, and every link in the digest note is built by code from vault paths,
+  never from model output. With `LLM_FALLBACKS=true` a refused request is re-run by
   Anthropic on another Claude model, recorded as an analysis warning. The Anthropic API is
   an operator endpoint reached by the SDK's own httpx2 client, not through `fetch.py`
   (base URL from the SDK default or `ANTHROPIC_BASE_URL`; the SDK honours proxy
@@ -1218,7 +1326,8 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   `$SLOW_TEST_CACHE` (default `~/.cache/earmark-tests`), then transcribes it on CPU.
   Needs the `transcribe` extra and fails (does not skip) without it.
 - `llm`: calls the real analysis model (`tests/test_analyze_live.py`: a short synthetic
-  transcript, effort `low`, about two requests). Needs `ANTHROPIC_API_KEY` or an `ant
+  transcript, effort `low`, about two requests; `tests/test_digest_live.py`, step 18: eight
+  fixed leads grouped into themes, about two requests). Needs `ANTHROPIC_API_KEY` or an `ant
   auth login` profile and fails (does not skip) without one. For every test without this
   marker, `tests/conftest.py` deletes all `ANTHROPIC_*` variables and points
   `ANTHROPIC_CONFIG_DIR` at an empty directory, so a developer's key, profile, or base URL

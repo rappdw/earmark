@@ -16,11 +16,16 @@ def _escape_inline(text: str) -> str:
     return text.replace("<", "&lt;")
 
 
+def escape_block_start(text: str) -> str:
+    """Backslash-escape ``text`` when its start would open a block (list, quote, heading,
+    rule). Other text is returned unchanged."""
+    if _BLOCK_SYNTAX.match(text):
+        return "\\" + text
+    return text
+
+
 def _escape_block(paragraph: str) -> str:
-    escaped = _escape_inline(paragraph)
-    if _BLOCK_SYNTAX.match(escaped):
-        return "\\" + escaped
-    return escaped
+    return escape_block_start(_escape_inline(paragraph))
 
 
 def _collapse(text: str) -> str:

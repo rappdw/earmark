@@ -364,3 +364,23 @@ def test_readme_http_api_lists_every_route(tmp_path: Path) -> None:
     }
     assert actual
     assert _readme_routes() == actual
+
+
+def test_deploy_doc_digest_section() -> None:
+    text = read_doc("docs/deploy.md")
+    start = text.index("## 14. Weekly digest")
+    section = text[start : text.index("\n## ", start + 1)]
+    assert "earmark-digest.timer" in section
+    assert "docker compose run --rm --no-deps worker digest" in section
+    assert "EARMARK_TZ" in section
+    assert "systemctl enable --now earmark-digest.timer" in section
+    assert text.index("## 15. Backups and upgrades") > start
+    assert "## 16. Troubleshooting" in text
+
+
+def test_readme_documents_digest() -> None:
+    text = read_doc("README.md")
+    assert "Planned: a weekly digest" not in text
+    assert "**Weekly digest.**" in text
+    assert "Digests/<year>-W<week>.md" in text
+    assert "earmark digest --since 7d" in _quickstart()

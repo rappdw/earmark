@@ -1,0 +1,22 @@
+# Example unit for a native install under /srv/earmark (see docs/deploy.md, "Weekly digest").
+# Started by earmark-digest.timer. A failed run is retried by hand with
+# `systemctl start earmark-digest` or `earmark digest --week 2026-W47`.
+# Settings: /srv/earmark/.env (mode 0600, owned by earmark), read by earmark itself.
+[Unit]
+Description=earmark weekly digest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=earmark
+Group=earmark
+WorkingDirectory=/srv/earmark
+ExecStart=/srv/earmark/.venv/bin/earmark digest
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Replace the second path with your vault folder (EARMARK_VAULT_DIR).
+ReadWritePaths=/srv/earmark/data /home/you/Obsidian/Vault
+TimeoutStartSec=1h

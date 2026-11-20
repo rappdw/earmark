@@ -59,6 +59,7 @@ REANALYZE_TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
     "failed": "Analysis failed",
     "skipped": "Analysis skipped",
 }
+DIGEST_TAG: Final = "newspaper"
 DEFAULT_ANALYSIS_LINE: Final = "Default analysis"
 UNKNOWN_EPISODE: Final = "podcast episode"
 UNKNOWN_SHOW: Final = "Apple Podcasts episode"
@@ -189,6 +190,42 @@ def compose(
         message=redact(message, secrets),
         tags=(TAGS[status],),
         priority=PRIORITY_HIGH if status == "failed" else PRIORITY_DEFAULT,
+        click=click,
+    )
+
+
+def compose_digest(
+    *,
+    label: str,
+    note_path: str,
+    episodes: int,
+    leads: int,
+    themes: int,
+    vault_name: str | None,
+    secrets: Sequence[str] = (),
+) -> Notification:
+    """The notification for a written digest: the label, counts, and the note link. No lead,
+    theme, or model text goes into it."""
+
+    def field(text: str, limit: int) -> str:
+        return clean_field(redact(text, secrets), limit)
+
+    def count(n: int, noun: str) -> str:
+        return f"{n} {noun}{'' if n == 1 else 's'}"
+
+    title = fit_bytes(f"Digest ready: {field(label, NAME_MAX_BYTES)}", TITLE_MAX_BYTES)
+    lines = [
+        f"{count(episodes, 'episode')} · {count(leads, 'research lead')} · {count(themes, 'theme')}"
+    ]
+    click = obsidian_url(vault_name, note_path) if vault_name else None
+    if click is None:
+        lines.append(f"Note: {field(note_path, LINE_MAX_BYTES)}")
+    message = fit_bytes("\n".join(lines), MESSAGE_MAX_BYTES)
+    return Notification(
+        title=redact(title, secrets),
+        message=redact(message, secrets),
+        tags=(DIGEST_TAG,),
+        priority=PRIORITY_DEFAULT,
         click=click,
     )
 

@@ -320,3 +320,56 @@ def test_fake_backends_as_backends(tmp_path: Path) -> None:
     assert b.store is fb.store
     assert b.indexer is fb.indexer
     assert b.notifier is fb.notifier
+
+
+# -- digest fakes ------------------------------------------------------------------------------
+
+
+def test_fake_themer_one_theme_per_show() -> None:
+    from earmark.digest.model import DigestLead, ThemeRequest
+    from earmark.fakes import FakeThemer
+    from tests.factories import make_episode
+
+    a = make_episode(guid="a").model_copy(update={"show_title": "Show A"})
+    b = make_episode(guid="b").model_copy(update={"show_title": "Show B"})
+    leads = (
+        DigestLead("L1", b.key, "x", "", None),
+        DigestLead("L2", a.key, "y", "", None),
+        DigestLead("L3", b.key, "z", "", None),
+    )
+    themer = FakeThemer()
+    record = themer.themes(ThemeRequest("0" * 16, leads, {a.key: a, b.key: b}))
+    assert themer.model == "fake-themes"
+    assert [(t.title, t.leads) for t in record.themes] == [
+        ("Show B", ("L1", "L3")),
+        ("Show A", ("L2",)),
+    ]
+    assert record.themes[0].summary == "Research leads from Show B."
+    assert (record.requests, record.warnings) == (0, ())
+    assert themer.call_count == 1
+    themer.fail_next(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        themer.themes(ThemeRequest("0" * 16, leads, {a.key: a, b.key: b}))
+
+
+def test_fake_store_write_digest_statuses(tmp_path: Path) -> None:
+    from earmark.digest.model import DigestNote
+    from earmark.fakes import FakeStore
+
+    text = ["one"]
+    note = DigestNote(
+        "2026-W47",
+        "2026-W47",
+        (("earmark", "digest"),),
+        (),
+        ("a" * 20,),
+        lambda paths: f"{text[0]} {sorted(paths)}\n",
+    )
+    store = FakeStore(tmp_path, "Earmark")
+    first = store.write_digest(note)
+    assert (first.status, first.note_path) == ("created", "Earmark/Digests/2026-W47.md")
+    assert store.write_digest(note).status == "unchanged"
+    text[0] = "two"
+    assert store.write_digest(note).status == "updated"
+    assert len(store.digest_calls) == 3
+    assert FakeStore().write_digest(note).status == "unchanged"

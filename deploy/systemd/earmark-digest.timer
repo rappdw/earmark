@@ -1,0 +1,12 @@
+# Example timer for earmark-digest.service (see docs/deploy.md, "Weekly digest").
+# The host time zone should equal EARMARK_TZ.
+[Unit]
+Description=Weekly earmark digest
+
+[Timer]
+OnCalendar=Mon *-*-* 07:00:00
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

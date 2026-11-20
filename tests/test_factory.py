@@ -17,6 +17,7 @@ from earmark.fakes import (
     FakeResolver,
     FakeSearcher,
     FakeStore,
+    FakeThemer,
     FakeTranscriber,
 )
 from earmark.ingest import enqueue_ingest
@@ -456,3 +457,100 @@ def test_openai_compat_config_error_touches_nothing(tmp_path: Path) -> None:
         "EARMARK_LLM_MODEL",
     ]
     assert not (tmp_path / "data").exists()
+
+
+# -- digest builders ---------------------------------------------------------------------------
+
+
+def test_themers_cover_every_llm_provider() -> None:
+    assert set(factory.THEMERS) == set(typing.get_args(config.LlmProvider))
+
+
+def test_build_themer_fake(tmp_path: Path) -> None:
+    from earmark.digest.cache import DigestCache
+
+    settings = _fake_settings(tmp_path)
+    themer = factory.build_themer(settings, DigestCache(tmp_path / "data"))
+    assert isinstance(themer, FakeThemer)
+    assert not (tmp_path / "data").exists()
+
+
+def test_build_themer_anthropic_without_credential_config_error(tmp_path: Path) -> None:
+    from earmark.digest.cache import DigestCache
+
+    settings = _fake_settings(tmp_path, llm_provider="anthropic")
+    with pytest.raises(ConfigError):
+        factory.build_themer(settings, DigestCache(tmp_path / "data"))
+
+
+def test_build_themer_anthropic_with_credential(tmp_path: Path) -> None:
+    from earmark.analyze.llm.anthropic import AnthropicClient
+    from earmark.digest.cache import DigestCache
+    from earmark.digest.themes import LlmThemer
+
+    settings = _fake_settings(
+        tmp_path, llm_provider="anthropic", llm_api_key=SecretStr("sk-x"), llm_model="claude-x"
+    )
+    themer = factory.build_themer(settings, DigestCache(tmp_path / "data"))
+    try:
+        assert isinstance(themer, LlmThemer)
+        assert themer.model == "claude-x"
+        assert isinstance(themer._client, AnthropicClient)
+    finally:
+        themer.close()
+
+
+def test_build_themer_openai_compat_requires_base_url(tmp_path: Path) -> None:
+    from earmark.digest.cache import DigestCache
+
+    settings = _fake_settings(tmp_path, llm_provider="openai_compat")
+    with pytest.raises(ConfigError) as info:
+        factory.build_themer(settings, DigestCache(tmp_path / "data"))
+    assert any("EARMARK_LLM_BASE_URL" in line for line in info.value.errors)
+
+
+def test_build_themer_unbuilt_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.digest.cache import DigestCache
+
+    monkeypatch.setattr(factory, "THEMERS", {"fake": factory.THEMERS["fake"]})
+    settings = _fake_settings(tmp_path, llm_provider="anthropic")
+    with pytest.raises(ConfigError) as info:
+        factory.build_themer(settings, DigestCache(tmp_path / "data"))
+    assert info.value.errors[0].startswith("EARMARK_LLM_PROVIDER: ")
+
+
+def test_build_digest_writer_vault_requires_vault_dir(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None, data_dir=tmp_path / "data", vault_dir=None, store_backend="vault"
+    )
+    with pytest.raises(ConfigError, match="EARMARK_VAULT_DIR"):
+        factory.build_digest_writer(settings)
+
+
+def test_build_digest_writer_vault_and_fake(tmp_path: Path) -> None:
+    from earmark.vault.notes import VaultStore
+
+    (tmp_path / "vault").mkdir()
+    assert isinstance(
+        factory.build_digest_writer(_fake_settings(tmp_path, store_backend="vault")), VaultStore
+    )
+    assert isinstance(factory.build_digest_writer(_fake_settings(tmp_path)), FakeStore)
+
+
+def test_build_digest_notifier_none_without_url(tmp_path: Path) -> None:
+    assert factory.build_digest_notifier(_fake_settings(tmp_path)) is None
+    assert factory.build_digest_notifier(_fake_settings(tmp_path, notify_backend="ntfy")) is None
+
+
+def test_build_digest_notifier_with_url(tmp_path: Path) -> None:
+    settings = _fake_settings(
+        tmp_path, notify_backend="ntfy", ntfy_url=SecretStr("https://ntfy.example.com/my-topic-1")
+    )
+    client = factory.build_digest_notifier(settings)
+    assert client is not None
+    client.close()
+    # With another notify backend the URL is ignored.
+    other = _fake_settings(
+        tmp_path, notify_backend="none", ntfy_url=SecretStr("https://ntfy.example.com/my-topic-1")
+    )
+    assert factory.build_digest_notifier(other) is None

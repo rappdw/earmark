@@ -12,7 +12,8 @@ the home network), and `tailnet-name`.
   of the extras, and a user-id check inside it. The API and worker have never run in a
   container, because the build sandbox has no Docker.
 - The `gpu` profile is untested: its vLLM service was never built or run.
-- The systemd units are examples, reviewed but never run.
+- The systemd units and timer are examples, reviewed but never run. The compose command
+  for the weekly digest (section 14) has not run either.
 - The reachability setup is not verified by the earmark build. That covers the DNS-only
   Cloudflare record, the WireGuard split tunnel, Caddy with the DNS-01 challenge,
   Tailscale Serve, and ntfy self-hosting, all described from their documentation. Only the
@@ -417,16 +418,58 @@ open.
 Exit code 0 means nothing failed (warnings are allowed), 1 means a check failed, and 2
 means the settings did not load.
 
-## 14. Backups and upgrades
+## 14. Weekly digest
+
+`earmark digest` writes one note, `Digests/2026-W47.md`, with the research leads of every
+episode first shared in that ISO week, grouped into themes and linked to the episode notes
+and to their moments in the transcript notes. With no option it covers the last complete
+week, so a run on Monday morning covers the week that just ended. It uses the same LLM
+settings as the analysis and never runs in the worker, so it must be scheduled.
+
+Run it by hand to catch up: `earmark digest --week 2026-W47`, or `earmark digest --since 7d`
+(the last seven local days, written to `Digests/<first day> to <last day>.md`). A second run
+with the same episodes and analyses makes no LLM call and changes nothing. `--refresh` asks
+the model again. When ntfy is configured, a written or changed digest sends one
+notification; `--no-notify` turns that off.
+
+**Natively with systemd.** Copy
+[`earmark-digest.service`](../deploy/systemd/earmark-digest.service) and
+[`earmark-digest.timer`](../deploy/systemd/earmark-digest.timer) to `/etc/systemd/system/`,
+edit the vault path in the service's `ReadWritePaths=`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now earmark-digest.timer
+systemctl list-timers earmark-digest.timer
+journalctl -u earmark-digest
+```
+
+The timer fires on Mondays at 07:00 host time and, with `Persistent=true`, runs once after
+the host was off. A failed run is retried with `sudo systemctl start earmark-digest`.
+
+**Under compose.** Compose has no scheduler. Run the command from a host cron line or a host
+systemd timer, for example every Monday at 07:07:
+
+```text
+7 7 * * 1 cd /path/to/earmark && docker compose run --rm --no-deps worker digest
+```
+
+Keep `EARMARK_TZ` equal to the host's time zone (or set the zone in the timer's
+`OnCalendar=`). Otherwise, shortly after Monday midnight, "the last complete week" can still
+be the week before. `DATA_DIR/digests/` is a cache; delete it at any time and the next
+digest asks the model again. The units and the compose command are examples: they have not
+been run in the build sandbox.
+
+## 15. Backups and upgrades
 
 - Back up the vault, and the data directory's `episodes/` (transcripts and analyses;
   `entities rebuild` and `reindex` need them). `lancedb/`, `models/`, and `huggingface/`
-  can be recreated.
+  can be recreated. `digests/` is a cache of digest themes and need not be backed up.
 - Upgrade with `git pull`, `docker compose build`, and `docker compose up -d` (or
   `uv sync --locked …` and `systemctl restart`). Database migrations run on start.
 - Run `earmark entities rebuild` after changing `EARMARK_TZ`.
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|

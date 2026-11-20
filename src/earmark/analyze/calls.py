@@ -6,7 +6,7 @@ import dataclasses
 import logging
 from dataclasses import dataclass, field
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from earmark.analyze.llm.base import LLMClient, LLMRequest, LLMResponse
 from earmark.analyze.prompts import REPAIR_SYSTEM_PROMPT, build_repair_message
@@ -42,10 +42,20 @@ def _problems(exc: ValidationError) -> list[tuple[str, str]]:
 
 
 class ModelCaller:
-    def __init__(self, client: LLMClient, *, repair: bool, episode_key: str) -> None:
+    def __init__(
+        self,
+        client: LLMClient,
+        *,
+        repair: bool,
+        episode_key: str,
+        subject: str = "this episode",
+        schema_label: str = "analysis",
+    ) -> None:
         self._client = client
         self._repair = repair
         self._key = episode_key
+        self._subject = subject
+        self._schema_label = schema_label
         self._stats = CallStats()
 
     @property
@@ -91,7 +101,7 @@ class ModelCaller:
                 raise OutputCapReached(what, request.max_tokens)
         if response.stop == "refusal":
             raise PermanentError(
-                f"{client.model} declined to analyze this episode"
+                f"{client.model} declined to analyze {self._subject}"
                 f"{'' if what == ANALYSIS else f' ({what})'} (refusal category: "
                 f"{response.refusal_category or 'unspecified'})"
             )
@@ -99,21 +109,25 @@ class ModelCaller:
             raise PermanentError(f"the model stopped unexpectedly ({response.raw_stop})")
         return response
 
-    @staticmethod
-    def _mismatch(what: str, problems: list[tuple[str, str]], middle: str = "") -> str:
+    def _mismatch(self, what: str, problems: list[tuple[str, str]], middle: str = "") -> str:
         count = len(problems)
         subject = "the model's answer" + ("" if what == ANALYSIS else f" for {what}")
         return (
-            f"{subject} does not match the analysis schema{middle} "
+            f"{subject} does not match the {self._schema_label} schema{middle} "
             f"({count} {plural(count, 'error')}, first at {problems[0][0]})"
         )
 
     def parse(self, response: LLMResponse, request: LLMRequest, *, what: str) -> AnalysisOutput:
+        return self.parse_as(AnalysisOutput, response, request, what=what)
+
+    def parse_as[T: BaseModel](
+        self, output_type: type[T], response: LLMResponse, request: LLMRequest, *, what: str
+    ) -> T:
         """Validate the answer. With repair on, an invalid answer gets exactly one repair
         request; otherwise (or if that fails too) the error is permanent. No message
         contains model text."""
         try:
-            return AnalysisOutput.model_validate_json(scrub_surrogates(response.text))
+            return output_type.model_validate_json(scrub_surrogates(response.text))
         except ValidationError as exc:
             problems = _problems(exc) or [("(root)", "invalid")]
         if not self._repair:
@@ -141,7 +155,7 @@ class ModelCaller:
         if repaired.stop != "end":
             raise PermanentError(self._mismatch(what, problems) + " after one repair attempt")
         try:
-            output = AnalysisOutput.model_validate_json(scrub_surrogates(repaired.text))
+            output = output_type.model_validate_json(scrub_surrogates(repaired.text))
         except ValidationError as exc:
             again = _problems(exc) or [("(root)", "invalid")]
             raise PermanentError(self._mismatch(what, again, " after one repair attempt")) from None

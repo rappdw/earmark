@@ -235,3 +235,31 @@ def test_region_surrogates_scrubbed() -> None:
     updated.text.encode("utf-8")
     assert not updated.edited
     assert content_digest(OWNED, bad) == content_digest(OWNED, "# T\n\nx\ufffdy\n")
+
+
+def test_note_identity_digest() -> None:
+    def note(front: str) -> str:
+        return f"---\n{front}---\nbody\n"
+
+    assert note_identity(note('earmark: "digest"\ndigest: "2026-W47"\n')) == ("digest", "2026-W47")
+    assert note_identity(note("earmark: digest\ndigest: 2026-11-14..2026-11-20\n")) == (
+        "digest",
+        "2026-11-14..2026-11-20",
+    )
+    for bad in ("2026-47", "2026-W4", "2026-11-14", "2026-11-14..x", "2026-W47 ", "", "nope"):
+        assert note_identity(note(f'earmark: digest\ndigest: "{bad}"\n')) is None, bad
+    assert note_identity(note("earmark: digest\n")) is None
+    # A digest key does not turn another kind of note into a digest, and vice versa.
+    assert note_identity(note(f'earmark: episode\ndigest: "2026-W47"\nepisode_key: "{KEY}"\n')) == (
+        "episode",
+        KEY,
+    )
+    assert note_identity(note(f'earmark: digest\nepisode_key: "{KEY}"\n')) is None
+
+
+def test_existing_identities_unchanged() -> None:
+    entity = "0123456789abcdef"
+    text = f'---\nearmark: "entity"\nentity_id: "{entity}"\n---\n'
+    assert note_identity(text) == ("entity", entity)
+    text = f'---\nearmark: "transcript"\nepisode_key: "{KEY}"\n---\n'
+    assert note_identity(text) == ("transcript", KEY)

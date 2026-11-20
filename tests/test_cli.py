@@ -3,6 +3,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,18 +15,21 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import earmark
+from earmark import cli
 from earmark.artifacts import ArtifactStore
 from earmark.cli import app
 from earmark.config import ConfigError, Settings, env_var
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import FakeResolver, FakeSearcher
+from earmark.fakes import FakeResolver, FakeSearcher, FakeStore
 from earmark.index.embed import IndexExtraMissing
 from earmark.index.search import IndexMismatchError, SearchQuery
 from earmark.jobs import open_job_store
 from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
+from earmark.pipeline import factory
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from earmark.transcribe import faster_whisper as fw
+from tests.digest_helpers import put_episode
 from tests.factories import make_analysis, make_episode, make_transcript
 from tests.index_helpers import RecordingTarget, make_docs, stub_extra_missing
 from tests.test_index_search import make_hit
@@ -1414,3 +1418,241 @@ def test_episodes_module_is_light() -> None:
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
+
+
+# -- digest ------------------------------------------------------------------------------------
+
+DIGEST_SHARED = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)  # in 2026-W47
+DIGEST_NOW = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+
+
+class _Notifier:
+    """Stands in for the ntfy client: records what would have been published."""
+
+    def __init__(self, fail: Exception | None = None) -> None:
+        self.published: list[Any] = []
+        self.closed = False
+        self._fail = fail
+        self.options = type("Options", (), {"vault_name": "My Vault"})()
+
+    def publish(self, notification: Any) -> None:
+        if self._fail is not None:
+            raise self._fail
+        self.published.append(notification)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def digest_env(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
+    monkeypatch.setenv("EARMARK_TZ", "UTC")
+    monkeypatch.setattr(cli, "_digest_now", lambda: DIGEST_NOW)
+    artifacts = ArtifactStore(fake_env / "data")
+    ep = put_episode(artifacts, "g", DIGEST_SHARED, analyses=[["a lead"]])
+    transcript = artifacts.read_transcript(ep.key)
+    assert transcript is not None
+    FakeStore(fake_env / "vault", "Earmark").store(
+        ep, transcript, artifacts.list_analyses(ep.key), DIGEST_SHARED
+    )
+    return fake_env
+
+
+def _digest(*args: str) -> Any:
+    return runner.invoke(app, ["digest", *args])
+
+
+def test_digest_week_writes_and_prints(digest_env: Path) -> None:
+    result = _digest("--week", "2026-W47", "--no-notify")
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == (
+        "wrote Earmark/Digests/2026-W47.md: 1 episode, 1 research lead, 1 theme "
+        "(0 model requests); the window is not over yet\n"
+    )
+    note = (digest_env / "vault/Earmark/Digests/2026-W47.md").read_text()
+    assert "## Show A" in note
+
+
+def test_digest_rerun_up_to_date(digest_env: Path) -> None:
+    assert _digest("--week", "2026-W47").exit_code == 0
+    again = _digest("--week", "2026-W47")
+    assert again.exit_code == 0
+    assert again.stdout == (
+        "Earmark/Digests/2026-W47.md is up to date: 1 episode, 1 research lead, 1 theme "
+        "(themes from cache); the window is not over yet\n"
+    )
+
+
+def test_digest_default_is_last_complete_week(
+    digest_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_digest_now", lambda: datetime(2026, 11, 23, 7, 0, tzinfo=UTC))
+    result = _digest()
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.startswith("wrote Earmark/Digests/2026-W47.md: 1 episode")
+    assert "not over yet" not in result.stdout
+
+
+def test_digest_since_names_range_note(digest_env: Path) -> None:
+    result = _digest("--since", "7d")
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.startswith("wrote Earmark/Digests/2026-11-14 to 2026-11-20.md: ")
+    assert (digest_env / "vault/Earmark/Digests/2026-11-14 to 2026-11-20.md").is_file()
+
+
+def test_digest_empty_window_exit_0(digest_env: Path) -> None:
+    result = _digest("--week", "2020-W01")
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "no episodes were first shared in 2020-W01 (2019-12-30 to 2020-01-05, UTC); "
+        "nothing written\n"
+    )
+    assert not (digest_env / "vault/Earmark/Digests").exists()
+
+
+def test_digest_bad_week_exit_2(digest_env: Path) -> None:
+    result = _digest("--week", "2025-W53")
+    assert result.exit_code == 2
+    assert result.stderr == "earmark digest: 2025 has no ISO week 53\n"
+    assert _digest("--week", "nonsense").exit_code == 2
+    assert _digest("--since", "0d").exit_code == 2
+
+
+def test_digest_both_options_exit_2(digest_env: Path) -> None:
+    result = _digest("--week", "2026-W47", "--since", "7d")
+    assert result.exit_code == 2
+    assert "use either --week or --since" in result.stderr
+
+
+def test_digest_missing_vault_dir_exit_2(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
+    monkeypatch.delenv("EARMARK_VAULT_DIR")
+    result = _digest("--since", "7d")
+    assert result.exit_code == 2
+    assert "EARMARK_VAULT_DIR" in result.stderr
+
+
+def test_digest_no_credential_exit_2_even_for_empty_window(
+    digest_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "anthropic")
+    result = _digest("--week", "2020-W01")
+    assert result.exit_code == 2
+
+
+class _FailingThemer:
+    model = "failing"
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.closed = False
+
+    def themes(self, request: Any, /) -> Any:
+        raise self.exc
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_digest_model_failure_exit_1(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    themer = _FailingThemer(PermanentError("the model declined to analyze the research leads"))
+    monkeypatch.setattr(factory, "build_themer", lambda settings, cache: themer)
+    result = _digest("--week", "2026-W47")
+    assert result.exit_code == 1
+    assert result.stderr == "earmark digest: the model declined to analyze the research leads\n"
+    assert themer.closed
+    assert not (digest_env / "vault/Earmark/Digests").exists()
+
+
+def test_digest_transient_exit_1_says_temporary(
+    digest_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    themer = _FailingThemer(TransientError("the server is busy"))
+    monkeypatch.setattr(factory, "build_themer", lambda settings, cache: themer)
+    result = _digest("--week", "2026-W47")
+    assert result.exit_code == 1
+    assert result.stderr == "earmark digest: the server is busy (temporary; try again later)\n"
+
+
+def test_digest_warnings_on_stderr(digest_env: Path) -> None:
+    ArtifactStore(digest_env / "data").analysis_path(
+        next(iter(ArtifactStore(digest_env / "data").list_episode_keys())), "0" * 16
+    ).write_text("{broken")
+    result = _digest("--week", "2026-W47")
+    assert result.exit_code == 0
+    assert "earmark digest: warning: episode " in result.stderr
+    assert "is unreadable" in result.stderr
+    assert "warning" not in result.stdout
+
+
+def test_digest_window_in_progress_note(digest_env: Path) -> None:
+    assert "the window is not over yet" in _digest("--week", "2026-W47").stdout
+    assert "not over yet" not in _digest("--week", "2026-W46").stdout
+
+
+def _patch_notifier(monkeypatch: pytest.MonkeyPatch, notifier: _Notifier) -> list[int]:
+    built: list[int] = []
+
+    def build(settings: Settings) -> _Notifier:
+        built.append(1)
+        return notifier
+
+    monkeypatch.setattr(factory, "build_digest_notifier", build)
+    return built
+
+
+def test_digest_notifies_when_written(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    notifier = _Notifier()
+    _patch_notifier(monkeypatch, notifier)
+    result = _digest("--week", "2026-W47")
+    assert result.exit_code == 0, result.stderr
+    [sent] = notifier.published
+    assert sent.title == "Digest ready: 2026-W47"
+    assert sent.message == "1 episode · 1 research lead · 1 theme"
+    assert sent.click is not None
+    assert sent.click.startswith("obsidian://open?vault=My%20Vault&file=")
+    assert notifier.closed
+
+
+def test_digest_no_notify_when_unchanged(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _digest("--week", "2026-W47").exit_code == 0
+    notifier = _Notifier()
+    _patch_notifier(monkeypatch, notifier)
+    assert _digest("--week", "2026-W47").exit_code == 0
+    assert notifier.published == []
+    assert notifier.closed
+
+
+def test_digest_no_notify_when_empty(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    notifier = _Notifier()
+    _patch_notifier(monkeypatch, notifier)
+    assert _digest("--week", "2020-W01").exit_code == 0
+    assert notifier.published == []
+
+
+def test_digest_no_notify_flag(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    notifier = _Notifier()
+    built = _patch_notifier(monkeypatch, notifier)
+    assert _digest("--week", "2026-W47", "--no-notify").exit_code == 0
+    assert notifier.published == []
+    assert built == []
+
+
+def test_digest_notify_failure_is_warning_exit_0(
+    digest_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifier = _Notifier(fail=TransientError("ntfy is down"))
+    _patch_notifier(monkeypatch, notifier)
+    result = _digest("--week", "2026-W47")
+    assert result.exit_code == 0
+    assert "earmark digest: warning: notify failed: ntfy is down" in result.stderr
+    assert result.stdout.startswith("wrote ")
+    assert notifier.closed
+
+
+def test_digest_registered_in_help() -> None:
+    result = runner.invoke(app, ["digest", "--help"])
+    assert result.exit_code == 0
+    for option in ("--week", "--since", "--refresh", "--no-notify"):
+        assert option in result.stdout

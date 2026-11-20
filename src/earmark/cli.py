@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -539,6 +540,140 @@ def analyze_command(
         return
     for line in render_analysis(analysis).splitlines():
         typer.echo(_clean(line))
+
+
+def _digest_now() -> datetime:
+    """The clock of ``earmark digest``; a seam so tests can fix the date."""
+    from earmark.models import utc_now
+
+    return utc_now()
+
+
+@app.command("digest")
+def digest_command(
+    week: Annotated[
+        str | None, typer.Option("--week", help="ISO week to cover, such as 2026-W47.")
+    ] = None,
+    since: Annotated[
+        str | None, typer.Option("--since", help="The last N local days, today included: 7d.")
+    ] = None,
+    refresh: Annotated[
+        bool, typer.Option("--refresh", help="Ask the model again, ignoring cached themes.")
+    ] = False,
+    no_notify: Annotated[
+        bool, typer.Option("--no-notify", help="Do not send a notification.")
+    ] = False,
+) -> None:
+    """Write the digest note: research leads grouped into themes, for the episodes first
+    shared in a week (default: the last complete ISO week in EARMARK_TZ)."""
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from zoneinfo import ZoneInfo
+
+    from earmark.artifacts import ArtifactStore
+    from earmark.digest.cache import DigestCache
+    from earmark.digest.run import run_digest
+    from earmark.digest.window import WindowError, select_window
+    from earmark.errors import EarmarkError, TransientError
+    from earmark.notify.ntfy import compose_digest
+    from earmark.pipeline.factory import (
+        build_digest_notifier,
+        build_digest_writer,
+        build_themer,
+    )
+
+    tz = ZoneInfo(settings.tz) if settings.tz else None
+    tz_label = settings.tz or "system time zone"
+    now = _digest_now()
+    try:
+        window = select_window(week=week, since=since, now=now, tz=tz)
+    except WindowError as exc:
+        typer.echo(f"earmark digest: {_clean(exc)}", err=True)
+        raise typer.Exit(code=2) from None
+    cache = DigestCache(settings.data_dir)
+    try:
+        writer = build_digest_writer(settings)
+        themer = build_themer(settings, cache)
+        notifier = None if no_notify else build_digest_notifier(settings)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        try:
+            report = run_digest(
+                window,
+                artifacts=ArtifactStore(settings.data_dir),
+                cache=cache,
+                themer=themer,
+                writer=writer,
+                tz=tz,
+                tz_label=tz_label,
+                refresh=refresh,
+            )
+        except TransientError as exc:
+            typer.echo(
+                f"earmark digest: {_clean(exc.message)} (temporary; try again later)", err=True
+            )
+            raise typer.Exit(code=1) from None
+        except EarmarkError as exc:
+            typer.echo(f"earmark digest: {_clean(exc.message)}", err=True)
+            raise typer.Exit(code=1) from None
+        except OSError as exc:
+            typer.echo(f"earmark digest: {_clean(exc)}", err=True)
+            raise typer.Exit(code=1) from None
+        finally:
+            themer.close()
+        for warning in report.warnings:
+            typer.echo(f"earmark digest: warning: {_clean(warning)}", err=True)
+
+        def count(n: int, noun: str) -> str:
+            return f"{n} {noun}{'' if n == 1 else 's'}"
+
+        tail = "; the window is not over yet" if window.end > now else ""
+        if report.status == "empty":
+            typer.echo(
+                _clean(
+                    f"no episodes were first shared in {window.label} ({window.first_day} to "
+                    f"{window.last_day}, {tz_label}); nothing written{tail}"
+                )
+            )
+            return
+        if report.cached:
+            detail = "themes from cache"
+        elif report.leads == 0:
+            detail = "no research leads"
+        else:
+            detail = count(report.requests, "model request")
+        summary = (
+            f"{count(report.episodes, 'episode')}, {count(report.leads, 'research lead')}, "
+            f"{count(report.themes, 'theme')} ({detail})"
+        )
+        line = (
+            f"{report.note_path} is up to date: {summary}"
+            if report.status == "unchanged"
+            else f"wrote {report.note_path}: {summary}"
+        )
+        typer.echo(_clean(line + tail))
+        if notifier is not None and report.status in ("created", "updated") and report.note_path:
+            try:
+                notifier.publish(
+                    compose_digest(
+                        label=window.label,
+                        note_path=report.note_path,
+                        episodes=report.episodes,
+                        leads=report.leads,
+                        themes=report.themes,
+                        vault_name=notifier.options.vault_name,
+                        secrets=tuple(settings.secret_values()),
+                    )
+                )
+            except EarmarkError as exc:
+                typer.echo(
+                    f"earmark digest: warning: notify failed: {_clean(exc.message)}", err=True
+                )
+    finally:
+        if notifier is not None:
+            notifier.close()
 
 
 @entities_app.command("rebuild")

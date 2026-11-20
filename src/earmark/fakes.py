@@ -11,9 +11,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Final, Literal
 
 from earmark.artifacts import ArtifactStore, atomic_write_bytes, atomic_write_text
+from earmark.digest.model import (
+    DigestNote,
+    DigestWriteResult,
+    ThemeEntry,
+    ThemeRecord,
+    ThemeRequest,
+)
+from earmark.digest.prompts import DIGEST_SCHEMA_VERSION
 from earmark.errors import PermanentError
 from earmark.index.chunks import NotePaths
 from earmark.index.search import SearchHit, SearchQuery, SearchResults
@@ -33,6 +41,7 @@ from earmark.models import (
     prompt_hash,
 )
 from earmark.pipeline.stages import Backends
+from earmark.vault.document import new_note
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -271,6 +280,29 @@ class FakeStore(FakeStage[StoreCall]):
             raise ValueError("subdir must be a relative POSIX path without '..'")
         self.vault_dir = vault_dir
         self.subdir = subdir
+        self.digest_calls: list[DigestNote] = []
+
+    def write_digest(self, note: DigestNote, /) -> DigestWriteResult:
+        """Records the call and, with ``vault_dir``, writes the digest note whole."""
+        self.digest_calls.append(note)
+        path = f"{self.subdir}/Digests/{note.file_stem}.md"
+        status: Literal["created", "updated", "unchanged"] = "unchanged"
+        if self.vault_dir is not None:
+            paths = {
+                key: NotePaths(found.note_path, None)
+                for key, found in self.locate_notes(note.episode_keys).items()
+                if found.note_path is not None and (self.vault_dir / found.note_path).is_file()
+            }
+            target = self.vault_dir / path
+            text = new_note(note.owned, note.seeds, note.render(paths))
+            try:
+                before: str | None = target.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                before = None
+            if before != text:
+                atomic_write_text(target, text)
+                status = "created" if before is None else "updated"
+        return DigestWriteResult(note_path=path, status=status)
 
     def store(
         self,
@@ -297,6 +329,34 @@ class FakeStore(FakeStage[StoreCall]):
     def locate_notes(self, keys: Sequence[str], /) -> dict[str, NotePaths]:
         """The paths ``store`` returns, for every key."""
         return {k: NotePaths(f"{self.subdir}/Podcasts/{k}.md", None) for k in keys}
+
+
+class FakeThemer(FakeStage[ThemeRequest]):
+    """Satisfies ``Themer``: one theme per show, in order of the show's first lead."""
+
+    model = "fake-themes"
+
+    def themes(self, request: ThemeRequest, /) -> ThemeRecord:
+        self._enter(request)
+        by_show: dict[str, list[str]] = {}
+        for lead in request.leads:
+            by_show.setdefault(request.episodes[lead.episode_key].show_title, []).append(
+                lead.lead_id
+            )
+        themes = tuple(
+            ThemeEntry(title=show, summary=f"Research leads from {show}.", leads=tuple(ids))
+            for show, ids in by_show.items()
+        )
+        return ThemeRecord(
+            version=DIGEST_SCHEMA_VERSION,
+            input_hash=request.input_hash,
+            model=self.model,
+            themes=themes,
+            requests=0,
+        )
+
+    def close(self) -> None:
+        return None
 
 
 class FakeIndexer(FakeStage[IndexCall]):
