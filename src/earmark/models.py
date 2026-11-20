@@ -22,6 +22,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 Source = Literal["apple_podcasts"]
 JobKind = Literal["ingest", "reanalyze"]
@@ -33,6 +34,12 @@ TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset({"done", "failed", "s
 ANALYSIS_SCHEMA_VERSION: Final = 1
 EPISODE_KEY_LENGTH: Final = 20
 PROMPT_HASH_LENGTH: Final = 16
+
+MAX_URL_CHARS: Final = 2048
+MAX_PROMPT_CHARS: Final = 4000
+INGEST_ERROR_TYPES: Final = frozenset(
+    {"url_empty", "url_too_long", "prompt_too_long", "timestamp_out_of_range"}
+)
 
 EpisodeKey = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{20}$")]
 PromptHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{16}$")]
@@ -103,6 +110,44 @@ class IngestRequest(Model):
     url: str
     prompt: str | None = None
     timestamp: AwareDatetime | None = None
+
+    @field_validator("url", mode="after")
+    @classmethod
+    def _normalise_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise PydanticCustomError("url_empty", "url must not be empty")
+        if len(v) > MAX_URL_CHARS:
+            raise PydanticCustomError(
+                "url_too_long", f"url is too long (at most {MAX_URL_CHARS} characters)"
+            )
+        return v
+
+    @field_validator("prompt", mode="after")
+    @classmethod
+    def _normalise_prompt(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > MAX_PROMPT_CHARS:
+            raise PydanticCustomError(
+                "prompt_too_long", f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)"
+            )
+        return v
+
+    @field_validator("timestamp", mode="after")
+    @classmethod
+    def _check_timestamp(cls, v: datetime | None) -> datetime | None:
+        if v is not None:
+            try:
+                v.astimezone(UTC)
+            except OverflowError:
+                raise PydanticCustomError(
+                    "timestamp_out_of_range", "timestamp is out of range"
+                ) from None
+        return v
 
 
 class EpisodeRef(Model):

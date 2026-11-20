@@ -10,6 +10,9 @@ from pydantic import ValidationError
 import earmark.models
 from earmark.models import (
     ANALYSIS_SCHEMA_VERSION,
+    INGEST_ERROR_TYPES,
+    MAX_PROMPT_CHARS,
+    MAX_URL_CHARS,
     Analysis,
     Claim,
     Entity,
@@ -28,7 +31,7 @@ from earmark.models import (
     is_episode_key,
     prompt_hash,
 )
-from tests.factories import T0, make_analysis, make_episode, make_job, make_transcript
+from tests.factories import PST, T0, make_analysis, make_episode, make_job, make_transcript
 
 KEY = "3848d011be9e28df3ac6"
 
@@ -321,3 +324,62 @@ def test_contract_modules_import_light() -> None:
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
+
+
+def _error_types(exc: pytest.ExceptionInfo[ValidationError]) -> set[str]:
+    return {e["type"] for e in exc.value.errors()}
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\n\t", "\N{NO-BREAK SPACE}", "\N{IDEOGRAPHIC SPACE}"])
+def test_ingest_blank_prompt_is_none(blank: str) -> None:
+    assert IngestRequest(url="u", prompt=blank).prompt is None
+
+
+def test_ingest_prompt_stripped() -> None:
+    assert IngestRequest(url="u", prompt="  why?\n").prompt == "why?"
+    assert IngestRequest(url="u", prompt=" a\nb ").prompt == "a\nb"
+
+
+def test_ingest_prompt_length_cap() -> None:
+    ok = "x" * MAX_PROMPT_CHARS
+    assert IngestRequest(url="u", prompt=f"  {ok}\n").prompt == ok
+    with pytest.raises(ValidationError) as exc:
+        IngestRequest(url="u", prompt=ok + "x")
+    assert _error_types(exc) == {"prompt_too_long"}
+    assert "at most 4000 characters" in exc.value.errors()[0]["msg"]
+
+
+def test_ingest_url_stripped_and_capped() -> None:
+    assert IngestRequest(url="  u \n").url == "u"
+    for empty in ("", "  "):
+        with pytest.raises(ValidationError) as exc:
+            IngestRequest(url=empty)
+        assert _error_types(exc) == {"url_empty"}
+    assert len(IngestRequest(url="u" * MAX_URL_CHARS).url) == MAX_URL_CHARS
+    with pytest.raises(ValidationError) as exc:
+        IngestRequest(url="u" * (MAX_URL_CHARS + 1))
+    assert _error_types(exc) == {"url_too_long"}
+
+
+def test_ingest_timestamp_out_of_range() -> None:
+    with pytest.raises(ValidationError) as exc:
+        IngestRequest.model_validate_json('{"url": "u", "timestamp": "0001-01-01T00:00:00+05:00"}')
+    assert _error_types(exc) == {"timestamp_out_of_range"}
+    ok = IngestRequest.model_validate_json('{"url": "u", "timestamp": "2026-01-01T00:00:00-08:00"}')
+    assert ok.timestamp is not None
+    assert ok.timestamp.utcoffset() == PST.utcoffset(None)
+
+
+def test_ingest_error_types_registry() -> None:
+    assert sorted(INGEST_ERROR_TYPES) == [
+        "prompt_too_long",
+        "timestamp_out_of_range",
+        "url_empty",
+        "url_too_long",
+    ]
+
+
+def test_ingest_normalised_round_trip() -> None:
+    req = IngestRequest(url=" u ", prompt="  padded \n", timestamp=T0)
+    assert IngestRequest.model_validate_json(req.model_dump_json()) == req
+    assert req.prompt == "padded"

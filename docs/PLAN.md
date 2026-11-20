@@ -15,7 +15,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 01a | CI: the gate on every push | 01 | done |
 | 02 | Core contracts and fakes | 01 | done |
 | 03 | Job store | 02 | done |
-| 04 | Ingest API | 03 | todo |
+| 04 | Ingest API | 03 | done |
 | 05 | Pipeline runner and worker | 04 | todo |
 | 06 | Guarded fetch and audio download | 05 | todo |
 | 07 | Resolver: Apple → iTunes → RSS | 06 | todo |

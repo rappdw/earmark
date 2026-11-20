@@ -57,9 +57,10 @@ src/earmark/
   db.py                SQLite connection and migrations (PRAGMA user_version)
   jobs.py              JobStore
   fetch.py             guarded HTTP fetch and streaming download
+  ingest.py            enqueue_ingest: IngestRequest → canonical URL → JobStore (API and CLI)
   fakes.py             fake backend for every stage (tests and smoke runs)
   cli.py               `earmark` entry point
-  api/                 app factory, auth, routes
+  api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
   pipeline/
     stages.py          stage Protocols
     runner.py          Pipeline
@@ -82,8 +83,17 @@ still load. All models are pydantic, frozen, and `extra="forbid"`; sequences are
 (pass `tuple(...)`: mypy rejects a list for a tuple field); datetimes are timezone-aware;
 seconds are finite and non-negative.
 
-- `IngestRequest`: `url`, `prompt: str | None`, `timestamp: datetime | None`.
+- `IngestRequest`: `url`, `prompt: str | None`, `timestamp: datetime | None`. The
+  `POST /ingest` body; unknown keys are rejected (a typo such as `promt` must not
+  silently drop the user's question). Validators normalise: `url` stripped, at most
+  `MAX_URL_CHARS` (2048); `prompt` stripped, blank or whitespace-only becomes `None`,
+  at most `MAX_PROMPT_CHARS` (4000) after stripping; `timestamp` must convert to UTC
+  (its offset is kept). Step 04.
 - `EpisodeRef`: `source` (`"apple_podcasts"`), `show_id`, `episode_id`, `country`, `url`.
+  Returned by `resolve.apple.parse_apple_url`; `url` is the canonical
+  `https://podcasts.apple.com/{country}/podcast/id{show_id}?i={episode_id}` (country
+  lower-case, `us` when the link has none; slug, tracking and share-from-time
+  parameters dropped; legacy `itunes.apple.com` and `http` mapped to it).
 - `Episode`: `key`, `source`, `show_id`, `episode_id`, `guid`, `title`, `show_title`,
   `published_at | None`, `duration_s | None`, `audio_url`, `feed_url | None`, `url`,
   `description`. A validator requires `key == episode_key(source, show_id, guid)`.
@@ -102,10 +112,10 @@ seconds are finite and non-negative.
   `file=` of an `obsidian://open` link.
 - `JobResult`: `note_path`, `transcript_note_path`, `analysis_hash`, all optional.
 - `Job`: `id` (`uuid4().hex`), `kind` (`ingest`, `reanalyze`), `status`, `stage`,
-  `url | None` (required for `ingest`), `prompt`, `episode_key | None` (required for
-  `reanalyze`), `attempts`, `run_after`, `error` (failure message or skip reason),
-  `warnings`, `result: JobResult | None`, `shared_at`, `created_at`, `updated_at`,
-  `heartbeat_at`.
+  `url | None` (required for `ingest`; the canonical episode URL, so `Episode.url` is
+  canonical too), `prompt`, `episode_key | None` (required for `reanalyze`), `attempts`,
+  `run_after`, `error` (failure message or skip reason), `warnings`,
+  `result: JobResult | None`, `shared_at`, `created_at`, `updated_at`, `heartbeat_at`.
 
 **Episode key.** `sha256("{source}:{show_id}:{guid}")` over UTF-8, first 20 hex
 characters, from `models.episode_key`. The Apple show id is used instead of the feed URL
@@ -288,15 +298,21 @@ rebuildable from `analyses/*.json`.
 
 ## HTTP API
 
-All routes except `/healthz` require `Authorization: Bearer $EARMARK_API_TOKEN`, compared
-in constant time. The service refuses to start with an empty token.
+Every path except `/healthz` requires `Authorization: Bearer $EARMARK_API_TOKEN`. A pure
+ASGI middleware (`api/auth.py`) checks it before routing or body parsing, comparing
+SHA-256 digests with `hmac.compare_digest`, so an unauthenticated request gets 401 with
+`WWW-Authenticate: Bearer realm="earmark"` whatever its path or body. The service
+refuses to start with an empty or whitespace-only token, or one that is not printable
+ASCII. Interactive docs and `/openapi.json` are off. Errors are `{"detail": "<short
+message>"}`, written to be shown by the Shortcut as is; validation errors never echo
+input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-api.md`.
 
 | Route | Purpose |
 |---|---|
-| `POST /ingest` | Body `{url, prompt?, timestamp?}`. 202 `{job_id, status}`. 401 bad token. 422 unsupported or malformed URL, with a message the Shortcut can display. |
-| `GET /jobs/{id}` | Status, stage, error, warnings, note path. |
-| `GET /jobs` | Recent jobs. |
-| `GET /healthz` | Liveness, no auth. |
+| `POST /ingest` | Body `{url, prompt?, timestamp?}` (`IngestRequest`, JSON, at most 64 KiB, else 413). Enqueues the canonical episode URL. 202 `{job_id, status, created}` with `Location: /jobs/{id}`; `created` is `false` when an identical active job was returned (dedupe). 401 bad token. 422 unsupported or malformed URL, show link, or invalid body, with a message the Shortcut can display. |
+| `GET /jobs/{id}` | The `Job` as JSON: status, stage, error, warnings, result (note path). 404 if unknown. |
+| `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [Job, …]}`, newest first. |
+| `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
 | `GET /search?q=` | Vector search (step 14). |
 | `GET /episodes`, `POST /episodes/{key}/analyze` | Re-run a prompt on a stored episode (step 17). |
 
@@ -349,7 +365,10 @@ The service runs on a private network, but it fetches URLs that third parties co
 and writes into a vault the user cares about.
 
 - **Ingest.** Only hosts with a registered source are accepted (`podcasts.apple.com`,
-  legacy `itunes.apple.com`). A show link without `?i=` is rejected with a clear message.
+  legacy `itunes.apple.com`, exact match). A show link without `?i=` is rejected with a
+  clear message. The API stores the canonical URL it built from the parsed ids, never
+  the client's string, so re-shares dedupe and no client-controlled URL reaches the
+  resolver. The handler does no outbound I/O.
 - **Outbound fetches.** Feed and enclosure URLs come from podcast publishers. Every such
   fetch goes through `fetch.py`: http/https only, hosts resolving to loopback, private,
   link-local, or metadata addresses are refused on every redirect hop, redirects are

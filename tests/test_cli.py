@@ -2,8 +2,11 @@ import importlib.metadata
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+import uvicorn
+from fastapi import FastAPI
 from typer.testing import CliRunner
 
 import earmark
@@ -99,3 +102,96 @@ def test_import_earmark_is_light() -> None:
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
     assert earmark.__version__ == VERSION
+
+
+# -- serve -------------------------------------------------------------------------------
+
+SERVE_TOKEN = "sentinel-serve-5c1d9e"
+
+
+class _UvicornCalls:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append((args, kwargs))
+
+
+@pytest.fixture
+def fake_uvicorn(monkeypatch: pytest.MonkeyPatch) -> _UvicornCalls:
+    calls = _UvicornCalls()
+    monkeypatch.setattr(uvicorn, "run", calls)
+    return calls
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+@pytest.mark.parametrize("token", [None, "   "])
+def test_serve_refuses_without_token(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls, tmp_path: Path, token: str | None
+) -> None:
+    if token is not None:
+        monkeypatch.setenv("EARMARK_API_TOKEN", token)
+    result = runner.invoke(app, ["serve"])
+    assert result.exit_code == 2
+    assert "EARMARK_API_TOKEN is not set" in result.stderr
+    assert fake_uvicorn.calls == []
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+@pytest.mark.parametrize("token", ["tok en", "tök"])
+def test_serve_rejects_unsafe_token(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls, token: str
+) -> None:
+    monkeypatch.setenv("EARMARK_API_TOKEN", token)
+    result = runner.invoke(app, ["serve"])
+    assert result.exit_code == 2
+    assert "printable ASCII" in result.stderr
+    assert token not in result.stdout + result.stderr
+    assert fake_uvicorn.calls == []
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_serve_runs_uvicorn(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    monkeypatch.setenv("EARMARK_PORT", "8799")
+    result = runner.invoke(app, ["serve"])
+    assert result.exit_code == 0
+    assert len(fake_uvicorn.calls) == 1
+    args, kwargs = fake_uvicorn.calls[0]
+    assert isinstance(args[0], FastAPI)
+    assert kwargs == {
+        "host": "127.0.0.1",
+        "port": 8799,
+        "log_config": None,
+        "server_header": False,
+    }
+    assert (tmp_path / "data" / "earmark.db").exists()
+    assert SERVE_TOKEN not in result.stdout + result.stderr
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_serve_store_error_exits_1(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls, tmp_path: Path
+) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(blocker))
+    result = runner.invoke(app, ["serve"])
+    assert result.exit_code == 1
+    assert result.stderr.startswith("earmark serve: cannot open the job store")
+    assert SERVE_TOKEN not in result.stdout + result.stderr
+    assert fake_uvicorn.calls == []
+
+
+def test_cli_import_is_light() -> None:
+    code = (
+        "import sys, earmark.cli\n"
+        "heavy = {'fastapi', 'starlette', 'uvicorn'}\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"
