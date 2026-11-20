@@ -138,6 +138,10 @@ def test_secret_values_lists_only_set_secrets(monkeypatch: pytest.MonkeyPatch) -
         ("EARMARK_LOG_LEVEL", "verbose-sentinel", True),
         ("EARMARK_VAULT_SUBDIR", "../x", True),
         ("EARMARK_VAULT_SUBDIR", "/abs", True),
+        ("EARMARK_ASR_DEVICE", "gpu-sentinel", True),
+        ("EARMARK_ASR_COMPUTE_TYPE", "float8-sentinel", True),
+        ("EARMARK_ASR_LANGUAGE", "english-sentinel", True),
+        ("EARMARK_ASR_MODEL", " ", False),
     ],
 )
 def test_invalid_values_rejected(
@@ -227,3 +231,25 @@ def test_env_example_lists_every_field() -> None:
 
 def test_env_example_values_are_defaults() -> None:
     assert Settings(_env_file=ROOT / ".env.example") == Settings(_env_file=None)
+
+
+def test_asr_settings_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ASR_DEVICE", "CUDA")
+    monkeypatch.setenv("EARMARK_ASR_COMPUTE_TYPE", " Int8 ")
+    monkeypatch.setenv("EARMARK_ASR_MODEL", "  small ")
+    monkeypatch.setenv("EARMARK_ASR_LANGUAGE", "auto")
+    s = load_settings(env_file=None)
+    assert (s.asr_device, s.asr_compute_type, s.asr_model, s.asr_language) == (
+        "cuda",
+        "int8",
+        "small",
+        None,
+    )
+    monkeypatch.setenv("EARMARK_ASR_LANGUAGE", "Haw")
+    assert load_settings(env_file=None).asr_language == "haw"
+
+
+def test_asr_model_dir_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert load_settings(env_file=None).asr_model_dir is None
+    monkeypatch.setenv("EARMARK_ASR_MODEL_DIR", "/models")
+    assert load_settings(env_file=None).asr_model_dir == Path("/models")

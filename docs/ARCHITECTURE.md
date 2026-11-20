@@ -17,7 +17,7 @@ backend, not the pipeline.
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
-| Transcription | faster-whisper `large-v3` in the worker process, with a remote OpenAI-compatible ASR endpoint as the alternative (step 09). | `EARMARK_ASR_BACKEND`. |
+| Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means step 09's remote server or a self-built CUDA CTranslate2. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
@@ -71,7 +71,9 @@ src/earmark/
   resolve/             apple.py (URL parsing, light), itunes.py (lookup JSON), apple_page.py
                        (episode page JSON), rss.py (feed parsing, matching), text.py,
                        resolver.py (AppleResolver, the `apple` backend; step 07)
-  transcribe/          faster_whisper.py, remote.py
+  transcribe/          base.py (CachedTranscriber: cache, transcript files, audio deletion;
+                       TranscriptionEngine), faster_whisper.py (the `faster_whisper`
+                       engine, step 08), remote.py (step 09)
   analyze/             schema.py, prompts.py, render.py, analyzer.py, chunking.py, llm/
   vault/               notes.py, sanitize.py, entities.py
   index/               chunks.py, embed.py, lancedb_index.py
@@ -336,6 +338,39 @@ Step 07; exact signatures in `docs/steps/07-resolver.md`.
 - **No cache.** Two requests in the window (lookup, feed), three outside it; the
   runner writes `episode.json` afterwards.
 
+### Transcribing
+
+Step 08; exact signatures in `docs/steps/08-transcribe.md`.
+
+- **Shell and engine.** `transcribe.base.CachedTranscriber(artifacts, engine,
+  keep_audio=...)` is the `Transcriber`: an existing `transcript.json` is returned without
+  calling the engine (and leftover audio is deleted unless `KEEP_AUDIO`); otherwise
+  `engine.transcribe_file(audio, key)` returns a `Transcript`, which is written with
+  `ArtifactStore.write_transcript` (`transcript.txt`, then `transcript.json`, both
+  atomic), and the episode's `audio.*` is deleted unless `EARMARK_KEEP_AUDIO`. On any
+  failure the audio is kept, except `UnusableAudioError` (a `PermanentError`:
+  undecodable, empty, or no speech), which deletes it unless `KEEP_AUDIO` so a re-share
+  downloads it again. Step 09's remote engine plugs into the same shell.
+- **`faster_whisper` engine.** `transcribe.faster_whisper.FasterWhisperEngine` imports
+  `faster_whisper` and `ctranslate2` only through `load_runtime()`
+  (`importlib.import_module`), which the factory's builder calls; without the extra the
+  worker refuses to start with a `ConfigError` naming the extra. The model is loaded on
+  the first transcription and kept for the life of the process (`ASR_MODEL`,
+  `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, downloaded to `ASR_MODEL_DIR`). Audio is decoded with
+  PyAV (bundled FFmpeg; whole file in memory, about 230 MB per hour), transcribed with
+  beam size 5 and VAD filtering, and segments are made monotonic (starts never decrease,
+  `end >= start`, all within the duration; blank segments dropped). `ASR_LANGUAGE`
+  forces a language, else Whisper detects it. Progress is logged about once a minute;
+  CTranslate2 releases the GIL, so the heartbeat thread keeps beating.
+- **Errors.** Model not found on Hugging Face, or a `ValueError` at load (bad model
+  name, unsupported compute type) → `PermanentError` naming the settings; other
+  `OSError`s while loading (download failures) → `TransientError`. `ASR_DEVICE=cuda` with
+  no CUDA device visible to CTranslate2 is a startup `ConfigError`. Messages carry file
+  base names and setting names, never full paths, URLs, or library error text.
+- **`earmark transcribe <file> [--json]`** runs the local engine on any file with the
+  `EARMARK_ASR_*` settings, prints `[HH:MM:SS] text` lines or the `Transcript` JSON, and
+  writes nothing outside the model cache.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -384,7 +419,8 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
     shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
-    audio.<ext>                 deleted after transcription unless EARMARK_KEEP_AUDIO
+    audio.<ext>                 deleted after transcription (or when it proves unusable)
+                                unless EARMARK_KEEP_AUDIO
     .audio.<ext>.<random>.part  download in progress; renamed to audio.<ext> when complete
     transcript.json             written last; its existence marks the transcript cached
     transcript.txt              Transcript.to_text()
@@ -454,7 +490,8 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `STORE_BACKEND` | `vault` | `vault`, `fake` |
 | `INDEX_BACKEND` | `lancedb` | `lancedb`, `fake`, `none` |
 | `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing |
-| `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options |
+| `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options (step 08). Model: a size such as `tiny`, `small`, `large-v3`, `distil-large-v3`, `large-v3-turbo`, a Hugging Face repo id, or a local directory. Device: `auto`, `cpu`, `cuda`. Compute type: `auto`, `default`, `int8`, `int8_float32`, `int8_float16`, `int8_bfloat16`, `int16`, `float16`, `bfloat16`, `float32` (device and compute type case-insensitive). Language: a lower-case code such as `en`; `auto` means detect |
+| `ASR_MODEL_DIR` | unset (the Hugging Face cache, `$HF_HOME/hub` or `~/.cache/huggingface/hub`) | Where faster-whisper downloads models |
 | `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset (no upload limit) | Remote ASR backend (key is secret) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
 | `LLM_MODEL` | `claude-opus-5-5` | Analysis model |
@@ -514,6 +551,11 @@ and writes into a vault the user cares about.
   episode page is read with the stdlib `html.parser` and `json`, nothing executed.
 - **Resolver requests.** The lookup and episode-page URLs are built from the parsed ids
   and country; the feed URL comes from Apple's lookup. All three go through `fetch.py`.
+- **Model downloads.** faster-whisper fetches models from Hugging Face with
+  `huggingface_hub`, not through `fetch.py`: the repository is chosen by the operator
+  (`ASR_MODEL`), not by a third party, and it honours the usual `HF_*` and proxy
+  environment variables. Weights are CTranslate2 binaries plus JSON and text; nothing is
+  unpickled. A cached model loads offline.
 - **Vault writes.** Titles and names from feeds and from the LLM are sanitized before
   they become paths or YAML. Resolved paths are checked to be inside the vault subdir.
 - **LLM.** The transcript is untrusted text. The analysis call has no tools, and its
@@ -534,7 +576,10 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
 - `network`: hits real Apple and feed endpoints. These tests call
   `tests/http_helpers.dns_intercepted()` and pass `allow_private=True` when the local
   DNS answers non-public addresses (the dev sandbox, Known risk 5).
-- `slow`: downloads a small Whisper model and transcribes a short clip on CPU.
+- `slow`: downloads the `tiny` Whisper model and a public-domain clip (JFK's 1961
+  inaugural address, 11 s, pinned by commit and sha256 in `tests/slow_assets.py`) into
+  `$SLOW_TEST_CACHE` (default `~/.cache/earmark-tests`), then transcribes it on CPU.
+  Needs the `transcribe` extra and fails (does not skip) without it.
 - `llm`: calls the real analysis model.
 - `gpu`: needs CUDA.
 
@@ -556,11 +601,15 @@ cancels the run in progress, and the job times out after 15 minutes.
 CI runs the default suite only. It does **not** run the opt-in markers (`network`,
 `slow`, `llm`, `gpu`), does not install the `transcribe` or `index` extras, never runs
 on a GPU, and does not build or run the container. Separate workflows:
-`.github/workflows/network.yml` (step 07) runs `uv run --locked pytest -m network -v -rs`
-every Monday at 05:23 UTC and on `workflow_dispatch`, with the same pinned actions and
-setup as `ci.yml`, `contents: read`, and no secrets. GitHub runs `schedule` and
+`.github/workflows/network.yml` ("Live tests") runs every Monday at 05:23 UTC and on
+`workflow_dispatch`, with `contents: read` and no secrets, in two jobs: `network` (step
+07) runs `uv run --locked pytest -m network -v -rs` with the same pinned actions and setup
+as `ci.yml`; `slow` (step 08) runs `uv sync --locked --extra transcribe` and `uv run
+--locked --extra transcribe pytest -m slow -v -rs`, with setup-uv's `cache-suffix:
+transcribe` and a pinned `actions/cache` step for `~/.cache/earmark-tests` (the model and
+clip). GitHub runs `schedule` and
 `workflow_dispatch` only for workflow files on the default branch, so it starts once the
-file is on `main`. Later steps add `-m slow` with the `transcribe` extra (step 08), a
+file is on `main`. Later steps add a
 manual-only `-m llm` run that reads its key from a GitHub environment secret (step 10),
 and an arm64 container build without push (step 16). None of those is a required check:
 their failures usually mean an outside service changed.
@@ -591,8 +640,14 @@ Step planners should check these against current documentation instead of assumi
    GPU server runs well there (a Whisper server, or Parakeet). Step 01 found (2026-11-19)
    that the `ctranslate2 4.9.0` cp313 manylinux aarch64 wheel links no CUDA libraries
    (`readelf -d` lists only libc, libstdc++, libgomp, and similar) and reports
-   `get_supported_compute_types('cpu') == {float32, int8, int8_float32}`. Step 08 should
-   treat the PyPI wheel as CPU-only on aarch64.
+   `get_supported_compute_types('cpu') == {float32, int8, int8_float32}`. Step 08
+   (2026-11-20) confirmed it: `get_cuda_device_count() == 0` and `device="cuda"` raises
+   "not compiled with CUDA support". Upstream ships CUDA 12 wheels for x86_64 only and
+   leaves CUDA 13 (which the GB10, sm_121, needs) to source builds (OpenNMT/CTranslate2
+   #1933, open); field reports show source builds working on GB10. So on the Spark this
+   backend runs on CPU unless the image builds CTranslate2 with CUDA (step 16), and step 09
+   is the supported GPU path. `large-v3` on CPU is slow for long episodes; a smaller
+   `ASR_MODEL` is the stopgap. See `docs/steps/08-transcribe.md` section 2.1.
 2. **iTunes Lookup window.** Verified on 2026-11-19 and 2026-11-20:
    `lookup?id=<show>&entity=podcastEpisode` returns the show record with `feedUrl`, then
    episode records with `trackId` (the `?i=` value), `episodeGuid`, `episodeUrl`,
@@ -620,3 +675,7 @@ Step planners should check these against current documentation instead of assumi
    `dts.podtrac.com`) makes the download fail as a refused non-public address. The job
    error names the host and `EARMARK_ALLOW_PRIVATE_FETCH`; allow-listing the tracker
    in the resolver is the better fix.
+7. **PyAV and faster-whisper.** faster-whisper 1.2.1 passes `metadata_errors` to
+   `av.open`, which PyAV 19.0.0 removed, so every transcription fails with a `TypeError`.
+   The `transcribe` extra pins `av>=18.1,<19` until a faster-whisper release includes the
+   fix already on its `master`. The weekly `slow` job would catch a regression.

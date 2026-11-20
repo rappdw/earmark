@@ -1,0 +1,715 @@
+import dataclasses
+import importlib
+import logging
+import math
+import random
+import re
+import subprocess
+import sys
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from earmark.artifacts import ArtifactStore
+from earmark.config import ConfigError, Settings, load_settings
+from earmark.errors import PermanentError, TransientError
+from earmark.fakes import FakeResolver, make_fake_backends
+from earmark.jobs import open_job_store
+from earmark.models import Episode, Transcript, is_episode_key
+from earmark.pipeline import factory
+from earmark.pipeline.stages import Transcriber
+from earmark.pipeline.worker import Shutdown
+from earmark.transcribe import faster_whisper as fw
+from earmark.transcribe.base import CachedTranscriber, TranscriptionEngine, UnusableAudioError
+from earmark.transcribe.faster_whisper import (
+    MAX_DETAIL_CHARS,
+    DecodedAudio,
+    FasterWhisperEngine,
+    MissingExtraError,
+    WhisperModelLike,
+    WhisperOptions,
+    build_faster_whisper_transcriber,
+    check_device,
+    file_key,
+    load_runtime,
+    segment_from,
+)
+from tests.factories import make_episode
+from tests.http_helpers import FakeMonotonic
+from tests.pipeline_env import CANON, CountingJobStore, make_env
+from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
+
+LOGGER = "earmark.transcribe.faster_whisper"
+
+THREE = (
+    FakeSegment(0.0, 4.0, " Hello\nthere "),
+    FakeSegment(4.0, 9.0, "  second   line"),
+    FakeSegment(9.0, 12.0, " third"),
+)
+
+
+def _options(**overrides: Any) -> WhisperOptions:
+    values: dict[str, Any] = {
+        "model": "tiny",
+        "device": "cpu",
+        "compute_type": "int8",
+        "language": None,
+        "model_dir": None,
+    }
+    values.update(overrides)
+    return WhisperOptions(**values)
+
+
+def _fake(
+    segments: tuple[FakeSegment, ...] = THREE,
+    *,
+    language: str = "en",
+    duration: float = 12.0,
+    **kwargs: Any,
+) -> FakeRuntime:
+    model = FakeWhisperModel(segments, FakeInfo(language, duration), **kwargs)
+    return FakeRuntime(model, duration_s=duration)
+
+
+def _setup(tmp_path: Path, guid: str = "urn:example:guid-1") -> tuple[ArtifactStore, Episode, Path]:
+    artifacts = ArtifactStore(tmp_path / "data")
+    episode = make_episode(guid=guid)
+    audio = artifacts.audio_path(episode.key, "mp3")
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"audio")
+    return artifacts, episode, audio
+
+
+def _transcriber(
+    artifacts: ArtifactStore, fake: FakeRuntime, *, keep_audio: bool = False, **options: Any
+) -> CachedTranscriber:
+    engine = FasterWhisperEngine(_options(**options), fake.runtime())
+    return CachedTranscriber(artifacts, engine, keep_audio=keep_audio)
+
+
+# -- A1: light imports and the missing extra --------------------------------------------
+
+
+def test_transcribe_modules_import_light() -> None:
+    code = (
+        "import sys\n"
+        "import earmark.transcribe.base, earmark.transcribe.faster_whisper\n"
+        "import earmark.pipeline.factory, earmark.cli\n"
+        "heavy = {'faster_whisper', 'ctranslate2', 'av', 'huggingface_hub', 'numpy',\n"
+        "         'onnxruntime', 'tokenizers'}\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"
+
+
+@pytest.mark.parametrize("hidden", ["faster_whisper", "ctranslate2"])
+def test_load_runtime_missing_extra(monkeypatch: pytest.MonkeyPatch, hidden: str) -> None:
+    monkeypatch.setitem(sys.modules, hidden, None)
+    if hidden == "ctranslate2":
+        monkeypatch.setitem(sys.modules, "faster_whisper", types.ModuleType("faster_whisper"))
+    with pytest.raises(MissingExtraError) as info:
+        load_runtime()
+    assert isinstance(info.value, ConfigError)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_ASR_BACKEND: ")
+    assert "'transcribe' extra" in line
+    assert "not installed" in line
+    assert "uv sync --extra transcribe" in line
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("libfoo.so: cannot open shared object file"),
+        ModuleNotFoundError("No module named 'av'", name="av"),
+    ],
+)
+def test_load_runtime_broken_extra(monkeypatch: pytest.MonkeyPatch, error: ImportError) -> None:
+    real = importlib.import_module
+
+    def wrapper(name: str, package: str | None = None) -> types.ModuleType:
+        if name == "faster_whisper":
+            raise error
+        return real(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", wrapper)
+    with pytest.raises(MissingExtraError) as info:
+        load_runtime()
+    [line] = info.value.errors
+    assert "failed to import" in line
+    assert type(error).__name__ in line
+    assert "uv sync --extra transcribe" in line
+    assert "libfoo" not in line
+    assert "No module named" not in line
+    assert "not installed" not in line
+
+
+def test_factory_missing_extra_is_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        vault_dir=tmp_path / "vault",
+        resolver_backend="fake",
+        fetch_backend="fake",
+        asr_backend="faster_whisper",
+        llm_provider="fake",
+        store_backend="fake",
+        index_backend="fake",
+        notify_backend="fake",
+    )
+    with pytest.raises(ConfigError) as info:
+        factory.build_backends(settings, ArtifactStore(settings.data_dir))
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_ASR_BACKEND: ")
+    assert "uv sync --extra transcribe" in line
+    assert not (tmp_path / "data").exists()
+
+
+# -- A2: lazy, once per process ----------------------------------------------------------
+
+
+def test_builder_loads_no_model(tmp_path: Path) -> None:
+    fake = _fake()
+    t = build_faster_whisper_transcriber(
+        Settings(_env_file=None, data_dir=tmp_path), ArtifactStore(tmp_path), runtime=fake.runtime()
+    )
+    assert fake.loads == []
+    assert isinstance(t.engine, FasterWhisperEngine)
+    assert t.engine.model_loaded is False
+
+
+def test_model_loaded_once_for_two_episodes(tmp_path: Path) -> None:
+    artifacts, first, first_audio = _setup(tmp_path)
+    _, second, second_audio = _setup(tmp_path, guid="urn:example:guid-2")
+    fake = _fake()
+    t = _transcriber(artifacts, fake)
+    t.transcribe(first, first_audio)
+    t.transcribe(second, second_audio)
+    assert len(fake.loads) == 1
+    assert len(fake.model.calls) == 2
+
+
+def test_failed_load_is_retried(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.load_errors = [OSError("network down")]
+    t = _transcriber(artifacts, fake)
+    with pytest.raises(TransientError):
+        t.transcribe(episode, audio)
+    assert isinstance(t.engine, FasterWhisperEngine)
+    assert t.engine.model_loaded is False
+    t.transcribe(episode, audio)
+    assert len(fake.loads) == 2
+    assert t.engine.model_loaded is True
+
+
+def test_worker_loads_model_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _fake()
+    monkeypatch.setattr(fw, "load_runtime", fake.runtime)
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        vault_dir=tmp_path / "vault",
+        resolver_backend="fake",
+        fetch_backend="fake",
+        asr_backend="faster_whisper",
+        llm_provider="fake",
+        store_backend="fake",
+        index_backend="fake",
+        notify_backend="fake",
+    )
+    worker = factory.build_worker(settings)
+    store = open_job_store(settings)
+    store.enqueue(CANON)
+    store.enqueue(CANON.replace("1000802907981", "1000802907982"))
+    for _ in range(2):
+        job = worker.run_once()
+        assert job is not None
+        assert job.status == "done"
+    assert len(fake.loads) == 1
+    assert len(fake.model.calls) == 2
+
+
+# -- A3: settings reach the model --------------------------------------------------------
+
+
+def test_options_from_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ASR_MODEL", "small")
+    monkeypatch.setenv("EARMARK_ASR_DEVICE", "CPU")
+    monkeypatch.setenv("EARMARK_ASR_COMPUTE_TYPE", "INT8")
+    monkeypatch.setenv("EARMARK_ASR_LANGUAGE", " EN ")
+    monkeypatch.setenv("EARMARK_ASR_MODEL_DIR", str(tmp_path))
+    settings = load_settings(env_file=None)
+    expected = WhisperOptions("small", "cpu", "int8", "en", tmp_path)
+    assert WhisperOptions.from_settings(settings) == expected
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    t = build_faster_whisper_transcriber(settings, artifacts, runtime=fake.runtime())
+    t.transcribe(episode, audio)
+    assert fake.loads == [expected]
+
+
+def test_language_and_options_reach_model(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake(language="fr")
+    result = _transcriber(artifacts, fake, language="en").transcribe(episode, audio)
+    [call] = fake.model.calls
+    assert call["language"] == "en"
+    assert call["beam_size"] == 5
+    assert call["vad_filter"] is True
+    assert call["audio"] == ("fake", "audio.mp3")
+    assert result.language == "en"
+
+    artifacts, episode, audio = _setup(tmp_path / "b")
+    fake = _fake(language="fr")
+    result = _transcriber(artifacts, fake).transcribe(episode, audio)
+    assert fake.model.calls[0]["language"] is None
+    assert result.language == "fr"
+
+
+def test_real_runtime_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    constructed: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    decoded: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    class RecordingModel:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            constructed.append((args, kwargs))
+
+    def fake_decode(*args: Any, **kwargs: Any) -> list[float]:
+        decoded.append((args, kwargs))
+        return [0.0] * 32_000
+
+    class StubFasterWhisper(types.ModuleType):
+        WhisperModel = RecordingModel
+        decode_audio = staticmethod(fake_decode)
+
+    class StubCtranslate2(types.ModuleType):
+        @staticmethod
+        def get_cuda_device_count() -> int:
+            return 2
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", StubFasterWhisper("faster_whisper"))
+    monkeypatch.setitem(sys.modules, "ctranslate2", StubCtranslate2("ctranslate2"))
+
+    runtime = load_runtime()
+    runtime.load_model(_options(model="small", model_dir=tmp_path))
+    runtime.load_model(_options(model="small"))
+    assert constructed == [
+        (("small",), {"device": "cpu", "compute_type": "int8", "download_root": str(tmp_path)}),
+        (("small",), {"device": "cpu", "compute_type": "int8", "download_root": None}),
+    ]
+    audio = runtime.decode_audio(tmp_path / "a.mp3")
+    assert decoded == [((str(tmp_path / "a.mp3"),), {"sampling_rate": 16000})]
+    assert audio.duration_s == 2.0
+    assert runtime.cuda_device_count() == 2
+
+
+def test_cuda_without_device_is_config_error(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path, asr_device="cuda")
+    artifacts = ArtifactStore(tmp_path)
+    with pytest.raises(ConfigError) as info:
+        build_faster_whisper_transcriber(settings, artifacts, runtime=_fake().runtime())
+    text = str(info.value)
+    assert "EARMARK_ASR_DEVICE" in text
+    assert "EARMARK_ASR_BACKEND=remote" in text
+    gpu = _fake()
+    gpu.cuda_devices = 1
+    build_faster_whisper_transcriber(settings, artifacts, runtime=gpu.runtime())
+    check_device(_options(device="auto"), _fake().runtime())
+
+
+def test_auto_device_without_cuda_logs_cpu(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        _transcriber(artifacts, _fake(), device="auto").transcribe(episode, audio)
+    messages = [r.getMessage() for r in caplog.records]
+    assert "CTranslate2 sees no CUDA device; transcribing on CPU" in messages
+    assert any(m.startswith("loading Whisper model 'tiny'") for m in messages)
+    assert any(m.startswith("loaded Whisper model 'tiny' in ") for m in messages)
+
+
+# -- A4: segment mapping -----------------------------------------------------------------
+
+
+def test_segments_map_to_transcript(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    result = _transcriber(artifacts, _fake()).transcribe(episode, audio)
+    assert result.model == "faster-whisper:tiny"
+    assert result.language == "en"
+    assert result.duration_s == 12.0
+    assert result.episode_key == episode.key
+    assert [s.text for s in result.segments] == ["Hello there", "second line", "third"]
+    assert [(s.start, s.end) for s in result.segments] == [(0.0, 4.0), (4.0, 9.0), (9.0, 12.0)]
+    assert result.warnings == ()
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "previous", "duration", "expected"),
+    [
+        (2.0, 5.0, 3.0, 10.0, (3.0, 5.0)),
+        (4.0, 3.0, 0.0, 10.0, (4.0, 4.0)),
+        (math.nan, 6.0, 2.0, 10.0, (2.0, 6.0)),
+        (3.0, math.nan, 0.0, 10.0, (3.0, 3.0)),
+        (-5.0, 1.0, 0.0, 10.0, (0.0, 1.0)),
+        (12.0, 15.0, 0.0, 10.0, (10.0, 10.0)),
+        (12.0, 15.0, 0.0, 0.0, (12.0, 15.0)),
+        (math.inf, math.inf, 1.0, 10.0, (1.0, 1.0)),
+    ],
+)
+def test_segment_from(
+    start: float, end: float, previous: float, duration: float, expected: tuple[float, float]
+) -> None:
+    seg = segment_from(FakeSegment(start, end, "x"), previous_start=previous, duration_s=duration)
+    assert seg is not None
+    assert (seg.start, seg.end) == expected
+
+
+def test_segment_from_blank_text_is_none() -> None:
+    assert segment_from(FakeSegment(0, 1, " \n\t "), previous_start=0, duration_s=5) is None
+
+
+def test_timestamps_monotonic_property(tmp_path: Path) -> None:
+    rng = random.Random(7)  # noqa: S311  # deterministic test data, not security
+    segments = tuple(
+        FakeSegment(rng.uniform(-10, 130), rng.uniform(-10, 130), f"s{i}") for i in range(50)
+    )
+    artifacts, episode, audio = _setup(tmp_path)
+    result = _transcriber(artifacts, _fake(segments, duration=100.0)).transcribe(episode, audio)
+    starts = [s.start for s in result.segments]
+    assert starts == sorted(starts)
+    assert all(s.end >= s.start for s in result.segments)
+    assert all(s.start >= 0 and s.end <= 100.0 for s in result.segments)
+
+
+# -- A5: cache ---------------------------------------------------------------------------
+
+
+def test_cached_transcript_loads_no_model(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    t = _transcriber(artifacts, fake, keep_audio=True)
+    first = t.transcribe(episode, audio)
+    fake2 = _fake()
+    again = _transcriber(artifacts, fake2).transcribe(episode, audio)
+    assert again == first
+    assert fake2.loads == []
+    assert fake2.decodes == []
+
+
+# -- A6: progress and heartbeat ----------------------------------------------------------
+
+
+def test_progress_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    clock = FakeMonotonic()
+    segments = tuple(FakeSegment(300.0 * i, 300.0 * (i + 1), f"s{i}") for i in range(12))
+    fake = _fake(segments, duration=3600.0, on_segment=lambda i: clock.advance(25))
+    engine = FasterWhisperEngine(
+        _options(), fake.runtime(), monotonic=clock, progress_interval_s=60.0
+    )
+    t = CachedTranscriber(artifacts, engine, keep_audio=False)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        t.transcribe(episode, audio)
+    messages = [r.getMessage() for r in caplog.records if r.name == LOGGER]
+    pattern = re.compile(
+        rf"^transcribing {episode.key}: \d{{2}}:\d{{2}}:\d{{2}} of 01:00:00 \((\d+)%\)$"
+    )
+    progress = [m for m in messages if pattern.match(m)]
+    assert 4 <= len(progress) <= 6
+    assert len(progress) < 12
+    percents = [int(m.rsplit("(", 1)[1].rstrip("%)")) for m in progress]
+    assert percents == sorted(set(percents))
+    assert any(
+        m == f"transcribing {episode.key}: 01:00:00 of audio with faster-whisper:tiny"
+        for m in messages
+    )
+    assert any(m.startswith(f"transcribed {episode.key}: 12 segments") for m in messages)
+
+
+def test_heartbeat_fresh_during_transcription(tmp_path: Path) -> None:
+    stale: list[Any] = []
+    holder: list[Any] = []
+
+    def on_segment(index: int) -> None:
+        if index != 0:
+            return
+        env = holder[0]
+        env.clock.advance(31)
+        assert env.jobs.wait_for_beats(env.jobs.beats + 2)
+        stale.append(env.jobs.requeue_stale())
+
+    fake = _fake(on_segment=on_segment)
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    transcriber = CachedTranscriber(
+        fakes.artifacts, FasterWhisperEngine(_options(), fake.runtime()), keep_audio=False
+    )
+    env = make_env(
+        tmp_path,
+        store_type=CountingJobStore,
+        lease_s=30,
+        heartbeat_s=0.01,
+        fakes=fakes,
+        backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
+    )
+    holder.append(env)
+    env.jobs.enqueue(CANON)
+    job = env.worker.run_once()
+    assert job is not None
+    assert job.status == "done"
+    assert stale == [[]]
+
+
+# -- A7: audio cleanup through the builder and pipeline ----------------------------------
+
+
+def test_builder_passes_keep_audio(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path, keep_audio=True)
+    t = build_faster_whisper_transcriber(
+        settings, ArtifactStore(tmp_path), runtime=_fake().runtime()
+    )
+    assert t.keep_audio is True
+
+
+def test_pipeline_with_faster_whisper(tmp_path: Path) -> None:
+    fake = _fake()
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    transcriber = CachedTranscriber(
+        fakes.artifacts, FasterWhisperEngine(_options(), fake.runtime()), keep_audio=False
+    )
+    env = make_env(
+        tmp_path,
+        fakes=fakes,
+        backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
+    )
+    env.jobs.enqueue(CANON)
+    job = env.worker.run_once()
+    assert job is not None
+    assert job.status == "done"
+    key = job.episode_key
+    assert key is not None
+    assert fakes.artifacts.transcript_json_path(key).is_file()
+    assert fakes.artifacts.find_audio(key) is None
+    loads, decodes = len(fake.loads), len(fake.decodes)
+    env.jobs.enqueue(CANON, prompt="a new prompt")
+    again = env.worker.run_once()
+    assert again is not None
+    assert again.status == "done"
+    assert (len(fake.loads), len(fake.decodes)) == (loads, decodes)
+
+
+# -- A8 / B1: protocols and the factory --------------------------------------------------
+
+
+def test_transcriber_satisfies_protocol(tmp_path: Path) -> None:
+    fake = _fake()
+    m: WhisperModelLike = fake.model
+    e: TranscriptionEngine = FasterWhisperEngine(_options(), fake.runtime())
+    t: Transcriber = CachedTranscriber(ArtifactStore(tmp_path), e, keep_audio=False)
+    assert (m, e, t) is not None
+
+
+def test_factory_builds_faster_whisper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _fake()
+    monkeypatch.setattr(fw, "load_runtime", fake.runtime)
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        vault_dir=tmp_path / "vault",
+        resolver_backend="fake",
+        fetch_backend="fake",
+        asr_backend="faster_whisper",
+        asr_model="small",
+        llm_provider="fake",
+        store_backend="fake",
+        index_backend="fake",
+        notify_backend="fake",
+    )
+    b = factory.build_backends(settings, ArtifactStore(settings.data_dir))
+    assert isinstance(b.transcriber, CachedTranscriber)
+    engine = b.transcriber.engine
+    assert isinstance(engine, FasterWhisperEngine)
+    assert engine.options == WhisperOptions.from_settings(settings)
+    assert engine.model_loaded is False
+    assert fake.loads == []
+
+
+# -- B2: load error mapping --------------------------------------------------------------
+
+
+class RepositoryNotFoundError(OSError):
+    pass
+
+
+class GatedRepoError(RepositoryNotFoundError):
+    pass
+
+
+class LocalEntryNotFoundError(FileNotFoundError):
+    pass
+
+
+URL = "https://huggingface.co/api/models/Systran/faster-whisper-nope"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected", "message"),
+    [
+        (ValueError("Invalid model size 'x'"), PermanentError, "EARMARK_ASR_COMPUTE_TYPE"),
+        (RepositoryNotFoundError(f"404 at {URL}"), PermanentError, "was not found"),
+        (GatedRepoError(f"401 at {URL}"), PermanentError, "was not found"),
+        (LocalEntryNotFoundError(f"offline: {URL}"), TransientError, "LocalEntryNotFoundError"),
+        (ConnectionError(f"reset {URL}"), TransientError, "ConnectionError"),
+    ],
+)
+def test_load_error_mapping(
+    tmp_path: Path, error: Exception, expected: type[Exception], message: str
+) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.load_errors = [error]
+    t = _transcriber(artifacts, fake, model="whisper-x")
+    with pytest.raises(expected) as info:
+        t.transcribe(episode, audio)
+    assert type(info.value) is expected
+    assert message in str(info.value)
+    assert "huggingface.co" not in str(info.value)
+    assert "whisper-x" in str(info.value)
+    assert info.value.__cause__ is error
+    if isinstance(error, ValueError):
+        for name in ("EARMARK_ASR_MODEL", "EARMARK_ASR_DEVICE", "EARMARK_ASR_COMPUTE_TYPE"):
+            assert name in str(info.value)
+
+
+def test_load_error_unknown_propagates(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.load_errors = [RuntimeError("boom")]
+    with pytest.raises(RuntimeError, match="boom"):
+        _transcriber(artifacts, fake).transcribe(episode, audio)
+
+
+# -- B3: unusable audio ------------------------------------------------------------------
+
+
+class DecodeError(ValueError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"[Errno 1094995529] Invalid data found when processing input: '{path}'")
+        self.strerror = "Invalid data found when processing input"
+
+
+def test_decode_error_is_unusable_audio(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.decode_error = DecodeError(audio)
+    with pytest.raises(UnusableAudioError) as info:
+        _transcriber(artifacts, fake).transcribe(episode, audio)
+    assert str(info.value) == "could not decode audio.mp3: Invalid data found when processing input"
+    assert str(tmp_path) not in str(info.value)
+    assert not audio.exists()
+
+
+def test_decode_error_without_strerror_names_class(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.decode_error = RuntimeError(f"secret {tmp_path}")
+    with pytest.raises(UnusableAudioError, match=r"could not decode audio\.mp3: RuntimeError$"):
+        _transcriber(artifacts, fake).transcribe(episode, audio)
+
+
+def test_decode_memory_error_propagates(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.decode_error = MemoryError()
+    with pytest.raises(MemoryError):
+        _transcriber(artifacts, fake).transcribe(episode, audio)
+    assert audio.exists()
+
+
+def test_zero_duration_is_unusable(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.duration_s = 0.0
+    with pytest.raises(UnusableAudioError, match=r"audio\.mp3 contains no audio"):
+        _transcriber(artifacts, fake).transcribe(episode, audio)
+    assert fake.model.calls == []
+
+
+@pytest.mark.parametrize("segments", [(), (FakeSegment(0, 1, "  "), FakeSegment(1, 2, "\n"))])
+def test_no_speech_is_unusable(tmp_path: Path, segments: tuple[FakeSegment, ...]) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    with pytest.raises(UnusableAudioError, match=r"no speech found in audio.mp3 \(00:00:12 of"):
+        _transcriber(artifacts, _fake(segments)).transcribe(episode, audio)
+    assert not artifacts.has_transcript(episode.key)
+    assert not audio.exists()
+
+
+def test_transcribe_value_error_is_permanent(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    detail = "'xx' is not a valid language code " + "x" * 500
+    fake = _fake(transcribe_error=ValueError(detail))
+    with pytest.raises(PermanentError) as info:
+        _transcriber(artifacts, fake, language="xx").transcribe(episode, audio)
+    message = str(info.value)
+    assert message.endswith("(check EARMARK_ASR_LANGUAGE)")
+    assert message.startswith("transcription failed: 'xx' is not a valid language code")
+    suffix = " (check EARMARK_ASR_LANGUAGE)"
+    assert len(message) <= len("transcription failed: ") + MAX_DETAIL_CHARS + len(suffix)
+    assert audio.exists()
+
+
+# -- B4: interruption --------------------------------------------------------------------
+
+
+def test_shutdown_mid_transcription(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+
+    def interrupt(index: int) -> None:
+        if index == 1:
+            raise Shutdown
+
+    fake = _fake(on_segment=interrupt)
+    t = _transcriber(artifacts, fake)
+    with pytest.raises(Shutdown):
+        t.transcribe(episode, audio)
+    directory = artifacts.episode_dir(episode.key)
+    assert not list(directory.glob("transcript.*"))
+    assert not [p for p in directory.iterdir() if p.name.endswith(".tmp")]
+    assert audio.exists()
+    fake.model.on_segment = None
+    t.transcribe(episode, audio)
+    assert len(fake.loads) == 1
+
+
+# -- B5: file_key ------------------------------------------------------------------------
+
+
+def test_file_key_deterministic(tmp_path: Path) -> None:
+    a, b, c = tmp_path / "a.mp3", tmp_path / "b.mp3", tmp_path / "c.mp3"
+    a.write_bytes(b"same")
+    b.write_bytes(b"same")
+    c.write_bytes(b"different")
+    assert file_key(a) == file_key(b)
+    assert file_key(a) != file_key(c)
+    assert is_episode_key(file_key(a))
+
+
+def test_decoded_audio_is_opaque() -> None:
+    assert DecodedAudio(samples=object(), duration_s=1.0).duration_s == 1.0
+
+
+def test_transcript_validates_back(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    result = _transcriber(artifacts, _fake(), keep_audio=True).transcribe(episode, audio)
+    assert (
+        Transcript.model_validate_json(artifacts.transcript_json_path(episode.key).read_text())
+        == result
+    )
+    assert FakeResolver().resolve(CANON).key  # fakes are importable alongside

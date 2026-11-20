@@ -17,7 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-transcribe = []   # step 08: faster-whisper
+transcribe = [
+  "faster-whisper>=1.2.1",
+  # faster-whisper 1.2.1 breaks with PyAV 19 (av.open lost metadata_errors); drop this
+  # bound once a faster-whisper release after 1.2.1 ships the fix. See docs/steps/08-transcribe.md 2.2.
+  "av>=18.1,<19",
+]
 index = []        # step 14: lancedb, fastembed
 
 [project.scripts]

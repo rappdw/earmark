@@ -1,5 +1,6 @@
 """Settings: EARMARK_* environment variables, then .env, then defaults."""
 
+import re
 import zoneinfo
 from pathlib import Path, PurePosixPath
 from typing import Final, Literal
@@ -16,6 +17,19 @@ StoreBackend = Literal["vault", "fake"]
 IndexBackend = Literal["lancedb", "fake", "none"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+AsrDevice = Literal["auto", "cpu", "cuda"]
+AsrComputeType = Literal[
+    "auto",
+    "default",
+    "int8",
+    "int8_float32",
+    "int8_float16",
+    "int8_bfloat16",
+    "int16",
+    "float16",
+    "bfloat16",
+    "float32",
+]
 
 ENV_PREFIX: Final = "EARMARK_"
 REDACTED: Final = "**********"
@@ -58,9 +72,12 @@ class Settings(BaseSettings):
     index_backend: IndexBackend = Field("lancedb", description="Search index.")
     notify_backend: NotifyBackend = Field("ntfy", description="Notifier.")
     asr_model: str = Field("large-v3", description="Whisper model name.")
-    asr_device: str = Field("auto", description="Whisper device.")
-    asr_compute_type: str = Field("auto", description="Whisper compute type.")
+    asr_device: AsrDevice = Field("auto", description="Whisper device.")
+    asr_compute_type: AsrComputeType = Field("auto", description="Whisper compute type.")
     asr_language: str | None = Field(None, description="Force a transcription language.")
+    asr_model_dir: Path | None = Field(
+        None, description="Where Whisper models are downloaded (default: the Hugging Face cache)."
+    )
     asr_base_url: str | None = Field(None, description="Remote ASR endpoint.")
     asr_api_key: SecretStr | None = Field(None, description="Remote ASR API key.")
     asr_max_upload_mb: int | None = Field(None, gt=0, description="Remote ASR upload cap.")
@@ -103,6 +120,31 @@ class Settings(BaseSettings):
     @classmethod
     def _upper_log_level(cls, v: object) -> object:
         return v.upper() if isinstance(v, str) else v
+
+    @field_validator("asr_model")
+    @classmethod
+    def _check_asr_model(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("asr_device", "asr_compute_type", mode="before")
+    @classmethod
+    def _lower_asr_choice(cls, v: object) -> object:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("asr_language")
+    @classmethod
+    def _check_asr_language(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if v == "auto":
+            return None
+        if not re.fullmatch("[a-z]{2,3}", v):
+            raise ValueError("must be a language code such as 'en', or 'auto'")
+        return v
 
     def secret_values(self) -> list[str]:
         values: list[str] = []

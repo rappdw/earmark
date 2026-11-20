@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -246,3 +247,47 @@ def resolve_command(
     if note is not None:
         typer.echo(note, err=True)
     typer.echo(episode.model_dump_json(indent=2))
+
+
+@app.command("transcribe")
+def transcribe_command(
+    audio: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Local audio file."),
+    ],
+    as_json: Annotated[bool, typer.Option("--json", help="Print the Transcript as JSON.")] = False,
+) -> None:
+    """Transcribe a local audio file with the faster-whisper engine and print the result.
+
+    Always uses the local engine and the EARMARK_ASR_* settings; writes nothing under
+    EARMARK_DATA_DIR and leaves the input file alone.
+    """
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from earmark.errors import PermanentError, TransientError
+    from earmark.transcribe import faster_whisper as fw
+
+    try:
+        options = fw.WhisperOptions.from_settings(settings)
+        runtime = fw.load_runtime()
+        fw.check_device(options, runtime)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        transcript = fw.FasterWhisperEngine(options, runtime).transcribe_file(
+            audio, fw.file_key(audio)
+        )
+    except TransientError as exc:
+        typer.echo(
+            f"earmark transcribe: {_clean(exc.message)} (temporary; try again later)", err=True
+        )
+        raise typer.Exit(code=1) from None
+    except PermanentError as exc:
+        typer.echo(f"earmark transcribe: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=1) from None
+    if as_json:
+        typer.echo(transcript.model_dump_json(indent=2))
+        return
+    for line in transcript.to_text().splitlines():
+        typer.echo(_clean(line))

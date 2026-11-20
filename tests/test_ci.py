@@ -72,6 +72,12 @@ def _only_job(workflow: dict[Any, Any]) -> dict[str, Any]:
     return job
 
 
+def _network_job(job_id: str) -> dict[str, Any]:
+    job = _jobs(_network())[job_id]
+    assert isinstance(job, dict)
+    return job
+
+
 def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
     steps = job["steps"]
     assert isinstance(steps, list)
@@ -337,8 +343,12 @@ def test_network_workflow_triggers() -> None:
     assert minute != "0"
 
 
+def test_live_workflow_jobs() -> None:
+    assert set(_jobs(_network())) == {"network", "slow"}
+
+
 def test_network_workflow_runs_network_marker() -> None:
-    job = _only_job(_network())
+    job = _network_job("network")
     assert job["runs-on"] == ARM64_RUNNER
     timeout = job["timeout-minutes"]
     assert type(timeout) is int
@@ -353,7 +363,7 @@ def test_network_workflow_read_only_no_secrets() -> None:
     assert workflow["permissions"] == {"contents": "read"}
     assert "secrets" not in NETWORK_WORKFLOW.read_text()
     assert "env" not in workflow
-    job = _only_job(workflow)
+    job = _network_job("network")
     assert "env" not in job
     steps = _steps(job)
     assert all("env" not in s for s in steps)
@@ -361,10 +371,14 @@ def test_network_workflow_read_only_no_secrets() -> None:
     assert checkout["with"]["persist-credentials"] is False
 
 
+def _job_remote_uses(job: dict[str, Any]) -> list[str]:
+    return [s["uses"] for s in _steps(job) if isinstance(s.get("uses"), str)]
+
+
 def test_network_workflow_pins_match_ci() -> None:
-    network = _network()
-    assert _remote_uses(network) == _remote_uses(_ci())
-    [network_uv] = [s for s in _steps(_only_job(network)) if _action(s) == SETUP_UV]
+    job = _network_job("network")
+    assert _job_remote_uses(job) == _remote_uses(_ci())
+    [network_uv] = [s for s in _steps(job) if _action(s) == SETUP_UV]
     assert network_uv["with"] == _ci_step(SETUP_UV)["with"]
 
 
@@ -372,4 +386,54 @@ def test_network_workflow_is_not_the_gate() -> None:
     # The default suite must never run the live tests: the marker expression excludes them.
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
     addopts = pyproject["tool"]["pytest"]["addopts"]
-    assert "not network" in addopts[addopts.index("-m") + 1]
+    expression = addopts[addopts.index("-m") + 1]
+    assert "not network" in expression
+    assert "not slow" in expression
+
+
+# --- slow job (step 08) --------------------------------------------------------------------
+
+SLOW_COMMANDS = [
+    "uv sync --locked --extra transcribe",
+    "uv run --locked --extra transcribe pytest -m slow -v -rs",
+]
+CACHE_ACTION = "actions/cache"
+CACHE_PIN = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+
+
+def test_slow_job_runs_slow_marker() -> None:
+    job = _network_job("slow")
+    assert job["runs-on"] == ARM64_RUNNER
+    timeout = job["timeout-minutes"]
+    assert type(timeout) is int
+    assert 1 <= timeout <= 30
+    steps = _steps(job)
+    assert [s["run"].strip() for s in steps if "run" in s] == SLOW_COMMANDS
+    assert [_action(s) for s in steps] == [CHECKOUT, SETUP_UV, CACHE_ACTION, "", ""]
+
+
+def test_slow_job_read_only_no_secrets() -> None:
+    workflow = _network()
+    assert "env" not in workflow
+    job = _network_job("slow")
+    assert "env" not in job
+    steps = _steps(job)
+    assert all("env" not in s for s in steps)
+    [checkout] = [s for s in steps if _action(s) == CHECKOUT]
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_slow_job_pins() -> None:
+    job = _network_job("slow")
+    assert _job_remote_uses(job) == [*_remote_uses(_ci()), CACHE_PIN]
+    [slow_uv] = [s for s in _steps(job) if _action(s) == SETUP_UV]
+    assert slow_uv["with"] == {**_ci_step(SETUP_UV)["with"], "cache-suffix": "transcribe"}
+
+
+def test_slow_job_caches_test_assets() -> None:
+    from tests.slow_assets import DEFAULT_CACHE_DIR
+
+    job = _network_job("slow")
+    [cache] = [s for s in _steps(job) if _action(s) == CACHE_ACTION]
+    assert cache["with"]["path"] == "~/" + DEFAULT_CACHE_DIR.relative_to(Path.home()).as_posix()
+    assert "hashFiles('tests/slow_assets.py')" in cache["with"]["key"]

@@ -61,6 +61,12 @@ def _apple_resolver(ctx: BuildContext) -> Resolver:
     return build_apple_resolver(ctx.settings)
 
 
+def _faster_whisper_transcriber(ctx: BuildContext) -> Transcriber:
+    from earmark.transcribe.faster_whisper import build_faster_whisper_transcriber
+
+    return build_faster_whisper_transcriber(ctx.settings, ctx.artifacts)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -71,6 +77,7 @@ FETCHERS: Final[Mapping[str, Builder[AudioFetcher]]] = {
 }
 TRANSCRIBERS: Final[Mapping[str, Builder[Transcriber]]] = {
     "fake": lambda ctx: FakeTranscriber(ctx.artifacts),
+    "faster_whisper": _faster_whisper_transcriber,
 }
 ANALYZERS: Final[Mapping[str, Builder[Analyzer]]] = {
     "fake": lambda ctx: FakeAnalyzer(ctx.artifacts, clock=ctx.clock),

@@ -68,15 +68,20 @@ def test_unbuilt_backend_names_setting(tmp_path: Path, field: str) -> None:
 
 def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, data_dir=tmp_path / "data")
+    expected = {
+        field for field, (_, registry) in FIELDS.items() if getattr(settings, field) not in registry
+    }
+    assert expected == {"llm_provider", "store_backend", "index_backend", "notify_backend"}
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     errors = info.value.errors
-    assert len(errors) == len(UNBUILT_FIELDS) == 5
+    assert len(errors) == len(expected) == 4
     for field in FIELDS:
-        expected = 1 if field in UNBUILT_FIELDS else 0
-        assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == expected
+        count = 1 if field in expected else 0
+        assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == count
     assert not any(line.startswith("EARMARK_FETCH_BACKEND") for line in errors)
     assert not any(line.startswith("EARMARK_RESOLVER_BACKEND") for line in errors)
+    assert not any(line.startswith("EARMARK_ASR_BACKEND") for line in errors)
 
 
 def test_all_fake_builds_fakes(tmp_path: Path) -> None:
@@ -125,7 +130,7 @@ def test_build_worker_runs_a_job(tmp_path: Path) -> None:
 
 
 def test_build_worker_config_error_touches_nothing(tmp_path: Path) -> None:
-    settings = _fake_settings(tmp_path, asr_backend="faster_whisper")
+    settings = _fake_settings(tmp_path, asr_backend="remote")
     with pytest.raises(ConfigError):
         factory.build_worker(settings)
     assert not (tmp_path / "data").exists()

@@ -17,10 +17,12 @@ from earmark.config import Settings, env_var
 from earmark.errors import PermanentError, SkipEpisode, TransientError
 from earmark.fakes import FakeResolver
 from earmark.jobs import open_job_store
-from earmark.models import MAX_PROMPT_CHARS, Episode
+from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
+from earmark.transcribe import faster_whisper as fw
 from tests.factories import make_episode
+from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
 
 runner = CliRunner()
 VERSION = importlib.metadata.version("earmark")
@@ -274,7 +276,7 @@ def test_worker_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.usefixtures("restore_root_logging")
 def test_worker_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EARMARK_ASR_BACKEND", "faster_whisper")
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
     result = runner.invoke(app, ["worker", "--once"])
     assert result.exit_code == 2
     assert "EARMARK_ASR_BACKEND" in result.stderr
@@ -460,3 +462,118 @@ def test_resolve_error_messages_are_cleaned(
     result = runner.invoke(app, ["resolve", SHARE])
     assert "\x1b" not in result.stderr
     assert "bad ?[31m" in result.stderr
+
+
+# -- worker and transcribe without the extra (step 08) -----------------------------------
+
+
+def _hide_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)
+
+
+def test_worker_missing_extra_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "faster_whisper")
+    _hide_extra(monkeypatch)
+    result = runner.invoke(app, ["worker", "--once"])
+    assert result.exit_code == 2
+    assert "EARMARK_ASR_BACKEND" in result.stderr
+    assert "transcribe" in result.stderr
+    assert "uv sync --extra transcribe" in result.stderr
+    assert not (fake_env / "data").exists()
+
+
+def test_transcribe_missing_extra_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _hide_extra(monkeypatch)
+    clip = fake_env / "clip.mp3"
+    clip.write_bytes(b"x")
+    result = runner.invoke(app, ["transcribe", str(clip)])
+    assert result.exit_code == 2
+    assert "uv sync --extra transcribe" in result.stderr
+    assert not (fake_env / "data").exists()
+
+
+# -- transcribe ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def whisper(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> FakeRuntime:
+    segments = (FakeSegment(0.0, 4.0, " Hello there"), FakeSegment(65.0, 70.0, "second"))
+    fake = FakeRuntime(FakeWhisperModel(segments, FakeInfo("en", 70.0)), duration_s=70.0)
+    monkeypatch.setattr(fw, "load_runtime", fake.runtime)
+    return fake
+
+
+def _clip(directory: Path, data: bytes = b"audio bytes") -> Path:
+    clip = directory / "clip.mp3"
+    clip.write_bytes(data)
+    return clip
+
+
+def test_transcribe_prints_lines(fake_env: Path, whisper: FakeRuntime) -> None:
+    clip = _clip(fake_env)
+    result = runner.invoke(app, ["transcribe", str(clip)])
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "[00:00:00] Hello there\n[00:01:05] second\n"
+    assert clip.read_bytes() == b"audio bytes"
+    assert not (fake_env / "data").exists()
+    assert whisper.decodes == [clip]
+
+
+def test_transcribe_json(fake_env: Path, whisper: FakeRuntime) -> None:
+    clip = _clip(fake_env)
+    result = runner.invoke(app, ["transcribe", "--json", str(clip)])
+    assert result.exit_code == 0, result.stderr
+    transcript = Transcript.model_validate_json(result.stdout)
+    assert transcript.episode_key == fw.file_key(clip)
+    assert transcript.model == "faster-whisper:large-v3"
+    assert [s.text for s in transcript.segments] == ["Hello there", "second"]
+
+
+def test_transcribe_missing_file_exits_2(fake_env: Path, whisper: FakeRuntime) -> None:
+    result = runner.invoke(app, ["transcribe", str(fake_env / "nope.mp3")])
+    assert result.exit_code == 2
+    assert whisper.loads == []
+
+
+def test_transcribe_unusable_audio_exits_1(fake_env: Path, whisper: FakeRuntime) -> None:
+    whisper.decode_error = ValueError("bad")
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 1
+    assert result.stderr.splitlines()[-1].startswith(
+        "earmark transcribe: could not decode clip.mp3"
+    )
+    assert result.stdout == ""
+
+
+def test_transcribe_transient_exits_1(fake_env: Path, whisper: FakeRuntime) -> None:
+    whisper.load_errors = [OSError("offline")]
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 1
+    assert result.stderr.splitlines()[-1].startswith("earmark transcribe: ")
+    assert result.stderr.rstrip().endswith("(temporary; try again later)")
+
+
+def test_transcribe_cleans_control_chars(fake_env: Path, whisper: FakeRuntime) -> None:
+    whisper.model.segments = [FakeSegment(0.0, 1.0, "\x1b[31mred")]
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 0, result.stderr
+    assert "\x1b" not in result.stdout
+    assert "red" in result.stdout
+
+
+def test_transcribe_ignores_asr_backend(
+    fake_env: Path, whisper: FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_ASR_BACKEND", "fake")
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 0, result.stderr
+    assert len(whisper.loads) == 1
+
+
+def test_transcribe_cuda_without_device_exits_2(
+    fake_env: Path, whisper: FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_ASR_DEVICE", "cuda")
+    result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
+    assert result.exit_code == 2
+    assert "EARMARK_ASR_DEVICE" in result.stderr
