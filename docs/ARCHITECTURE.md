@@ -19,7 +19,7 @@ backend, not the pipeline.
 | Vector store | LanceDB, embedded, no server. | Swap the `Indexer` backend. |
 | Transcription | faster-whisper `large-v3` in the worker process, with a remote OpenAI-compatible ASR endpoint as the alternative (step 09). | `EARMARK_ASR_BACKEND`. |
 | Reachability | Tailscale. The API binds to the tailnet and is never exposed publicly. | See `docs/deploy.md` (step 16). |
-| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`. Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
@@ -31,7 +31,7 @@ API (FastAPI) ── validates, enqueues, returns 202 {job_id} ──► jobs ta
                                                                    │ claim
                                                                    ▼
 Worker ── Pipeline.run(job)
-   resolve     Apple URL → iTunes Lookup → RSS feed → Episode (guid, enclosure URL)
+   resolve     Apple URL → iTunes Lookup (or the episode page) → RSS feed → Episode
    fetch       enclosure → data/episodes/<key>/audio.<ext>
    transcribe  audio → transcript.json + transcript.txt
    analyze     transcript + prompt → analyses/<prompt_hash>.json
@@ -68,7 +68,9 @@ src/earmark/
     runner.py          Pipeline: runs one claimed job, maps exceptions to job outcomes
     factory.py         composition root: Settings → backends (registries), build_worker
     worker.py          Worker (claim/run loop), Heartbeat thread, SIGTERM/SIGINT handling
-  resolve/             apple.py (URL parsing), itunes.py, rss.py, resolver.py
+  resolve/             apple.py (URL parsing, light), itunes.py (lookup JSON), apple_page.py
+                       (episode page JSON), rss.py (feed parsing, matching), text.py,
+                       resolver.py (AppleResolver, the `apple` backend; step 07)
   transcribe/          faster_whisper.py, remote.py
   analyze/             schema.py, prompts.py, render.py, analyzer.py, chunking.py, llm/
   vault/               notes.py, sanitize.py, entities.py
@@ -99,6 +101,11 @@ seconds are finite and non-negative.
 - `Episode`: `key`, `source`, `show_id`, `episode_id`, `guid`, `title`, `show_title`,
   `published_at | None`, `duration_s | None`, `audio_url`, `feed_url | None`, `url`,
   `description`. A validator requires `key == episode_key(source, show_id, guid)`.
+  From the `apple` resolver (step 07): `guid` is Apple's episode GUID when Apple gives
+  one, else the matched feed item's, else `apple-podcasts:<episode_id>`; `title` and
+  `show_title` are Apple's, cleaned of control characters and capped (500 characters);
+  `audio_url` is the feed enclosure, else Apple's public audio URL; `feed_url` is the
+  lookup's `feedUrl`; `description` is plain text, capped at 20 000 characters.
 - `Segment`: `start`, `end`, `text`, `speaker: str | None`.
 - `Transcript`: `episode_key`, `language | None`, `duration_s`, `model`, `segments`,
   `warnings`. `to_text()` renders one `[HH:MM:SS] text` line per segment (whitespace
@@ -293,6 +300,42 @@ Step 06; exact signatures in `docs/steps/06-fetch.md`.
   extension of the final URL's path, else the `Content-Type`'s, else the original URL
   path's, else `bin`.
 
+### Resolving
+
+Step 07; exact signatures in `docs/steps/07-resolver.md`.
+
+- **`apple` Resolver.** `resolve.resolver.AppleResolver` (built by
+  `build_apple_resolver(settings)` with `fetch.guarded_fetcher(settings)` and
+  `MAX_FEED_MB`) parses the canonical URL, then calls the iTunes Lookup
+  `https://itunes.apple.com/lookup?id=<show>&entity=podcastEpisode&limit=200&country=<cc>`
+  (200 is Apple's maximum; there is no paging, and some shows list far fewer).
+  `resolve_details(url)` also reports where the episode was identified (`lookup` or
+  `page`) and the feed match tier; `earmark resolve <url>` prints it.
+- **Out-of-window episodes.** `lookup?id=<episode id>` returns nothing, so an episode
+  not in the lookup result is identified from its Apple Podcasts web page (the canonical
+  URL): the `serialized-server-data` JSON (GUID, title, date, duration, show, public
+  `STDQ` audio URL), else the schema.org `PodcastEpisode` JSON-LD (title, date,
+  duration). The page's show must equal the URL's show.
+- **Feed matching**, first hit wins: GUID; enclosure host and path (query and scheme
+  ignored, unique only); normalized title (NFKC, casefold, punctuation and symbols
+  removed; nearest date breaks ties); publish date, which must equal Apple's to the
+  minute (or, when Apple gives only a calendar date, fall within one day of it) with
+  durations agreeing within max(30 s, 2 %) where known (required for date-only), and
+  must identify exactly one item. There is no "nearest" choice: on daily shows the
+  previous episode is about 24 h away, and a false match is worse than none. Audio comes
+  from the matched item's enclosure; when the feed does not list the episode, from
+  Apple's audio URL.
+- **Outcomes.** No show record → `PermanentError`. No public `feedUrl` → `SkipEpisode`.
+  Matched item without a usable enclosure, or an unmatched episode whose only Apple
+  stream is for subscribers → `SkipEpisode`. Both skip reasons name subscriber-only and
+  Apple-exclusive content. Unmatched with no Apple audio URL, an episode Apple does not
+  list, or a page for another show → `PermanentError`. Lookup 403 (rate limiting) and
+  an unreadable lookup body are transient; lookup 400 (bad store) is permanent; other
+  statuses follow `fetch.py`. A malformed feed, one declaring entities, or a non-RSS
+  root is permanent.
+- **No cache.** Two requests in the window (lookup, feed), three outside it; the
+  runner writes `episode.json` afterwards.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -418,7 +461,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_CONTEXT_TOKENS` | unset | Local LLM endpoint and its context budget (key is secret) |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (fastembed's default; step 14 may revise) |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
-| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024). `ALLOW_PRIVATE_FETCH` turns off the address check only |
+| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
 | `TZ` | unset (system) | IANA zone for note dates and digests, validated at load |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive) |
@@ -462,8 +505,15 @@ and writes into a vault the user cares about.
     for documents, so a gzip bomb stops at the cap).
   - No proxies from the environment, no cookies kept between fetches, and a generic
     `User-Agent: earmark/<version>`. URL paths and queries (which can carry session
-    ids) are not logged or put in job errors.
-- **XML.** Feed parsing must be safe against entity expansion and external entities.
+    ids) are not logged or put in job errors. `log.configure_logging` keeps the `httpx2` and
+    `httpcore2` loggers at WARNING or above, because they print every request URL at INFO.
+- **XML.** Feeds are parsed only by `resolve/rss.py`, with `defusedxml.ElementTree`
+  (entity declarations and external references refused, so no expansion bombs and no
+  external entities; a DOCTYPE alone is allowed and never fetched). The stdlib parser
+  is not used on feeds: with expat 2.9 it still expands internal entities. Apple's
+  episode page is read with the stdlib `html.parser` and `json`, nothing executed.
+- **Resolver requests.** The lookup and episode-page URLs are built from the parsed ids
+  and country; the feed URL comes from Apple's lookup. All three go through `fetch.py`.
 - **Vault writes.** Titles and names from feeds and from the LLM are sanitized before
   they become paths or YAML. Resolved paths are checked to be inside the vault subdir.
 - **LLM.** The transcript is untrusted text. The analysis call has no tools, and its
@@ -481,7 +531,9 @@ asyncio event loop, and so FastAPI's `TestClient`, needs a socketpair. Tests car
 default `-m` expression deselects all four markers; passing `-m` on the command line
 replaces it, so `-m network` runs only network tests. Opt-in markers:
 
-- `network`: hits real Apple and feed endpoints.
+- `network`: hits real Apple and feed endpoints. These tests call
+  `tests/http_helpers.dns_intercepted()` and pass `allow_private=True` when the local
+  DNS answers non-public addresses (the dev sandbox, Known risk 5).
 - `slow`: downloads a small Whisper model and transcribes a short clip on CPU.
 - `llm`: calls the real analysis model.
 - `gpu`: needs CUDA.
@@ -503,11 +555,15 @@ cancels the run in progress, and the job times out after 15 minutes.
 
 CI runs the default suite only. It does **not** run the opt-in markers (`network`,
 `slow`, `llm`, `gpu`), does not install the `transcribe` or `index` extras, never runs
-on a GPU, and does not build or run the container. Later steps add separate workflows:
-a scheduled and manual run of `-m network` (step 07) and `-m slow` with the `transcribe`
-extra (step 08), a manual-only `-m llm` run that reads its key from a GitHub environment
-secret (step 10), and an arm64 container build without push (step 16). None of those is
-a required check.
+on a GPU, and does not build or run the container. Separate workflows:
+`.github/workflows/network.yml` (step 07) runs `uv run --locked pytest -m network -v -rs`
+every Monday at 05:23 UTC and on `workflow_dispatch`, with the same pinned actions and
+setup as `ci.yml`, `contents: read`, and no secrets. GitHub runs `schedule` and
+`workflow_dispatch` only for workflow files on the default branch, so it starts once the
+file is on `main`. Later steps add `-m slow` with the `transcribe` extra (step 08), a
+manual-only `-m llm` run that reads its key from a GitHub environment secret (step 10),
+and an arm64 container build without push (step 16). None of those is a required check:
+their failures usually mean an outside service changed.
 
 Rules for every workflow under `.github/workflows/`, enforced by `tests/test_ci.py`: it
 passes `actionlint` (installed by the `actionlint-py` dev dependency and run offline by
@@ -516,7 +572,14 @@ SHA followed by a `# vX.Y.Z` comment, it declares a top-level `permissions` bloc
 never uses `pull_request_target`. `ci.yml` additionally gets only `contents: read` and
 references no secrets. Dependabot (`.github/dependabot.yml`) proposes weekly updates for
 the `uv` and `github-actions` ecosystems; it reads its config from the default branch
-(`main`) and opens pull requests against it.
+(`main`) but opens pull requests against `impl` (`target-branch`), so updates pass the
+same gate as a step and `main` stays a fast-forward of `impl`.
+
+Branches: steps land on `impl`. After a step's CI run is green, `/step` fast-forwards
+`main` to that commit (`git push origin <sha>:main`), so `main` is always the latest
+verified, green step and the scheduled workflows test current code. `main` is protected
+(required check `make check (linux/arm64)`, no force-push, no deletion); nothing is
+merged into `main` that did not come through `impl`.
 
 ## Known risks
 
@@ -530,11 +593,16 @@ Step planners should check these against current documentation instead of assumi
    (`readelf -d` lists only libc, libstdc++, libgomp, and similar) and reports
    `get_supported_compute_types('cpu') == {float32, int8, int8_float32}`. Step 08 should
    treat the PyPI wheel as CPU-only on aarch64.
-2. **iTunes Lookup window.** Verified on 2026-11-19: `lookup?id=<show>&entity=podcastEpisode`
-   returns the show record with `feedUrl`, then episode records with `trackId` (the `?i=`
-   value), `episodeGuid`, `episodeUrl`, `trackName`, `releaseDate`, and
-   `trackTimeMillis`. Not verified: the maximum `limit`, and how to identify an episode
-   older than the returned window.
+2. **iTunes Lookup window.** Verified on 2026-11-19 and 2026-11-20:
+   `lookup?id=<show>&entity=podcastEpisode` returns the show record with `feedUrl`, then
+   episode records with `trackId` (the `?i=` value), `episodeGuid`, `episodeUrl`,
+   `trackName`, `releaseDate`, and `trackTimeMillis`, newest first. `limit` is at most
+   200 (default 50; no paging), and some shows list far fewer (The Daily: 44 of 2785).
+   `lookup?id=<episode id>` returns nothing. Older episodes are identified from the
+   episode web page's embedded JSON, which is undocumented and may change; the weekly
+   `network` workflow resolves one such episode so a change shows up. Feeds can carry a
+   different GUID and title than Apple for the same episode (art19), which is why
+   matching has four tiers. See `docs/steps/07-resolver.md` section 2.
 3. **Wheels on aarch64 and Python 3.13** for ctranslate2, lancedb, onnxruntime, and
    fastembed. Resolved in step 01 (2026-11-19): all have cp313 (or abi3/pure) manylinux
    aarch64 wheels, install with `--only-binary :all:`, and import on this sandbox. Python

@@ -39,7 +39,9 @@ For each step:
 5. **On `VERDICT: PASS`,** set the step to `done` in the status table and commit
    everything as one commit titled `step NN: <title>`. Then push `impl` and wait for the
    CI run for that commit (`gh run watch <id> --exit-status`). If CI fails, stop the loop
-   and bring the failure to the user; do not start the next step on a red build.
+   and bring the failure to the user; do not start the next step on a red build. On
+   green, fast-forward `main` to that commit with `git push origin <sha>:main` (never
+   force; if it is not a fast-forward, stop and ask).
 6. **Report and continue.** Give the user a short report for the step: the verdict, the
    commit, the CI result, the verifier's notes, and the unverified items. Then, unless
    `--one` was given, move on to the next step: the first `todo` row in the status

@@ -149,3 +149,13 @@ def guarded_fetcher_for(
     network: httpcore2.NetworkBackend, resolver: StaticResolver, **kwargs: Any
 ) -> GuardedFetcher:
     return GuardedFetcher(network=network, resolve=resolver, **kwargs)
+
+
+def dns_intercepted() -> bool:
+    """True when local DNS answers non-public addresses for a real host (the dev sandbox).
+
+    Only call this inside ``network`` tests or tools: the default suite blocks sockets.
+    """
+    from earmark.fetch import is_public_address, system_resolve
+
+    return not all(is_public_address(a) for a in system_resolve("itunes.apple.com", 443))

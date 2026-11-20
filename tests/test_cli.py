@@ -14,10 +14,13 @@ from typer.testing import CliRunner
 import earmark
 from earmark.cli import app
 from earmark.config import Settings, env_var
+from earmark.errors import PermanentError, SkipEpisode, TransientError
+from earmark.fakes import FakeResolver
 from earmark.jobs import open_job_store
-from earmark.models import MAX_PROMPT_CHARS
+from earmark.models import MAX_PROMPT_CHARS, Episode
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
+from tests.factories import make_episode
 
 runner = CliRunner()
 VERSION = importlib.metadata.version("earmark")
@@ -340,3 +343,120 @@ def test_jobs_empty(fake_env: Path) -> None:
     result = runner.invoke(app, ["jobs"])
     assert result.exit_code == 0
     assert result.stdout == "no jobs\n"
+
+
+# -- resolve ------------------------------------------------------------------------------
+
+CANONICAL_SHARE = "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981"
+
+
+def _use_resolver(monkeypatch: pytest.MonkeyPatch, resolver: object) -> None:
+    from earmark.pipeline import factory
+
+    monkeypatch.setattr(factory, "build_resolver", lambda settings: resolver)
+
+
+def test_resolve_prints_episode_json(fake_env: Path) -> None:
+    result = runner.invoke(app, ["resolve", SHARE])
+    assert result.exit_code == 0, result.stderr
+    episode = Episode.model_validate_json(result.stdout)
+    assert episode.url == CANONICAL_SHARE
+    assert result.stdout.endswith("}\n")
+    assert result.stderr == ""
+
+
+def test_resolve_apple_details_on_stderr(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.apple_fixtures import DAILY_GUID, default_server, resolver_for
+
+    _use_resolver(monkeypatch, resolver_for(default_server()))
+    result = runner.invoke(app, ["resolve", SHARE])
+    assert result.exit_code == 0, result.stderr
+    assert "resolved from the lookup; feed match: guid" in result.stderr
+    assert json.loads(result.stdout)["guid"] == DAILY_GUID
+
+
+def test_resolve_apple_unlisted_episode_note(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.apple_fixtures import (
+        default_server,
+        drop_item,
+        feed_reply,
+        fixture_bytes,
+        resolver_for,
+    )
+
+    server = default_server()
+    server.feeds["feeds.npr.org/510289/podcast.xml"] = feed_reply(
+        drop_item(fixture_bytes("feed_planet_money.xml"), "e3153a19-8617-46a1-a9ef-989fe009911c")
+    )
+    _use_resolver(monkeypatch, resolver_for(server))
+    old = "https://podcasts.apple.com/us/podcast/x/id290783428?i=1000655720058"
+    result = runner.invoke(app, ["resolve", old])
+    assert result.exit_code == 0, result.stderr
+    assert (
+        "resolved from the page; the feed does not list it, audio URL from Apple" in result.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "message"),
+    [
+        (SkipEpisode("no feed"), 3, "earmark resolve: skipped: no feed\n"),
+        (PermanentError("gone"), 1, "earmark resolve: gone\n"),
+        (TransientError("busy"), 1, "earmark resolve: busy (temporary; try again later)\n"),
+    ],
+    ids=["skip", "permanent", "transient"],
+)
+def test_resolve_failures_exit_codes(
+    fake_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    code: int,
+    message: str,
+) -> None:
+    resolver = FakeResolver()
+    resolver.fail_next(error)
+    _use_resolver(monkeypatch, resolver)
+    result = runner.invoke(app, ["resolve", SHARE])
+    assert result.exit_code == code
+    assert result.stderr == message
+    assert result.stdout == ""
+
+
+def test_resolve_unsupported_url_exits_2(fake_env: Path) -> None:
+    result = runner.invoke(app, ["resolve", SHOW_LINK])
+    assert result.exit_code == 2
+    assert result.stderr == f"earmark resolve: {MESSAGES['show_link']}\n"
+    assert result.stdout == ""
+
+
+def test_resolve_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.pipeline import factory
+
+    monkeypatch.delenv("EARMARK_RESOLVER_BACKEND")
+    monkeypatch.setattr(factory, "RESOLVERS", {"fake": factory.RESOLVERS["fake"]})
+    result = runner.invoke(app, ["resolve", SHARE])
+    assert result.exit_code == 2
+    assert "EARMARK_RESOLVER_BACKEND" in result.stderr
+
+
+def test_resolve_sanitizes_output(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    episode = make_episode(title="\x1b[31mx")
+    resolver = FakeResolver({CANONICAL_SHARE: episode})
+    _use_resolver(monkeypatch, resolver)
+    result = runner.invoke(app, ["resolve", SHARE])
+    assert result.exit_code == 0
+    assert "\x1b" not in result.stdout
+    assert json.loads(result.stdout)["title"] == "\x1b[31mx"
+
+
+def test_resolve_error_messages_are_cleaned(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver = FakeResolver()
+    resolver.fail_next(PermanentError("bad \x1b[31m"))
+    _use_resolver(monkeypatch, resolver)
+    result = runner.invoke(app, ["resolve", SHARE])
+    assert "\x1b" not in result.stderr
+    assert "bad ?[31m" in result.stderr

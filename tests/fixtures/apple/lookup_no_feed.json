@@ -1,0 +1,10 @@
+
+
+
+{
+ "resultCount":1,
+ "results": [
+{"wrapperType":"track", "kind":"podcast", "collectionId":1656859371, "trackId":1656859371, "artistName":"Dr. Raj Dasgupta", "collectionName":"Beyond The Pearls Premium: Internal Medicine Board Review", "trackName":"Beyond The Pearls Premium: Internal Medicine Board Review", "collectionCensoredName":"Beyond The Pearls Premium: Internal Medicine Board Review", "trackCensoredName":"Beyond The Pearls Premium: Internal Medicine Board Review", "collectionViewUrl":"https://podcasts.apple.com/us/podcast/beyond-the-pearls-premium-internal-medicine-board-review/id1656859371?uo=4", "trackViewUrl":"https://podcasts.apple.com/us/podcast/beyond-the-pearls-premium-internal-medicine-board-review/id1656859371?uo=4", "artworkUrl30":"https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/d3/4f/10/d34f1047-0167-a6e6-1468-d3fca80c4695/mza_6064335823687112956.jpg/30x30bb.jpg", "artworkUrl60":"https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/d3/4f/10/d34f1047-0167-a6e6-1468-d3fca80c4695/mza_6064335823687112956.jpg/60x60bb.jpg", "artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/d3/4f/10/d34f1047-0167-a6e6-1468-d3fca80c4695/mza_6064335823687112956.jpg/100x100bb.jpg", "collectionPrice":0.00, "trackPrice":0.00, "collectionHdPrice":0, "releaseDate":"2022-12-05T02:32:00Z", "collectionExplicitness":"notExplicit", "trackExplicitness":"cleaned", "trackCount":59, "trackTimeMillis":82, "country":"USA", "currency":"USD", "primaryGenreName":"Education", "contentAdvisoryRating":"Clean", "artworkUrl600":"https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/d3/4f/10/d34f1047-0167-a6e6-1468-d3fca80c4695/mza_6064335823687112956.jpg/600x600bb.jpg", "genreIds":["1304", "26", "1512", "1518"], "genres":["Education", "Podcasts", "Health & Fitness", "Medicine"]}]
+}
+
+

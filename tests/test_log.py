@@ -75,3 +75,16 @@ def test_redact() -> None:
     assert redact("abcdef and abc", ["abc", "abcdef"]) == f"{REDACTED} and {REDACTED}"
     assert redact("unchanged", ["", "zzz"]) == "unchanged"
     assert redact("x", []) == "x"
+
+
+def test_http_client_loggers_do_not_log_urls_at_info() -> None:
+    stream = io.StringIO()
+    configure_logging("DEBUG", stream=stream)
+    try:
+        logging.getLogger("httpx2").info("HTTP Request: GET https://x.example/secret/path?sid=1")
+        logging.getLogger("httpx2").warning("kept")
+    finally:
+        for name in ("httpx2", "httpcore2"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+    assert "secret/path" not in stream.getvalue()
+    assert "kept" in stream.getvalue()

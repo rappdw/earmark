@@ -191,3 +191,58 @@ def jobs_command(
     for job in jobs:
         for line in _job_lines(job):
             typer.echo(line)
+
+
+@app.command("resolve")
+def resolve_command(
+    url: Annotated[str, typer.Argument(help="Apple Podcasts episode URL.")],
+) -> None:
+    """Resolve an episode URL to its feed, GUID, and audio URL, and print it as JSON."""
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from earmark.errors import PermanentError, SkipEpisode, TransientError
+    from earmark.pipeline.factory import build_resolver
+    from earmark.resolve.apple import UnsupportedUrlError, parse_apple_url
+    from earmark.resolve.resolver import AppleResolver
+
+    try:
+        canonical = parse_apple_url(url).url
+    except UnsupportedUrlError as exc:
+        typer.echo(f"earmark resolve: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        resolver = build_resolver(settings)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        if isinstance(resolver, AppleResolver):
+            resolution = resolver.resolve_details(canonical)
+            episode = resolution.episode
+            how = (
+                f"feed match: {resolution.match}"
+                if resolution.match
+                else "the feed does not list it, audio URL from Apple"
+            )
+            note = f"resolved from the {resolution.source}; {how}"
+        else:
+            episode = resolver.resolve(canonical)
+            note = None
+    except UnsupportedUrlError as exc:
+        typer.echo(f"earmark resolve: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=2) from None
+    except SkipEpisode as exc:
+        typer.echo(f"earmark resolve: skipped: {_clean(exc.reason)}", err=True)
+        raise typer.Exit(code=3) from None
+    except PermanentError as exc:
+        typer.echo(f"earmark resolve: {_clean(exc.message)}", err=True)
+        raise typer.Exit(code=1) from None
+    except TransientError as exc:
+        typer.echo(f"earmark resolve: {_clean(exc.message)} (temporary; try again later)", err=True)
+        raise typer.Exit(code=1) from None
+    finally:
+        if isinstance(resolver, AppleResolver):
+            resolver.close()
+    if note is not None:
+        typer.echo(note, err=True)
+    typer.echo(episode.model_dump_json(indent=2))

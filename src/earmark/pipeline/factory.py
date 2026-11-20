@@ -55,7 +55,14 @@ def _http_fetcher(ctx: BuildContext) -> AudioFetcher:
     return build_http_fetcher(ctx.settings, ctx.artifacts)
 
 
+def _apple_resolver(ctx: BuildContext) -> Resolver:
+    from earmark.resolve.resolver import build_apple_resolver
+
+    return build_apple_resolver(ctx.settings)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
+    "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
 }
 FETCHERS: Final[Mapping[str, Builder[AudioFetcher]]] = {
@@ -126,6 +133,16 @@ def build_backends(
         indexer=indexer(ctx),
         notifier=notifier(ctx),
     )
+
+
+def build_resolver(settings: Settings, *, clock: Clock = utc_now) -> Resolver:
+    """Build only the resolver (for ``earmark resolve``); no other backend is built or checked."""
+    problems: list[str] = []
+    builder = _lookup(RESOLVERS, "resolver_backend", settings.resolver_backend, problems)
+    if builder is None:
+        raise ConfigError(problems)
+    ctx = BuildContext(settings=settings, artifacts=ArtifactStore(settings.data_dir), clock=clock)
+    return builder(ctx)
 
 
 def build_worker(

@@ -35,7 +35,7 @@ FIELDS: dict[str, tuple[typing.Any, typing.Mapping[str, object]]] = {
 }
 
 
-def _fake_settings(tmp_path: Path, **overrides: str) -> Settings:
+def _fake_settings(tmp_path: Path, **overrides: typing.Any) -> Settings:
     values: dict[str, typing.Any] = dict.fromkeys(FIELDS, "fake")
     values.update(overrides)
     return Settings(
@@ -71,11 +71,12 @@ def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     errors = info.value.errors
-    assert len(errors) == len(UNBUILT_FIELDS) == 6
+    assert len(errors) == len(UNBUILT_FIELDS) == 5
     for field in FIELDS:
         expected = 1 if field in UNBUILT_FIELDS else 0
         assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == expected
     assert not any(line.startswith("EARMARK_FETCH_BACKEND") for line in errors)
+    assert not any(line.startswith("EARMARK_RESOLVER_BACKEND") for line in errors)
 
 
 def test_all_fake_builds_fakes(tmp_path: Path) -> None:
@@ -151,3 +152,60 @@ def test_fetch_module_not_imported_by_factory() -> None:
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
+
+
+def test_factory_builds_apple_resolver(tmp_path: Path) -> None:
+    from earmark.fetch import MIB
+    from earmark.resolve.resolver import AppleResolver
+
+    settings = _fake_settings(
+        tmp_path, resolver_backend="apple", allow_private_fetch=True, max_feed_mb=3
+    )
+    resolver = factory.build_resolver(settings)
+    assert isinstance(resolver, AppleResolver)
+    assert resolver.max_bytes == 3 * MIB
+    assert resolver.fetcher.allow_private is True
+    default = factory.build_resolver(_fake_settings(tmp_path, resolver_backend="apple"))
+    assert isinstance(default, AppleResolver)
+    assert default.fetcher.allow_private is False
+
+
+def test_build_backends_uses_apple_resolver(tmp_path: Path) -> None:
+    from earmark.resolve.resolver import AppleResolver
+
+    b = factory.build_backends(
+        _fake_settings(tmp_path, resolver_backend="apple"), ArtifactStore(tmp_path / "data")
+    )
+    assert isinstance(b.resolver, AppleResolver)
+
+
+def test_resolver_modules_not_imported_by_factory() -> None:
+    code = (
+        "import sys\n"
+        "import earmark.pipeline.factory\n"
+        "names = ('earmark.resolve.resolver', 'earmark.resolve.rss', 'earmark.resolve.itunes',\n"
+        "         'earmark.resolve.apple_page', 'defusedxml')\n"
+        "print(sorted(m for m in names if m in sys.modules))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"
+
+
+def test_build_resolver_only_builds_resolver(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        resolver_backend="fake",
+        asr_backend="faster_whisper",
+    )
+    assert isinstance(factory.build_resolver(settings), FakeResolver)
+    assert not (tmp_path / "data").exists()
+
+
+def test_build_resolver_unbuilt_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(factory, "RESOLVERS", {"fake": factory.RESOLVERS["fake"]})
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data")
+    with pytest.raises(ConfigError) as info:
+        factory.build_resolver(settings)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_RESOLVER_BACKEND: ")

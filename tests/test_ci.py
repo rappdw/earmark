@@ -309,4 +309,67 @@ def test_dependabot_config() -> None:
     assert Counter(u["package-ecosystem"] for u in updates) == Counter(["uv", "github-actions"])
     for update in updates:
         assert update["directory"] == "/"
+        assert update["target-branch"] == "impl"
         assert update["schedule"]["interval"] == "weekly"
+
+
+# --- network workflow (step 07) ------------------------------------------------------------
+
+NETWORK_WORKFLOW = WORKFLOWS_DIR / "network.yml"
+NETWORK_COMMANDS = ["uv sync --locked", "uv run --locked pytest -m network -v -rs"]
+
+
+def _network() -> dict[Any, Any]:
+    return _load_yaml(NETWORK_WORKFLOW)
+
+
+def test_network_workflow_triggers() -> None:
+    triggers = _triggers(_network())
+    assert set(triggers) == {"schedule", "workflow_dispatch"}
+    schedule = triggers["schedule"]
+    assert isinstance(schedule, list)
+    assert len(schedule) == 1
+    fields = schedule[0]["cron"].split()
+    assert len(fields) == 5
+    minute, _hour, day_of_month, month, day_of_week = fields
+    assert (day_of_month, month) == ("*", "*")
+    assert re.fullmatch(r"[0-6]", day_of_week)
+    assert minute != "0"
+
+
+def test_network_workflow_runs_network_marker() -> None:
+    job = _only_job(_network())
+    assert job["runs-on"] == ARM64_RUNNER
+    timeout = job["timeout-minutes"]
+    assert type(timeout) is int
+    assert 1 <= timeout <= 30
+    steps = _steps(job)
+    assert [s["run"].strip() for s in steps if "run" in s] == NETWORK_COMMANDS
+    assert [_action(s) for s in steps] == [CHECKOUT, SETUP_UV, "", ""]
+
+
+def test_network_workflow_read_only_no_secrets() -> None:
+    workflow = _network()
+    assert workflow["permissions"] == {"contents": "read"}
+    assert "secrets" not in NETWORK_WORKFLOW.read_text()
+    assert "env" not in workflow
+    job = _only_job(workflow)
+    assert "env" not in job
+    steps = _steps(job)
+    assert all("env" not in s for s in steps)
+    [checkout] = [s for s in steps if _action(s) == CHECKOUT]
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_network_workflow_pins_match_ci() -> None:
+    network = _network()
+    assert _remote_uses(network) == _remote_uses(_ci())
+    [network_uv] = [s for s in _steps(_only_job(network)) if _action(s) == SETUP_UV]
+    assert network_uv["with"] == _ci_step(SETUP_UV)["with"]
+
+
+def test_network_workflow_is_not_the_gate() -> None:
+    # The default suite must never run the live tests: the marker expression excludes them.
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    addopts = pyproject["tool"]["pytest"]["addopts"]
+    assert "not network" in addopts[addopts.index("-m") + 1]

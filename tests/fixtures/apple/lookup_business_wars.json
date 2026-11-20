@@ -1,0 +1,181 @@
+{
+ "resultCount": 5,
+ "results": [
+  {
+   "wrapperType": "track",
+   "kind": "podcast",
+   "artistId": 1134742667,
+   "collectionId": 1335814741,
+   "trackId": 1335814741,
+   "artistName": "Audible Original",
+   "collectionName": "Business Wars",
+   "trackName": "Business Wars",
+   "collectionCensoredName": "Business Wars",
+   "trackCensoredName": "Business Wars",
+   "artistViewUrl": "https://podcasts.apple.com/us/artist/wondery/1134742667?uo=4",
+   "collectionViewUrl": "https://podcasts.apple.com/us/podcast/business-wars/id1335814741?uo=4",
+   "feedUrl": "https://rss.art19.com/business-wars",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/business-wars/id1335814741?uo=4",
+   "artworkUrl30": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/30x30bb.jpg",
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/60x60bb.jpg",
+   "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/100x100bb.jpg",
+   "collectionPrice": 0.0,
+   "trackPrice": 0.0,
+   "collectionHdPrice": 0,
+   "releaseDate": "2026-11-19T08:00:00Z",
+   "collectionExplicitness": "notExplicit",
+   "trackExplicitness": "cleaned",
+   "trackCount": 746,
+   "trackTimeMillis": 2634,
+   "country": "USA",
+   "currency": "USD",
+   "primaryGenreName": "Management",
+   "contentAdvisoryRating": "Clean",
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/600x600bb.jpg",
+   "genreIds": [
+    "1491",
+    "26",
+    "1321",
+    "1487"
+   ],
+   "genres": [
+    "Management",
+    "Podcasts",
+    "Business",
+    "History"
+   ]
+  },
+  {
+   "previewUrl": "https://rss.art19.com/episodes/88f2ce7b-0ead-4e39-80f4-fa16a9a4b552.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "closedCaptioning": "none",
+   "collectionId": 1335814741,
+   "collectionName": "Business Wars",
+   "episodeUrl": "https://rss.art19.com/episodes/88f2ce7b-0ead-4e39-80f4-fa16a9a4b552.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "artistIds": [],
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/600x600bb.jpg",
+   "collectionViewUrl": "https://itunes.apple.com/us/podcast/business-wars/id1335814741?mt=2&uo=4",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/big-beef-the-war-on-your-wallet-a-bloody-business/id1335814741?i=1000799743520&uo=4",
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/60x60bb.jpg",
+   "trackTimeMillis": 2491000,
+   "contentAdvisoryRating": "Clean",
+   "artworkUrl160": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/160x160bb.jpg",
+   "episodeFileExtension": "mp3",
+   "episodeContentType": "audio",
+   "feedUrl": "https://rss.art19.com/business-wars",
+   "shortDescription": "",
+   "kind": "podcast-episode",
+   "wrapperType": "podcastEpisode",
+   "description": "In 1996, a handful of cattle ranchers make a bold decision: to sue IBP, the biggest beef processor in the world. They accuse IBP of price-fixing, putting cattle producers out of business while raising prices for consumers. But the ranchers will soon learn that their fight with Big Beef has actually been raging for decades, involving antitrust crusaders in the 1920s and New York mobsters in the 1970s. And the meatpackers do not intend to lose now.If you’d like to learn more about the corporate meat industry, listen to the audiobook version of “The Meat Racket” by Christopher Leonard, or “Raw Deal” by Chloe Sorvino, available now on Audible.Audible subscribers can listen to all episodes of Business Wars ad-free right now. Join Audible today by downloading the Audible app.See Privacy Policy at https://art19.com/privacy and California Privacy Notice at https://art19.com/privacy#do-not-sell-my-info.",
+   "country": "USA",
+   "trackId": 1000799743520,
+   "trackName": "Big Beef: The War on Your Wallet | A Bloody Business",
+   "releaseDate": "2026-11-04T08:00:00Z",
+   "genres": [
+    {
+     "name": "Management",
+     "id": "1491"
+    }
+   ],
+   "episodeGuid": "63f0a3d4-76bb-4236-a39e-10d1b235b3bd"
+  },
+  {
+   "previewUrl": "https://rss.art19.com/episodes/a59d9401-1fc3-481c-aa67-fcc916dfedc9.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "closedCaptioning": "none",
+   "collectionId": 1335814741,
+   "collectionName": "Business Wars",
+   "episodeUrl": "https://rss.art19.com/episodes/a59d9401-1fc3-481c-aa67-fcc916dfedc9.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "artistIds": [],
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/600x600bb.jpg",
+   "collectionViewUrl": "https://itunes.apple.com/us/podcast/business-wars/id1335814741?mt=2&uo=4",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/big-beef-the-war-on-your-wallet-something-rotten/id1335814741?i=1000799743409&uo=4",
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/60x60bb.jpg",
+   "trackTimeMillis": 2487000,
+   "contentAdvisoryRating": "Clean",
+   "artworkUrl160": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/160x160bb.jpg",
+   "episodeFileExtension": "mp3",
+   "episodeContentType": "audio",
+   "feedUrl": "https://rss.art19.com/business-wars",
+   "shortDescription": "",
+   "kind": "podcast-episode",
+   "wrapperType": "podcastEpisode",
+   "description": "A lot has changed in the eight years since the ranchers first sued Big Beef. IBP was acquired by Tyson Foods, a behemoth with even more ability to withstand a lawsuit. But no sooner does Tyson take the crown as world’s biggest meatpacker than a new heavyweight emerges: Brazil’s JBS. Founded as a family-owned business in the 1950s, JBS is now run by the billionaire Batista brothers, Joesley and Wesley. And they have an appetite for growth…  by any means necessary.If you’d like to learn more about the corporate meat industry, listen to the audiobook version of “The Meat Racket” by Christopher Leonard, or “Raw Deal” by Chloe Sorvino, available now on Audible.Audible subscribers can listen to all episodes of Business Wars ad-free right now. Join Audible today by downloading the Audible app.See Privacy Policy at https://art19.com/privacy and California Privacy Notice at https://art19.com/privacy#do-not-sell-my-info.",
+   "country": "USA",
+   "trackId": 1000799743409,
+   "trackName": "Big Beef: The War on Your Wallet | Something Rotten",
+   "releaseDate": "2026-11-11T08:00:00Z",
+   "genres": [
+    {
+     "name": "Management",
+     "id": "1491"
+    }
+   ],
+   "episodeGuid": "9a38d03a-05f3-4a08-b947-8fb548fb3eab"
+  },
+  {
+   "previewUrl": "https://rss.art19.com/episodes/ec3ff5af-1e94-4a33-aa9a-a6bf9f869647.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "closedCaptioning": "none",
+   "collectionId": 1335814741,
+   "collectionName": "Business Wars",
+   "episodeUrl": "https://rss.art19.com/episodes/ec3ff5af-1e94-4a33-aa9a-a6bf9f869647.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "artistIds": [],
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/600x600bb.jpg",
+   "collectionViewUrl": "https://itunes.apple.com/us/podcast/business-wars/id1335814741?mt=2&uo=4",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/big-beef-the-war-on-your-wallet-mystery-meat/id1335814741?i=1000799743555&uo=4",
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/60x60bb.jpg",
+   "trackTimeMillis": 2761000,
+   "contentAdvisoryRating": "Clean",
+   "artworkUrl160": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/160x160bb.jpg",
+   "episodeFileExtension": "mp3",
+   "episodeContentType": "audio",
+   "feedUrl": "https://rss.art19.com/business-wars",
+   "shortDescription": "",
+   "kind": "podcast-episode",
+   "wrapperType": "podcastEpisode",
+   "description": "It’s early 2020, and COVID-19 is tearing through the world’s meatpacking plants at an alarming pace. Years of consolidation have produced vast quantities of retail-ready meat, and enormous profits for meatpacking conglomerates. But it’s also made them vulnerable to sudden disruption — like a pandemic. And people are starting to ask: is it too late to roll back the clock on Big Beef?If you’d like to learn more about the corporate meat industry, listen to the audiobook version of “The Meat Racket” by Christopher Leonard, or “Raw Deal” by Chloe Sorvino, available now on Audible.Audible subscribers can listen to all episodes of Business Wars ad-free right now. Join Audible today by downloading the Audible app.See Privacy Policy at https://art19.com/privacy and California Privacy Notice at https://art19.com/privacy#do-not-sell-my-info.",
+   "country": "USA",
+   "trackId": 1000799743555,
+   "trackName": "Big Beef: The War on Your Wallet | Mystery Meat",
+   "releaseDate": "2026-11-18T08:00:00Z",
+   "genres": [
+    {
+     "name": "Management",
+     "id": "1491"
+    }
+   ],
+   "episodeGuid": "7a84a36b-79a7-4dab-bc12-88dcb0f52527"
+  },
+  {
+   "previewUrl": "https://rss.art19.com/episodes/88fbd6c7-2fe9-495b-b893-2849a59bd5ff.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "closedCaptioning": "none",
+   "collectionId": 1335814741,
+   "collectionName": "Business Wars",
+   "episodeUrl": "https://rss.art19.com/episodes/88fbd6c7-2fe9-495b-b893-2849a59bd5ff.mp3?rss_browser=BAhJIglpVE1TBjoGRVQ%3D--4577cbcc3cc5282be318e551563630a2c5c2f06f",
+   "artistIds": [],
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/600x600bb.jpg",
+   "collectionViewUrl": "https://itunes.apple.com/us/podcast/business-wars/id1335814741?mt=2&uo=4",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/big-beef-the-war-on-your-wallet-can-the-beef-industry-survive/id1335814741?i=1000802882841&uo=4",
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/60x60bb.jpg",
+   "trackTimeMillis": 2634000,
+   "contentAdvisoryRating": "Clean",
+   "artworkUrl160": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/88/78/24/887824a1-8191-f922-a27e-499bb3f9e624/mza_2534133078841157643.jpeg/160x160bb.jpg",
+   "episodeFileExtension": "mp3",
+   "episodeContentType": "audio",
+   "feedUrl": "https://rss.art19.com/business-wars",
+   "shortDescription": "The U.S. consumes more beef annually than any other country in the world. But if you’ve been to the grocery store lately, you might have experienced some sticker shock. Beef prices have hit all-time highs in recent years. Joining David to unpack the s",
+   "kind": "podcast-episode",
+   "wrapperType": "podcastEpisode",
+   "description": "The U.S. consumes more beef annually than any other country in the world. But if you’ve been to the grocery store lately, you might have experienced some sticker shock. Beef prices have hit all-time highs in recent years. Joining David to unpack the state of the beef industry is Chloe Sorvino, a staff writer at Forbes covering food and agriculture, and author of _Raw Deal: Hidden Corruption, Corporate Greed, and the Fight for the Future of Meat. _They’ll discuss the forces driving high prices for consumers, recent scandals at JBS, concerns over food safety, and what the new generation of ranchers is doing to make meat more sustainable.\nIf you’d like to learn more about the corporate meat industry, listen to the audiobook version of “The Meat Racket” by Christopher Leonard, or “Raw Deal” by Chloe Sorvino, available now on Audible.\nAudible subscribers can listen to all episodes of Business Wars ad-free right now. Join Audible today by downloading the Audible app.\nSee Privacy Policy at https://art19.com/privacy and California Privacy Notice at https://art19.com/privacy#do-not-sell-my-info.",
+   "country": "USA",
+   "trackId": 1000802882841,
+   "trackName": "Big Beef: The War on Your Wallet | Can the Beef Industry Survive?",
+   "releaseDate": "2026-11-19T08:00:00Z",
+   "genres": [
+    {
+     "name": "Management",
+     "id": "1491"
+    }
+   ],
+   "episodeGuid": "gid://art19-episode-locator/V0/uRs_Qns0nTlHvHL0ClU2aCzeUgB2MOskIg3O-WrXXrs"
+  }
+ ]
+}

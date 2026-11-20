@@ -1,0 +1,79 @@
+{
+ "resultCount": 2,
+ "results": [
+  {
+   "wrapperType": "track",
+   "kind": "podcast",
+   "artistId": 125443881,
+   "collectionId": 290783428,
+   "trackId": 290783428,
+   "artistName": "NPR",
+   "collectionName": "Planet Money",
+   "trackName": "Planet Money",
+   "collectionCensoredName": "Planet Money",
+   "trackCensoredName": "Planet Money",
+   "artistViewUrl": "https://podcasts.apple.com/us/artist/npr/125443881?uo=4",
+   "collectionViewUrl": "https://podcasts.apple.com/us/podcast/planet-money/id290783428?uo=4",
+   "feedUrl": "https://feeds.npr.org/510289/podcast.xml",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/planet-money/id290783428?uo=4",
+   "artworkUrl30": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/85/df/53/85df5334-0fae-28a9-2bc4-b97b81061d0e/mza_10839245066228881011.jpg/30x30bb.jpg",
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/85/df/53/85df5334-0fae-28a9-2bc4-b97b81061d0e/mza_10839245066228881011.jpg/60x60bb.jpg",
+   "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/85/df/53/85df5334-0fae-28a9-2bc4-b97b81061d0e/mza_10839245066228881011.jpg/100x100bb.jpg",
+   "collectionPrice": 0.0,
+   "trackPrice": 0.0,
+   "collectionHdPrice": 0,
+   "releaseDate": "2026-11-18T08:00:00Z",
+   "collectionExplicitness": "notExplicit",
+   "trackExplicitness": "notExplicit",
+   "trackCount": 705,
+   "trackTimeMillis": 1108,
+   "country": "USA",
+   "currency": "USD",
+   "primaryGenreName": "Business",
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/85/df/53/85df5334-0fae-28a9-2bc4-b97b81061d0e/mza_10839245066228881011.jpg/600x600bb.jpg",
+   "genreIds": [
+    "1321",
+    "26",
+    "1489"
+   ],
+   "genres": [
+    "Business",
+    "Podcasts",
+    "News"
+   ]
+  },
+  {
+   "artistIds": [],
+   "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/6e/70/0d/6e700dae-3b14-1aea-74f6-f484d92cb9c3/mza_17492604313311554449.jpeg/60x60bb.jpg",
+   "contentAdvisoryRating": "Clean",
+   "trackViewUrl": "https://podcasts.apple.com/us/podcast/two-ways-big-bets-on-data-centers-might-affect-you/id290783428?i=1000802563674&uo=4",
+   "collectionViewUrl": "https://itunes.apple.com/us/podcast/planet-money/id290783428?mt=2&uo=4",
+   "trackTimeMillis": 1108000,
+   "genres": [
+    {
+     "name": "Business",
+     "id": "1321"
+    }
+   ],
+   "episodeGuid": "74bdb425-023b-4ef5-b70d-e3405c832b87",
+   "releaseDate": "2026-11-18T08:00:00Z",
+   "trackId": 1000802563674,
+   "trackName": "Two ways big bets on data centers might affect you (Two Indicators)",
+   "shortDescription": "",
+   "feedUrl": "https://feeds.npr.org/510289/podcast.xml",
+   "closedCaptioning": "none",
+   "collectionId": 290783428,
+   "collectionName": "Planet Money",
+   "kind": "podcast-episode",
+   "wrapperType": "podcastEpisode",
+   "description": "Your money might be fueling the AI boom … just as some AI data center bets are starting to look riskier. If you own stocks, that money is likely tied up in giant tech companies like Microsoft and Nvidia. And if your 401(k) has money invested in the US bond fund, you might be lending tech companies the money to build data centers. \n\nToday on the show, two stories from our short daily podcast The Indicator from Planet Money on how risky these data center bets are for investors and the companies making them. And, of course, for all of us. \n\nRead: \n\nOur book: Planet Money: A Guide to the Economic Forces That Shape Your Life Our weekly longform Planet Money newsletterOur weekly Indicator round-up newsletterFollow: \n\nInstagramTikTokYouTubeFacebookThe original Indicator episodes were produced by Corey Bridges and Julia Ritchey. They were engineered by Kwesi Lee and Cena Loffredo, fact checked by Sierra Juarez and edited by Kate Concannon. This episode of Planet Money was produced by Vito Emanuel and Emma Peaslee. Alex Goldmark is our executive producer.\n\nMusic: NPR Source Audio - \"Saunter\" and \"Super-Fi\" \n\nSupport public media with NPR+ and enjoy perks for over 25 podcasts like this one. This show’s perks include bonus episodes and sponsor-free listening. Learn more at plus.npr.org.\n\nSee pcm.adswizz.com for information about our collection and use of personal data for sponsorship and to manage your podcast sponsorship preferences.\n\nNPR Privacy Policy",
+   "country": "USA",
+   "episodeFileExtension": "mp3",
+   "episodeContentType": "audio",
+   "artworkUrl160": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/6e/70/0d/6e700dae-3b14-1aea-74f6-f484d92cb9c3/mza_17492604313311554449.jpeg/160x160bb.jpg",
+   "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/6e/70/0d/6e700dae-3b14-1aea-74f6-f484d92cb9c3/mza_17492604313311554449.jpeg/600x600bb.jpg",
+   "episodeUrl": "https://tracking.swap.fm/track/XvDEoI11TR00olTUO8US/prfx.byspotify.com/e/play.podtrac.com/npr-510289/npr.simplecastaudio.com/43b5acee-463e-4612-95ad-d2596d9dd337/episodes/b19ce1fb-95ca-4339-9f74-93cd72d20032/audio/128/default.mp3?awCollectionId=43b5acee-463e-4612-95ad-d2596d9dd337&awEpisodeId=b19ce1fb-95ca-4339-9f74-93cd72d20032&feed=hvWWWzRv&t=podcast&e=nx-s1-6044772&p=510289&d=1108&size=17739090",
+   "previewUrl": "https://tracking.swap.fm/track/XvDEoI11TR00olTUO8US/prfx.byspotify.com/e/play.podtrac.com/npr-510289/npr.simplecastaudio.com/43b5acee-463e-4612-95ad-d2596d9dd337/episodes/b19ce1fb-95ca-4339-9f74-93cd72d20032/audio/128/default.mp3?awCollectionId=43b5acee-463e-4612-95ad-d2596d9dd337&awEpisodeId=b19ce1fb-95ca-4339-9f74-93cd72d20032&feed=hvWWWzRv&t=podcast&e=nx-s1-6044772&p=510289&d=1108&size=17739090"
+  }
+ ]
+}
