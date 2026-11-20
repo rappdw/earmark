@@ -72,11 +72,11 @@ def test_default_settings_list_all_unbuilt(tmp_path: Path) -> None:
     expected = {
         field for field, (_, registry) in FIELDS.items() if getattr(settings, field) not in registry
     }
-    assert expected == {"store_backend", "index_backend", "notify_backend"}
+    assert expected == {"index_backend", "notify_backend"}
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     errors = info.value.errors
-    assert len(errors) == len(expected) == 3
+    assert len(errors) == len(expected) == 2
     for field in FIELDS:
         count = 1 if field in expected else 0
         assert sum(line.startswith(f"{env_var(field)}: ") for line in errors) == count
@@ -116,6 +116,61 @@ def test_fake_analyzer_uses_real_clock(tmp_path: Path) -> None:
     )
     assert isinstance(b.analyzer, FakeAnalyzer)
     assert b.analyzer.clock is clock
+
+
+def test_vault_store_requires_vault_dir(tmp_path: Path) -> None:
+    values: dict[str, typing.Any] = dict.fromkeys(FIELDS, "fake")
+    values["store_backend"] = "vault"
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data", **values)
+    with pytest.raises(ConfigError) as info:
+        factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_VAULT_DIR: required when EARMARK_STORE_BACKEND=vault")
+
+
+def test_vault_store_dir_must_exist(tmp_path: Path) -> None:
+    artifacts = ArtifactStore(tmp_path / "data")
+    missing = _fake_settings(tmp_path, store_backend="vault")
+    with pytest.raises(ConfigError) as info:
+        factory.build_backends(missing, artifacts)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_VAULT_DIR: ")
+    assert line.endswith("does not exist")
+    assert not (tmp_path / "vault").exists()
+    (tmp_path / "vault").write_text("a file")
+    with pytest.raises(ConfigError) as info:
+        factory.build_backends(missing, artifacts)
+    assert info.value.errors[0].endswith("is not a directory")
+
+
+def test_vault_store_built(tmp_path: Path) -> None:
+    from zoneinfo import ZoneInfo
+
+    from earmark.vault.notes import VaultStore
+
+    (tmp_path / "vault").mkdir()
+    settings = _fake_settings(tmp_path, store_backend="vault", tz="Europe/Paris")
+    b = factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    assert isinstance(b.store, VaultStore)
+    assert list((tmp_path / "vault").iterdir()) == []
+    assert not (tmp_path / "data" / "vault.lock").exists()
+    assert b.store._tz == ZoneInfo("Europe/Paris")  # no public accessor
+
+
+def test_build_worker_runs_a_job_with_vault(tmp_path: Path) -> None:
+    (tmp_path / "vault").mkdir()
+    settings = _fake_settings(tmp_path, store_backend="vault")
+    worker = factory.build_worker(settings)
+    from earmark.jobs import open_job_store
+
+    enqueue_ingest(open_job_store(settings), IngestRequest(url=SHARE))
+    job = worker.run_once()
+    assert job is not None
+    assert job.status == "done"
+    notes = list((tmp_path / "vault" / "Earmark" / "Podcasts" / "Fake Show").glob("*.md"))
+    assert len(notes) == 1
+    assert job.result is not None
+    assert job.result.note_path == f"Earmark/Podcasts/Fake Show/{notes[0].name}"
 
 
 def test_build_worker_runs_a_job(tmp_path: Path) -> None:

@@ -86,7 +86,10 @@ src/earmark/
                        (run_map_reduce; step 11), llm/ (base.py: the LLMClient Protocol;
                        anthropic.py: AnthropicClient, step 10; openai_compat.py:
                        OpenAICompatClient, step 11)
-  vault/               notes.py, sanitize.py, entities.py
+  vault/               sanitize.py (file names, fold keys, Markdown and YAML escaping), fs.py
+                       (Vault, VaultDir: fd-based symlink-refusing I/O, vault_lock), document.py
+                       (frontmatter emit/merge/identity, managed regions), notes.py
+                       (VaultStore, the `vault` Store; step 12), entities.py (step 13)
   index/               chunks.py, embed.py, lancedb_index.py
   notify/              ntfy.py
 tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS
@@ -518,6 +521,35 @@ Step 10; exact signatures in `docs/steps/10-analysis.md`.
   the configured provider (writing or reusing the analysis cache, not the note) and prints
   the rendered section or the `Analysis` JSON; warnings go to stderr.
 
+### Storing
+
+Step 12; exact rules in `docs/steps/12-vault-writer.md` section 5.
+
+- **`vault` Store.** `vault.notes.VaultStore(vault_dir, subdir, data_dir=, tz=)`, built by
+  `build_vault_store(settings)`. It needs `VAULT_DIR`, which must exist; otherwise the
+  worker refuses to start with a `ConfigError`. The build creates nothing. Each `store`
+  holds `<DATA_DIR>/vault.lock` (`flock`; a 60 s wait is transient). It scans the subdir
+  once for note identities, settles the episode-note and transcript-note paths, writes
+  the transcript note and then the episode note, and returns both vault-relative paths
+  plus any warnings. Note contents depend only on the inputs, `TZ`, and the paths on
+  disk, never on a clock. A store whose output equals the file writes nothing.
+- **Filesystem.** `vault.fs` reaches everything below `VAULT_DIR` only through directory
+  fds with `O_NOFOLLOW` (`VAULT_DIR` itself may be a symlink). A symlink or
+  non-directory on the write path is a `PermanentError` (`SymlinkRefused`). A symlink at
+  a note's name only makes that name occupied. Reads use `O_NONBLOCK` and require a
+  regular file of at most 16 MiB. Writes go to `.earmark-<16 hex>.tmp`, are fsynced,
+  checked against the stamp of the earlier read, and renamed (`NoteChanged`, a
+  transient error, after 3 attempts). Nothing in the vault is ever deleted or renamed,
+  except earmark's own temp files older than one hour.
+- **Errors.** A missing `VAULT_DIR`, `ENOSPC`, `EDQUOT`, and other `OSError`s are
+  transient. `EACCES`, `EPERM`, `EROFS`, `ENAMETOOLONG`, symlinks, and an exhausted
+  collision suffix are permanent. Messages name vault-relative paths and errno names
+  only.
+- **Frontmatter** is written by a constrained emitter (`vault.document`), not by a YAML
+  library: fixed keys, every string a one-line double-quoted scalar with `\uXXXX`
+  escapes, unquoted dates, and naive local date-times. Existing frontmatter is never
+  parsed as YAML; it is split into lines and top-level keys.
+
 ## Jobs
 
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
@@ -563,6 +595,7 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
   earmark.db                    jobs (step 03), entity registry (step 13); WAL mode
+  vault.lock                    flock held while a process writes the vault (step 12)
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
     shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
@@ -577,19 +610,72 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
   lancedb/
 
 $EARMARK_VAULT_DIR/$EARMARK_VAULT_SUBDIR/        earmark writes nowhere else in the vault
-  Podcasts/<Show>/<YYYY-MM-DD> <Title>.md
+  Podcasts/<Show>/<YYYY-MM-DD> <Title>.md                     where a new episode note goes
   Podcasts/<Show>/transcripts/<YYYY-MM-DD> <Title> (transcript).md
+  Backups/<note stem> (<region digest>).md   a note's previous version, before hand edits
+                                inside its markers were replaced (step 12)
   Entities/{People,Papers,Companies,Tools,Topics}/<Name>.md
   Digests/<ISO-year>-W<week>.md
   aliases.yaml                  optional, user-maintained entity merges
 ```
 
+**Names.** `<Show>` and `<Title>` come from untrusted feed text through
+`vault.sanitize.file_component`:
+
+- NFC; control, format (except ZWJ/ZWNJ), and unassigned characters removed;
+- `/ \ |` → `-`, `: ` → ` - `, other `:` → `-`, `"` → `'`, `[ ]` → `( )`, and
+  `* ? < > # ^` removed;
+- no leading or trailing `.` or space, and Windows device names get `_`;
+- Unicode kept, capped at 100 (show) or 120 (title) UTF-8 bytes at a safe boundary,
+  with `…`; every name at most 200 bytes.
+
+The date is the publish date in `TZ`, or the share date when unknown. A name is taken
+when any entry in the directory has the same fold key (NFKC + casefold), so the vault
+stays valid on case- and normalization-insensitive filesystems (APFS, iCloud). A taken
+name gets ` (<key[:8]>)`, then ` (<key>)`. A fold-equal existing directory is reused.
+The transcript note is named after the episode note's actual stem, plus
+` (transcript)`, in `transcripts/` beside it.
+
+**Identity.** A note is found again by `earmark: episode|transcript` and `episode_key`
+in its frontmatter, by scanning the subdir (not `Backups/`, dot entries, or symlinks).
+So a note keeps its first path when the episode is retitled, and the user may rename or
+move it anywhere in the subdir. Duplicates (sync conflict copies) give a warning; the
+candidate-named or smallest path is updated.
+
 **Notes.** One note per episode, regenerated from artifacts on every store, so storing
-twice produces the same bytes. Frontmatter: `show`, `episode`, `date`, `url`, `guid`,
-`episode_key`, `duration`, `prompts`, `tags`, `shared_at`, `model`. The body has one
-section per analysis, newest first, each showing its prompt. Generated content sits
-between `<!-- earmark:begin -->` and `<!-- earmark:end -->`; anything the user writes
-outside those markers survives regeneration.
+twice produces the same bytes (and writes nothing).
+
+- **Episode note frontmatter**, owned by earmark and rewritten on every store:
+  `earmark` (`episode`), `show`, `episode`, `date` (YAML date or null), `url`, `guid`,
+  `episode_key`, `duration` (`HH:MM:SS`), `prompts` (non-default prompts, newest first,
+  capped at 200 characters), `shared_at` (first share, local time in `TZ`, no offset,
+  Obsidian's date-time format), `model` (newest analysis), and `transcript` (a quoted
+  wikilink).
+- `tags` (`earmark`, `podcast`) is seeded when absent and then belongs to the user.
+- Every other frontmatter line (user properties, comments) is kept verbatim after the
+  owned keys.
+- **Episode note body**: a title, show, date, and duration line; links to Apple
+  Podcasts and the transcript note; then one `render_analysis` section per analysis,
+  newest first, each showing its prompt and followed by a folded callout with the
+  model, the creation time, and the analysis warnings.
+- **The transcript note** has its own owned keys (`earmark: transcript`, show, episode,
+  date, url, guid, episode_key, duration, language, model, `episode_note`), a link
+  back, and one `[HH:MM:SS] text` paragraph per segment.
+- Untrusted text in bodies is whitespace-collapsed and Markdown-escaped (`<` →
+  `&lt;`; `` \ ` * _ [ ] | ~ = $ % ^ # `` backslash-escaped). Links use full
+  vault-relative wikilinks, or percent-encoded Markdown links when a path contains a
+  character that breaks wikilinks.
+
+**Managed regions.** Generated body content sits between
+`<!-- earmark:begin hash=<16 hex> -->` and `<!-- earmark:end -->`. The hash is the
+sha256 prefix of the region as earmark wrote it, and a bare `<!-- earmark:begin -->` is
+accepted. Text outside the markers survives regeneration byte for byte, invalid UTF-8
+and CRLF included. If the region was edited by hand (the hash does not match and the
+content differs from the new one), the previous file is copied to `Backups/` and the
+region is replaced, with a job warning. If the markers are missing, duplicated, or out
+of order, the note is not touched and a warning says how to restore or regenerate it.
+That is also how a user takes a note over. Steps 13 and 18 use the same region and
+frontmatter functions.
 
 **Entities.** People, papers, companies, tools, and topics are normalized (NFKC,
 casefold, collapsed whitespace, stripped punctuation), recorded in SQLite (`entities`,
@@ -630,7 +716,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `API_TOKEN` | unset; required to serve (step 04) | Bearer token for the API (secret) |
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | API bind address |
 | `DATA_DIR` | `./data` | Database, artifacts, index |
-| `VAULT_DIR`, `VAULT_SUBDIR` | unset (required for the vault store), `Earmark` | Where notes go. The subdir is a relative path without `..` |
+| `VAULT_DIR`, `VAULT_SUBDIR` | unset (required for the vault store), `Earmark` | Where notes go. `VAULT_DIR` is the Obsidian vault root and must exist (it may be a symlink); the subdir is a relative path without `..`, created if missing, and must not be a symlink |
 | `OBSIDIAN_VAULT_NAME` | unset | Enables `obsidian://` links in notifications |
 | `RESOLVER_BACKEND` | `apple` | `apple`, `fake` |
 | `FETCH_BACKEND` | `http` | `http`, `fake` |
@@ -656,7 +742,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional token (secret) |
 | `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
-| `TZ` | unset (system) | IANA zone for note dates and digests, validated at load |
+| `TZ` | unset (system) | IANA zone for note dates and digests, validated at load. Note file names, `date`, `shared_at`, and analysis times use it (step 12) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive) |
 
 Backend names are `Literal` types, so a misspelt name fails when settings load, naming
@@ -728,7 +814,16 @@ and writes into a vault the user cares about.
   environment variables. Weights are CTranslate2 binaries plus JSON and text; nothing is
   unpickled. A cached model loads offline.
 - **Vault writes.** Titles and names from feeds and from the LLM are sanitized before
-  they become paths or YAML. Resolved paths are checked to be inside the vault subdir.
+  they become paths (`vault.sanitize.file_component`: no separators, no leading dot,
+  NFC, byte-capped), and are always double-quoted and escaped in YAML. Containment is
+  enforced by construction rather than by resolving paths. Every component below
+  `VAULT_DIR` is opened relative to its parent's fd with `O_NOFOLLOW`. A symlink on the
+  write path fails the job, and a symlink at a note's name is treated as an occupied
+  name. Existing files are never opened for writing, only replaced by rename, so
+  neither symlinks nor hard links can redirect a write. earmark writes only inside
+  `<VAULT_DIR>/<VAULT_SUBDIR>/`: its own notes, its managed regions and owned
+  frontmatter keys in them, and `Backups/`. It deletes nothing but its own stale temp
+  files.
 - **LLM.** The transcript, feed metadata, and the model's answer are untrusted text. The
   analysis call has no tools; the fixed system prompt tells the model that metadata and
   transcript are material, never instructions; untrusted sections have `<` and `>`

@@ -70,7 +70,9 @@ POST /ingest ─► jobs table (SQLite) ─► worker ─► Pipeline
 - **Feeds, enclosure URLs, titles, and transcripts are untrusted.** All third-party
   fetches go through `earmark/fetch.py` (scheme check, private-address block, size cap).
   Anything that becomes a filename or YAML goes through the vault sanitizers. Earmark
-  writes only inside `<vault>/<subdir>/` and only inside its managed-region markers.
+  writes only inside `<vault>/<subdir>/`, and within a note only inside its
+  managed-region markers and its own documented frontmatter keys; every other line the
+  user wrote is kept.
 - **Never log or print the API token or LLM keys.** `Settings` holds them as secrets.
 - **Never truncate a transcript to fit a model.** Chunk it or fail loudly.
 - **Claude calls use the official `anthropic` SDK.** Load the `claude-api` skill before

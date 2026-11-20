@@ -85,6 +85,12 @@ def _openai_compat_analyzer(ctx: BuildContext) -> Analyzer:
     return build_openai_compat_analyzer(ctx.settings, ctx.artifacts, clock=ctx.clock)
 
 
+def _vault_store(ctx: BuildContext) -> Store:
+    from earmark.vault.notes import build_vault_store
+
+    return build_vault_store(ctx.settings)
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -104,6 +110,7 @@ ANALYZERS: Final[Mapping[str, Builder[Analyzer]]] = {
     "fake": lambda ctx: FakeAnalyzer(ctx.artifacts, clock=ctx.clock),
 }
 STORES: Final[Mapping[str, Builder[Store]]] = {
+    "vault": _vault_store,
     "fake": lambda ctx: FakeStore(ctx.settings.vault_dir, ctx.settings.vault_subdir),
 }
 INDEXERS: Final[Mapping[str, Builder[Indexer | None]]] = {
