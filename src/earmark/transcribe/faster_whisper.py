@@ -11,6 +11,7 @@ import logging
 import math
 import threading
 import time
+import types
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ from earmark.errors import PermanentError, TransientError
 from earmark.models import Segment, Transcript, episode_key, format_hms
 from earmark.transcribe.base import (
     CachedTranscriber,
+    NoSpeechError,
     UnusableAudioError,
 )
 from earmark.transcribe.base import (
@@ -46,11 +48,23 @@ NOT_FOUND_ERRORS: Final = frozenset(
     {"RepositoryNotFoundError", "RevisionNotFoundError", "GatedRepoError", "DisabledRepoError"}
 )
 
+DECODE_ERROR_NAMES: Final = ("InvalidDataError", "EOFError")  # attributes of av.error
+LANGUAGE_ERROR_MARK: Final = "not a valid language code"
+NO_AUDIO_STREAM: Final = "no audio stream"
+
 type Monotonic = Callable[[], float]
 
 
 class MissingExtraError(ConfigError):
     """faster-whisper (the `transcribe` extra) is not installed or does not import."""
+
+
+class AudioDecodeError(Exception):
+    """Raised by ``WhisperRuntime.decode_audio`` when the input itself is not decodable audio."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 class InfoLike(Protocol):
@@ -109,6 +123,8 @@ def load_runtime() -> WhisperRuntime:
     try:
         fw = importlib.import_module("faster_whisper")
         ct2 = importlib.import_module("ctranslate2")
+        av = importlib.import_module("av")
+        av_error = importlib.import_module("av.error")
     except ModuleNotFoundError as exc:
         if exc.name in ("faster_whisper", "ctranslate2"):
             raise _missing(f"which is not installed; {INSTALL_HINT}") from None
@@ -122,6 +138,11 @@ def load_runtime() -> WhisperRuntime:
             f"`uv sync --extra {EXTRA}`"
         ) from None
 
+    candidates = (getattr(av_error, name, None) for name in DECODE_ERROR_NAMES)
+    bad_input: tuple[type[Exception], ...] = tuple(
+        c for c in candidates if isinstance(c, type) and issubclass(c, Exception)
+    )
+
     def load_model(options: WhisperOptions) -> WhisperModelLike:
         model: WhisperModelLike = fw.WhisperModel(
             options.model,
@@ -132,13 +153,30 @@ def load_runtime() -> WhisperRuntime:
         return model
 
     def decode_audio(path: Path) -> DecodedAudio:
-        samples = fw.decode_audio(str(path), sampling_rate=SAMPLE_RATE)
+        try:
+            samples = fw.decode_audio(str(path), sampling_rate=SAMPLE_RATE)
+        except bad_input as exc:
+            raise AudioDecodeError(_decode_detail(exc)) from exc
+        except IndexError as exc:
+            if _audio_streams(av, path) == 0:
+                raise AudioDecodeError(NO_AUDIO_STREAM) from exc
+            raise
         return DecodedAudio(samples, duration_s=len(samples) / SAMPLE_RATE)
 
     def cuda_device_count() -> int:
         return int(ct2.get_cuda_device_count())
 
     return WhisperRuntime(load_model, decode_audio, cuda_device_count)
+
+
+def _audio_streams(av: types.ModuleType, path: Path) -> int | None:
+    """Count the audio streams with a plain ``av.open``; None when the probe itself fails."""
+    try:
+        with av.open(str(path)) as container:
+            return len(container.streams.audio)
+    except Exception as exc:
+        logger.debug("could not count the audio streams of %s", path.name, exc_info=exc)
+        return None
 
 
 def check_device(options: WhisperOptions, runtime: WhisperRuntime) -> None:
@@ -273,11 +311,9 @@ class FasterWhisperEngine:
         model = self._load()
         try:
             decoded = self._runtime.decode_audio(audio)
-        except MemoryError:
-            raise
-        except Exception as exc:
+        except AudioDecodeError as exc:
             raise UnusableAudioError(
-                f"could not decode {audio.name}: {_decode_detail(exc)}"
+                f"could not decode {audio.name}: {_collapse(exc.detail)}"
             ) from exc
         if decoded.duration_s <= 0:
             raise UnusableAudioError(f"{audio.name} contains no audio")
@@ -291,40 +327,42 @@ class FasterWhisperEngine:
                 beam_size=BEAM_SIZE,
                 vad_filter=VAD_FILTER,
             )
-            info_duration = float(info.duration)
-            duration = (
-                info_duration
-                if math.isfinite(info_duration) and info_duration > 0
-                else decoded.duration_s
-            )
-            logger.info(
-                "transcribing %s: %s of audio with %s",
-                episode_key,
-                format_hms(duration),
-                self.name,
-            )
-            previous = 0.0
-            last_log = self._monotonic()
-            for raw in raw_segments:
-                seg = segment_from(raw, previous_start=previous, duration_s=duration)
-                if seg is not None:
-                    segments.append(seg)
-                    previous = seg.start
-                if self._monotonic() - last_log >= self._progress_interval_s:
-                    seg_end = raw.end if math.isfinite(raw.end) else previous
-                    seg_end = min(max(seg_end, 0.0), duration)
-                    logger.info(
-                        "transcribing %s: %s of %s (%d%%)",
-                        episode_key,
-                        format_hms(seg_end),
-                        format_hms(duration),
-                        min(100, int(100 * seg_end / duration)),
-                    )
-                    last_log = self._monotonic()
         except ValueError as exc:
-            raise self._value_error(exc) from exc
+            if LANGUAGE_ERROR_MARK in str(exc):
+                raise self._value_error(exc) from exc
+            raise
+        info_duration = float(info.duration)
+        duration = (
+            info_duration
+            if math.isfinite(info_duration) and info_duration > 0
+            else decoded.duration_s
+        )
+        logger.info(
+            "transcribing %s: %s of audio with %s",
+            episode_key,
+            format_hms(duration),
+            self.name,
+        )
+        previous = 0.0
+        last_log = self._monotonic()
+        for raw in raw_segments:
+            seg = segment_from(raw, previous_start=previous, duration_s=duration)
+            if seg is not None:
+                segments.append(seg)
+                previous = seg.start
+            if self._monotonic() - last_log >= self._progress_interval_s:
+                seg_end = raw.end if math.isfinite(raw.end) else previous
+                seg_end = min(max(seg_end, 0.0), duration)
+                logger.info(
+                    "transcribing %s: %s of %s (%d%%)",
+                    episode_key,
+                    format_hms(seg_end),
+                    format_hms(duration),
+                    min(100, int(100 * seg_end / duration)),
+                )
+                last_log = self._monotonic()
         if not segments:
-            raise UnusableAudioError(
+            raise NoSpeechError(
                 f"no speech found in {audio.name} ({format_hms(duration)} of audio)"
             )
         elapsed = max(self._monotonic() - started, 1e-9)

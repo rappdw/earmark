@@ -8,7 +8,12 @@ from earmark.errors import PermanentError, TransientError
 from earmark.models import Episode, Segment, Transcript
 from earmark.pipeline.stages import Transcriber
 from earmark.pipeline.worker import Shutdown
-from earmark.transcribe.base import CachedTranscriber, TranscriptionEngine, UnusableAudioError
+from earmark.transcribe.base import (
+    CachedTranscriber,
+    NoSpeechError,
+    TranscriptionEngine,
+    UnusableAudioError,
+)
 from tests.factories import make_episode
 
 
@@ -120,6 +125,16 @@ def test_unusable_audio_deleted(tmp_path: Path, keep: bool) -> None:
     with pytest.raises(UnusableAudioError):
         t.transcribe(episode, audio)
     assert audio.exists() is keep
+    assert not artifacts.has_transcript(episode.key)
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_no_speech_error_keeps_audio(tmp_path: Path, keep: bool) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    t = _make(artifacts, RecordingEngine(error=NoSpeechError("x")), keep_audio=keep)
+    with pytest.raises(NoSpeechError):
+        t.transcribe(episode, audio)
+    assert audio.exists()
     assert not artifacts.has_transcript(episode.key)
 
 

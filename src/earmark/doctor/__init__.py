@@ -13,6 +13,7 @@ import httpx2
 from earmark.config import Settings
 from earmark.doctor.report import CheckResult
 from earmark.fetch import GuardedFetcher
+from earmark.transcribe.compat import Lookup, installed
 
 ONLINE_TIMEOUT_S: Final = 10.0
 
@@ -25,6 +26,7 @@ class Probes:
     fetcher: GuardedFetcher | None = None  # the iTunes lookup
     anthropic_http_client: httpx2.Client | None = None
     timeout_s: float = ONLINE_TIMEOUT_S
+    installed: Lookup = installed  # package metadata, for the asr libraries check
 
 
 def run_doctor(

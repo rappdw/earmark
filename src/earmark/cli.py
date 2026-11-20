@@ -467,6 +467,17 @@ def transcribe_command(
     except PermanentError as exc:
         typer.echo(f"earmark transcribe: {_clean(exc.message)}", err=True)
         raise typer.Exit(code=1) from None
+    except Exception as exc:
+        from earmark.pipeline.runner import describe_error
+
+        logger.error("earmark transcribe failed", exc_info=exc)
+        text = describe_error(exc, settings.secret_values())
+        typer.echo(
+            f"earmark transcribe: {_clean(text)} (not a problem with the audio file; "
+            "`earmark doctor` checks the installed libraries)",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
     finally:
         if close is not None:
             close()

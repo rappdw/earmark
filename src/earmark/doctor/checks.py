@@ -101,6 +101,7 @@ class OfflineChecks:
         asr = guarded("asr", self.asr)
         results.append(asr)
         if s.asr_backend == "faster_whisper" and asr.status == "ok":
+            results.append(guarded("asr libraries", self.asr_libraries))
             results.append(guarded("asr model", self.asr_model))
         results.append(guarded("llm", self.llm))
         index = guarded("index", self.index)
@@ -316,6 +317,14 @@ class OfflineChecks:
             f"faster_whisper, model {s.asr_model}, device {s.asr_device}, "
             f"compute {s.asr_compute_type}",
         )
+
+    def asr_libraries(self) -> CheckResult:
+        from earmark.transcribe.compat import check_transcribe_packages
+
+        result = check_transcribe_packages(self.probes.installed)
+        if result.status == "ok":
+            return CheckResult("asr libraries", "ok", result.detail)
+        return CheckResult("asr libraries", "warn", result.detail)
 
     def asr_model(self) -> CheckResult:
         from earmark.transcribe.faster_whisper import WhisperOptions, model_cache_status

@@ -29,6 +29,7 @@ from earmark.pipeline import factory
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from earmark.transcribe import faster_whisper as fw
+from earmark.transcribe.faster_whisper import AudioDecodeError
 from tests.digest_helpers import put_episode
 from tests.factories import make_analysis, make_episode, make_transcript
 from tests.index_helpers import RecordingTarget, make_docs, stub_extra_missing
@@ -561,13 +562,28 @@ def test_transcribe_missing_file_exits_2(fake_env: Path, whisper: FakeRuntime) -
 
 
 def test_transcribe_unusable_audio_exits_1(fake_env: Path, whisper: FakeRuntime) -> None:
-    whisper.decode_error = ValueError("bad")
+    whisper.decode_error = AudioDecodeError("bad")
     result = runner.invoke(app, ["transcribe", str(_clip(fake_env))])
     assert result.exit_code == 1
     assert result.stderr.splitlines()[-1].startswith(
         "earmark transcribe: could not decode clip.mp3"
     )
     assert result.stdout == ""
+
+
+def test_transcribe_unexpected_error_exits_1(fake_env: Path, whisper: FakeRuntime) -> None:
+    message = "open() got an unexpected keyword argument 'metadata_errors'"
+    whisper.decode_error = TypeError(message)
+    clip = _clip(fake_env)
+    before = clip.read_bytes()
+    result = runner.invoke(app, ["transcribe", str(clip)])
+    assert result.exit_code == 1
+    last = result.stderr.splitlines()[-1]
+    assert last.startswith(f"earmark transcribe: unexpected error: TypeError: {message}")
+    assert "earmark doctor" in last
+    assert "could not decode" not in result.stderr
+    assert result.stdout == ""
+    assert clip.read_bytes() == before
 
 
 def test_transcribe_transient_exits_1(fake_env: Path, whisper: FakeRuntime) -> None:

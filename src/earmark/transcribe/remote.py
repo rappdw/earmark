@@ -31,6 +31,7 @@ from earmark.fetch import AUDIO_EXTENSIONS, MIB, USER_AGENT, parse_retry_after
 from earmark.models import Segment, Transcript, format_hms, utc_now
 from earmark.transcribe.base import (
     CachedTranscriber,
+    NoSpeechError,
     UnusableAudioError,
     segment_from,
 )
@@ -116,7 +117,7 @@ class _WireSegment(BaseModel):
 
 class _WireTranscription(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    text: str = ""
+    text: str
     language: str | None = None
     duration: float | None = None
     segments: list[_WireSegment] | None = None
@@ -186,7 +187,7 @@ def transcript_from_response(
     if not segments:
         text = _collapse(wire.text) or _collapse(" ".join(s.text for s in wire_segments))
         if not text:
-            raise UnusableAudioError(f"no speech found in {audio_name} (remote ASR)")
+            raise NoSpeechError(f"no speech found in {audio_name} (remote ASR)")
         segments = [Segment(start=0.0, end=duration, text=text)]
         warnings = (NO_TIMESTAMPS_WARNING,)
     return Transcript(

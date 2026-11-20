@@ -79,7 +79,9 @@ src/earmark/
   transcribe/          base.py (CachedTranscriber: cache, transcript files, audio deletion;
                        TranscriptionEngine; segment_from), faster_whisper.py (the
                        `faster_whisper` engine, step 08), remote.py (the `remote` engine:
-                       OpenAI-compatible /v1/audio/transcriptions client, step 09)
+                       OpenAI-compatible /v1/audio/transcriptions client, step 09),
+                       compat.py (known-incompatible extra versions from package
+                       metadata, light; step 19)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
                        (remote ASR, local LLM, ntfy; step 11)
   analyze/             schema.py (output JSON schema, wire models, build_analysis), prompts.py
@@ -416,10 +418,13 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   `engine.transcribe_file(audio, key)` returns a `Transcript`, which is written with
   `ArtifactStore.write_transcript` (`transcript.txt`, then `transcript.json`, both
   atomic), and the episode's `audio.*` is deleted unless `EARMARK_KEEP_AUDIO`. On any
-  failure the audio is kept, except `UnusableAudioError` (a `PermanentError`:
-  undecodable, empty, or no speech), which deletes it unless `KEEP_AUDIO` so a re-share
-  downloads it again. `base.segment_from` is the shared monotonic mapping (starts never
-  decrease, `end >= start`, all within the duration; blank segments dropped).
+  failure the audio is kept, except `UnusableAudioError` (a `PermanentError`: the file is
+  not decodable audio, or decodes to no samples), which deletes it unless `KEEP_AUDIO`
+  so a re-share downloads it again. "No speech found" is `NoSpeechError` (a
+  `PermanentError`, not an `UnusableAudioError`): the job fails and the audio is kept,
+  because on a podcast it more likely means a broken engine than a silent file (step
+  19). `base.segment_from` is the shared monotonic mapping (starts never decrease,
+  `end >= start`, all within the duration; blank segments dropped).
 - **`faster_whisper` engine.** `transcribe.faster_whisper.FasterWhisperEngine` imports
   `faster_whisper` and `ctranslate2` only through `load_runtime()`
   (`importlib.import_module`), which the factory's builder calls; without the extra the
@@ -436,6 +441,21 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   `OSError`s while loading (download failures) → `TransientError`. `ASR_DEVICE=cuda` with
   no CUDA device visible to CTranslate2 is a startup `ConfigError`. Messages carry file
   base names and setting names, never full paths, URLs, or library error text.
+- **Library errors are not bad audio** (step 19; `docs/steps/19-library-errors.md`).
+  `load_runtime()` also imports `av`. Its `decode_audio` raises
+  `transcribe.faster_whisper.AudioDecodeError` for bad input only:
+  - PyAV's `av.error.InvalidDataError` or `av.error.EOFError`;
+  - an `IndexError` from a container that a plain `av.open` probe confirms has no
+    audio stream.
+
+  The engine turns `AudioDecodeError` and a zero-sample decode into
+  `UnusableAudioError`. Every other exception from decoding or the model propagates
+  unchanged to the runner's unexpected-exception path (transient, traceback logged,
+  audio kept). That covers PyAV 19's `TypeError` with faster-whisper 1.2.1, `OSError`s
+  (PyAV's included), `MemoryError`, `DecoderNotFoundError` and PyAV's other
+  capability errors, and code bugs. Of the model's `ValueError`s, only "not a valid
+  language code" from the `transcribe(...)` call is a `PermanentError` (check
+  `ASR_LANGUAGE`).
 - **`remote` engine** (step 09; exact signatures in `docs/steps/09-remote-asr.md`).
   `transcribe.remote.RemoteAsrEngine` POSTs the audio as streamed `multipart/form-data`
   (64 KiB chunks, `Content-Length` from the file) to `{ASR_BASE_URL}/audio/transcriptions`
@@ -446,9 +466,11 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   segment timestamps (no segments, or none with an end above 0) becomes one segment with
   the warning "the ASR server returned no segment timestamps; …". Errors: file larger
   than `ASR_MAX_UPLOAD_MB` → `PermanentError` before any request (audio kept); empty file
-  or no text → `UnusableAudioError`; 408, 429, 5xx, timeouts, connection and protocol
-  errors → transient (`Retry-After` honoured); 3xx (never followed), other 4xx, and an
-  unreadable or oversized (64 MiB) response → permanent. Messages name the host and the
+  → `UnusableAudioError`; empty text → `NoSpeechError` (audio kept); 408, 429, 5xx,
+  timeouts, connection and protocol errors → transient (`Retry-After` honoured); 3xx
+  (never followed), other 4xx, and an unreadable or oversized (64 MiB) response →
+  permanent. A 200 body without a string `text` field (for example `{}` or
+  `{"error": ...}`) is unreadable: "not a transcription". Messages name the host and the
   setting to check, and carry at most 200 characters of the server's error message with
   the key redacted. Read and write timeouts are `ASR_TIMEOUT_SECONDS`. Needs no extra;
   `ASR_BACKEND=remote` without `ASR_BASE_URL` is a startup `ConfigError`.
@@ -734,6 +756,12 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
     constructor finds the credential chain).
   - Whether the Whisper and embedding models are in the cache: faster-whisper's
     `download_model(local_files_only=True)` and `huggingface_hub.try_to_load_from_cache`.
+  - `asr libraries` (step 19, `faster_whisper` only): the installed `faster-whisper` and
+    `av` versions, read from package metadata (`importlib.metadata`, through
+    `Probes.installed`), checked against `transcribe.compat.KNOWN_INCOMPATIBLE`. It
+    warns on a known-bad pair (today faster-whisper <= 1.2.1 with av >= 19), or when a
+    version cannot be read. A package installed from a source tree (PEP 610
+    `vcs_info`/`dir_info`) is not checked by version.
   - Whether an existing index matches `EMBED_MODEL`.
 
   Offline doctor makes no network call, loads no model, downloads nothing, and creates no
@@ -918,8 +946,8 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
     shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
-    audio.<ext>                 deleted after transcription (or when it proves unusable)
-                                unless EARMARK_KEEP_AUDIO
+    audio.<ext>                 deleted after transcription (or when it proves undecodable)
+                                unless EARMARK_KEEP_AUDIO; kept on every other failure
     .audio.<ext>.<random>.part  download in progress; renamed to audio.<ext> when complete
     transcript.json             written last; its existence marks the transcript cached
     transcript.txt              Transcript.to_text()

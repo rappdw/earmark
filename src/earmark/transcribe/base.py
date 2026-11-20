@@ -52,7 +52,11 @@ def segment_from(raw: SegmentLike, *, previous_start: float, duration_s: float) 
 
 
 class UnusableAudioError(PermanentError):
-    """The audio cannot be transcribed: undecodable, empty, or without speech."""
+    """The file is not decodable audio, or decodes to no samples. The audio is deleted."""
+
+
+class NoSpeechError(PermanentError):
+    """The audio decoded but the engine found no speech. Permanent; the audio is kept."""
 
 
 class CachedTranscriber:

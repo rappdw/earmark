@@ -30,6 +30,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 16 | Deployment and Shortcut docs | 06–15 | done |
 | 17 | Extension: re-run a prompt | 10, 12 | done |
 | 18 | Extension: weekly digest | 10, 12 | done |
+| 19 | Fix: library errors are not bad audio | 08 | done |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -505,6 +506,31 @@ first, Cloudflare Tunnel as the alternative), `docs/shortcut.md`, and the `READM
 - An empty window makes no LLM call and writes no note.
 - Running twice for the same week yields the same file, and user text outside the
   managed markers survives.
+
+## Step 19: Fix: library errors are not bad audio
+
+**Goal.** A broken or incompatible dependency must not be mistaken for unusable audio.
+
+**Why.** `transcribe/faster_whisper.py` wraps any exception raised while decoding in
+`UnusableAudioError`, which fails the job permanently and deletes its audio. With
+PyAV 19.0.2 and faster-whisper 1.2.1, every file fails with
+`could not decode <file>: TypeError` (reproduced with the real `tiny` model on
+2026-11-20, when Dependabot proposed the bump). If that upgrade had landed, every
+episode would have failed permanently and lost its download.
+
+**Acceptance.**
+- Only genuine decode failures count as unusable audio: PyAV's decode and FFmpeg
+  errors for bad input, and a file that decodes to no samples. They stay permanent and
+  delete the audio unless `KEEP_AUDIO` is set.
+- Any other exception from the decoder or the model is not a permanent audio error. It
+  takes the worker's normal unexpected-exception path (transient, with a traceback), and
+  the audio file is kept. A test shows the PyAV-19-style `TypeError`, raised from the
+  decoder, keeps the audio and requeues the job.
+- The planner audits the other stages for the same kind of broad catch, where an
+  exception from the code or a library becomes a permanent, data-destroying outcome.
+  Each one found is fixed in this step or listed with its reason.
+- `earmark doctor` warns when the installed `av` and `faster-whisper` versions are a
+  known-incompatible pair, without loading a model.
 
 ## Backlog
 

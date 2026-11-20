@@ -23,6 +23,7 @@ from earmark.index import embed as embed_module
 from earmark.index.embed import ModelInfo
 from earmark.index.lancedb_index import META_DIM, META_MODEL, META_VERSION, LanceRuntime
 from earmark.jobs import open_job_store
+from earmark.transcribe.compat import Installed
 from tests.anthropic_stub import KEY, AnthropicStub, error_reply, model_info_body
 from tests.http_helpers import ScriptedNetwork, StaticResolver
 from tests.index_helpers import BGE, stub_extra_missing, stub_fastembed_runtime
@@ -325,6 +326,11 @@ class WhisperStubs:
         monkeypatch.setitem(sys.modules, "faster_whisper", fw)
         monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
         monkeypatch.setitem(sys.modules, "ctranslate2", ct2)
+        av = types.ModuleType("av")
+        av_error = types.ModuleType("av.error")
+        av.__dict__["error"] = av_error
+        monkeypatch.setitem(sys.modules, "av", av)
+        monkeypatch.setitem(sys.modules, "av.error", av_error)
 
 
 def whisper_settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -370,6 +376,64 @@ def test_doctor_whisper_ok_with_stub_runtime(
     assert unknown.status == "fail"
     assert "EARMARK_ASR_MODEL" in unknown.detail
     assert stubs.models_built == 0
+
+
+def _lookup(fw: str | None, av: str | None) -> Callable[[str], Installed | None]:
+    versions = {"faster-whisper": fw, "av": av}
+
+    def lookup(name: str) -> Installed | None:
+        version = versions[name]
+        return None if version is None else Installed(version, from_source=False)
+
+    return lookup
+
+
+def test_doctor_asr_libraries_incompatible_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stubs = WhisperStubs(monkeypatch)
+    probes = Probes(installed=_lookup("1.2.1", "19.0.2"))
+    settings = whisper_settings(tmp_path)
+    results = run_doctor(settings, probes=probes)
+    names = [r.name for r in results]
+    assert names.index("asr") + 1 == names.index("asr libraries")
+    assert names.index("asr libraries") + 1 == names.index("asr model")
+    libs = {r.name: r for r in results}["asr libraries"]
+    assert libs.status == "warn"
+    assert "known-incompatible" in libs.detail
+    assert stubs.models_built == 0
+    assert exit_code(results) == 0
+
+
+def test_doctor_asr_libraries_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    WhisperStubs(monkeypatch)
+    results = check(whisper_settings(tmp_path), probes=Probes(installed=_lookup("1.2.1", "18.1.0")))
+    assert results["asr libraries"] == CheckResult(
+        "asr libraries", "ok", "faster-whisper 1.2.1, av 18.1.0"
+    )
+
+
+def test_doctor_asr_libraries_unknown_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperStubs(monkeypatch)
+    results = check(whisper_settings(tmp_path), probes=Probes(installed=_lookup(None, None)))
+    assert results["asr libraries"].status == "warn"
+
+
+@pytest.mark.parametrize("case", ["extra-missing", "remote", "fake"])
+def test_doctor_asr_libraries_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    probes = Probes(installed=_lookup("1.2.1", "19.0.2"))
+    if case == "extra-missing":
+        monkeypatch.setitem(sys.modules, "faster_whisper", None)
+        settings = whisper_settings(tmp_path)
+    elif case == "remote":
+        settings = make_settings(tmp_path, asr_backend="remote", asr_base_url=ASR_URL)
+    else:
+        settings = make_settings(tmp_path)
+    assert "asr libraries" not in check(settings, probes=probes)
 
 
 def test_doctor_whisper_local_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

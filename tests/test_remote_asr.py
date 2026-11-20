@@ -26,7 +26,12 @@ from earmark.models import Transcript
 from earmark.pipeline import factory
 from earmark.pipeline.stages import Transcriber
 from earmark.pipeline.worker import Shutdown
-from earmark.transcribe.base import CachedTranscriber, TranscriptionEngine, UnusableAudioError
+from earmark.transcribe.base import (
+    CachedTranscriber,
+    NoSpeechError,
+    TranscriptionEngine,
+    UnusableAudioError,
+)
 from earmark.transcribe.remote import (
     MAX_DETAIL_CHARS,
     NO_TIMESTAMPS_WARNING,
@@ -370,12 +375,12 @@ def test_text_only_warning_reaches_job(tmp_path: Path) -> None:
     [{"text": ""}, {"text": "  ", "segments": [{"start": 0, "end": 1, "text": " "}]}],
 )
 @pytest.mark.parametrize("keep_audio", [False, True])
-def test_no_speech_is_unusable(tmp_path: Path, body: dict[str, Any], keep_audio: bool) -> None:
+def test_no_speech_keeps_audio(tmp_path: Path, body: dict[str, Any], keep_audio: bool) -> None:
     server = Server(_json(200, body))
     with _cached(tmp_path, server, keep_audio=keep_audio) as (transcriber, artifacts, path):
-        with pytest.raises(UnusableAudioError, match="no speech found"):
+        with pytest.raises(NoSpeechError, match="no speech found"):
             transcriber.transcribe(CANON_EPISODE, path)
-        assert path.exists() is keep_audio
+        assert path.exists()
         assert not artifacts.has_transcript(CANON_EPISODE.key)
 
 
@@ -629,12 +634,36 @@ def test_error_detail_extraction(body: bytes, ctype: str | None, expected: str |
         httpx2.Response(200, json=["a"]),
         httpx2.Response(200, json={"text": 5}),
         httpx2.Response(200, content=b"\xff\xfe"),
+        httpx2.Response(200, json={}),
+        httpx2.Response(200, json={"error": {"message": "model not loaded"}}),
+        httpx2.Response(200, json={"detail": "Not Found"}),
+        httpx2.Response(200, json={"segments": []}),
     ],
-    ids=["html", "list", "wrong-type", "binary"],
+    ids=["html", "list", "wrong-type", "binary", "empty", "error", "detail", "segments-only"],
 )
 def test_unreadable_200_is_permanent(tmp_path: Path, response: httpx2.Response) -> None:
-    with pytest.raises(PermanentError):
+    with pytest.raises(PermanentError, match=r"not JSON|not a transcription") as info:
         _engine(Server(response)).transcribe_file(_audio(tmp_path), EKEY)
+    assert not isinstance(info.value, NoSpeechError)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"error": {"message": "model not loaded"}}, {"detail": "Not Found"}, {"segments": []}],
+)
+def test_body_without_text_is_not_a_transcription(tmp_path: Path, body: dict[str, Any]) -> None:
+    with pytest.raises(PermanentError, match="not a transcription") as info:
+        _engine(Server(httpx2.Response(200, json=body))).transcribe_file(_audio(tmp_path), EKEY)
+    assert not isinstance(info.value, NoSpeechError)
+
+
+def test_error_shaped_200_keeps_audio(tmp_path: Path) -> None:
+    server = Server(_json(200, {"error": "busy"}))
+    with _cached(tmp_path, server, keep_audio=False) as (transcriber, artifacts, path):
+        with pytest.raises(PermanentError, match="not a transcription"):
+            transcriber.transcribe(CANON_EPISODE, path)
+        assert path.exists()
+        assert not artifacts.has_transcript(CANON_EPISODE.key)
 
 
 def test_oversized_response_is_permanent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -22,9 +22,15 @@ from earmark.pipeline import factory
 from earmark.pipeline.stages import Transcriber
 from earmark.pipeline.worker import Shutdown
 from earmark.transcribe import faster_whisper as fw
-from earmark.transcribe.base import CachedTranscriber, TranscriptionEngine, UnusableAudioError
+from earmark.transcribe.base import (
+    CachedTranscriber,
+    NoSpeechError,
+    TranscriptionEngine,
+    UnusableAudioError,
+)
 from earmark.transcribe.faster_whisper import (
     MAX_DETAIL_CHARS,
+    AudioDecodeError,
     DecodedAudio,
     FasterWhisperEngine,
     MissingExtraError,
@@ -39,7 +45,17 @@ from earmark.transcribe.faster_whisper import (
 from tests.factories import make_episode
 from tests.http_helpers import FakeMonotonic
 from tests.pipeline_env import CANON, CountingJobStore, make_env
-from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
+from tests.whisper_fakes import (
+    FakeInfo,
+    FakeRuntime,
+    FakeSegment,
+    FakeWhisperModel,
+    StubDecoderNotFoundError,
+    StubEOFError,
+    StubExtra,
+    StubFileNotFoundError,
+    StubInvalidDataError,
+)
 
 LOGGER = "earmark.transcribe.faster_whisper"
 
@@ -144,6 +160,17 @@ def test_load_runtime_broken_extra(monkeypatch: pytest.MonkeyPatch, error: Impor
     assert "uv sync --extra transcribe" in line
     assert "libfoo" not in line
     assert "No module named" not in line
+    assert "not installed" not in line
+
+
+def test_load_runtime_av_unimportable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.ModuleType("faster_whisper"))
+    monkeypatch.setitem(sys.modules, "ctranslate2", types.ModuleType("ctranslate2"))
+    monkeypatch.setitem(sys.modules, "av", None)
+    with pytest.raises(MissingExtraError) as info:
+        load_runtime()
+    [line] = info.value.errors
+    assert "failed to import" in line
     assert "not installed" not in line
 
 
@@ -296,6 +323,11 @@ def test_real_runtime_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setitem(sys.modules, "faster_whisper", StubFasterWhisper("faster_whisper"))
     monkeypatch.setitem(sys.modules, "ctranslate2", StubCtranslate2("ctranslate2"))
+    av_stub = types.ModuleType("av")
+    av_error = types.ModuleType("av.error")
+    av_stub.__dict__["error"] = av_error
+    monkeypatch.setitem(sys.modules, "av", av_stub)
+    monkeypatch.setitem(sys.modules, "av.error", av_error)
 
     runtime = load_runtime()
     runtime.load_model(_options(model="small", model_dir=tmp_path))
@@ -599,56 +631,265 @@ def test_load_error_unknown_propagates(tmp_path: Path) -> None:
 # -- B3: unusable audio ------------------------------------------------------------------
 
 
-class DecodeError(ValueError):
-    def __init__(self, path: Path) -> None:
-        super().__init__(f"[Errno 1094995529] Invalid data found when processing input: '{path}'")
-        self.strerror = "Invalid data found when processing input"
-
-
-def test_decode_error_is_unusable_audio(tmp_path: Path) -> None:
+@pytest.mark.parametrize("keep_audio", [False, True])
+def test_decode_error_is_unusable_audio(tmp_path: Path, keep_audio: bool) -> None:
     artifacts, episode, audio = _setup(tmp_path)
     fake = _fake()
-    fake.decode_error = DecodeError(audio)
+    cause = AudioDecodeError("Invalid data found when processing input")
+    fake.decode_error = cause
     with pytest.raises(UnusableAudioError) as info:
-        _transcriber(artifacts, fake).transcribe(episode, audio)
+        _transcriber(artifacts, fake, keep_audio=keep_audio).transcribe(episode, audio)
     assert str(info.value) == "could not decode audio.mp3: Invalid data found when processing input"
+    assert info.value.__cause__ is cause
     assert str(tmp_path) not in str(info.value)
-    assert not audio.exists()
+    assert audio.exists() is keep_audio
 
 
-def test_decode_error_without_strerror_names_class(tmp_path: Path) -> None:
-    artifacts, episode, audio = _setup(tmp_path)
-    fake = _fake()
-    fake.decode_error = RuntimeError(f"secret {tmp_path}")
-    with pytest.raises(UnusableAudioError, match=r"could not decode audio\.mp3: RuntimeError$"):
-        _transcriber(artifacts, fake).transcribe(episode, audio)
-
-
-def test_decode_memory_error_propagates(tmp_path: Path) -> None:
-    artifacts, episode, audio = _setup(tmp_path)
-    fake = _fake()
-    fake.decode_error = MemoryError()
-    with pytest.raises(MemoryError):
-        _transcriber(artifacts, fake).transcribe(episode, audio)
-    assert audio.exists()
-
-
-def test_zero_duration_is_unusable(tmp_path: Path) -> None:
+@pytest.mark.parametrize("keep_audio", [False, True])
+def test_zero_duration_is_unusable(tmp_path: Path, keep_audio: bool) -> None:
     artifacts, episode, audio = _setup(tmp_path)
     fake = _fake()
     fake.duration_s = 0.0
     with pytest.raises(UnusableAudioError, match=r"audio\.mp3 contains no audio"):
-        _transcriber(artifacts, fake).transcribe(episode, audio)
+        _transcriber(artifacts, fake, keep_audio=keep_audio).transcribe(episode, audio)
     assert fake.model.calls == []
+    assert audio.exists() is keep_audio
 
 
+@pytest.mark.parametrize("keep_audio", [False, True])
 @pytest.mark.parametrize("segments", [(), (FakeSegment(0, 1, "  "), FakeSegment(1, 2, "\n"))])
-def test_no_speech_is_unusable(tmp_path: Path, segments: tuple[FakeSegment, ...]) -> None:
+def test_no_speech_keeps_audio(
+    tmp_path: Path, segments: tuple[FakeSegment, ...], keep_audio: bool
+) -> None:
     artifacts, episode, audio = _setup(tmp_path)
-    with pytest.raises(UnusableAudioError, match=r"no speech found in audio.mp3 \(00:00:12 of"):
-        _transcriber(artifacts, _fake(segments)).transcribe(episode, audio)
+    with pytest.raises(NoSpeechError, match=r"no speech found in audio.mp3 \(00:00:12 of") as info:
+        _transcriber(artifacts, _fake(segments), keep_audio=keep_audio).transcribe(episode, audio)
+    assert type(info.value) is NoSpeechError
+    assert isinstance(info.value, PermanentError)
+    assert not isinstance(info.value, UnusableAudioError)
     assert not artifacts.has_transcript(episode.key)
+    assert audio.exists()
+
+
+def test_no_speech_fails_job_and_keeps_audio(tmp_path: Path) -> None:
+    fake = _fake(())
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    transcriber = CachedTranscriber(
+        fakes.artifacts, FasterWhisperEngine(_options(), fake.runtime()), keep_audio=False
+    )
+    env = make_env(
+        tmp_path,
+        fakes=fakes,
+        backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
+    )
+    env.jobs.enqueue(CANON)
+    job = env.worker.run_once()
+    assert job is not None
+    assert job.status == "failed"
+    assert job.attempts == 1
+    assert job.error is not None
+    assert "no speech found in audio.mp3" in job.error
+    assert job.episode_key is not None
+    assert fakes.artifacts.find_audio(job.episode_key) is not None
+
+
+_LIBRARY_ERRORS: list[Any] = [
+    TypeError("open() got an unexpected keyword argument 'metadata_errors'"),
+    RuntimeError("x"),
+    IndexError("tuple index out of range"),
+    PermissionError(13, "Permission denied"),
+    StubDecoderNotFoundError("/x/audio.mp3"),
+    MemoryError(),
+]
+
+
+@pytest.mark.parametrize("error", _LIBRARY_ERRORS, ids=lambda e: type(e).__name__)
+def test_decoder_library_errors_propagate(tmp_path: Path, error: BaseException) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    fake = _fake()
+    fake.decode_error = error
+    with pytest.raises(type(error)) as info:
+        _transcriber(artifacts, fake, keep_audio=False).transcribe(episode, audio)
+    assert info.value is error
+    assert not isinstance(info.value, UnusableAudioError)
+    assert audio.exists()
+    assert not artifacts.has_transcript(episode.key)
+
+
+def _stub_extra(decode: Any, **kwargs: Any) -> StubExtra:
+    model = FakeWhisperModel(THREE, FakeInfo("en", 12.0))
+    return StubExtra(model, decode=decode, **kwargs)
+
+
+def _raiser(error: BaseException) -> Any:
+    def decode(path: str) -> list[float]:
+        raise error
+
+    return decode
+
+
+@pytest.mark.parametrize(
+    ("error_type", "detail"),
+    [
+        (StubInvalidDataError, "Invalid data found when processing input"),
+        (StubEOFError, "End of file"),
+    ],
+)
+def test_real_runtime_classifies_bad_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: Any, detail: str
+) -> None:
+    path = tmp_path / "audio.mp3"
+    cause = error_type(path)
+    stub = _stub_extra(_raiser(cause))
+    stub.install(monkeypatch)
+    with pytest.raises(AudioDecodeError) as info:
+        load_runtime().decode_audio(path)
+    assert info.value.detail == detail
+    assert str(tmp_path) not in info.value.detail
+    assert info.value.__cause__ is cause
+    assert stub.open_calls == []
+
+
+def test_real_runtime_no_audio_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "audio.mp4"
+    cause = IndexError("tuple index out of range")
+    stub = _stub_extra(_raiser(cause), audio_streams=0)
+    stub.install(monkeypatch)
+    with pytest.raises(AudioDecodeError, match="no audio stream") as info:
+        load_runtime().decode_audio(path)
+    assert info.value.__cause__ is cause
+    assert stub.open_calls == [str(path)]
+
+
+def test_real_runtime_unusable_through_transcriber(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    stub = _stub_extra(_raiser(StubInvalidDataError(audio)))
+    stub.install(monkeypatch)
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data", asr_device="cpu")
+    transcriber = build_faster_whisper_transcriber(settings, artifacts)
+    with pytest.raises(UnusableAudioError, match=r"could not decode audio\.mp3: Invalid data"):
+        transcriber.transcribe(episode, audio)
     assert not audio.exists()
+
+
+def test_real_runtime_type_error_not_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = TypeError("open() got an unexpected keyword argument 'metadata_errors'")
+    stub = _stub_extra(_raiser(error))
+    stub.install(monkeypatch)
+    with pytest.raises(TypeError) as info:
+        load_runtime().decode_audio(tmp_path / "audio.mp3")
+    assert info.value is error
+    assert stub.open_calls == []
+
+
+@pytest.mark.parametrize(
+    "streams",
+    [1, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")],
+    ids=["has-audio-stream", "probe-fails"],
+)
+def test_real_runtime_index_error_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, streams: int | BaseException
+) -> None:
+    path = tmp_path / "audio.mp3"
+    error = IndexError("tuple index out of range")
+    stub = _stub_extra(_raiser(error), audio_streams=streams)
+    stub.install(monkeypatch)
+    with pytest.raises(IndexError) as info:
+        load_runtime().decode_audio(path)
+    assert info.value is error
+    assert stub.open_calls == [str(path)]
+
+
+@pytest.mark.parametrize("error_type", [StubFileNotFoundError, StubDecoderNotFoundError])
+def test_real_runtime_other_av_errors_propagate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: Any
+) -> None:
+    path = tmp_path / "audio.mp3"
+    error = error_type(path)
+    stub = _stub_extra(_raiser(error))
+    stub.install(monkeypatch)
+    with pytest.raises(type(error)) as info:
+        load_runtime().decode_audio(path)
+    assert info.value is error
+
+
+def test_pyav19_type_error_requeues_and_keeps_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    message = "open() got an unexpected keyword argument 'metadata_errors'"
+    broken = True
+
+    def decode(path: str) -> list[float]:
+        if broken:
+            raise TypeError(message)
+        return [0.0] * 32_000
+
+    stub = _stub_extra(decode)
+    stub.install(monkeypatch)
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data", asr_device="cpu")
+    transcriber = build_faster_whisper_transcriber(settings, fakes.artifacts)
+    env = make_env(
+        tmp_path,
+        fakes=fakes,
+        backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
+    )
+    env.jobs.enqueue(CANON)
+    with caplog.at_level(logging.ERROR):
+        job = env.worker.run_once()
+    assert job is not None
+    assert job.status == "queued"
+    assert job.attempts == 1
+    assert job.error is not None
+    assert job.error.startswith(f"unexpected error: TypeError: {message}")
+    assert "could not decode" not in job.error
+    key = job.episode_key
+    assert key is not None
+    assert fakes.artifacts.find_audio(key) is not None
+    assert not fakes.artifacts.has_transcript(key)
+    assert stub.open_calls == []
+    assert any(
+        r.name == "earmark.pipeline.runner"
+        and r.levelno == logging.ERROR
+        and r.exc_info is not None
+        and r.exc_info[0] is TypeError
+        for r in caplog.records
+    )
+
+    broken = False
+    env.clock.advance(61)
+    again = env.worker.run_once()
+    assert again is not None
+    assert again.status == "done"
+    assert fakes.artifacts.has_transcript(key)
+    assert fakes.artifacts.find_audio(key) is None
+    assert len(stub.decode_calls) == 2
+
+
+def test_pyav19_type_error_exhausted_keeps_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = _stub_extra(_raiser(TypeError("open() got an unexpected keyword argument")))
+    stub.install(monkeypatch)
+    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data", asr_device="cpu")
+    transcriber = build_faster_whisper_transcriber(settings, fakes.artifacts)
+    env = make_env(
+        tmp_path,
+        max_attempts=1,
+        fakes=fakes,
+        backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
+    )
+    env.jobs.enqueue(CANON)
+    job = env.worker.run_once()
+    assert job is not None
+    assert job.status == "failed"
+    assert job.episode_key is not None
+    assert fakes.artifacts.find_audio(job.episode_key) is not None
 
 
 def test_transcribe_value_error_is_permanent(tmp_path: Path) -> None:
@@ -662,6 +903,31 @@ def test_transcribe_value_error_is_permanent(tmp_path: Path) -> None:
     assert message.startswith("transcription failed: 'xx' is not a valid language code")
     suffix = " (check EARMARK_ASR_LANGUAGE)"
     assert len(message) <= len("transcription failed: ") + MAX_DETAIL_CHARS + len(suffix)
+    assert audio.exists()
+
+
+def test_transcribe_other_value_error_propagates(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    error = ValueError("stft: expected 0 < n_fft <= 10, but got n_fft=400")
+    fake = _fake(transcribe_error=error)
+    with pytest.raises(ValueError, match="n_fft") as info:
+        _transcriber(artifacts, fake, language="en").transcribe(episode, audio)
+    assert info.value is error
+    assert not isinstance(info.value, PermanentError)
+    assert audio.exists()
+
+
+def test_value_error_while_iterating_propagates(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+
+    def on_segment(index: int) -> None:
+        if index == 1:
+            raise ValueError("not a valid language code")
+
+    fake = _fake(on_segment=on_segment)
+    with pytest.raises(ValueError, match="not a valid language code") as info:
+        _transcriber(artifacts, fake, language="en").transcribe(episode, audio)
+    assert not isinstance(info.value, PermanentError)
     assert audio.exists()
 
 

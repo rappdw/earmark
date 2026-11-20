@@ -1,6 +1,7 @@
 """Real faster-whisper `tiny` on CPU. Opt-in: `pytest -m slow` with the transcribe extra."""
 
 import hashlib
+import importlib
 import shutil
 import threading
 import time
@@ -12,8 +13,9 @@ from typer.testing import CliRunner
 from earmark.artifacts import ArtifactStore
 from earmark.cli import app
 from earmark.config import Settings
-from earmark.transcribe.base import CachedTranscriber
+from earmark.transcribe.base import CachedTranscriber, UnusableAudioError
 from earmark.transcribe.faster_whisper import (
+    AudioDecodeError,
     FasterWhisperEngine,
     MissingExtraError,
     WhisperOptions,
@@ -126,3 +128,94 @@ def test_cli_transcribe_tiny(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert first.startswith("[00:00:00]")
     assert "country" in first.lower()
     assert hashlib.sha256(clip.read_bytes()).hexdigest() == before
+
+
+def _write_flac(path: Path) -> None:
+    av = importlib.import_module("av")
+    np = importlib.import_module("numpy")
+
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("flac", rate=16_000)
+        stream.layout = "mono"
+        t = np.arange(32_000) / 16_000
+        samples = (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+        frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = 16_000
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+
+def _write_video_only_mp4(path: Path) -> None:
+    av = importlib.import_module("av")
+    np = importlib.import_module("numpy")
+
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate=10)
+        stream.width = 64
+        stream.height = 64
+        stream.pix_fmt = "yuv420p"
+        for _ in range(5):
+            frame = av.VideoFrame.from_ndarray(
+                np.zeros((64, 64, 3), dtype=np.uint8), format="rgb24"
+            )
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+
+@pytest.mark.usefixtures("whisper_runtime")
+def test_real_decode_classifies_inputs(tmp_path: Path) -> None:
+    flac = tmp_path / "ok.flac"
+    _write_flac(flac)
+    mp4 = tmp_path / "video.mp4"
+    _write_video_only_mp4(mp4)
+    text = tmp_path / "text.mp3"
+    text.write_text("not audio")
+    empty = tmp_path / "empty.mp3"
+    empty.write_bytes(b"")
+    short = tmp_path / "short.flac"
+    short.write_bytes(flac.read_bytes()[:100])
+
+    runtime = load_runtime()
+    assert runtime.decode_audio(flac).duration_s > 1.0
+    for path, detail in [
+        (text, None),
+        (empty, "Invalid data found when processing input"),
+        (short, "End of file"),
+        (mp4, "no audio stream"),
+    ]:
+        with pytest.raises(AudioDecodeError) as info:
+            runtime.decode_audio(path)
+        if detail is not None:
+            assert info.value.detail == detail
+    for bad in (tmp_path / "missing.mp3", tmp_path):
+        try:
+            runtime.decode_audio(bad)
+        except AudioDecodeError:
+            pytest.fail(f"{bad.name} must not be classified as bad audio")
+        except OSError:
+            pass
+        else:
+            pytest.fail(f"{bad.name} should not decode")
+
+    artifacts = ArtifactStore(tmp_path / "data")
+    episode = make_episode()
+    audio = artifacts.audio_path(episode.key, "mp3")
+    audio.parent.mkdir(parents=True)
+    shutil.copyfile(text, audio)
+    model = FakeWhisperModel([], FakeInfo("en", 1.0))
+    fake_runtime = WhisperRuntime(
+        load_model=lambda _o: model,
+        decode_audio=runtime.decode_audio,
+        cuda_device_count=runtime.cuda_device_count,
+    )
+    options = WhisperOptions("tiny", "cpu", "int8", None, None)
+    cached = CachedTranscriber(
+        artifacts, FasterWhisperEngine(options, fake_runtime), keep_audio=False
+    )
+    with pytest.raises(UnusableAudioError):
+        cached.transcribe(episode, audio)
+    assert not audio.exists()

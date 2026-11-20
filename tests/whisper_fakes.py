@@ -1,8 +1,14 @@
 """A fake faster-whisper model and runtime, so tests exercise the engine without the extra."""
 
+import builtins
+import sys
+import types
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from earmark.transcribe.faster_whisper import (
     DecodedAudio,
@@ -63,7 +69,11 @@ class FakeWhisperModel:
 
 
 class FakeRuntime:
-    """Builds a WhisperRuntime; counts loads and decodes; can fail either."""
+    """Builds a WhisperRuntime; counts loads and decodes; can fail either.
+
+    ``decode_error = AudioDecodeError("...")`` simulates bad input; any other exception
+    simulates a library or environment failure.
+    """
 
     def __init__(
         self,
@@ -98,3 +108,94 @@ class FakeRuntime:
             decode_audio=self._decode_audio,
             cuda_device_count=lambda: self.cuda_devices,
         )
+
+
+class _StubFFmpegError(Exception):
+    """Mirrors PyAV's ``FFmpegError``: ``strerror`` plus the path in ``str()``."""
+
+    strerror = "Unknown error"
+    code = 1
+
+    def __init__(self, path: object = "") -> None:
+        super().__init__(f"[Errno {self.code}] {self.strerror}: '{path}'")
+
+
+class StubInvalidDataError(_StubFFmpegError, ValueError):
+    strerror = "Invalid data found when processing input"
+
+
+class StubEOFError(_StubFFmpegError, EOFError):
+    strerror = "End of file"
+
+
+class StubFileNotFoundError(_StubFFmpegError, builtins.FileNotFoundError):
+    strerror = "No such file or directory"
+
+
+class StubDecoderNotFoundError(_StubFFmpegError, LookupError):
+    strerror = "Decoder not found"
+
+
+class StubExtra:
+    """Stub faster_whisper, ctranslate2, av, and av.error modules for the real load_runtime."""
+
+    def __init__(
+        self,
+        model: FakeWhisperModel,
+        *,
+        decode: Callable[[str], Sequence[float]],
+        audio_streams: int | BaseException = 1,
+        cuda_devices: int = 0,
+    ) -> None:
+        self.model = model
+        self.decode = decode
+        self.audio_streams = audio_streams
+        self.cuda_devices = cuda_devices
+        self.decode_calls: list[str] = []
+        self.open_calls: list[str] = []
+        self.errors = types.ModuleType("av.error")
+        self.errors.__dict__.update(
+            {
+                "FFmpegError": _StubFFmpegError,
+                "InvalidDataError": StubInvalidDataError,
+                "EOFError": StubEOFError,
+                "FileNotFoundError": StubFileNotFoundError,
+                "DecoderNotFoundError": StubDecoderNotFoundError,
+            }
+        )
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fw = types.ModuleType("faster_whisper")
+        ct2 = types.ModuleType("ctranslate2")
+        av = types.ModuleType("av")
+
+        def decode_audio(path: str, sampling_rate: int) -> Sequence[float]:
+            self.decode_calls.append(path)
+            return self.decode(path)
+
+        def open_(path: str) -> Any:
+            self.open_calls.append(path)
+            if isinstance(self.audio_streams, BaseException):
+                raise self.audio_streams
+            container = types.SimpleNamespace(
+                streams=types.SimpleNamespace(audio=[object()] * self.audio_streams)
+            )
+
+            class Context:
+                def __enter__(self) -> Any:
+                    return container
+
+                def __exit__(self, *exc: object) -> None:
+                    return None
+
+            return Context()
+
+        fw.__dict__.update(
+            {"WhisperModel": lambda *a, **k: self.model, "decode_audio": decode_audio}
+        )
+        ct2.__dict__["get_cuda_device_count"] = lambda: self.cuda_devices
+        av.__dict__.update({"open": open_, "error": self.errors})
+        monkeypatch.setitem(sys.modules, "faster_whisper", fw)
+        monkeypatch.setitem(sys.modules, "ctranslate2", ct2)
+        monkeypatch.setitem(sys.modules, "av", av)
+        monkeypatch.setitem(sys.modules, "av.error", self.errors)
