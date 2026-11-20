@@ -217,19 +217,46 @@ Rules every backend follows:
 States: `queued → running → done | failed | skipped`. Job ids are `uuid4().hex`, so
 they cannot be guessed or enumerated through `GET /jobs/{id}`.
 
-- `claim_next` is a single atomic `UPDATE … RETURNING` on the oldest `queued` row whose
-  `run_after` has passed.
-- The worker heartbeats while a stage runs. A `running` job whose heartbeat is older
-  than the lease is requeued by `requeue_stale`, which covers a crashed worker.
-- Dedupe: enqueueing the same `(url, prompt)` while an identical job is `queued` or
-  `running` returns the existing job id. A double-tapped share creates one job.
-- Clocks are injected so tests control time.
+`jobs.JobStore` over `db.Database` (exact signatures in `docs/steps/03-jobs.md`):
+
+- **Connections.** `db.py` opens one short-lived connection per operation
+  (`autocommit=True`, busy timeout, always closed), so a store can be shared by threads
+  and each process builds its own. Every read-then-write runs in `BEGIN IMMEDIATE`;
+  deferred transactions fail with `SQLITE_BUSY_SNAPSHOT` under contention. WAL is set
+  once (retrying on `SQLITE_BUSY`), and migrations are an append-only tuple in `db.py`
+  applied in one transaction under `PRAGMA user_version`. A database newer than the
+  code is refused.
+- **Claim.** `claim_next` is one `UPDATE jobs … WHERE seq = (SELECT seq … WHERE status
+  = 'queued' AND run_after <= now ORDER BY created_at, seq LIMIT 1) RETURNING *` inside
+  `BEGIN IMMEDIATE`. (`UPDATE … LIMIT` is not available in the SQLite that uv-managed
+  CPython ships.) It returns a `Claim`: the job plus a random lease token stored in the
+  row but not in `Job`. `heartbeat`, `set_stage`, `set_episode_key`, `complete`,
+  `fail`, `skip`, and `release` take the `Claim` and raise `LeaseLostError` if the
+  token no longer matches, so a worker that lost its lease cannot touch the job.
+- **Attempts and retries.** `attempts` counts claims. `fail(transient=True)` requeues
+  with `run_after = now + retry_delay(attempts, retry_after_s)` (60 s × 4ⁿ⁻¹, capped
+  at 6 h, raised to `retry_after_s`) until `attempts` reaches `JOB_MAX_ATTEMPTS`, then
+  fails. `fail(transient=False)` fails at once. `release` (SIGTERM) requeues
+  immediately and undoes the attempt.
+- **Leases.** The worker heartbeats while a stage runs. A `running` job whose heartbeat
+  is older than `JOB_LEASE_SECONDS` is requeued by `requeue_stale` (or failed, if it has
+  used its attempts), which covers a crashed worker. `requeue_stale` returns the jobs it
+  changed.
+- **Dedupe.** Enqueueing the same `(kind, url or episode_key, prompt)` while an
+  identical job is `queued` or `running` returns the existing job (`Enqueued.created`
+  is `False`). A partial unique index on a `dedupe_key` column enforces one active job
+  per request. A double-tapped share creates one job.
+- **Warnings.** `add_warning(job_id, message)` appends unless the same text is already
+  there, and works on terminal jobs (notifier failures are recorded after `done`).
+- **Time.** Clocks are injected so tests control time. Timestamps are stored as
+  fixed-width UTC ISO strings, so SQL compares them as text; a `shared_at` offset is
+  kept as an instant, read back in UTC.
 
 ## Data layout
 
 ```
-$EARMARK_DATA_DIR/
-  earmark.db
+$EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
+  earmark.db                    jobs (step 03), entity registry (step 13); WAL mode
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
     audio.<ext>                 deleted after transcription unless EARMARK_KEEP_AUDIO

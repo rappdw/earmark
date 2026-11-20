@@ -21,6 +21,19 @@ PST = timezone(timedelta(hours=-8))
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
 
+class MutableClock:
+    """A Clock whose time tests move by hand."""
+
+    def __init__(self, start: datetime = T0) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
 def make_episode(
     *,
     guid: str = "urn:example:guid-1",
