@@ -32,6 +32,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 18 | Extension: weekly digest | 10, 12 | done |
 | 19 | Fix: library errors are not bad audio | 08 | done |
 | 20 | Fix: dry-run findings (third-party URL logging, noisy output) | 19 | done |
+| 21 | Hugging Face telemetry off by default | 20 | done |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -564,6 +565,30 @@ analyzer, and the vault store.
 - `--since` output no longer says the window is not over. `--week` still says it for
   an in-progress week.
 - The opt-in `slow` and `index` tests still pass where they can run.
+
+## Step 21: Hugging Face telemetry off by default
+
+**Goal.** Earmark's own deployments send no Hugging Face telemetry. This is the
+operator's decision of 2026-11-21.
+
+**Why.** Step 20 found that `hf_xet` sends a download summary to the Hub
+(`telemetry accepted … xet_download_summary`) and writes its own log files under
+`$HF_HOME/xet/logs/`. `huggingface_hub` has telemetry of its own. Step 20 documented the
+settings but left them unset.
+
+**Acceptance.**
+- Every shipped way of running earmark sets `HF_HUB_DISABLE_TELEMETRY=1`: the
+  container image, both compose services, and every systemd unit, including the digest
+  service. An operator can still override it.
+- With the setting applied, a real model download in this sandbox, using the
+  `transcribe` extra in a scratch venv, shows whether `hf_xet` still sends its summary.
+  The planner records the result. If `HF_HUB_DISABLE_TELEMETRY` alone does not stop it,
+  the plan adds whatever setting does, such as `DO_NOT_TRACK=1`, or documents that
+  nothing does.
+- The planner decides whether `HF_XET_LOG_DEST` should also be set by default, and
+  records why either way.
+- `docs/deploy.md` and `docs/ARCHITECTURE.md` say telemetry is off by default and how
+  to turn it back on. A test pins the setting in each deploy file.
 
 ## Backlog
 

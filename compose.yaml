@@ -21,6 +21,8 @@ x-earmark: &earmark
     # Empty means unset: models go to the volume (HF_HOME and DATA_DIR defaults).
     EARMARK_ASR_MODEL_DIR: ""
     EARMARK_EMBED_MODEL_DIR: ""
+    # Hugging Face telemetry off; HF_HUB_DISABLE_TELEMETRY=0 in .env turns it back on.
+    HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}
   volumes:
     - data:/data
     - ${VAULT_PATH:?set VAULT_PATH in .env to the vault folder on this host}:/vault
@@ -73,6 +75,8 @@ services:
       VLLM_MAX_AUDIO_DECODE_DURATION_S: "14400"
       VLLM_MAX_AUDIO_DECODE_BYTES: "4294967296"
       HF_HOME: /models
+      # Hugging Face telemetry off; HF_HUB_DISABLE_TELEMETRY=0 in .env turns it back on.
+      HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}
     volumes:
       - asr-models:/models
     shm_size: 8gb

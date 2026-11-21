@@ -626,6 +626,13 @@ def test_container_workflow_validates_compose() -> None:
     assert "VAULT_PATH" in runs
 
 
+def test_container_workflow_checks_hf_telemetry() -> None:
+    runs = "\n".join(_container_runs())
+    assert "--entrypoint printenv earmark:ci HF_HUB_DISABLE_TELEMETRY" in runs
+    assert "config --format json" in runs
+    assert "HF_HUB_DISABLE_TELEMETRY=0 docker compose" in runs
+
+
 def test_container_workflow_read_only() -> None:
     workflow = _container()
     assert workflow["permissions"] == {"contents": "read"}

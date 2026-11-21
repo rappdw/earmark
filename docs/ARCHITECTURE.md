@@ -1170,7 +1170,8 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
     `/data` and `/vault` are owned by it.
   - Environment: `EARMARK_HOST=0.0.0.0`, `EARMARK_DATA_DIR=/data`,
     `EARMARK_VAULT_DIR=/vault`, `HF_HOME=/data/huggingface` (so Whisper models persist on
-    the volume).
+    the volume), `HF_HUB_DISABLE_TELEMETRY=1` (Hugging Face telemetry off, step 21; see
+    "Model downloads" under Security).
   - Entrypoint `earmark`, default command `serve`.
   - It installs `ca-certificates`, and has no `HEALTHCHECK`, no `VOLUME`, and no `.env`.
   - `.dockerignore` is an allow-list: `pyproject.toml`, `uv.lock`, `.python-version`,
@@ -1180,6 +1181,11 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
     `/data`, and the vault bind mount `${VAULT_PATH}` at `/vault`.
   - Settings come from `env_file: .env`. `environment:` forces the in-container
     `DATA_DIR`, `VAULT_DIR`, `HOST`, `PORT`, and empty (so default) model directories.
+  - `api`, `worker`, and `asr` set `HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}`
+    (step 21). Compose interpolates it from the shell or `.env`, so a
+    `HF_HUB_DISABLE_TELEMETRY=0` line in `.env` turns telemetry back on, and an empty or
+    missing value keeps it off. A literal `"1"` would beat `env_file` and could only be
+    overridden by editing `compose.yaml`.
   - Exposure: only `api` publishes a port, `${API_BIND:-127.0.0.1:8787}`.
   - Hardening: `init: true`, `no-new-privileges`, `cap_drop: ALL`.
   - The worker gets `stop_grace_period: 2m`; SIGTERM releases the running job.
@@ -1188,7 +1194,9 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
     audio limits, a GPU reservation, and no published port. The worker uses it with
     `EARMARK_ASR_BACKEND=remote` and `EARMARK_ASR_BASE_URL=http://asr:8000/v1`.
   - Compose-only variables (`VAULT_PATH`, `API_BIND`, `APP_UID`, `APP_GID`, `EXTRAS`,
-    `ASR_GPU_MEMORY_UTILIZATION`) are unprefixed, so `Settings` ignores them.
+    `ASR_GPU_MEMORY_UTILIZATION`, `HF_HUB_DISABLE_TELEMETRY`) are unprefixed, so `Settings`
+    ignores them. `HF_HUB_DISABLE_TELEMETRY` is read by Hugging Face's libraries inside the
+    containers, not by earmark.
 - **Reverse proxy.** It is not part of compose. `deploy/caddy/Caddyfile` is an example
   for Caddy on the host:
   - it binds only the private LAN address, on 443, with no port 80;
@@ -1208,6 +1216,10 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   the worker). `earmark-digest.service` (`Type=oneshot`, `earmark digest`, the worker's
   hardening and paths, no `[Install]`) is started by `earmark-digest.timer`
   (`OnCalendar=Mon *-*-* 07:00:00`, `Persistent=true`, `WantedBy=timers.target`; step 18).
+  All three service units set `Environment=HF_HUB_DISABLE_TELEMETRY=1` (step 21). A
+  `systemctl edit` drop-in with `Environment=HF_HUB_DISABLE_TELEMETRY=0` overrides it.
+  A line in `/srv/earmark/.env` does not, because earmark reads that file itself and never
+  exports it. Commands run by hand outside the units do not get the setting.
 - **Not verified.** No container has run in the build sandbox (no Docker). CI builds the
   image and runs only one-off commands in it. The `gpu` profile has never been built or
   run. A CUDA build of CTranslate2 in the image is documented in `docs/deploy.md` as an
@@ -1329,13 +1341,25 @@ and writes into a vault the user cares about.
     earmark's handler (step 20).
   - *hf_xet.* Xet-backed files (Whisper `model.bin`) are fetched by `hf_xet`, whose Rust
     logger writes JSON lines at INFO to its own files under `$HF_HOME/xet/logs/` (default
-    `~/.cache/huggingface/xet/logs/`), outside earmark's handler, and which reports a
-    download summary to the Hub (`telemetry accepted … xet_download_summary`). In a real
-    download of `tiny` (step 20, 2026-11-21) those files held hosts, request ids, hashes,
-    and local paths, but no URL path or query. earmark leaves both as the library ships
-    them. The operator's knobs are `HF_XET_LOG_DEST`, which upstream's config maps to a
-    file or directory (an empty value is ignored), and `HF_HUB_DISABLE_TELEMETRY` or
-    `DO_NOT_TRACK`, which the binary reads. Neither knob has been tested here.
+    `~/.cache/huggingface/xet/logs/`), outside earmark's handler. In a real download of
+    `tiny` (step 20, 2026-11-21) those files held hosts, request ids, hashes, and local
+    paths, but no URL path or query. hf_xet prunes them itself (at most 250 MB, 14 days).
+    earmark leaves the logs where the library puts them, which is inside the data
+    directory wherever earmark sets `HF_HOME`. `HF_XET_LOG_DEST` moves them to another
+    directory (trailing `/`) or file, and an empty value is ignored (step 21).
+  - *Telemetry, off by default* (step 21, the operator's decision). Unless disabled, two
+    things are sent. hf_xet POSTs a `xet_download_summary` to the CAS server's
+    `/v1/telemetry` after each Xet download. `huggingface_hub` fetches
+    `/api/agent-harnesses` once a day per `HF_HOME` and adds the torch version and any
+    detected agent to its User-Agent. `HF_HUB_DISABLE_TELEMETRY=1` stops all three (tested
+    live with hf_xet 1.8.0 and huggingface_hub 1.33.0). hf_xet reads the process
+    environment directly, so the variable must be set in the environment, not patched
+    into `huggingface_hub.constants`. `DO_NOT_TRACK=1`, `DISABLE_TELEMETRY=1`, and the
+    xet-only `HF_XET_TELEMETRY_ENABLED=false` also stop the summary. earmark sets only
+    `HF_HUB_DISABLE_TELEMETRY=1`, in the image, the compose services, and the systemd
+    units (see Deployment). Setting it to `0` (or leaving it empty outside compose) turns
+    telemetry back on, unless one of the other variables is set. earmark's Python code does
+    not set it.
 - **Search** (step 14). `GET /search` is behind the bearer middleware like every route but
   `/healthz`. The query only reaches the embedder: it is never logged (uvicorn's access
   line has its query string dropped, step 20), never put in a filter string, and never
@@ -1463,7 +1487,8 @@ Documents are tested against the code (step 16).
   - Real share-sheet captures in `tests/fixtures/share_sheet.json` canonicalise as
     recorded.
 - **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,
-  `compose.yaml`, and the systemd units.
+  `compose.yaml`, and the systemd units, including that each one sets
+  `HF_HUB_DISABLE_TELEMETRY` (step 21).
 - **The gate.** `ruff format --check .` also formats Python code blocks in Markdown, so
   those must be ruff-clean.
 

@@ -144,6 +144,17 @@ def test_dockerfile_environment() -> None:
         assert expected in env
 
 
+def _runtime_stage_lines() -> list[str]:
+    lines = _logical_lines(DOCKERFILE)
+    last_from = max(i for i, line in enumerate(lines) if line.split()[0].upper() == "FROM")
+    return lines[last_from:]
+
+
+def test_dockerfile_disables_hf_telemetry() -> None:
+    env = " ".join(line for line in _runtime_stage_lines() if line.split()[0].upper() == "ENV")
+    assert "HF_HUB_DISABLE_TELEMETRY=1" in env.split()
+
+
 # --- .dockerignore ------------------------------------------------------------------------
 
 
@@ -277,12 +288,20 @@ def test_compose_only_variables_documented() -> None:
         "APP_GID",
         "EXTRAS",
         "ASR_GPU_MEMORY_UTILIZATION",
+        "HF_HUB_DISABLE_TELEMETRY",
     }
     deploy = read_doc("docs/deploy.md")
     example = (ROOT / ".env.example").read_text()
     for name in names:
         assert re.search(rf"^\| `{name}` \|", deploy, re.MULTILINE), name
         assert re.search(rf"^# {name}=", example, re.MULTILINE), name
+
+
+@pytest.mark.parametrize("name", ["api", "worker", "asr"])
+def test_compose_disables_hf_telemetry(name: str) -> None:
+    value = SERVICES[name]["environment"]["HF_HUB_DISABLE_TELEMETRY"]
+    assert value == "${HF_HUB_DISABLE_TELEMETRY:-1}"
+    assert value.startswith("${HF_HUB_DISABLE_TELEMETRY:")  # interpolated, so .env can override
 
 
 # --- systemd units ------------------------------------------------------------------------
@@ -395,3 +414,34 @@ def test_digest_timer_unit() -> None:
     assert calendar.startswith("Mon ")
     assert unit["Timer"]["Persistent"] == ["true"]
     assert unit["Install"]["WantedBy"] == ["timers.target"]
+
+
+# --- Hugging Face telemetry (step 21) -----------------------------------------------------
+
+SERVICE_FILES = sorted((ROOT / "deploy" / "systemd").glob("*.service"))
+
+
+def test_systemd_service_files_are_the_known_three() -> None:
+    assert {p.name for p in SERVICE_FILES} == {
+        "earmark-api.service",
+        "earmark-worker.service",
+        "earmark-digest.service",
+    }
+
+
+@pytest.mark.parametrize("path", SERVICE_FILES, ids=lambda p: p.name)
+def test_systemd_services_disable_hf_telemetry(path: Path) -> None:
+    service = _parse_unit(path)["Service"]
+    assert "HF_HUB_DISABLE_TELEMETRY=1" in " ".join(service.get("Environment", [])).split()
+
+
+def test_deploy_files_leave_xet_logs_alone() -> None:
+    files = [
+        ROOT / "Dockerfile",
+        ROOT / "compose.yaml",
+        *sorted((ROOT / "deploy" / "systemd").glob("*")),
+    ]
+    for path in files:
+        text = path.read_text()
+        for name in ("HF_XET_LOG_DEST", "RUST_LOG"):
+            assert name not in text, (path.name, name)

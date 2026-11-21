@@ -92,6 +92,7 @@ in `.env`, which compose also reads.
 | `APP_GID` | `1000` | Group id the image runs as. |
 | `EXTRAS` | `transcribe index` | Optional extras installed in the image. |
 | `ASR_GPU_MEMORY_UTILIZATION` | `0.2` | Share of GPU memory the `asr` service takes (`gpu` profile). |
+| `HF_HUB_DISABLE_TELEMETRY` | `1` | Hugging Face telemetry in the containers; `0` turns it back on (section 17). Read by Hugging Face's libraries, not by earmark. |
 
 Things to know:
 
@@ -148,6 +149,9 @@ of its own (the same image runs the worker; compose checks the API), and reads n
    sudo systemctl daemon-reload
    sudo systemctl enable --now earmark-api earmark-worker
    ```
+
+   The units set `HF_HUB_DISABLE_TELEMETRY=1` (Hugging Face telemetry off); section 17 has
+   the details.
 
 5. Check it. Run from `/srv/earmark`, so that `.env` is read:
 
@@ -307,10 +311,8 @@ Three options.
 `EARMARK_ASR_MODEL` (`distil-large-v3`, `large-v3-turbo`, `small`) is the stopgap. The PyPI
 CTranslate2 wheel for aarch64 is CPU-only.
 
-Hugging Face's `hf_xet` writes its own JSON logs under `$HF_HOME/xet/logs/`
-(`/data/huggingface/xet/logs` in the container) and reports a download summary to the Hub.
-`HF_HUB_DISABLE_TELEMETRY=1` (or `DO_NOT_TRACK=1`) and `HF_XET_LOG_DEST` (a directory ending
-in `/`, or a file) are Hugging Face's settings for that; earmark has not tested them.
+`hf_xet` writes its own logs under `$HF_HOME/xet/logs/`, and Hugging Face telemetry is off by
+default (section 17).
 
 ### 7b. The `gpu` profile (the recommended GPU path, untested)
 
@@ -488,3 +490,34 @@ been run in the build sandbox.
 | "refused non-public address" | A resolver answered a tracker with `0.0.0.0` (section 11). |
 | "You are sending unauthenticated requests to the HF Hub" in the worker log | Informational, shown once per process on a model download. Public models need no token, and earmark never reads one; `huggingface_hub` uses `HF_TOKEN` if you set it in the service environment. |
 | `/search` answers 503 | The embedding model is not downloaded yet (section 9). |
+
+## 17. Hugging Face telemetry and logs
+
+**Off by default.** Every shipped way of running earmark sets `HF_HUB_DISABLE_TELEMETRY=1`:
+the image, the `api`, `worker`, and `asr` compose services, and the three systemd services.
+
+**What that stops.** `hf_xet`'s download summary to the Xet CAS server, and
+`huggingface_hub`'s daily `/api/agent-harnesses` fetch and User-Agent extras. It was tested
+with a real model download (hf_xet 1.8.0, huggingface_hub 1.33.0), outside a container.
+
+**Turning it back on:**
+
+- compose: `HF_HUB_DISABLE_TELEMETRY=0` in `.env`, then `docker compose up -d`;
+- systemd: `sudo systemctl edit earmark-worker` (and `earmark-api`, `earmark-digest`) with
+  `[Service]` and `Environment=HF_HUB_DISABLE_TELEMETRY=0`, then restart. A line in
+  `/srv/earmark/.env` has no effect, because earmark reads that file itself;
+- `docker run`: `-e HF_HUB_DISABLE_TELEMETRY=0`.
+
+It stays off while `DO_NOT_TRACK=1` or `DISABLE_TELEMETRY=1` is set in the environment.
+
+**Commands run by hand** on a native install, such as `earmark reindex` (which downloads the
+embedding model), do not get the unit's environment. Prefix them with
+`env HF_HUB_DISABLE_TELEMETRY=1`. `docker compose run` gets it from compose.
+
+**hf_xet logs.** They live in `$HF_HOME/xet/logs/` (`/data/huggingface/xet/logs` in the
+container). hf_xet prunes them at 250 MB or 14 days. They hold hosts and request ids but no
+URL paths. Earmark leaves them there. `HF_XET_LOG_DEST` (a directory ending in `/`, or a
+file) moves them, and an empty value is ignored.
+
+**The `asr` container.** The variable covers its Hugging Face downloads. vLLM has its own
+usage-statistics setting; see its documentation.

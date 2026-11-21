@@ -40,7 +40,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
     EARMARK_HOST=0.0.0.0 \
     EARMARK_DATA_DIR=/data \
     EARMARK_VAULT_DIR=/vault \
-    HF_HOME=/data/huggingface
+    HF_HOME=/data/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1
 WORKDIR /home/earmark
 USER earmark:earmark
 EXPOSE 8787

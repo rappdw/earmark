@@ -378,6 +378,26 @@ def test_deploy_doc_digest_section() -> None:
     assert "## 16. Troubleshooting" in text
 
 
+def test_deploy_doc_hf_telemetry_section() -> None:
+    text = read_doc("docs/deploy.md")
+    start = text.index("## 17. Hugging Face telemetry and logs")
+    assert start > text.index("## 16. Troubleshooting")
+    end = text.find("\n## ", start + 1)
+    section = text[start : end if end != -1 else len(text)]
+    for needle in (
+        "HF_HUB_DISABLE_TELEMETRY=1",
+        "HF_HUB_DISABLE_TELEMETRY=0",
+        "systemctl edit",
+        ".env",
+        "HF_XET_LOG_DEST",
+        "DO_NOT_TRACK",
+    ):
+        assert needle in section, needle
+    architecture = read_doc("docs/ARCHITECTURE.md")
+    assert "HF_HUB_DISABLE_TELEMETRY=1" in architecture
+    assert "HF_HUB_DISABLE_TELEMETRY=0" in architecture
+
+
 def test_readme_documents_digest() -> None:
     text = read_doc("README.md")
     assert "Planned: a weekly digest" not in text

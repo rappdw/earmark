@@ -12,6 +12,7 @@ Type=oneshot
 User=earmark
 Group=earmark
 WorkingDirectory=/srv/earmark
+Environment=HF_HUB_DISABLE_TELEMETRY=1
 ExecStart=/srv/earmark/.venv/bin/earmark digest
 NoNewPrivileges=yes
 PrivateTmp=yes

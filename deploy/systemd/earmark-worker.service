@@ -11,6 +11,7 @@ User=earmark
 Group=earmark
 WorkingDirectory=/srv/earmark
 Environment=HF_HOME=/srv/earmark/data/huggingface
+Environment=HF_HUB_DISABLE_TELEMETRY=1
 ExecStart=/srv/earmark/.venv/bin/earmark worker
 Restart=on-failure
 RestartSec=5
