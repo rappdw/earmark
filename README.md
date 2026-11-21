@@ -128,6 +128,8 @@ reaches the API.
 - [docs/deploy.md](docs/deploy.md): Docker Compose, systemd, reaching the API from the
   iPhone, GPU transcription, search, notifications, backups.
 - [docs/shortcut.md](docs/shortcut.md): building the iOS Shortcut.
+- [docs/runbook-spark.md](docs/runbook-spark.md): a step-by-step first setup on a DGX
+  Spark, with a check after each phase.
 - [docs/asr.md](docs/asr.md): remote transcription servers.
 - [docs/llm.md](docs/llm.md): running the analysis on a local model.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the design, contracts, and security rules.

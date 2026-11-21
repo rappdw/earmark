@@ -5,6 +5,9 @@ the iPhone and the Mac reach the API. The examples use the placeholders `spark` 
 host), `earmark.example.com` (the name of the API), `192.168.1.10` (the host's address on
 the home network), and `tailnet-name`.
 
+For a first setup on a DGX Spark, [docs/runbook-spark.md](runbook-spark.md) walks
+through this guide in order, with a check after each phase.
+
 ## 1. What is tested
 
 - The container image is build-tested in CI (`.github/workflows/container.yml` on
