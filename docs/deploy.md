@@ -307,6 +307,11 @@ Three options.
 `EARMARK_ASR_MODEL` (`distil-large-v3`, `large-v3-turbo`, `small`) is the stopgap. The PyPI
 CTranslate2 wheel for aarch64 is CPU-only.
 
+Hugging Face's `hf_xet` writes its own JSON logs under `$HF_HOME/xet/logs/`
+(`/data/huggingface/xet/logs` in the container) and reports a download summary to the Hub.
+`HF_HUB_DISABLE_TELEMETRY=1` (or `DO_NOT_TRACK=1`) and `HF_XET_LOG_DEST` (a directory ending
+in `/`, or a file) are Hugging Face's settings for that; earmark has not tested them.
+
 ### 7b. The `gpu` profile (the recommended GPU path, untested)
 
 - In `.env`:
@@ -481,4 +486,5 @@ been run in the build sandbox.
 | The worker keeps restarting | `docker compose logs worker`: usually a `ConfigError` naming the setting (no LLM key, vault missing). |
 | Permission denied in the vault | `APP_UID` and `APP_GID` do not match the vault's owner (section 4). |
 | "refused non-public address" | A resolver answered a tracker with `0.0.0.0` (section 11). |
+| "You are sending unauthenticated requests to the HF Hub" in the worker log | Informational, shown once per process on a model download. Public models need no token, and earmark never reads one; `huggingface_hub` uses `HF_TOKEN` if you set it in the service environment. |
 | `/search` answers 503 | The embedding model is not downloaded yet (section 9). |

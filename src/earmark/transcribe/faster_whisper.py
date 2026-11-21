@@ -20,6 +20,7 @@ from typing import Final, Literal, Protocol, Self
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
 from earmark.errors import PermanentError, TransientError
+from earmark.log import adopt_library_loggers
 from earmark.models import Segment, Transcript, episode_key, format_hms
 from earmark.transcribe.base import (
     CachedTranscriber,
@@ -137,6 +138,7 @@ def load_runtime() -> WhisperRuntime:
             f"which failed to import ({type(exc).__name__}); reinstall it with "
             f"`uv sync --extra {EXTRA}`"
         ) from None
+    adopt_library_loggers()
 
     candidates = (getattr(av_error, name, None) for name in DECODE_ERROR_NAMES)
     bad_input: tuple[type[Exception], ...] = tuple(
@@ -210,6 +212,7 @@ def model_cache_status(options: WhisperOptions) -> WhisperCacheStatus:
             ]
         )
     utils = importlib.import_module("faster_whisper.utils")
+    adopt_library_loggers()
     try:
         utils.download_model(
             options.model,

@@ -51,7 +51,8 @@ src/earmark/
   __init__.py          __version__ only; importing earmark loads nothing heavy
   __main__.py          `python -m earmark`
   config.py            Settings (pydantic-settings, EARMARK_* env, .env), load_settings, ConfigError
-  log.py               configure_logging: stderr handler with a secret-redacting formatter
+  log.py               configure_logging: stderr handler with a secret-redacting, URL-scrubbing
+                       formatter and a wire-logger gate; scrub_urls; adopt_library_loggers
   models.py            domain models
   errors.py            TransientError, PermanentError, SkipEpisode
   artifacts.py         ArtifactStore: per-episode cache paths, atomic writes
@@ -328,8 +329,9 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   run out; any other `Exception` → transient, with the traceback logged at ERROR and a
   one-line summary naming the raising file, line, and function in `job.error`. Error
   and warning text is whitespace-collapsed, redacted of every `Settings` secret, and
-  capped at 500 characters. Index failures, and notifier failures, are warnings
-  (`index failed: …`, `notify failed: …`) and never change the status.
+  capped at 500 characters; the text of a non-earmark exception also has URL paths and
+  queries scrubbed (`log.scrub_urls`, step 20). Index failures, and notifier failures,
+  are warnings (`index failed: …`, `notify failed: …`) and never change the status.
 - **Notify.** Exactly once per job that reaches `done`, `failed`, or `skipped`, with the
   job as written (warnings included) and the episode if resolution got that far. Not for
   a requeued retry, a released job, or a lost lease.
@@ -886,7 +888,9 @@ worker never runs it.
   A failure is a warning.
 - **`earmark digest [--week YYYY-Www | --since Nd] [--refresh] [--no-notify]`.**
   - Prints one line: `wrote <path>: …`, `<path> is up to date: …`, or `no episodes were
-    first shared in <label> …; nothing written`. Warnings go to stderr.
+    first shared in <label> …; nothing written`. Warnings go to stderr. A `--week` window
+    that has not ended yet adds `; the window is not over yet`. A `--since` window never
+    does (step 20): it always includes today, so the note would be on every run.
   - Exits 0 on success, including an empty window and damaged markers. Exits 1 on model,
     vault, or data errors, and 2 on bad options or configuration.
 - **Scheduling.** `deploy/systemd/earmark-digest.timer` (Mondays 07:00, `Persistent=true`)
@@ -1239,8 +1243,42 @@ and writes into a vault the user cares about.
     for documents, so a gzip bomb stops at the cap).
   - No proxies from the environment, no cookies kept between fetches, and a generic
     `User-Agent: earmark/<version>`. URL paths and queries (which can carry session
-    ids) are not logged or put in job errors. `log.configure_logging` keeps the `httpx2` and
-    `httpcore2` loggers at WARNING or above, because they print every request URL at INFO.
+    ids) are not logged or put in job errors.
+- **Third-party logging** (step 20). Every log record goes through earmark's one handler
+  (`log.configure_logging`), which applies three rules on top of secret redaction:
+  - *Wire loggers are gated at the handler.* Records below WARNING from `httpx`,
+    `httpcore`, `httpx2`, `httpcore2`, `urllib3`, `anthropic`, and `huggingface_hub` (and
+    their children) are dropped by a handler filter, and the loggers' levels are also set
+    to WARNING or above. These loggers print request URLs, redirect `Location` headers
+    (relative paths a URL pattern cannot recognise), and, for `anthropic`, whole request
+    bodies. The filter is what holds: libraries reset their own levels at import
+    (`ANTHROPIC_LOG=debug` sets `anthropic` and `httpx2` to DEBUG when the SDK is
+    imported, which earmark does lazily, after logging is configured; `HF_HUB_VERBOSITY`
+    does the same for `huggingface_hub`). `LOG_LEVEL=DEBUG` does not show these records.
+  - *Third-party text is scrubbed of URL paths.* For every record from a logger outside
+    `earmark.*`, and for the traceback and stack text of every record, `log.scrub_urls`
+    rewrites each `scheme://[userinfo@]host[:port]/path?query#fragment` to
+    `scheme://host[:port]/…` and drops the query from an HTTP request line
+    (`"GET /search?q=… HTTP/1.1"` becomes `"GET /search HTTP/1.1"`). So a
+    `huggingface_hub` retry warning keeps its host and reason, uvicorn's access line keeps
+    the method, route, and status but not the search query, and an unexpected library
+    exception logged by the runner loses its URL path. earmark's own messages are left as
+    written: they name hosts only, except the canonical Apple URL that ingest logs, which
+    earmark builds from parsed ids.
+  - *Libraries do not print around the handler.* `huggingface_hub` installs its own stderr
+    `StreamHandler` on its logger at import and still propagates, so each of its warnings
+    printed twice, once unformatted and unredacted. `log.adopt_library_loggers()` removes
+    every non-`NullHandler` from the loggers in `log.LIBRARY_HANDLER_LOGGERS`
+    (`huggingface_hub`). It runs at the end of `configure_logging` and right after each
+    lazy import that can load `huggingface_hub` (`transcribe.faster_whisper.load_runtime`
+    and `model_cache_status`, `index.embed.load_fastembed_runtime` and `model_cached`).
+    Because `huggingface_hub` installs the handler only when `huggingface_hub.utils.logging`
+    is first imported, which its lazy package can delay until the first download, the
+    function imports that module first whenever `huggingface_hub` is already loaded (9 ms,
+    no `httpx`). It never imports `huggingface_hub` itself.
+
+  `runner.describe_error` applies `scrub_urls` to the text of non-earmark exceptions, so
+  job errors and warnings follow the same rule.
 - **XML.** Feeds are parsed only by `resolve/rss.py`, with `defusedxml.ElementTree`
   (entity declarations and external references refused, so no expansion bombs and no
   external entities; a DOCTYPE alone is allowed and never fetched). The stdlib parser
@@ -1283,9 +1321,25 @@ and writes into a vault the user cares about.
   same way by fastembed (`huggingface_hub`, operator-chosen `EMBED_MODEL`, ONNX graph plus
   tokenizer JSON, `HF_*` variables honoured), only by the worker and `earmark reindex`;
   fastembed's loguru output is disabled so its messages cannot bypass the log redaction.
+  - *Tokens.* earmark never asks for, reads, or passes a Hugging Face token; public models
+    download anonymously. `huggingface_hub` itself uses `HF_TOKEN` or its token file if
+    the operator provides one. The Hub answers anonymous requests with an `X-HF-Warning`
+    header ("You are sending unauthenticated requests to the HF Hub…"), which
+    `huggingface_hub` logs at WARNING once per process; it reaches the log once, through
+    earmark's handler (step 20).
+  - *hf_xet.* Xet-backed files (Whisper `model.bin`) are fetched by `hf_xet`, whose Rust
+    logger writes JSON lines at INFO to its own files under `$HF_HOME/xet/logs/` (default
+    `~/.cache/huggingface/xet/logs/`), outside earmark's handler, and which reports a
+    download summary to the Hub (`telemetry accepted … xet_download_summary`). In a real
+    download of `tiny` (step 20, 2026-11-21) those files held hosts, request ids, hashes,
+    and local paths, but no URL path or query. earmark leaves both as the library ships
+    them. The operator's knobs are `HF_XET_LOG_DEST`, which upstream's config maps to a
+    file or directory (an empty value is ignored), and `HF_HUB_DISABLE_TELEMETRY` or
+    `DO_NOT_TRACK`, which the binary reads. Neither knob has been tested here.
 - **Search** (step 14). `GET /search` is behind the bearer middleware like every route but
-  `/healthz`. The query only reaches the embedder: it is never logged, never put in a
-  filter string, and never echoed in an error. LanceDB filter strings are built only from
+  `/healthz`. The query only reaches the embedder: it is never logged (uvicorn's access
+  line has its query string dropped, step 20), never put in a filter string, and never
+  echoed in an error. LanceDB filter strings are built only from
   `kind` literals and episode keys matched against `[0-9a-f]{20}`. Query length (500
   characters) and result count (50) are capped. Hits carry untrusted transcript and model
   text as JSON strings; the CLI strips control characters before printing.
@@ -1315,8 +1369,8 @@ and writes into a vault the user cares about.
   Anthropic on another Claude model, recorded as an analysis warning. The Anthropic API is
   an operator endpoint reached by the SDK's own httpx2 client, not through `fetch.py`
   (base URL from the SDK default or `ANTHROPIC_BASE_URL`; the SDK honours proxy
-  environment variables). The `anthropic` logger is kept at WARNING or above, because its
-  DEBUG records contain the whole request body.
+  environment variables). The `anthropic` logger is a gated wire logger (see Third-party
+  logging), because its DEBUG records contain the whole request body.
 - **Secrets.** Tokens are `SecretStr`, redacted in `earmark config` and `earmark doctor`,
   and never logged. `EARMARK_NTFY_URL` is a `SecretStr` too (step 15), because on public
   ntfy.sh the topic is the password. Doctor prints only its host. `Settings.secret_values()`
@@ -1366,6 +1420,11 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   tests also prove the index makes no network call. Fails (does not skip) without the
   extra. `tests/test_index_slow.py` is `slow` instead: it downloads `BAAI/bge-small-en-v1.5`
   into `$SLOW_TEST_CACHE/fastembed` and checks semantic ranking with the real model.
+  `tests/test_log_libraries.py` (step 20) is `index` too: it drives `huggingface_hub`
+  (through `httpx.MockTransport`), `httpx`/`httpcore` and `urllib3` (against
+  `tests/uds_http.py`, a unix-socket HTTP server), fastembed, and LanceDB with sockets
+  blocked, and checks that no URL path or query reaches earmark's log output. The
+  default suite does the same for `httpx2`/`httpcore2`, the anthropic SDK, and uvicorn.
 
 For every test without `network`, `slow`, or `llm`, `tests/conftest.py` also sets
 `HF_HUB_OFFLINE=1` and points `FASTEMBED_CACHE_PATH` at an empty directory, so no default

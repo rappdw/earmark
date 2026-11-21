@@ -50,3 +50,19 @@ def restore_root_logging() -> Iterator[None]:
     yield
     root.handlers[:] = handlers
     root.setLevel(level)
+
+
+@pytest.fixture
+def restore_library_loggers() -> Iterator[None]:
+    """Undo level changes on the wire loggers and handlers added to library loggers."""
+    from earmark import log
+
+    levels = {name: logging.getLogger(name).level for name in log.QUIET_LOGGERS}
+    handlers = {
+        name: list(logging.getLogger(name).handlers) for name in log.LIBRARY_HANDLER_LOGGERS
+    }
+    yield
+    for name, level in levels.items():
+        logging.getLogger(name).setLevel(level)
+    for name, saved in handlers.items():
+        logging.getLogger(name).handlers[:] = saved

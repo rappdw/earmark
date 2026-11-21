@@ -31,6 +31,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 17 | Extension: re-run a prompt | 10, 12 | done |
 | 18 | Extension: weekly digest | 10, 12 | done |
 | 19 | Fix: library errors are not bad audio | 08 | done |
+| 20 | Fix: dry-run findings (third-party URL logging, noisy output) | 19 | done |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -531,6 +532,38 @@ episode would have failed permanently and lost its download.
   Each one found is fixed in this step or listed with its reason.
 - `earmark doctor` warns when the installed `av` and `faster-whisper` versions are a
   known-incompatible pair, without loading a model.
+
+## Step 20: Fix: dry-run findings (third-party URL logging, noisy output)
+
+**Goal.** Fix what the first end-to-end dry run found. That run, on 2026-11-21, used a
+real Apple URL, the real resolver and download, faster-whisper `tiny` on CPU, the fake
+analyzer, and the vault store.
+
+**Findings.**
+1. `huggingface_hub` makes its requests with plain `httpx`, and the `httpx` logger
+   prints every request URL at INFO, query strings included. For example:
+   `INFO httpx: HTTP Request: GET https://huggingface.co/api/resolve-cache/...?...&etag=...`.
+   Step 07 quieted only `httpx2`, `httpcore2` and `anthropic`, so the architecture's
+   "URL paths and queries are not logged" rule is broken by a third-party logger.
+2. The Hugging Face "You are sending unauthenticated requests to the HF Hub" warning
+   prints twice during a model download: once on stderr and once as a log record.
+3. Every `earmark digest --since …` run ends with "; the window is not over yet",
+   because a `--since` window always ends tomorrow at midnight. The note is only
+   useful for an in-progress `--week`.
+
+**Acceptance.**
+- No third-party logger records a URL path or query at INFO or below. The planner
+  audits every library earmark or its extras can load, and quiets or filters each one
+  that does: at least `httpx`, `huggingface_hub`, and any used by faster-whisper,
+  fastembed (which uses loguru), lancedb, and the anthropic SDK. A test drives a
+  representative request through each library that can run offline, with sockets
+  blocked, and asserts that no URL path or query reaches the log output. Earmark's own
+  host-only messages remain.
+- A model download shows the Hugging Face authentication hint at most once, or not at
+  all. Earmark never asks for or reads an HF token unless the operator sets one.
+- `--since` output no longer says the window is not over. `--week` still says it for
+  an in-progress week.
+- The opt-in `slow` and `index` tests still pass where they can run.
 
 ## Backlog
 

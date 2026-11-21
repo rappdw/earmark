@@ -13,7 +13,7 @@ from typing import Final
 from earmark.artifacts import ArtifactStore
 from earmark.errors import EarmarkError, PermanentError, SkipEpisode, TransientError
 from earmark.jobs import Claim, JobStore, LeaseLostError
-from earmark.log import redact
+from earmark.log import redact, scrub_urls
 from earmark.models import (
     Analysis,
     Episode,
@@ -43,7 +43,7 @@ def describe_error(exc: BaseException, secrets: Iterable[str] = ()) -> str:
         text = exc.message
     else:
         text = f"unexpected error: {type(exc).__name__}"
-        message = str(exc)
+        message = scrub_urls(str(exc))
         if message:
             text += f": {message}"
         frames = traceback.extract_tb(exc.__traceback__)

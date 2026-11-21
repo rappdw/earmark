@@ -602,3 +602,20 @@ def test_describe_error_redacts_bare_ntfy_topic() -> None:
     text = describe_error(PermanentError("bad topic sentinel-topic-404x"), settings.secret_values())
     assert "sentinel-topic-404x" not in text
     assert text == f"bad topic {REDACTED}"
+
+
+def test_describe_error_scrubs_library_urls() -> None:
+    exc = _raised(
+        ValueError(
+            "Client error '404 Not Found' for url 'https://huggingface.co/api/models/x?sid=1'"
+        )
+    )
+    text = describe_error(exc)
+    assert "https://huggingface.co/…" in text
+    assert "sid=1" not in text
+    assert "api/models" not in text
+
+
+def test_describe_error_keeps_earmark_text() -> None:
+    exc = PermanentError("see https://example.org/docs/x")
+    assert describe_error(exc) == "see https://example.org/docs/x"

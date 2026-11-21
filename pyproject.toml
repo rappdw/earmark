@@ -70,7 +70,7 @@ markers = [
   "slow: downloads a model or does CPU-heavy work",
   "llm: calls the real analysis model",
   "gpu: needs CUDA",
-  "index: needs the index extra; real LanceDB in a temp directory, no network",
+  "index: needs the index extra; real LanceDB, fastembed, or huggingface_hub offline in a temp directory, no network",
 ]
 filterwarnings = [
   "error",

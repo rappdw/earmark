@@ -640,7 +640,7 @@ def digest_command(
         def count(n: int, noun: str) -> str:
             return f"{n} {noun}{'' if n == 1 else 's'}"
 
-        tail = "; the window is not over yet" if window.end > now else ""
+        tail = "; the window is not over yet" if window.weekly and window.end > now else ""
         if report.status == "empty":
             typer.echo(
                 _clean(

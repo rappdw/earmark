@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import types
@@ -215,6 +216,40 @@ def test_model_cached_looks_in_the_cache_only(
     assert model_cached(info, tmp_path) is False
     assert model_cached(info, tmp_path) is True
     assert calls[0] == (("Qdrant/x", "model.onnx"), {"cache_dir": str(tmp_path)})
+
+
+def _stray_hf_handler() -> logging.Handler:
+    handler = logging.StreamHandler()
+    logging.getLogger("huggingface_hub").addHandler(handler)
+    return handler
+
+
+@pytest.mark.usefixtures("restore_library_loggers")
+def test_model_cached_adopts_library_loggers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hub = types.ModuleType("huggingface_hub")
+    hub.try_to_load_from_cache = lambda *a, **k: None  # type: ignore[attr-defined]  # stub
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.utils.logging", types.ModuleType("x"))
+    stray = _stray_hf_handler()
+    model_cached(ModelInfo(BGE, 384, "Qdrant/x", "model.onnx"), tmp_path)
+    assert stray not in logging.getLogger("huggingface_hub").handlers
+
+
+@pytest.mark.usefixtures("restore_library_loggers")
+def test_load_fastembed_runtime_adopts_library_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Logger:
+        def disable(self, name: str) -> None:
+            return None
+
+    loguru = types.ModuleType("loguru")
+    loguru.logger = _Logger()  # type: ignore[attr-defined]  # stub module
+    monkeypatch.setitem(sys.modules, "fastembed", types.ModuleType("fastembed"))
+    monkeypatch.setitem(sys.modules, "loguru", loguru)
+    stray = _stray_hf_handler()
+    load_fastembed_runtime()
+    assert stray not in logging.getLogger("huggingface_hub").handlers
 
 
 def test_model_cached_cannot_tell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

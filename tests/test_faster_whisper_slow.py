@@ -219,3 +219,22 @@ def test_real_decode_classifies_inputs(tmp_path: Path) -> None:
     with pytest.raises(UnusableAudioError):
         cached.transcribe(episode, audio)
     assert not audio.exists()
+
+
+def test_load_runtime_leaves_no_library_handlers(restore_root_logging: None) -> None:
+    import io
+    import logging
+
+    from earmark.log import configure_logging
+
+    configure_logging("INFO", stream=io.StringIO())
+    load_runtime()
+    importlib.import_module("faster_whisper.utils")
+    offenders = [
+        f"{name}: {handler!r}"
+        for name, logger in logging.Logger.manager.loggerDict.items()
+        if isinstance(logger, logging.Logger)
+        for handler in logger.handlers
+        if not isinstance(handler, logging.NullHandler)
+    ]
+    assert offenders == []

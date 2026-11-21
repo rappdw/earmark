@@ -483,13 +483,22 @@ def test_build_anthropic_analyzer(tmp_path: Any) -> None:
 
 @pytest.mark.parametrize("unquieted", [False, True])
 def test_key_not_logged(
-    stub: AnthropicStub, tmp_path: Any, restore_root_logging: None, unquieted: bool
+    stub: AnthropicStub,
+    tmp_path: Any,
+    restore_root_logging: None,
+    restore_library_loggers: None,
+    unquieted: bool,
 ) -> None:
     buf = io.StringIO()
     configure_logging("DEBUG", secrets=(), stream=buf)
+    sdk_buf = io.StringIO()
+    sdk_handler = logging.StreamHandler(sdk_buf)
+    sdk_logger = logging.getLogger("anthropic")
     if unquieted:
-        # The SDK logs request bodies at DEBUG (hence the quieting), but never the key.
-        logging.getLogger("anthropic").setLevel(logging.DEBUG)
+        # The SDK logs request bodies at DEBUG, but never the key. Earmark's handler gates
+        # these records, so a plain handler on the SDK logger proves it from the SDK's side.
+        sdk_logger.addHandler(sdk_handler)
+        sdk_logger.setLevel(logging.DEBUG)
     transcript = sample_transcript()
     segments = (transcript.segments[0].model_copy(update={"text": TRANSCRIPT_SENTINEL}),)
     transcript = transcript.model_copy(update={"segments": segments})
@@ -502,10 +511,41 @@ def test_key_not_logged(
             analyzer.analyze(sample_episode(), transcript, "another prompt")
     finally:
         analyzer.close()
+        sdk_logger.removeHandler(sdk_handler)
     logged = buf.getvalue()
     assert KEY not in logged
-    if not unquieted:
-        assert TRANSCRIPT_SENTINEL not in logged
+    assert KEY not in sdk_buf.getvalue()
+    if unquieted:
+        assert sdk_buf.getvalue(), "the SDK logged nothing at DEBUG; the test proves nothing"
+    assert TRANSCRIPT_SENTINEL not in logged
+
+
+def test_sdk_log_env_cannot_unquiet(
+    stub: AnthropicStub,
+    tmp_path: Any,
+    restore_root_logging: None,
+    restore_library_loggers: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from anthropic._utils import _logs
+
+    monkeypatch.setenv("ANTHROPIC_LOG", "debug")
+    buf = io.StringIO()
+    configure_logging("DEBUG", stream=buf)
+    _logs.setup_logging()  # what importing the SDK does
+    assert logging.getLogger("anthropic").level == logging.DEBUG
+    transcript = sample_transcript()
+    segments = (transcript.segments[0].model_copy(update={"text": TRANSCRIPT_SENTINEL}),)
+    transcript = transcript.model_copy(update={"segments": segments})
+    stub.replies.append(stream_reply(message_events(valid_wire_json())))
+    analyzer = LlmAnalyzer(ArtifactStore(tmp_path / "data"), make_client(stub))
+    try:
+        analyzer.analyze(sample_episode(), transcript, None)
+    finally:
+        analyzer.close()
+    out = buf.getvalue()
+    assert TRANSCRIPT_SENTINEL not in out
+    assert "/v1/messages" not in out
 
 
 def test_error_detail_redacts_key(stub: AnthropicStub, client: AnthropicClient) -> None:

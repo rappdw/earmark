@@ -16,6 +16,7 @@ from typing import Final, Protocol
 
 from earmark.config import ConfigError, Settings
 from earmark.errors import TransientError
+from earmark.log import adopt_library_loggers
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,7 @@ def load_fastembed_runtime() -> FastEmbedRuntime:
         raise missing_extra(exc, "fastembed", "loguru") from None
     # fastembed logs through loguru, which the redacting formatter never sees.
     loguru.logger.disable("fastembed")
+    adopt_library_loggers()
 
     def supported() -> Sequence[ModelInfo]:
         listed: Iterable[dict[str, object]] = fe.TextEmbedding.list_supported_models()
@@ -269,6 +271,7 @@ def model_cached(info: ModelInfo, cache_dir: Path) -> bool | None:
         hub = importlib.import_module("huggingface_hub")
     except ImportError:
         return None
+    adopt_library_loggers()
     found = hub.try_to_load_from_cache(info.hf_repo, info.model_file, cache_dir=str(cache_dir))
     return isinstance(found, str)
 

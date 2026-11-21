@@ -1,4 +1,5 @@
 import importlib.metadata
+import io
 import json
 import re
 import subprocess
@@ -24,6 +25,7 @@ from earmark.fakes import FakeResolver, FakeSearcher, FakeStore
 from earmark.index.embed import IndexExtraMissing
 from earmark.index.search import IndexMismatchError, SearchQuery
 from earmark.jobs import open_job_store
+from earmark.log import configure_logging
 from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
 from earmark.pipeline import factory
 from earmark.pipeline.worker import Worker
@@ -34,6 +36,7 @@ from tests.digest_helpers import put_episode
 from tests.factories import make_analysis, make_episode, make_transcript
 from tests.index_helpers import RecordingTarget, make_docs, stub_extra_missing
 from tests.test_index_search import make_hit
+from tests.uds_http import asgi_on_uds
 from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
 
 runner = CliRunner()
@@ -202,6 +205,34 @@ def test_serve_runs_uvicorn(
     }
     assert (tmp_path / "data" / "earmark.db").exists()
     assert SERVE_TOKEN not in result.stdout + result.stderr
+
+
+@pytest.mark.usefixtures("restore_root_logging", "restore_library_loggers")
+def test_serve_access_log_drops_search_query(
+    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls
+) -> None:
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "none")
+    assert runner.invoke(app, ["serve"]).exit_code == 0
+    args, kwargs = fake_uvicorn.calls[0]
+    stream = io.StringIO()
+    configure_logging("INFO", stream=stream)
+    config = {k: v for k, v in kwargs.items() if k not in ("host", "port")}
+    with (
+        asgi_on_uds(args[0], **config) as path,
+        httpx2.Client(
+            transport=httpx2.HTTPTransport(uds=str(path)), base_url="http://earmark.test"
+        ) as client,
+    ):
+        url = "/search?q=private-sentinel&limit=3"
+        auth = {"Authorization": f"Bearer {SERVE_TOKEN}"}
+        assert client.get(url, headers=auth).status_code == 503
+        assert client.get(url).status_code == 401
+    out = stream.getvalue()
+    assert '"GET /search HTTP/1.1" 503' in out
+    assert '"GET /search HTTP/1.1" 401' in out
+    assert "private-sentinel" not in out
+    assert "limit=" not in out
 
 
 @pytest.mark.usefixtures("restore_root_logging")
@@ -1514,7 +1545,24 @@ def test_digest_since_names_range_note(digest_env: Path) -> None:
     result = _digest("--since", "7d")
     assert result.exit_code == 0, result.stderr
     assert result.stdout.startswith("wrote Earmark/Digests/2026-11-14 to 2026-11-20.md: ")
+    assert "not over yet" not in result.stdout
     assert (digest_env / "vault/Earmark/Digests/2026-11-14 to 2026-11-20.md").is_file()
+
+
+def test_digest_since_rerun_no_tail(digest_env: Path) -> None:
+    assert _digest("--since", "7d").exit_code == 0
+    again = _digest("--since", "7d")
+    assert again.exit_code == 0
+    assert "is up to date: " in again.stdout
+    assert "not over yet" not in again.stdout
+
+
+def test_digest_since_empty_no_tail(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_digest_now", lambda: datetime(2027, 1, 15, 12, 0, tzinfo=UTC))
+    result = _digest("--since", "1d")
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.startswith("no episodes were first shared in 2027-01-15 to 2027-01-15 (")
+    assert result.stdout.rstrip().endswith("; nothing written")
 
 
 def test_digest_empty_window_exit_0(digest_env: Path) -> None:

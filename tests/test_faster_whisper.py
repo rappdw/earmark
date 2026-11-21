@@ -342,6 +342,36 @@ def test_real_runtime_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert runtime.cuda_device_count() == 2
 
 
+def _stray_hf_handler() -> logging.Handler:
+    handler = logging.StreamHandler()
+    logging.getLogger("huggingface_hub").addHandler(handler)
+    return handler
+
+
+@pytest.mark.usefixtures("restore_library_loggers")
+def test_load_runtime_adopts_library_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.ModuleType("faster_whisper"))
+    monkeypatch.setitem(sys.modules, "ctranslate2", types.ModuleType("ctranslate2"))
+    av_stub = types.ModuleType("av")
+    av_error = types.ModuleType("av.error")
+    av_stub.__dict__["error"] = av_error
+    monkeypatch.setitem(sys.modules, "av", av_stub)
+    monkeypatch.setitem(sys.modules, "av.error", av_error)
+    stray = _stray_hf_handler()
+    load_runtime()
+    assert stray not in logging.getLogger("huggingface_hub").handlers
+
+
+@pytest.mark.usefixtures("restore_library_loggers")
+def test_model_cache_status_adopts_library_loggers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_utils(monkeypatch, "/cache/snapshot")
+    stray = _stray_hf_handler()
+    fw.model_cache_status(_options(model="small", model_dir=tmp_path))
+    assert stray not in logging.getLogger("huggingface_hub").handlers
+
+
 def test_cuda_without_device_is_config_error(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, data_dir=tmp_path, asr_device="cuda")
     artifacts = ArtifactStore(tmp_path)
