@@ -211,6 +211,7 @@ def test_real_decode_classifies_inputs(tmp_path: Path) -> None:
         load_model=lambda _o: model,
         decode_audio=runtime.decode_audio,
         cuda_device_count=runtime.cuda_device_count,
+        supported_compute_types=runtime.supported_compute_types,
     )
     options = WhisperOptions("tiny", "cpu", "int8", None, None)
     cached = CachedTranscriber(

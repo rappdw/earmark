@@ -34,6 +34,7 @@ AsrComputeType = Literal[
 
 SMTP_DEFAULT_PORTS: Final[Mapping[str, int]] = {"starttls": 587, "tls": 465}
 SMTP_TIMEOUT_MAX_S: Final = 90.0
+ASR_BATCH_SIZE_MAX: Final = 64
 # The worker's stop grace (compose stop_grace_period, systemd TimeoutStopSec) must be at least
 # SMTP_TIMEOUT_MAX_S + WORKER_STOP_MARGIN_S. The margin covers the push (ntfy: 5 s connect,
 # 10 s write, 10 s read) and the job-store writes. tests/test_deploy.py pins this.
@@ -80,6 +81,12 @@ class Settings(BaseSettings):
     asr_model: str = Field("large-v3", description="Whisper model name.")
     asr_device: AsrDevice = Field("auto", description="Whisper device.")
     asr_compute_type: AsrComputeType = Field("auto", description="Whisper compute type.")
+    asr_batch_size: int = Field(
+        0,
+        ge=0,
+        le=ASR_BATCH_SIZE_MAX,
+        description="Batched faster-whisper decoding: chunks per batch (0 is off).",
+    )
     asr_language: str | None = Field(None, description="Force a transcription language.")
     asr_model_dir: Path | None = Field(
         None, description="Where Whisper models are downloaded (default: the Hugging Face cache)."

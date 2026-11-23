@@ -8,12 +8,13 @@ transcript. It emails the transcript note and the instructions to the destinatio
 Markdown attachments, in the mail contract's format (step 25). Last, it sends an ntfy push.
 The operator's PKA instances do the analysis and filing.
 
-Step 26 adds GPU transcription in the image. Its contract is in "Planned (step 26)".
+On the DGX Spark the worker transcribes on the GB10 GPU in-process, from a GPU build of the
+image that compiles CTranslate2 with CUDA (step 26).
 
 How to read this document:
 
-- The sections before "Planned (step 26)" describe the code as it is.
-- "Planned (step 26)" is what step 26 builds against.
+- The sections before "Settled questions" describe the code as it is.
+- "Settled questions" records what the planners of steps 24–26 decided, and why.
 - "History: removed in step 22" lists what step 22 removed.
 
 When a step changes a contract described here, it changes this file in the same commit.
@@ -33,9 +34,9 @@ backend, not the pipeline.
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
-| Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2, which step 26 plans inside the image. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
+| Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative for a server elsewhere (`remote`, step 09; see `docs/asr.md`). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so the GPU image (`Dockerfile.gpu`, step 26) builds CTranslate2 from source with CUDA for `sm_121` and swaps it into the venv; the compose worker runs it with `EARMARK_ASR_DEVICE=cuda`. faster-whisper's batched pipeline is optional (`EARMARK_ASR_BATCH_SIZE`). | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_DEVICE`, `EARMARK_ASR_BATCH_SIZE`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge; the Cloudflare token lives only with the proxy. Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
-| Deployment | One container image (CPU, extras by build argument, `transcribe` by default) running either `earmark serve` or `earmark worker`; `compose.yaml` with a shared data volume; GPU transcription through a vLLM Whisper service in the compose `gpu` profile and the `remote` ASR backend; systemd units for the API and the worker (steps 16, 22). | See "Deployment" below and `docs/deploy.md`. |
+| Deployment | Two images. The CPU image (`Dockerfile`, extras by build argument, `transcribe` by default) runs `earmark serve`, or anything on a host without a GPU. The GPU image (`Dockerfile.gpu`: `nvidia/cuda` 12.9.1 cuDNN devel and runtime images, uv-managed Python 3.13, CTranslate2 built for `sm_121`) runs `earmark worker` with `gpus: all`. `compose.yaml` has a shared data volume and no vLLM service or `gpu` profile any more. systemd units for the API and the worker (steps 16, 22, 26). | See "Deployment" below and `docs/deploy.md`. |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), python-multipart's streaming `MultipartParser` for uploads (step 24; Starlette's own form parser spools files to the system temp dir, so it is not used), the stdlib `email`, `smtplib` and `ssl` for delivery (step 25). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
@@ -133,7 +134,8 @@ tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS,
                        step 25); legacy_db.py builds a database shaped like v0.1.0's for the
                        refusal tests (step 22); smtp_stub.py is the SMTP server for the
                        delivery tests (step 25)
-Dockerfile, .dockerignore, compose.yaml    the container image and services (step 16)
+Dockerfile, .dockerignore, compose.yaml    the CPU image and the services (step 16)
+Dockerfile.gpu         the GPU image: CTranslate2 built with CUDA, swapped into the venv (step 26)
 deploy/systemd/        earmark-api.service and earmark-worker.service (step 16)
 deploy/caddy/Caddyfile the example reverse proxy (step 16)
 ```
@@ -500,11 +502,11 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   - **The engine.** Every `TranscriptionEngine` has a `profile`:
     `asr_profile(backend, options)`, that is `<backend> <JSON of the options, keys sorted>`.
     - `faster_whisper`: model, device, compute type, language (`null` for auto), beam size
-      and VAD filter.
+      and VAD filter, plus `batch_size` only when `ASR_BATCH_SIZE` is above 0 (step 26). So
+      the profile with batching off is byte-for-byte the one from before step 26, and
+      transcripts cached then are still reused.
     - `remote`: model and language.
     - The fake: model and language.
-
-    Step 26's batch size joins the `faster_whisper` options.
   - **The stamp.** `CachedTranscriber` stamps it on every transcript it writes
     (`Transcript.asr_profile`). `cached(episode)` returns `transcript.json` only when the
     stamp equals the engine's profile.
@@ -522,12 +524,34 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   beam size 5 and VAD filtering, and segments are made monotonic (starts never decrease,
   `end >= start`, all within the duration; blank segments dropped). `ASR_LANGUAGE`
   forces a language, else Whisper detects it. Progress is logged about once a minute;
-  CTranslate2 releases the GIL, so the heartbeat thread keeps beating.
+  CTranslate2 releases the GIL, so the heartbeat thread keeps beating. The load is logged as
+  `loaded Whisper model '<model>' in <s> s on <device> (<compute type>)`, read from the
+  CTranslate2 model, so the log shows what `auto` resolved to.
+- **Batched decoding** (step 26; `docs/steps/26-gpu-image.md` section 4.10). With
+  `ASR_BATCH_SIZE` above 0, `load_runtime()`'s model loader wraps the `WhisperModel` in
+  faster-whisper's `BatchedInferencePipeline` and passes `batch_size` on every
+  `transcribe(...)` call. It takes the same language, beam size and VAD filter. Batched mode
+  decodes VAD chunks of up to 30 s without conditioning on the previous text and with
+  chunk-level timestamps (faster-whisper 1.2.1's defaults), so its text can differ from
+  sequential decoding; that is why the batch size is part of the cache key. `0`, the
+  default, is sequential decoding as before.
+- **CUDA.** `WhisperRuntime` exposes `cuda_device_count()` and
+  `supported_compute_types(device)` (step 26). `cuda_report(runtime)` gives doctor the device
+  count, and the CUDA compute types when there is a device. The PyPI wheel raises
+  `ValueError` ("not compiled with CUDA support") for `get_supported_compute_types("cuda")`,
+  so the report asks only when the count is above 0, and records the exception's type name
+  if it raises anyway. `get_cuda_device_count()` is CUDA's `cudaGetDeviceCount`: it is 0
+  for a build without CUDA or with no device visible, but a build for the wrong GPU
+  architecture still counts the device and fails at the first kernel ("no kernel image is
+  available"). Only a real transcription proves the build.
 - **Errors.** Model not found on Hugging Face, or a `ValueError` at load (bad model
   name, unsupported compute type) → `PermanentError` naming the settings; other
   `OSError`s while loading (download failures) → `TransientError`. `ASR_DEVICE=cuda` with
-  no CUDA device visible to CTranslate2 is a startup `ConfigError`. Messages carry file
-  base names and setting names, never full paths, URLs, or library error text.
+  no CUDA device visible to CTranslate2 is a startup `ConfigError`. Its message names
+  `EARMARK_ASR_DEVICE`, says the PyPI wheels for linux/aarch64 are CPU-only, and points at
+  the GPU image with GPU access (compose `gpus: all`), `auto` or `cpu`, or
+  `EARMARK_ASR_BACKEND=remote`. Messages carry file base names and setting names, never full
+  paths, URLs, or library error text.
 - **Library errors are not bad audio** (step 19; `docs/steps/19-library-errors.md`).
   `load_runtime()` also imports `av`. Its `decode_audio` raises
   `transcribe.faster_whisper.AudioDecodeError` for bad input only:
@@ -818,7 +842,11 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
     version cannot be read. A package installed from a source tree (PEP 610
     `vcs_info`/`dir_info`) is not checked by version. Then `asr model`: whether the Whisper
     model is local or in the cache, through faster-whisper's
-    `download_model(local_files_only=True)`.
+    `download_model(local_files_only=True)`. Then `asr cuda` (step 26): the CUDA device count
+    and whether `float16` is among `ctranslate2.get_supported_compute_types("cuda")`, through
+    `cuda_report`. It fails when the configured device cannot work (`cuda` with no device,
+    the compute types unreadable, or `float16` configured and unsupported), and is `ok` with
+    no device for `auto` and `cpu`. Exact wording in `docs/steps/26-gpu-image.md` section 4.11.
   - `mail` (step 25), built through the `MAILERS` registry:
     - `warn` for `fake`;
     - `FAIL` naming the missing `EARMARK_SMTP_*` settings;
@@ -1082,6 +1110,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `MAIL_BACKEND` | `smtp` | `smtp`, `fake` (step 25). `smtp` without its required settings is a startup `ConfigError`; `fake` sends nothing and writes `data/outbox/<job_id>.eml` |
 | `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing (the worker still starts) |
 | `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options (step 08); `remote` also uses `ASR_MODEL` (sent as the server's model id, e.g. `openai/whisper-large-v3`) and `ASR_LANGUAGE`. Model: a size such as `tiny`, `small`, `large-v3`, `distil-large-v3`, `large-v3-turbo`, a Hugging Face repo id, or a local directory. Device: `auto`, `cpu`, `cuda`. Compute type: `auto`, `default`, `int8`, `int8_float32`, `int8_float16`, `int8_bfloat16`, `int16`, `float16`, `bfloat16`, `float32` (device and compute type case-insensitive). Language: a lower-case code such as `en`; `auto` means detect |
+| `ASR_BATCH_SIZE` | `0` (off) | faster-whisper's batched pipeline: chunks decoded together, `0`–`64`; `0` or unset is sequential decoding. Part of the transcript cache key when above 0 (step 26) |
 | `ASR_MODEL_DIR` | unset (the Hugging Face cache, `$HF_HOME/hub` or `~/.cache/huggingface/hub`) | Where faster-whisper downloads models |
 | `ASR_BASE_URL`, `ASR_API_KEY`, `ASR_MAX_UPLOAD_MB` | unset, unset, unset (no upload limit) | Remote ASR backend (step 09). Base URL: the server's OpenAI-compatible base, ending in `/v1` (http or https, a host, no credentials, query, or fragment; a trailing `/` is dropped). Key: secret, printable ASCII without spaces, sent as a bearer token. Upload limit in MiB |
 | `ASR_TIMEOUT_SECONDS` | `10800` | How long the remote backend waits for the server's answer (read and write timeout) |
@@ -1129,14 +1158,55 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   - Entrypoint `earmark`, default command `serve`.
   - It installs `ca-certificates`, and has no `HEALTHCHECK`, no `VOLUME`, and no `.env`.
   - `.dockerignore` is an allow-list: `pyproject.toml`, `uv.lock`, `.python-version`,
-    `README.md`, `src/`.
+    `README.md`, `src/`. Both Dockerfiles use it.
+- **GPU image** (step 26; exact instructions in `docs/steps/26-gpu-image.md` section 4.1).
+  `Dockerfile.gpu` has stages `uv`, `build` and `runtime`, and carries earshot's
+  attribution comment.
+  - Bases, pinned by digest: `nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04` to build and
+    `nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04` to run (CUDA 12.9.1, cuBLAS 12.9.1.4, cuDNN
+    9.10.2.21; CUDA 12.9 is the first toolkit with `sm_121`), and the same uv image as the
+    CPU `Dockerfile`. The NGC PyTorch base that earshot used was not taken: see the step
+    plan, section 2.
+  - Python: uv installs CPython 3.13.18, the CPU image's version, into `/opt/python`, which
+    the runtime copies. It has the headers the bindings need; Ubuntu 24.04's own Python is
+    3.12 and is not used.
+  - The venv: `uv sync --locked --no-dev --no-editable --extra transcribe` into
+    `/app/.venv`, as in the CPU image.
+  - CTranslate2: the tag `CT2_VERSION` (a global build argument, default `v` plus the
+    locked version, `v4.9.0`) is cloned and built with the recipe's flags and
+    `-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"` (default `121`). It is installed under
+    `/opt/ctranslate2`. Its Python wheel is built against the venv's interpreter, with the
+    tag's own `install_requirements.txt` (pybind11) in a throwaway build venv. Then it is
+    swapped in with `uv pip install --python /app/.venv/bin/python --no-deps --reinstall`,
+    which also removes the PyPI wheel's bundled `ctranslate2.libs/`. No uv command runs
+    after the swap, and the runtime stage has no uv at all, because `uv sync` and `uv run`
+    put the locked PyPI wheel back (checked in step 26's research). No `pip` runs anywhere.
+  - Runtime: `/opt/python`, `/app/.venv` and `/opt/ctranslate2/lib` are copied from the
+    build stage, with `libopenblas0-pthread`, `libgomp1` and `ca-certificates` installed.
+    The base image's `ubuntu` user (UID 1000) is removed. User, `/data`, environment,
+    entrypoint and command are the CPU image's.
+  - Build-time check, in the runtime stage, with no GPU: `ctranslate2` and `faster_whisper`
+    import (with `BatchedInferencePipeline`), `ctranslate2.__version__` equals
+    `CT2_VERSION`, `ctranslate2.__file__` is under `/app/.venv/`, and the loaded
+    `libctranslate2` is the one in `/opt/ctranslate2/lib/`, not a wheel's bundled copy.
+  - `v4.6.0`, earshot's proven tag, is the fallback (`--build-arg CT2_VERSION=v4.6.0`). Its
+    CMake ignores `CMAKE_CUDA_ARCHITECTURES` and, with no GPU at build time, builds the
+    common architectures up to `8.6+PTX`, so the GB10 JIT-compiles the PTX.
+  - NVIDIA's images are under NVIDIA's licence terms: a built image is not published.
+  - Not built in CI (see "Continuous integration"). Only the operator's Spark smoke in
+    `docs/deploy.md` section 7 checks it.
 - **Compose.**
-  - `api` (`serve`) and `worker` (`worker`) share the image (built with
-    `EXTRAS: ${EXTRAS:-transcribe}`) and the named volume `data` at `/data`.
+  - `api` (`serve`) runs the CPU image `earmark:local` (built with
+    `EXTRAS: ${EXTRAS:-transcribe}`). `worker` (`worker`) runs the GPU image `earmark:gpu`
+    (`dockerfile: Dockerfile.gpu`) with `gpus: all`, which needs an NVIDIA GPU, the NVIDIA
+    Container Toolkit and Compose 2.30 or later. Both share the named volume `data` at
+    `/data` and get `APP_UID`/`APP_GID` as build arguments.
   - Settings come from `env_file: .env`. `environment:` forces the in-container
     `DATA_DIR`, `HOST`, `PORT`, an empty (so default) `ASR_MODEL_DIR`, and
-    `HF_HUB_DISABLE_TELEMETRY`.
-  - `api`, `worker`, and `asr` set `HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}`
+    `HF_HUB_DISABLE_TELEMETRY`. The worker also gets `EARMARK_ASR_DEVICE: cuda` (forced) and
+    `EARMARK_ASR_COMPUTE_TYPE: ${EARMARK_ASR_COMPUTE_TYPE:-float16}` (`.env` can override
+    it; `.env.example` leaves it commented out for that reason).
+  - `api` and `worker` set `HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}`
     (step 21). Compose interpolates it from the shell or `.env`, so a
     `HF_HUB_DISABLE_TELEMETRY=0` line in `.env` turns telemetry back on, and an empty or
     missing value keeps it off. A literal `"1"` would beat `env_file` and could only be
@@ -1147,14 +1217,13 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   - The worker gets `stop_grace_period: 2m`. SIGTERM releases the running job, or lets a
     delivery in progress finish (at most `EARMARK_SMTP_TIMEOUT_S`, 90 s, plus a 30 s
     margin; step 25).
-  - The `gpu` profile adds `asr`: NVIDIA's arm64 CUDA 13 vLLM container (pinned by digest)
-    serving `EARMARK_ASR_MODEL`, with its API key from `EARMARK_ASR_API_KEY`, raised
-    audio limits, a GPU reservation, and no published port. The worker uses it with
-    `EARMARK_ASR_BACKEND=remote` and `EARMARK_ASR_BASE_URL=http://asr:8000/v1`.
+  - There is no `asr` (vLLM) service, `asr-models` volume or `gpu` profile any more (step
+    26). The `remote` ASR backend stays for a server elsewhere (`docs/asr.md`).
   - Compose-only variables (`API_BIND`, `APP_UID`, `APP_GID`, `EXTRAS`,
-    `ASR_GPU_MEMORY_UTILIZATION`, `HF_HUB_DISABLE_TELEMETRY`) are unprefixed, so `Settings`
-    ignores them. `HF_HUB_DISABLE_TELEMETRY` is read by Hugging Face's libraries inside the
-    containers, not by earmark.
+    `HF_HUB_DISABLE_TELEMETRY`) are unprefixed, so `Settings` ignores them.
+    `HF_HUB_DISABLE_TELEMETRY` is read by Hugging Face's libraries inside the containers, not
+    by earmark. The GPU build arguments (`CT2_VERSION`, `CUDA_ARCH`) are not interpolated;
+    `docker compose build --build-arg CT2_VERSION=v4.6.0 worker` overrides one.
 - **Reverse proxy.** It is not part of compose. `deploy/caddy/Caddyfile` is an example
   for Caddy on the host:
   - it binds only the private LAN address, on 443, with no port 80;
@@ -1177,9 +1246,9 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   itself and never exports it. Commands run by hand outside the units do not get the
   setting.
 - **Not verified.** No container has run in the build sandbox (no Docker). CI builds the
-  image and runs only one-off commands in it. The `gpu` profile has never been built or
-  run. A CUDA build of CTranslate2 in the image is documented in `docs/deploy.md` as an
-  unverified outline, not provided; step 26 plans it.
+  CPU image and runs only one-off commands in it. The GPU image has never been built
+  anywhere by earmark's build: CI only runs `docker build --check` on it. The operator's
+  Spark smoke (`docs/deploy.md` section 7) is the only real check of the GPU path.
 
 ## Security
 
@@ -1490,7 +1559,17 @@ Documents are tested against the code (step 16).
   - This file contains `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=0`.
 - **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,
   `compose.yaml`, and the two systemd units, including that each one sets
-  `HF_HUB_DISABLE_TELEMETRY` (step 21).
+  `HF_HUB_DISABLE_TELEMETRY` (step 21). `tests/test_deploy_gpu.py` (step 26) checks
+  `Dockerfile.gpu` the same way:
+  - the recipe's cmake flags, with `CMAKE_CUDA_ARCHITECTURES` from the build argument;
+  - `CT2_VERSION` matching `uv.lock`;
+  - the attribution;
+  - the swap;
+  - no `pip install`, and no uv after the swap or at runtime;
+  - the build-time check;
+  - parity with the CPU runtime stage.
+
+  `tests/test_docs.py` checks that `docs/deploy.md` documents the Spark smoke.
 - **The gate.** `ruff format --check .` also formats Python code blocks in Markdown, so
   those must be ruff-clean.
 
@@ -1535,14 +1614,19 @@ run the container. There are exactly three workflows
 - `container.yml` ("Container image", step 16) runs on the same pushes and pull requests
   as `ci.yml`, with `contents: read`, no secrets, and the same pinned checkout as its only
   action. Its job `docker build (linux/arm64)`:
-  - validates `compose.yaml` with `docker compose config` (with and without `--profile
-    gpu`) against a `.env` copied from `.env.example`, and checks the telemetry variable
-    in all three services;
-  - builds the image with plain `docker build` (no push, no login, no Docker actions);
+  - validates `compose.yaml` with `docker compose config` against a `.env` copied from
+    `.env.example`, and checks the telemetry variable in both services and the worker's
+    `float16` default;
+  - runs `docker build --check -f Dockerfile.gpu .` (step 26). That runs BuildKit's
+    Dockerfile checks and resolves the pinned base images' metadata, without building;
+  - builds the CPU image with plain `docker build` (no push, no login, no Docker actions);
   - runs `earmark --version`, an import of `ctranslate2` and `faster_whisper`, an `id -u`
     check, and a check of `HF_HUB_DISABLE_TELEMETRY` in the image.
 
-  It never starts the API or the worker.
+  It never starts the API or the worker, and never builds the GPU image. The free arm64
+  runner has about 14 GB of disk, and the CUDA devel base alone is 5.94 GB compressed. Its
+  4 cores would take a long time over the CUDA compile, and it has no GPU to run the checks
+  that matter. See `docs/steps/26-gpu-image.md` section 2.
 
 No workflow references secrets (`test_no_workflow_references_secrets`). None of the
 scheduled or container workflows is a required check: their failures usually mean an
@@ -1556,7 +1640,9 @@ never uses `pull_request_target`. `ci.yml` additionally gets only `contents: rea
 references no secrets. Dependabot (`.github/dependabot.yml`) proposes weekly updates for
 the `uv` and `github-actions` ecosystems, and (step 16) `docker` for the Dockerfile's base
 images, limited to patch and digest updates because Python 3.14 and uv 0.14 need project
-changes. The vLLM tag in `compose.yaml` is bumped by hand. Dependabot reads its config from the default branch
+changes. Whether Dependabot also reads `Dockerfile.gpu` was not verified; if it does, the
+`images` group bumps both `nvidia/cuda` stages together, and `tests/test_deploy_gpu.py`
+fails a pull request that bumps only one. Dependabot reads its config from the default branch
 (`main`) but opens pull requests against `impl` (`target-branch`), so updates pass the
 same gate as a step and `main` stays a fast-forward of `impl`.
 
@@ -1600,8 +1686,16 @@ Step planners should check these against current documentation instead of assumi
    -DOPENMP_RUNTIME=COMP`, architecture through `CMAKE_CUDA_ARCHITECTURES`), and
    `docs/deploy.md` outlines it for sm_121 as unverified. Upstream's CUDA 13 issue #1933 is
    still open. None of this was run.
-   Step 26 plans the in-image CUDA build from
-   `docs/decisions/2026-11-23-gpu-build-recipe.md`.
+   Step 26 (2026-11-23) replaced the vLLM profile with the GPU image: CTranslate2 built
+   from source with CUDA 12.9.1 for `sm_121`, after
+   `docs/decisions/2026-11-23-gpu-build-recipe.md`. CUDA 12.9 is the first toolkit with
+   `sm_121`. Since 4.9.0 (#2067), CTranslate2 uses CMake's own CUDA support, so
+   `CMAKE_CUDA_ARCHITECTURES` takes effect. 4.6.0 used `FindCUDA` and `CUDA_ARCH_LIST`. With no
+   GPU at build time, that falls back to the common architectures up to `8.6+PTX`. So
+   earshot's 4.6.0 most likely ran on the GB10 through PTX JIT; this is inferred, not
+   measured. Upstream's aarch64 wheels stay CPU-only, and its CUDA wheels are x86_64 with
+   CUDA 12.8. So no one upstream builds 4.9.0 for aarch64 with CUDA. The image has never
+   been built; the operator's Spark smoke is the only check.
 2. **iTunes Lookup window.** Verified on 2026-11-19 and 2026-11-20:
    `lookup?id=<show>&entity=podcastEpisode` returns the show record with `feedUrl`, then
    episode records with `trackId` (the `?i=` value), `episodeGuid`, `episodeUrl`,
@@ -1618,9 +1712,9 @@ Step planners should check these against current documentation instead of assumi
    to 3.13. See `docs/steps/01-scaffold.md`.
 4. **Container and GPU paths cannot be exercised in the dev sandbox.** They are reviewed
    statically (`tests/test_deploy.py`) and verified on the homelab. Since step 16, CI
-   builds the image on linux/arm64 and runs one-off commands in it (`container.yml`), but
-   no service has ever run in a container, and the `gpu` profile has never been built or
-   run. The reachability setup has not been run either: WireGuard, the DNS-only record,
+   builds the CPU image on linux/arm64 and runs one-off commands in it (`container.yml`),
+   but no service has ever run in a container. The GPU image (step 26) has never been
+   built: CI only lints it with `docker build --check`. The reachability setup has not been run either: WireGuard, the DNS-only record,
    resolvers' DNS rebinding protection, and Caddy's DNS-01 issuance. Only the example
    Caddyfile was checked, with `caddy validate`. What the iOS share sheet hands a Shortcut
    is also unverified (no iPhone);
@@ -1712,54 +1806,9 @@ context. earmark's job is:
   GB10 is in `docs/decisions/2026-11-23-gpu-build-recipe.md`, with what was measured and
   what was not.
 
-## Planned (step 26)
+## Settled questions
 
-Nothing in this section is built yet. It is what step 26 builds against, restated from
-its brief in `docs/PLAN.md`. Its planner may settle what is listed under "Open questions",
-and records the choice here. Steps 24 and 25 are built. Their contracts moved from here
-into the sections above. `docs/steps/24-transcription-requests.md` and
-`docs/steps/25-delivery.md` have the exact rules.
-
-### GPU transcription in the image (step 26)
-
-- **Goal.** The worker transcribes on the Spark's GB10 GPU in-process, without the vLLM
-  service. Step 26 runs after step 25.
-- **The GPU image** is a GPU build of the image, for example `Dockerfile.gpu` or a build
-  target. It compiles CTranslate2 with CUDA for `sm_121` following
-  `docs/decisions/2026-11-23-gpu-build-recipe.md`, with the earshot attribution comment.
-  - It builds against the venv's Python 3.13 and swaps the built bindings into
-    `/app/.venv`. The build stage has the Python 3.13 headers and pybind11, from a
-    uv-managed 3.13 if the base ships an older Python.
-  - The `CT2_VERSION` build argument defaults to the locked `ctranslate2` version (4.9.0
-    today). `v4.6.0`, the version proven on the GB10, is the documented fallback if the
-    Spark smoke fails.
-  - A build-time check imports `ctranslate2` and `faster_whisper` and asserts the swapped
-    version.
-  - Nothing at runtime invokes `uv sync` or `uv run` without `--no-sync`, because either
-    would put the locked PyPI wheel back. A static test pins this, and no `pip install`
-    may pull a CPU `ctranslate2` over the build.
-  - Static tests check the cmake flags from the recipe, `CMAKE_CUDA_ARCHITECTURES` taken
-    from the build argument, the version default matching `uv.lock`, and the attribution
-    comment.
-  - The NGC base images are under NVIDIA's container licence: pulling them is fine, but a
-    built image is not published without checking those terms.
-- **The worker** runs `faster_whisper` with `EARMARK_ASR_DEVICE=cuda`. faster-whisper's
-  batched pipeline is an option, `EARMARK_ASR_BATCH_SIZE`, with 0 or unset meaning off. The
-  option feeds the transcript cache key. With `EARMARK_ASR_DEVICE=cuda` and no CUDA device,
-  the worker refuses to start with a clear message, as it does today.
-- **Compose.** The `asr` (vLLM) service and its `gpu` profile are removed, and replaced with
-  the GPU image and `gpus: all`. The `remote` backend stays as the generic option for a
-  server elsewhere.
-- **Doctor** reports the CUDA device count and whether `float16` is among
-  `ctranslate2.get_supported_compute_types("cuda")`.
-- New settings go in `Settings`, `.env.example` and the README settings table.
-- The CPU image still builds in CI, unchanged in behaviour.
-- **Spark smoke**, the only real check of the GPU path, done by the operator: build;
-  `ctranslate2.get_cuda_device_count() >= 1`, with `ctranslate2.__file__` inside the venv,
-  checked after any uv command; `doctor`; transcribe a short public clip on `cuda` and see
-  `float16` in the log.
-
-### Open questions
+The planners of steps 24–26 settled these. Each step plan, section 8, has the reasons.
 
 - **Settled by step 24** (see `docs/steps/24-transcription-requests.md` section 8):
   - the caps: `instructions` 4000 characters, `title` 200;
@@ -1791,12 +1840,23 @@ into the sections above. `docs/steps/24-transcription-requests.md` and
     may-already-be-delivered lines.
   - **Still open:** the contract is final only once the operator approves the PKA's
     receiving procedure.
-- **Step 26:** the base image, the slim `nvidia/cuda` devel and runtime pair (nobody has
-  tried it) or the NGC base (earshot proved it), with the reason; whether CI builds the GPU
-  image at all, given the free runner's roughly 14 GB of disk; whether it is a separate
-  file or a build target.
+- **Settled by step 26** (see `docs/steps/26-gpu-image.md` sections 2 and 8):
+  - **The base** is the slim pair `nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04` and
+    `-cudnn-runtime-ubuntu24.04`, not the NGC PyTorch image:
+    - it is the same CUDA 12.9.1 and Ubuntu 24.04 that earshot's NGC 25.06 build ran on;
+    - it is the pattern upstream CTranslate2's own Dockerfile uses;
+    - earmark needs no torch;
+    - NGC's Python is 3.12, so it would need a uv-managed 3.13 anyway;
+    - the runtime base is 3.09 GB compressed on arm64.
+  - **CI does not build the GPU image.** It runs `docker build --check` on it, and the
+    static tests run in `make check`.
+  - **A separate file**, `Dockerfile.gpu`, so the CPU `Dockerfile` is untouched.
+  - **Compose:** the API stays on the CPU image; the worker is the GPU image with
+    `EARMARK_ASR_DEVICE` forced to `cuda` and the compute type defaulting to `float16`.
+  - **The cache key** gains `batch_size` only when batching is on.
+  - **Doctor's check** is a new `asr cuda` line after `asr model`.
 
-### Not planned
+## Not planned
 
 `docs/PLAN.md` "Backlog" lists what the design leaves room for: a send-rate cap, re-shares
 as a reference only, an "analysis done" push, speaker diarization, other sources, and an

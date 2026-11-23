@@ -267,8 +267,9 @@ def test_options_from_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("EARMARK_ASR_COMPUTE_TYPE", "INT8")
     monkeypatch.setenv("EARMARK_ASR_LANGUAGE", " EN ")
     monkeypatch.setenv("EARMARK_ASR_MODEL_DIR", str(tmp_path))
+    monkeypatch.setenv("EARMARK_ASR_BATCH_SIZE", "8")
     settings = load_settings(env_file=None)
-    expected = WhisperOptions("small", "cpu", "int8", "en", tmp_path)
+    expected = WhisperOptions("small", "cpu", "int8", "en", tmp_path, 8)
     assert WhisperOptions.from_settings(settings) == expected
     artifacts, episode, audio = _setup(tmp_path)
     fake = _fake()
@@ -374,6 +375,9 @@ def test_cuda_without_device_is_config_error(tmp_path: Path) -> None:
         build_faster_whisper_transcriber(settings, artifacts, runtime=_fake().runtime())
     text = str(info.value)
     assert "EARMARK_ASR_DEVICE" in text
+    assert "no CUDA device" in text
+    assert "Dockerfile.gpu" in text
+    assert "gpus: all" in text
     assert "EARMARK_ASR_BACKEND=remote" in text
     gpu = _fake()
     gpu.cuda_devices = 1
@@ -584,6 +588,9 @@ def test_profile_includes_model_and_options() -> None:
     assert profile(language="fr") != base
     assert profile(compute_type="float16") != base
     assert profile(device="cuda") != base
+    assert profile(batch_size=8) != base
+    assert profile(batch_size=16) != profile(batch_size=8)
+    assert profile(batch_size=0) == base
     assert profile(model_dir=Path("/elsewhere")) == base  # where models live is not an option
     assert profile() == base
 
@@ -1069,3 +1076,146 @@ def test_model_cache_status_local_directory(tmp_path: Path) -> None:
         fw.model_cache_status(_options(model=str(model)))
     (model / "model.bin").write_bytes(b"x")
     assert fw.model_cache_status(_options(model=str(model))) == "local"
+
+
+# -- step 26: batching, the CUDA report, the refusal --------------------------------------
+
+PRE_STEP_26_PROFILE = (
+    'faster_whisper {"beam_size":5,"compute_type":"int8","device":"cpu","language":null,'
+    '"model":"tiny","vad_filter":true}'
+)
+
+
+def test_profile_unchanged_when_batching_off() -> None:
+    engine = FasterWhisperEngine(_options(), _fake().runtime())
+    assert engine.profile == PRE_STEP_26_PROFILE
+
+
+def _store_pre_step_transcript(artifacts: ArtifactStore, episode: Episode) -> None:
+    transcript = Transcript(
+        episode_key=episode.key,
+        language="en",
+        duration_s=12.0,
+        model="faster-whisper:tiny",
+        segments=(),
+        asr_profile=PRE_STEP_26_PROFILE,
+    )
+    artifacts.write_transcript(transcript)
+
+
+def test_cached_transcript_kept_when_batching_off(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    _store_pre_step_transcript(artifacts, episode)
+    fake = _fake()
+    _transcriber(artifacts, fake).transcribe(episode, audio)
+    assert fake.loads == []
+    assert fake.decodes == []
+
+
+def test_cached_transcript_miss_when_batch_changes(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    _store_pre_step_transcript(artifacts, episode)
+    batched = _fake()
+    _transcriber(artifacts, batched, batch_size=8).transcribe(episode, audio)
+    assert len(batched.loads) == 1
+    assert batched.loads[0].batch_size == 8
+    assert len(batched.decodes) == 1
+
+
+def _stub_model(**extra: Any) -> tuple[FakeWhisperModel, StubExtra]:
+    model = FakeWhisperModel(THREE, FakeInfo("en", 12.0))
+    return model, StubExtra(model, decode=lambda _p: [0.0] * 32_000, **extra)
+
+
+def test_sequential_when_batch_zero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    model, stub = _stub_model()
+    stub.install(monkeypatch)
+    loaded = load_runtime().load_model(_options())
+    assert loaded is model
+    assert stub.pipelines == []
+    loaded.transcribe("a", language=None, beam_size=5, vad_filter=True)
+    assert all("batch_size" not in call for call in model.calls)
+
+
+def test_batched_pipeline_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, stub = _stub_model()
+    stub.install(monkeypatch)
+    loaded = load_runtime().load_model(_options(batch_size=8, language="en"))
+    assert isinstance(loaded, fw.BatchedWhisper)
+    [pipeline] = stub.pipelines
+    assert pipeline.model is model
+    segments, info = loaded.transcribe("a", language="en", beam_size=5, vad_filter=True)
+    assert [seg.text for seg in segments] == [seg.text for seg in THREE]
+    assert info.language == "en"
+    assert pipeline.calls == [
+        {"language": "en", "beam_size": 5, "vad_filter": True, "batch_size": 8}
+    ]
+
+
+def test_batched_load_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _, stub = _stub_model()
+    stub.install(monkeypatch)
+    engine = FasterWhisperEngine(
+        _options(device="cuda", compute_type="float16", batch_size=8), load_runtime()
+    )
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        engine._load()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("batch size 8" in m and m.startswith("loading Whisper model") for m in messages)
+    assert any(m.endswith("on cuda (float16)") for m in messages)
+
+
+def test_load_log_unchanged_without_batching(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        FasterWhisperEngine(_options(), _fake().runtime())._load()
+    [loading] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("loading")]
+    assert loading == "loading Whisper model 'tiny' (device cpu, compute type int8)"
+
+
+def test_real_supported_compute_types(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, stub = _stub_model(cuda_devices=1, cuda_types=["float32", "float16"])
+    stub.install(monkeypatch)
+    assert load_runtime().supported_compute_types("cuda") == frozenset({"float32", "float16"})
+
+
+def test_cuda_report_no_device_skips_query() -> None:
+    fake = _fake()
+    report = fw.cuda_report(fake.runtime())
+    assert report == fw.CudaReport(0, None, None)
+    assert fake.types_queries == []
+
+
+def test_cuda_report_types() -> None:
+    fake = _fake()
+    fake.cuda_devices = 2
+    fake.cuda_types = frozenset({"float16", "int8"})
+    assert fw.cuda_report(fake.runtime()) == fw.CudaReport(2, frozenset({"float16", "int8"}), None)
+    assert fake.types_queries == ["cuda"]
+
+
+def test_cuda_report_query_error_is_type_name() -> None:
+    fake = _fake()
+    fake.cuda_devices = 1
+    fake.types_error = ValueError("secret detail not to be shown")
+    report = fw.cuda_report(fake.runtime())
+    assert report == fw.CudaReport(1, None, "ValueError")
+
+
+def test_worker_refuses_cuda_without_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fw, "load_runtime", _fake().runtime)
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        resolver_backend="fake",
+        fetch_backend="fake",
+        asr_backend="faster_whisper",
+        asr_device="cuda",
+    )
+    with pytest.raises(ConfigError) as info:
+        factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    assert "no CUDA device" in str(info.value)
+    assert "Dockerfile.gpu" in str(info.value)

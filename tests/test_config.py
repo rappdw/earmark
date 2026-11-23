@@ -127,6 +127,8 @@ def test_secret_values_lists_only_set_secrets(monkeypatch: pytest.MonkeyPatch) -
         ("EARMARK_LOG_LEVEL", "verbose-sentinel", True),
         ("EARMARK_ASR_DEVICE", "gpu-sentinel", True),
         ("EARMARK_ASR_COMPUTE_TYPE", "float8-sentinel", True),
+        ("EARMARK_ASR_BATCH_SIZE", "-1", False),
+        ("EARMARK_ASR_BATCH_SIZE", "65", False),
         ("EARMARK_ASR_LANGUAGE", "english-sentinel", True),
         ("EARMARK_ASR_MODEL", " ", False),
         ("EARMARK_ASR_BASE_URL", "ftp://sentinel-host/v1", True),
@@ -226,6 +228,18 @@ def test_asr_settings_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setenv("EARMARK_ASR_LANGUAGE", "Haw")
     assert load_settings(env_file=None).asr_language == "haw"
+
+
+def test_batch_size_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Settings(_env_file=None).asr_batch_size == 0
+    monkeypatch.setenv("EARMARK_ASR_BATCH_SIZE", "")
+    assert load_settings(env_file=None).asr_batch_size == 0
+    monkeypatch.setenv("EARMARK_ASR_BATCH_SIZE", "8")
+    assert load_settings(env_file=None).asr_batch_size == 8
+    for bad in ("-1", "65"):
+        monkeypatch.setenv("EARMARK_ASR_BATCH_SIZE", bad)
+        with pytest.raises(ConfigError, match="EARMARK_ASR_BATCH_SIZE"):
+            load_settings(env_file=None)
 
 
 def test_asr_model_dir_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -335,6 +349,7 @@ def test_settings_fields_are_exactly() -> None:
         "asr_model",
         "asr_device",
         "asr_compute_type",
+        "asr_batch_size",
         "asr_language",
         "asr_model_dir",
         "asr_base_url",

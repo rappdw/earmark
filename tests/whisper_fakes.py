@@ -81,10 +81,15 @@ class FakeRuntime:
         *,
         duration_s: float = 60.0,
         cuda_devices: int = 0,
+        cuda_types: frozenset[str] = frozenset(),
+        types_error: BaseException | None = None,
     ) -> None:
         self.model = model
         self.duration_s = duration_s
         self.cuda_devices = cuda_devices
+        self.cuda_types = cuda_types
+        self.types_error = types_error
+        self.types_queries: list[str] = []
         self.loads: list[WhisperOptions] = []
         self.decodes: list[Path] = []
         self.load_errors: list[BaseException] = []
@@ -102,11 +107,18 @@ class FakeRuntime:
             raise self.decode_error
         return DecodedAudio(samples=("fake", path.name), duration_s=self.duration_s)
 
+    def _supported_compute_types(self, device: str) -> frozenset[str]:
+        self.types_queries.append(device)
+        if self.types_error is not None:
+            raise self.types_error
+        return self.cuda_types
+
     def runtime(self) -> WhisperRuntime:
         return WhisperRuntime(
             load_model=self._load_model,
             decode_audio=self._decode_audio,
             cuda_device_count=lambda: self.cuda_devices,
+            supported_compute_types=self._supported_compute_types,
         )
 
 
@@ -136,6 +148,37 @@ class StubDecoderNotFoundError(_StubFFmpegError, LookupError):
     strerror = "Decoder not found"
 
 
+class StubPipeline:
+    """Stands in for faster_whisper.BatchedInferencePipeline: records, then delegates."""
+
+    def __init__(self, model: object, delegate: FakeWhisperModel) -> None:
+        self.model = model
+        self.delegate = delegate
+        self.calls: list[dict[str, object]] = []
+
+    def transcribe(
+        self,
+        audio: object,
+        /,
+        *,
+        language: str | None,
+        beam_size: int,
+        vad_filter: bool,
+        batch_size: int,
+    ) -> tuple[Iterable[FakeSegment], FakeInfo]:
+        self.calls.append(
+            {
+                "language": language,
+                "beam_size": beam_size,
+                "vad_filter": vad_filter,
+                "batch_size": batch_size,
+            }
+        )
+        return self.delegate.transcribe(
+            audio, language=language, beam_size=beam_size, vad_filter=vad_filter
+        )
+
+
 class StubExtra:
     """Stub faster_whisper, ctranslate2, av, and av.error modules for the real load_runtime."""
 
@@ -146,11 +189,18 @@ class StubExtra:
         decode: Callable[[str], Sequence[float]],
         audio_streams: int | BaseException = 1,
         cuda_devices: int = 0,
+        cuda_types: Iterable[str] = (),
+        types_error: BaseException | None = None,
     ) -> None:
         self.model = model
         self.decode = decode
         self.audio_streams = audio_streams
         self.cuda_devices = cuda_devices
+        self.cuda_types = list(cuda_types)
+        self.types_error = types_error
+        self.model_kwargs: list[dict[str, Any]] = []
+        self.pipelines: list[StubPipeline] = []
+        self.inner_model = types.SimpleNamespace(device="cuda", compute_type="float16")
         self.decode_calls: list[str] = []
         self.open_calls: list[str] = []
         self.errors = types.ModuleType("av.error")
@@ -190,10 +240,30 @@ class StubExtra:
 
             return Context()
 
+        def whisper_model(*args: Any, **kwargs: Any) -> FakeWhisperModel:
+            self.model_kwargs.append({"args": args, **kwargs})
+            self.model.model = self.inner_model  # type: ignore[attr-defined]  # test stub attr
+            return self.model
+
+        def pipeline(model: object) -> StubPipeline:
+            made = StubPipeline(model, self.model)
+            self.pipelines.append(made)
+            return made
+
+        def supported_compute_types(device: str) -> list[str]:
+            if self.types_error is not None:
+                raise self.types_error
+            return self.cuda_types
+
         fw.__dict__.update(
-            {"WhisperModel": lambda *a, **k: self.model, "decode_audio": decode_audio}
+            {
+                "WhisperModel": whisper_model,
+                "BatchedInferencePipeline": pipeline,
+                "decode_audio": decode_audio,
+            }
         )
         ct2.__dict__["get_cuda_device_count"] = lambda: self.cuda_devices
+        ct2.__dict__["get_supported_compute_types"] = supported_compute_types
         av.__dict__.update({"open": open_, "error": self.errors})
         monkeypatch.setitem(sys.modules, "faster_whisper", fw)
         monkeypatch.setitem(sys.modules, "ctranslate2", ct2)

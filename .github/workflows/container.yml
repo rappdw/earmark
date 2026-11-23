@@ -1,6 +1,7 @@
-# Builds the container image on linux/arm64 without pushing it, then runs three one-off
-# checks inside it. It never starts the API or the worker, and does not build the gpu
-# profile's server. Not a required check. See docs/deploy.md.
+# Builds the CPU container image on linux/arm64 without pushing it, then runs one-off
+# checks inside it. It never starts the API or the worker. For Dockerfile.gpu it runs only
+# `docker build --check`; the GPU image is built and run by the operator on the Spark
+# (docs/deploy.md section 7). Not a required check.
 name: Container image
 
 on:
@@ -29,10 +30,11 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config --quiet
-          docker compose --profile gpu config --quiet
-          check='import json, sys; s = json.load(sys.stdin)["services"]; v = {n: s[n]["environment"]["HF_HUB_DISABLE_TELEMETRY"] for n in ("api", "worker", "asr")}; assert set(v.values()) == {sys.argv[1]}, v'
-          docker compose --profile gpu config --format json | python3 -c "$check" 1
-          HF_HUB_DISABLE_TELEMETRY=0 docker compose --profile gpu config --format json | python3 -c "$check" 0
+          check='import json, sys; s = json.load(sys.stdin)["services"]; assert set(s) == {"api", "worker"}, sorted(s); v = {n: s[n]["environment"]["HF_HUB_DISABLE_TELEMETRY"] for n in s}; assert set(v.values()) == {sys.argv[1]}, v; w = s["worker"]["environment"]; assert (w["EARMARK_ASR_DEVICE"], w["EARMARK_ASR_COMPUTE_TYPE"]) == ("cuda", "float16"), w'
+          docker compose config --format json | python3 -c "$check" 1
+          HF_HUB_DISABLE_TELEMETRY=0 docker compose config --format json | python3 -c "$check" 0
+      - name: Check Dockerfile.gpu (not built here)
+        run: docker build --check -f Dockerfile.gpu .
       - name: Build the image
         run: docker build --tag earmark:ci .
       - name: Check the image

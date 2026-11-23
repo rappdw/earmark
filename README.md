@@ -192,6 +192,7 @@ Copy `.env.example` to start.
 | `EARMARK_ASR_MODEL` | `large-v3` | Whisper model name (also the model id sent to a remote server). |
 | `EARMARK_ASR_DEVICE` | `auto` | `auto`, `cpu`, or `cuda`. |
 | `EARMARK_ASR_COMPUTE_TYPE` | `auto` | CTranslate2 compute type, such as `int8` or `float16`. |
+| `EARMARK_ASR_BATCH_SIZE` | `0` | faster-whisper's batched pipeline: chunks decoded together (8–16 on a GPU, at most 64). `0` is off. Changes the transcript cache key. |
 | `EARMARK_ASR_LANGUAGE` | unset | Force a language code such as `en`; unset or `auto` detects it. |
 | `EARMARK_ASR_MODEL_DIR` | unset | Where models are downloaded (default: the Hugging Face cache). |
 | `EARMARK_KEEP_AUDIO` | `false` | Keep the downloaded audio after transcription. |

@@ -116,3 +116,21 @@ pulling them is fine, but do not publish a built image without checking those te
   build or the smoke test fails on the Spark.
 - **The `transcribe` extra and diarization.** earmark does not need pyannote, torch or
   torchaudio. Speaker diarization stays in the backlog.
+
+## Notes from step 26's planning (2026-11-23)
+
+Checked against upstream sources while planning step 26. See
+`docs/steps/26-gpu-image.md` section 2 for the evidence.
+
+- **`get_cuda_device_count()` does not detect a wrong architecture.** It is CUDA's
+  `cudaGetDeviceCount` (CTranslate2 `src/cuda/utils.cc`). It prints 0 for a build without
+  CUDA or with no device visible. A build without kernels for the GPU still counts the
+  device, and fails at the first kernel launch. A real transcription is the proof.
+- **v4.6.0 ignores `CMAKE_CUDA_ARCHITECTURES`.** Its CMake uses the old `FindCUDA` module
+  with `CUDA_ARCH_LIST`, which defaults to `Auto`. `docker build` has no GPU, so `Auto`
+  falls back to CMake's common list, up to `8.6+PTX` in CMake 3.28. So earshot's GB10 run
+  most likely JIT-compiled the `compute_86` PTX. That is inferred from the sources, not
+  measured. v4.9.0 replaced `FindCUDA` with CMake's native CUDA support (#2067), so there
+  `-DCMAKE_CUDA_ARCHITECTURES=121` does build `sm_121` code.
+- **The NGC 25.06 base** is Ubuntu 24.04 with CUDA 12.9.1, according to NVIDIA's release
+  notes. `nvidia/cuda:12.9.1-cudnn-*-ubuntu24.04` has the same CUDA and OS.

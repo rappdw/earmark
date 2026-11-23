@@ -97,6 +97,7 @@ class OfflineChecks:
         if s.asr_backend == "faster_whisper" and asr.status == "ok":
             results.append(guarded("asr libraries", self.asr_libraries))
             results.append(guarded("asr model", self.asr_model))
+            results.append(guarded("asr cuda", self.asr_cuda))
         results.append(guarded("mail", self.mail))
         results.append(guarded("notify", self.notify))
         return results
@@ -268,12 +269,47 @@ class OfflineChecks:
             ro = RemoteOptions.from_settings(s)
             key = "API key set" if ro.api_key is not None else "no API key"
             return CheckResult("asr", "ok", f"remote server at {ro.host}, model {ro.model}, {key}")
+        batch = f", batch size {s.asr_batch_size}" if s.asr_batch_size > 0 else ""
         return CheckResult(
             "asr",
             "ok",
             f"faster_whisper, model {s.asr_model}, device {s.asr_device}, "
-            f"compute {s.asr_compute_type}",
+            f"compute {s.asr_compute_type}{batch}",
         )
+
+    def asr_cuda(self) -> CheckResult:
+        from earmark.transcribe.faster_whisper import FLOAT16, cuda_report, load_runtime
+
+        s = self.settings
+        report = cuda_report(load_runtime())
+        n = report.device_count
+        if n <= 0:
+            if s.asr_device == "cpu":
+                return CheckResult("asr cuda", "ok", "no CUDA device (EARMARK_ASR_DEVICE=cpu)")
+            if s.asr_device == "auto":
+                return CheckResult("asr cuda", "ok", "no CUDA device; transcribing on CPU")
+            return CheckResult("asr cuda", "fail", "no CUDA device, but EARMARK_ASR_DEVICE=cuda")
+        devices = f"{n} CUDA device" + ("" if n == 1 else "s")
+        on_cpu = s.asr_device == "cpu"
+        types = report.compute_types
+        if types is None:
+            return CheckResult(
+                "asr cuda",
+                "warn" if on_cpu else "fail",
+                f"{devices}; CTranslate2 could not list the CUDA compute types ({report.error})",
+            )
+        if FLOAT16 in types:
+            detail = f"{devices}, float16 supported"
+            if on_cpu:
+                detail += "; EARMARK_ASR_DEVICE=cpu leaves them unused"
+            return CheckResult("asr cuda", "ok", detail)
+        listed = ", ".join(sorted(types))
+        detail = f"{devices}, float16 not supported (CUDA compute types: {listed})"
+        if not on_cpu and s.asr_compute_type == FLOAT16:
+            return CheckResult(
+                "asr cuda", "fail", detail + "; set EARMARK_ASR_COMPUTE_TYPE to one of them"
+            )
+        return CheckResult("asr cuda", "warn", detail)
 
     def asr_libraries(self) -> CheckResult:
         from earmark.transcribe.compat import check_transcribe_packages

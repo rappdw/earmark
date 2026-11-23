@@ -9,8 +9,8 @@ Today (after step 25) a request is an Apple Podcasts episode link, a direct audi
 an uploaded file, with a destination address and instructions. The worker resolves or
 downloads the audio, transcribes it, caches the transcript, emails the transcript note and
 the instructions to the destination as two Markdown attachments, and sends an ntfy push.
-Step 26 adds GPU transcription inside the image. Its contract is in "Planned (step 26)" in
-`docs/ARCHITECTURE.md`.
+On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26), which builds
+CTranslate2 with CUDA.
 
 ## Status
 
@@ -19,8 +19,7 @@ assuming a module exists.
 
 - `docs/ARCHITECTURE.md`: the design. Decisions, module layout, contracts, data layout,
   config, security rules. This is the source of truth for how pieces fit; update it in
-  the same change whenever a contract changes. Its "Planned (step 26)" section holds
-  what that step builds against.
+  the same change whenever a contract changes.
 - `docs/PLAN.md`: the ordered steps, their acceptance criteria, and the build loop. Its
   "Re-scope" section is the record of the operator's decisions and the mail contract.
 - `docs/steps/NN-<slug>.md`: the detailed plan written for each step when it is dispatched.
@@ -104,6 +103,10 @@ POST /transcriptions ─► jobs table (SQLite) ─► worker ─► Pipeline
   attachment, verbatim, and the guid appears only inside the attachments.
 - **Never truncate a transcript.** A transcript over the attachment cap fails the job
   with a message naming the setting; nothing is cut or split.
+- **The GPU image's CUDA CTranslate2 is fragile** (step 26). In `Dockerfile.gpu` no `uv`
+  command runs after the swap, and none at runtime: `uv sync` and `uv run` reinstall the
+  locked CPU wheel. No `pip install` anywhere. `get_cuda_device_count() >= 1` does not
+  prove the build; a transcription on the Spark does.
 - **Removed code stays removed.** What step 22 deleted is recoverable from the
   `v0.1.0-full-pipeline` tag. Bring nothing back without a plan step.
 

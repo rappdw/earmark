@@ -1,0 +1,88 @@
+# earmark GPU image for the worker (`earmark worker`): faster-whisper on CTranslate2 built
+# with CUDA, for the DGX Spark's GB10 (sm_121, linux/arm64). Built and run only by the
+# operator on the Spark; never by CI (which runs `docker build --check` on this file) or
+# the build sandbox. See docs/deploy.md section 7 for the smoke test and the remedies.
+#
+# CUDA CTranslate2 build adapted from earshot (https://github.com/rappdw/earshot,
+# docker/Dockerfile), MIT License, Copyright (c) 2026 Dan Rapp.
+#
+# NVIDIA's CUDA images are under NVIDIA's licence terms; do not publish a built image
+# without checking them.
+
+ARG CT2_VERSION=v4.9.0
+ARG CUDA_ARCH=121
+
+FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d AS uv
+
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04@sha256:a2e1e2360c85298ac47ec2543b406ab1e8cec42e31ee47e4d32140ebc82e1067 AS build
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_INSTALL_DIR=/opt/python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    UV_PYTHON_DOWNLOADS=manual \
+    UV_PYTHON=3.13.18 \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential cmake git libopenblas-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN uv python install 3.13.18
+WORKDIR /src
+COPY pyproject.toml uv.lock .python-version README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project --extra transcribe
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable --extra transcribe
+ARG CT2_VERSION
+ARG CUDA_ARCH
+# The swap is the last uv command in this file: a later `uv sync` or `uv run` would put the
+# locked CPU-only PyPI wheel back.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone --depth 1 --branch "${CT2_VERSION}" --recursive https://github.com/OpenNMT/CTranslate2 /tmp/ct2 \
+ && cmake -S /tmp/ct2 -B /tmp/ct2/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/ctranslate2 \
+      -DWITH_CUDA=ON -DWITH_CUDNN=ON -DCUDA_DYNAMIC_LOADING=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+      -DWITH_MKL=OFF -DWITH_OPENBLAS=ON -DWITH_RUY=ON -DOPENMP_RUNTIME=COMP \
+ && cmake --build /tmp/ct2/build -j"$(nproc)" --target install \
+ && uv venv /opt/ct2-build \
+ && uv pip install --python /opt/ct2-build/bin/python -r /tmp/ct2/python/install_requirements.txt \
+ && CTRANSLATE2_ROOT=/opt/ctranslate2 uv build --wheel --no-build-isolation \
+      --python /opt/ct2-build/bin/python --out-dir /tmp/ct2-wheel /tmp/ct2/python \
+ && uv pip install --python /app/.venv/bin/python --no-deps --reinstall /tmp/ct2-wheel/ctranslate2-*.whl \
+ && rm -rf /tmp/ct2 /tmp/ct2-wheel /opt/ct2-build
+
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04@sha256:d02c4310b6d57ca0b16cd80298bdb33a74187baafe2eccd8a6a16180ddc90802 AS runtime
+# The user that owns /data.
+ARG UID=1000
+ARG GID=1000
+ARG CT2_VERSION
+RUN test "$UID" -ne 0 && test "$GID" -ne 0 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libopenblas0-pthread libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && if id -u ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \
+ && groupadd --gid "$GID" --non-unique earmark \
+ && useradd --uid "$UID" --gid "$GID" --non-unique --create-home \
+      --home-dir /home/earmark --shell /usr/sbin/nologin earmark \
+ && install -d -o earmark -g earmark -m 0750 /data
+COPY --from=build /opt/python /opt/python
+COPY --from=build /opt/ctranslate2/lib /opt/ctranslate2/lib
+COPY --from=build /app/.venv /app/.venv
+# Build-time check, no GPU needed: the venv holds the source build, not the PyPI wheel.
+RUN echo /opt/ctranslate2/lib > /etc/ld.so.conf.d/ctranslate2.conf \
+ && ldconfig \
+ && /app/.venv/bin/python -c "import sys, ctranslate2, faster_whisper; from faster_whisper import BatchedInferencePipeline; want = sys.argv[1].removeprefix('v'); assert ctranslate2.__version__ == want, (ctranslate2.__version__, want); assert ctranslate2.__file__.startswith('/app/.venv/'), ctranslate2.__file__; libs = {line.split()[-1] for line in open('/proc/self/maps') if 'libctranslate2' in line}; assert libs and all(p.startswith('/opt/ctranslate2/lib/') for p in libs), libs; print('ctranslate2', ctranslate2.__version__, sorted(libs))" "$CT2_VERSION"
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    EARMARK_HOST=0.0.0.0 \
+    EARMARK_DATA_DIR=/data \
+    HF_HOME=/data/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1
+WORKDIR /home/earmark
+USER earmark:earmark
+EXPOSE 8787
+ENTRYPOINT ["earmark"]
+CMD ["serve"]

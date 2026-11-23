@@ -14,7 +14,8 @@ through this guide in order, with a check after each phase.
   linux/arm64), not run-tested. CI builds it and runs only `earmark --version`, an import
   of the extras, and a user-id check inside it. The API and worker have never run in a
   container, because the build sandbox has no Docker.
-- The `gpu` profile is untested: its vLLM service was never built or run.
+- The GPU image is untested: CI only runs `docker build --check` on `Dockerfile.gpu`, and it
+  has never been built or run. The Spark smoke test in section 7 is the only real check.
 - The systemd units and timer are examples, reviewed but never run. The compose command
   for the weekly digest (section 14) has not run either.
 - The reachability setup is not verified by the earmark build. That covers the DNS-only
@@ -92,8 +93,7 @@ in `.env`, which compose also reads.
 | `API_BIND` | `127.0.0.1:8787` | Host address and port the API is published on. Leave it at the default. |
 | `APP_UID` | `1000` | User id the image runs as. Set it to the vault owner's id before building. |
 | `APP_GID` | `1000` | Group id the image runs as. |
-| `EXTRAS` | `transcribe index` | Optional extras installed in the image. |
-| `ASR_GPU_MEMORY_UTILIZATION` | `0.2` | Share of GPU memory the `asr` service takes (`gpu` profile). |
+| `EXTRAS` | `transcribe` | Optional extras installed in the API's CPU image. |
 | `HF_HUB_DISABLE_TELEMETRY` | `1` | Hugging Face telemetry in the containers; `0` turns it back on (section 17). Read by Hugging Face's libraries, not by earmark. |
 
 Things to know:
@@ -126,8 +126,8 @@ Things to know:
   `EARMARK_INDEX_BACKEND=none`, or `EXTRAS=` for neither. Selecting a backend whose extra
   is missing makes the worker refuse to start, with a message that names the extra.
 
-The image is CPU only, so GPU transcription uses the `asr` service (section 7). Its entrypoint is
-`earmark` and its default command is `serve`. It runs as a non-root user, has no health check
+`api` runs the CPU image (`Dockerfile`) and `worker` runs the GPU image (`Dockerfile.gpu`,
+section 7). Both entrypoints are `earmark`, and the default command is `serve`. It runs as a non-root user, has no health check
 of its own (the same image runs the worker; compose checks the API), and reads no `.env` file.
 
 ## 5. Install natively with systemd
@@ -305,62 +305,93 @@ A local DNS override for the name is an alternative. Caddy then still needs
 
 ## 7. Transcription on the DGX Spark
 
-Three options.
+### 7.1 The GPU image
 
-### 7a. CPU, in the worker (the default)
+`Dockerfile.gpu` builds the worker's image: CUDA 12.9.1 on Ubuntu 24.04, a uv-managed
+Python 3.13.18, and CTranslate2 compiled from source with CUDA for `sm_121` (the GB10),
+swapped into the venv over the CPU-only PyPI wheel. `compose.yaml` runs `worker` from it
+with `gpus: all`, forces `EARMARK_ASR_DEVICE=cuda`, and defaults
+`EARMARK_ASR_COMPUTE_TYPE` to `float16`. `api` stays on the CPU image.
 
-`faster_whisper` with `large-v3` on the Spark's CPU is slow for long episodes. A smaller
-`EARMARK_ASR_MODEL` (`distil-large-v3`, `large-v3-turbo`, `small`) is the stopgap. The PyPI
-CTranslate2 wheel for aarch64 is CPU-only.
+The host needs:
 
-`hf_xet` writes its own logs under `$HF_HOME/xet/logs/`, and Hugging Face telemetry is off by
-default (section 17).
+- the NVIDIA driver;
+- the NVIDIA Container Toolkit;
+- Docker Compose 2.30 or later, for `gpus: all`;
+- `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` printing `12.1`.
 
-### 7b. The `gpu` profile (the recommended GPU path, untested)
+Notes:
 
-- In `.env`:
+- The build takes a long time. The CUDA devel base is about 6 GB to download, and the build
+  time was not measured.
+- `EARMARK_ASR_BATCH_SIZE` (0, off, by default) turns on faster-whisper's batched pipeline.
+  Try 8 or 16 on a GPU. It holds the features of the whole file in memory, about 550 MB
+  for 3 hours of speech, on top of the decoded audio. Changing it changes the transcript
+  cache key.
+- Leave `EARMARK_ASR_COMPUTE_TYPE` out of `.env` to get `float16`. A line there overrides it.
+- `docker compose run --rm worker doctor` checks the CUDA device and `float16` in the
+  worker. The `api` container uses the CPU image.
+- `hf_xet` writes its own logs under `$HF_HOME/xet/logs/`, and Hugging Face telemetry is off
+  by default (section 17).
 
-  ```bash
-  EARMARK_ASR_BACKEND=remote
-  EARMARK_ASR_BASE_URL=http://asr:8000/v1
-  EARMARK_ASR_MODEL=openai/whisper-large-v3-turbo
-  EARMARK_ASR_API_KEY=<a random string>
-  ```
+### 7.2 Without a GPU
 
-  `EARMARK_ASR_MODEL` is also the model vLLM serves. Optionally set
-  `ASR_GPU_MEMORY_UTILIZATION`; GPU memory is shared with any LLM you run.
-- Then `docker compose --profile gpu up -d`. It needs the NVIDIA Container Toolkit, which
-  DGX OS ships.
-- The `asr` service is NVIDIA's vLLM container, pinned by digest to the `26.10-py3` tag.
-  Bump it by hand. It publishes no port: only the worker reaches it, over the compose
-  network.
-- The audio limits are raised to 1024 MB, 14400 s, and 4 GiB, so episodes up to about four
-  hours decode. Set `EARMARK_ASR_MAX_UPLOAD_MB=1024` so a larger file fails before upload.
-- Until vLLM has loaded the model, the worker's first transcription fails transiently and
-  is retried with backoff.
-- The image ships an ffmpeg build. Whether it decodes M4A is unverified.
-- For a server on another host, see [docs/asr.md](asr.md).
+Use the CPU image, or the `remote` backend ([docs/asr.md](asr.md)) for a server elsewhere.
+On such a host, `gpus: all` must be taken out of the worker. That is one line, and step 27
+covers it fully. The worker with `EARMARK_ASR_DEVICE=cuda` and no GPU refuses to start.
 
-### 7c. faster-whisper on the GPU inside the worker (advanced, an unverified outline)
+### 7.3 The Spark smoke test
 
-Nothing here was built. Upstream's CUDA 13 support issue (OpenNMT/CTranslate2#1933) is
-open.
+Run this in the checkout on the Spark, with a `.env` from `.env.example`. It is the only
+real check of the GPU path. Until it has passed, nothing here says the GPU image builds,
+sees the GB10, or transcribes.
 
-- Build CTranslate2 4.9.0 (the locked version) from source in an
-  `nvidia/cuda:13.x-cudnn-devel-ubuntu24.04` image, with `-DWITH_CUDA=ON -DWITH_CUDNN=ON
-  -DWITH_MKL=OFF -DOPENMP_RUNTIME=COMP -DCMAKE_CUDA_ARCHITECTURES=121`.
-- Build its Python wheel for Python 3.13 with `CTRANSLATE2_ROOT` set.
-- Install it over the locked wheel with `uv pip install --no-deps --reinstall`.
-- Run on a CUDA 13 cuDNN runtime image, with `LD_LIBRARY_PATH` set.
-- Run the venv's `earmark` directly, never `uv run`, which would sync the PyPI wheel back.
-- Set `EARMARK_ASR_DEVICE=cuda`. The worker refuses to start if CTranslate2 sees no CUDA
-  device. Verify with:
+<!-- gpu-smoke:begin -->
+```bash
+# 0. The host
+nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader  # NVIDIA GB10, 12.1, ...
+docker compose version                                                      # 2.30 or later
 
-  ```python
-  import ctranslate2
+# 1. Build. The log shows "-- CUDA architectures: 121". It takes a long time (unmeasured).
+docker compose build worker
 
-  print(ctranslate2.get_cuda_device_count(), ctranslate2.get_supported_compute_types("cuda"))
-  ```
+# 2. The CUDA build is the one in the venv, and the image has no uv that could undo it
+docker compose run --rm --no-deps --entrypoint python worker -c \
+  "import ctranslate2; print(ctranslate2.__version__, ctranslate2.__file__); print(ctranslate2.get_cuda_device_count(), sorted(ctranslate2.get_supported_compute_types('cuda')))"
+#    expect: 4.9.0 /app/.venv/lib/python3.13/site-packages/ctranslate2/__init__.py
+#            1 [..., 'float16', ...]
+docker compose run --rm --no-deps --entrypoint sh worker -c 'command -v uv || echo "no uv"'
+#    expect: no uv
+
+# 3. Doctor
+docker compose run --rm worker doctor
+#    expect: asr ok "faster_whisper, model large-v3, device cuda, compute float16"
+#            asr cuda ok "1 CUDA device, float16 supported"
+
+# 4. A short public clip on cuda (JFK, 1961, public domain; the slow tests' clip)
+curl -fsSLo jfk.flac https://raw.githubusercontent.com/SYSTRAN/faster-whisper/65882eee9f5cdbeeb2d877f1131d48cf241b327d/tests/data/jfk.flac
+echo "63a4b1e4c1dc655ac70961ffbf518acd249df237e5a0152faae9a4a836949715  jfk.flac" | sha256sum -c
+docker compose run --rm --no-deps -v "$PWD/jfk.flac:/tmp/jfk.flac:ro" worker transcribe /tmp/jfk.flac
+#    expect on stderr: loaded Whisper model 'large-v3' in ... s on cuda (float16)
+#    then the text: "And so my fellow Americans, ask not what your country can do for you ..."
+#    optional: add -e EARMARK_ASR_BATCH_SIZE=8 and compare the "x real time" figure
+```
+<!-- gpu-smoke:end -->
+
+Step 2's device count proves only that CUDA and the device are visible. Step 4 proves the
+build, because a wrong architecture fails there. Record the result, the build time and the
+image size (`docker image ls earmark:gpu`). Step 27's runbook carries them on.
+
+### 7.4 If the smoke test fails
+
+| Symptom | Remedy |
+|---|---|
+| The CTranslate2 compile or the bindings build fails, or the build-time check fails | `docker compose build --build-arg CT2_VERSION=v4.6.0 worker`, then step 2 again, expecting `4.6.0`. 4.6.0 builds the common architectures and the GB10 JIT-compiles the PTX on the first load, which is slow. `CUDA_CACHE_PATH=/data/cuda-cache` in `.env` keeps the JIT cache on the volume. Report the error: 4.9.0 is the first native-CMake release. |
+| `get_cuda_device_count()` prints 0, or the worker exits with "sees no CUDA device" | A host problem. Run `docker compose run --rm --no-deps --entrypoint nvidia-smi worker`. Check the NVIDIA Container Toolkit, and "nvml error: driver not loaded" after a kernel update. |
+| "no kernel image is available for execution on the device" at load or transcription | Wrong architecture. Check the build log's `CUDA architectures` line and the `CUDA_ARCH` build argument, or fall back to `v4.6.0`. |
+| `float16` missing from the list, or doctor's `asr cuda` fails | Report it. Set `EARMARK_ASR_COMPUTE_TYPE` to a listed type meanwhile. |
+| "Error 804: forward compatibility was attempted on non supported HW" | The base's `cuda-compat-12-9` is being used. Add `apt-get purge -y cuda-compat-12-9` to the runtime stage, as upstream CTranslate2's Dockerfile does, and report it. |
+| Compose rejects `gpus` | Compose older than 2.30. Upgrade the Docker Compose plugin. |
 
 ## 8. Analysis
 Analysis was removed in step 22; earmark now only transcribes. Step 27 rewrites this guide.
@@ -449,7 +480,7 @@ The weekly digest was removed in step 22. Step 27 rewrites this guide.
 ## 17. Hugging Face telemetry and logs
 
 **Off by default.** Every shipped way of running earmark sets `HF_HUB_DISABLE_TELEMETRY=1`:
-the image, the `api`, `worker`, and `asr` compose services, and the three systemd services.
+both images, the `api` and `worker` compose services, and the systemd services.
 
 **What that stops.** `hf_xet`'s download summary to the Xet CAS server, and
 `huggingface_hub`'s daily `/api/agent-harnesses` fetch and User-Agent extras. It was tested
@@ -473,6 +504,3 @@ embedding model), do not get the unit's environment. Prefix them with
 container). hf_xet prunes them at 250 MB or 14 days. They hold hosts and request ids but no
 URL paths. Earmark leaves them there. `HF_XET_LOG_DEST` (a directory ending in `/`, or a
 file) moves them, and an empty value is ignored.
-
-**The `asr` container.** The variable covers its Hugging Face downloads. vLLM has its own
-usage-statistics setting; see its documentation.

@@ -14,7 +14,7 @@ import types
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Protocol, Self
+from typing import Final, Literal, Protocol, Self, cast
 
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
@@ -52,6 +52,7 @@ NOT_FOUND_ERRORS: Final = frozenset(
 DECODE_ERROR_NAMES: Final = ("InvalidDataError", "EOFError")  # attributes of av.error
 LANGUAGE_ERROR_MARK: Final = "not a valid language code"
 NO_AUDIO_STREAM: Final = "no audio stream"
+FLOAT16: Final = "float16"
 
 type Monotonic = Callable[[], float]
 
@@ -82,6 +83,44 @@ class WhisperModelLike(Protocol):
     ) -> tuple[Iterable[SegmentLike], InfoLike]: ...
 
 
+class BatchedPipelineLike(Protocol):
+    def transcribe(
+        self,
+        audio: object,
+        /,
+        *,
+        language: str | None,
+        beam_size: int,
+        vad_filter: bool,
+        batch_size: int,
+    ) -> tuple[Iterable[SegmentLike], InfoLike]: ...
+
+
+class BatchedWhisper:
+    """A WhisperModelLike over faster-whisper's BatchedInferencePipeline, fixed batch size."""
+
+    def __init__(self, pipeline: object, whisper: object, batch_size: int) -> None:
+        self._pipeline = cast(BatchedPipelineLike, pipeline)
+        self._whisper = whisper
+        self._batch_size = batch_size
+
+    @property
+    def model(self) -> object:
+        """The CTranslate2 model, read by the load log."""
+        return getattr(self._whisper, "model", None)
+
+    def transcribe(
+        self, audio: object, /, *, language: str | None, beam_size: int, vad_filter: bool
+    ) -> tuple[Iterable[SegmentLike], InfoLike]:
+        return self._pipeline.transcribe(
+            audio,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            batch_size=self._batch_size,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WhisperOptions:
     model: str
@@ -89,6 +128,7 @@ class WhisperOptions:
     compute_type: str
     language: str | None
     model_dir: Path | None
+    batch_size: int = 0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
@@ -98,6 +138,7 @@ class WhisperOptions:
             compute_type=settings.asr_compute_type,
             language=settings.asr_language,
             model_dir=settings.asr_model_dir,
+            batch_size=settings.asr_batch_size,
         )
 
 
@@ -112,6 +153,7 @@ class WhisperRuntime:
     load_model: Callable[[WhisperOptions], WhisperModelLike]
     decode_audio: Callable[[Path], DecodedAudio]
     cuda_device_count: Callable[[], int]
+    supported_compute_types: Callable[[str], frozenset[str]]
 
 
 def _missing(detail: str) -> MissingExtraError:
@@ -146,13 +188,16 @@ def load_runtime() -> WhisperRuntime:
     )
 
     def load_model(options: WhisperOptions) -> WhisperModelLike:
-        model: WhisperModelLike = fw.WhisperModel(
+        whisper = fw.WhisperModel(
             options.model,
             device=options.device,
             compute_type=options.compute_type,
             download_root=None if options.model_dir is None else str(options.model_dir),
         )
-        return model
+        if options.batch_size > 0:
+            pipeline = fw.BatchedInferencePipeline(model=whisper)
+            return BatchedWhisper(pipeline, whisper, options.batch_size)
+        return cast(WhisperModelLike, whisper)
 
     def decode_audio(path: Path) -> DecodedAudio:
         try:
@@ -168,7 +213,10 @@ def load_runtime() -> WhisperRuntime:
     def cuda_device_count() -> int:
         return int(ct2.get_cuda_device_count())
 
-    return WhisperRuntime(load_model, decode_audio, cuda_device_count)
+    def supported_compute_types(device: str) -> frozenset[str]:
+        return frozenset(str(t) for t in ct2.get_supported_compute_types(device))
+
+    return WhisperRuntime(load_model, decode_audio, cuda_device_count, supported_compute_types)
 
 
 def _audio_streams(av: types.ModuleType, path: Path) -> int | None:
@@ -185,11 +233,32 @@ def check_device(options: WhisperOptions, runtime: WhisperRuntime) -> None:
     if options.device == "cuda" and runtime.cuda_device_count() == 0:
         raise ConfigError(
             [
-                "EARMARK_ASR_DEVICE: 'cuda' was requested but CTranslate2 sees no CUDA device "
-                "(the PyPI wheels for linux/aarch64 are CPU-only); use 'auto' or 'cpu', "
-                "or EARMARK_ASR_BACKEND=remote"
+                "EARMARK_ASR_DEVICE: 'cuda' was requested but CTranslate2 sees no CUDA device. "
+                "The PyPI wheels for linux/aarch64 are CPU-only: run the GPU image "
+                "(Dockerfile.gpu) with GPU access (compose `gpus: all`, or "
+                "`docker run --gpus all`), or use 'auto' or 'cpu', or "
+                "EARMARK_ASR_BACKEND=remote"
             ]
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CudaReport:
+    device_count: int
+    compute_types: frozenset[str] | None  # None: no device, or the query raised
+    error: str | None  # the exception's type name when the query raised
+
+
+def cuda_report(runtime: WhisperRuntime) -> CudaReport:
+    """The CUDA device count and its compute types. Loads no model, makes no network call."""
+    count = runtime.cuda_device_count()
+    if count <= 0:
+        return CudaReport(count, None, None)
+    try:
+        types_ = runtime.supported_compute_types("cuda")
+    except Exception as exc:  # noqa: BLE001 - any CTranslate2 failure is reported by type name
+        return CudaReport(count, None, type(exc).__name__)
+    return CudaReport(count, types_, None)
 
 
 type WhisperCacheStatus = Literal["local", "cached", "missing"]
@@ -267,17 +336,17 @@ class FasterWhisperEngine:
     @property
     def profile(self) -> str:
         o = self._options
-        return asr_profile(
-            "faster_whisper",
-            {
-                "model": o.model,
-                "device": o.device,
-                "compute_type": o.compute_type,
-                "language": o.language,
-                "beam_size": BEAM_SIZE,
-                "vad_filter": VAD_FILTER,
-            },
-        )
+        fields: dict[str, str | int | bool | None] = {
+            "model": o.model,
+            "device": o.device,
+            "compute_type": o.compute_type,
+            "language": o.language,
+            "beam_size": BEAM_SIZE,
+            "vad_filter": VAD_FILTER,
+        }
+        if o.batch_size > 0:
+            fields["batch_size"] = o.batch_size
+        return asr_profile("faster_whisper", fields)
 
     @property
     def options(self) -> WhisperOptions:
@@ -292,12 +361,21 @@ class FasterWhisperEngine:
             if self._model is not None:
                 return self._model
             o = self._options
-            logger.info(
-                "loading Whisper model %r (device %s, compute type %s)",
-                o.model,
-                o.device,
-                o.compute_type,
-            )
+            if o.batch_size > 0:
+                logger.info(
+                    "loading Whisper model %r (device %s, compute type %s, batch size %d)",
+                    o.model,
+                    o.device,
+                    o.compute_type,
+                    o.batch_size,
+                )
+            else:
+                logger.info(
+                    "loading Whisper model %r (device %s, compute type %s)",
+                    o.model,
+                    o.device,
+                    o.compute_type,
+                )
             started = self._monotonic()
             try:
                 model = self._runtime.load_model(o)

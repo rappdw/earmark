@@ -43,7 +43,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 23 | Re-scope II: architecture and CLAUDE.md | 22 | done |
 | 24 | Transcription requests: audio upload or URL, destination, instructions | 23 | done |
 | 25 | Delivery: the transcript note and the email | 24 | done |
-| 26 | GPU transcription inside the image | 25 | todo |
+| 26 | GPU transcription inside the image | 25 | done |
 | 27 | Docs, runbook and Shortcut for the transcription service | 26 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline

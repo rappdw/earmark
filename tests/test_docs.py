@@ -223,7 +223,31 @@ def test_deploy_doc_states_test_status() -> None:
     flat = head.lower().replace("`", "")
     assert "build-tested in ci" in flat
     assert "not run-tested" in flat
-    assert "gpu profile is untested" in flat
+    assert "gpu image is untested" in flat
+    assert "only real check" in flat
+
+
+def test_deploy_doc_gpu_smoke() -> None:
+    smoke = between_markers(read_doc("docs/deploy.md"), "gpu-smoke")
+    for needle in (
+        "docker compose build worker",
+        "get_cuda_device_count",
+        "ctranslate2.__file__",
+        "command -v uv",
+        "worker doctor",
+        "transcribe",
+        "float16",
+        "63a4b1e4c1dc655ac70961ffbf518acd249df237e5a0152faae9a4a836949715",
+    ):
+        assert needle in smoke, needle
+    assert "the only real check" in read_doc("docs/deploy.md").lower()
+    assert "CT2_VERSION=v4.6.0" in read_doc("docs/deploy.md")
+
+
+def test_deploy_doc_has_no_gpu_profile() -> None:
+    text = read_doc("docs/deploy.md")
+    for banned in ("--profile gpu", "COMPOSE_PROFILES", "ASR_GPU_MEMORY_UTILIZATION"):
+        assert banned not in text, banned
 
 
 def test_deploy_doc_reachability() -> None:

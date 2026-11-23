@@ -14,45 +14,29 @@ import yaml
 
 from earmark.config import SMTP_TIMEOUT_MAX_S, WORKER_STOP_MARGIN_S, Settings, env_var
 from tests.doc_helpers import ROOT, read_doc
+from tests.dockerfile_helpers import (
+    PINNED_IMAGE,
+    external_froms,
+    froms,
+    instructions,
+    runtime_stage_lines,
+)
 
 DOCKERFILE = (ROOT / "Dockerfile").read_text()
-PINNED_IMAGE = re.compile(r"^[^\s@]+:[^\s@]+@sha256:[0-9a-f]{64}$")
 ALLOWED_CONTEXT = {"pyproject.toml", "uv.lock", ".python-version", "README.md", "src/"}
 UNITS = {"api": "earmark-api.service", "worker": "earmark-worker.service"}
 
 
-def _logical_lines(text: str) -> list[str]:
-    """Dockerfile instructions with comments dropped and continuations joined."""
-    joined: list[str] = []
-    pending = ""
-    for raw in text.splitlines():
-        if raw.strip().startswith("#"):
-            continue
-        if raw.rstrip().endswith("\\"):
-            pending += raw.rstrip()[:-1] + " "
-            continue
-        joined.append((pending + raw).strip())
-        pending = ""
-    return [line for line in joined if line]
-
-
 def _instructions(name: str) -> list[str]:
-    return [line for line in _logical_lines(DOCKERFILE) if line.split()[0].upper() == name]
+    return instructions(DOCKERFILE, name)
 
 
 def _froms() -> list[tuple[str, str | None]]:
-    result: list[tuple[str, str | None]] = []
-    for line in _instructions("FROM"):
-        words = line.split()
-        stage = words[words.index("AS") + 1] if "AS" in words else None
-        image = next(w for w in words[1:] if not w.startswith("--"))
-        result.append((image, stage))
-    return result
+    return froms(DOCKERFILE)
 
 
 def _external_froms() -> list[str]:
-    stages = {s for _, s in _froms() if s}
-    return [image for image, _ in _froms() if image not in stages]
+    return external_froms(DOCKERFILE)
 
 
 def _pyproject() -> dict[str, Any]:
@@ -108,62 +92,65 @@ def test_dockerfile_default_extras_exist() -> None:
     assert set(default.split()) <= set(extras)
 
 
-def test_dockerfile_runtime_user_not_root() -> None:
-    assert _froms()[-1][1] == "runtime"
-    users = _instructions("USER")
+DOCKERFILES = {
+    "Dockerfile": DOCKERFILE,
+    "Dockerfile.gpu": (ROOT / "Dockerfile.gpu").read_text(),
+}
+BOTH = pytest.mark.parametrize("text", list(DOCKERFILES.values()), ids=list(DOCKERFILES))
+
+
+@BOTH
+def test_dockerfile_runtime_user_not_root(text: str) -> None:
+    assert froms(text)[-1][1] == "runtime"
+    users = instructions(text, "USER")
     assert users
     last = users[-1].split()[1]
     assert last.startswith("earmark")
     assert last not in {"root", "0"}
-    assert 'test "$UID" -ne 0' in DOCKERFILE
-    assert 'test "$GID" -ne 0' in DOCKERFILE
+    assert 'test "$UID" -ne 0' in text
+    assert 'test "$GID" -ne 0' in text
 
 
-def test_dockerfile_entrypoint() -> None:
-    assert _instructions("ENTRYPOINT") == ['ENTRYPOINT ["earmark"]']
-    assert _instructions("CMD") == ['CMD ["serve"]']
+@BOTH
+def test_dockerfile_entrypoint(text: str) -> None:
+    assert instructions(text, "ENTRYPOINT") == ['ENTRYPOINT ["earmark"]']
+    assert instructions(text, "CMD") == ['CMD ["serve"]']
 
 
-def test_dockerfile_no_volume_or_healthcheck() -> None:
-    assert _instructions("VOLUME") == []
-    assert _instructions("HEALTHCHECK") == []
+@BOTH
+def test_dockerfile_no_volume_or_healthcheck(text: str) -> None:
+    assert instructions(text, "VOLUME") == []
+    assert instructions(text, "HEALTHCHECK") == []
 
 
-def test_dockerfile_installs_ca_certificates() -> None:
-    assert "ca-certificates" in DOCKERFILE
+@BOTH
+def test_dockerfile_installs_ca_certificates(text: str) -> None:
+    assert "ca-certificates" in text
 
 
-def test_dockerfile_environment() -> None:
-    env = " ".join(_instructions("ENV"))
+@BOTH
+def test_dockerfile_environment(text: str) -> None:
+    runtime = runtime_stage_lines(text)
+    env = " ".join(line for line in runtime if line.split()[0].upper() == "ENV")
     for expected in (
         "EARMARK_HOST=0.0.0.0",
         "EARMARK_DATA_DIR=/data",
         "HF_HOME=/data/huggingface",
     ):
         assert expected in env
-    runtime_env = " ".join(
-        line for line in _runtime_stage_lines() if line.split()[0].upper() == "ENV"
-    )
-    assert set(re.findall(r"\b(EARMARK_[A-Z_]+)=", runtime_env)) == {
-        "EARMARK_HOST",
-        "EARMARK_DATA_DIR",
-    }
+    assert set(re.findall(r"\b(EARMARK_[A-Z_]+)=", env)) == {"EARMARK_HOST", "EARMARK_DATA_DIR"}
 
 
-def test_dockerfile_runtime_dirs() -> None:
-    runs = [line for line in _runtime_stage_lines() if line.split()[0].upper() == "RUN"]
+@BOTH
+def test_dockerfile_runtime_dirs(text: str) -> None:
+    runs = [line for line in runtime_stage_lines(text) if line.split()[0].upper() == "RUN"]
     [run] = [line for line in runs if "install -d" in line]
     assert run.endswith("install -d -o earmark -g earmark -m 0750 /data")
 
 
-def _runtime_stage_lines() -> list[str]:
-    lines = _logical_lines(DOCKERFILE)
-    last_from = max(i for i, line in enumerate(lines) if line.split()[0].upper() == "FROM")
-    return lines[last_from:]
-
-
-def test_dockerfile_disables_hf_telemetry() -> None:
-    env = " ".join(line for line in _runtime_stage_lines() if line.split()[0].upper() == "ENV")
+@BOTH
+def test_dockerfile_disables_hf_telemetry(text: str) -> None:
+    env = " ".join(line for line in runtime_stage_lines(text) if line.split()[0].upper() == "ENV")
     assert "HF_HUB_DISABLE_TELEMETRY=1" in env.split()
 
 
@@ -181,8 +168,9 @@ def test_dockerignore_is_allow_list() -> None:
     assert {r[1:] for r in rules if r.startswith("!")} == ALLOWED_CONTEXT
 
 
-def test_dockerfile_copies_only_allowed_paths() -> None:
-    copies = [c for c in _instructions("COPY") if "--from" not in c]
+@BOTH
+def test_dockerfile_copies_only_allowed_paths(text: str) -> None:
+    copies = [c for c in instructions(text, "COPY") if "--from" not in c]
     assert copies
     for line in copies:
         *sources, destination = line.split()[1:]
@@ -201,48 +189,62 @@ SERVICES: dict[str, dict[str, Any]] = COMPOSE["services"]
 
 
 def test_compose_services() -> None:
-    assert set(SERVICES) == {"api", "worker", "asr"}
-    assert SERVICES["api"]["command"] == ["serve"]
-    assert SERVICES["worker"]["command"] == ["worker"]
-    assert SERVICES["api"]["image"] == SERVICES["worker"]["image"]
-    assert SERVICES["api"]["build"] == SERVICES["worker"]["build"]
+    assert set(SERVICES) == {"api", "worker"}
+    api, worker = SERVICES["api"], SERVICES["worker"]
+    assert api["command"] == ["serve"]
+    assert worker["command"] == ["worker"]
+    assert api["image"] == "earmark:local"
+    assert worker["image"] == "earmark:gpu"
+    assert api["build"]["context"] == "." == worker["build"]["context"]
+    assert "dockerfile" not in api["build"]
+    assert worker["build"]["dockerfile"] == "Dockerfile.gpu"
+    assert (ROOT / "Dockerfile.gpu").is_file()
+    assert set(api["build"]["args"]) == {"EXTRAS", "UID", "GID"}
+    assert set(worker["build"]["args"]) == {"UID", "GID"}
+    for arg in ("UID", "GID"):
+        assert api["build"]["args"][arg] == worker["build"]["args"][arg]
 
 
 def test_compose_api_publishes_loopback_by_default() -> None:
     assert SERVICES["api"]["ports"] == ["${API_BIND:-127.0.0.1:8787}:8787"]
 
 
-def test_compose_worker_and_asr_publish_nothing() -> None:
+def test_compose_worker_publishes_nothing() -> None:
     assert "ports" not in SERVICES["worker"]
-    assert "ports" not in SERVICES["asr"]
     assert "0.0.0.0:" not in COMPOSE_TEXT
 
 
 def test_compose_shared_data() -> None:
     for name in ("api", "worker"):
         assert SERVICES[name]["volumes"] == ["data:/data"]
-    assert set(COMPOSE["volumes"]) == {"data", "asr-models"}
+    assert set(COMPOSE["volumes"]) == {"data"}
 
 
 def test_compose_builds_transcribe_extra() -> None:
     assert SERVICES["api"]["build"]["args"]["EXTRAS"] == "${EXTRAS:-transcribe}"
+    assert "EXTRAS" not in SERVICES["worker"]["build"]["args"]  # Dockerfile.gpu always has it
 
 
 def test_compose_forces_container_paths() -> None:
+    shared = {
+        "EARMARK_DATA_DIR",
+        "EARMARK_HOST",
+        "EARMARK_PORT",
+        "EARMARK_ASR_MODEL_DIR",
+        "HF_HUB_DISABLE_TELEMETRY",
+    }
+    worker_only = {"EARMARK_ASR_DEVICE", "EARMARK_ASR_COMPUTE_TYPE"}
     for name in ("api", "worker"):
         environment = SERVICES[name]["environment"]
-        assert set(environment) == {
-            "EARMARK_DATA_DIR",
-            "EARMARK_HOST",
-            "EARMARK_PORT",
-            "EARMARK_ASR_MODEL_DIR",
-            "HF_HUB_DISABLE_TELEMETRY",
-        }
+        assert set(environment) == shared | (worker_only if name == "worker" else set())
         assert environment["EARMARK_DATA_DIR"] == "/data"
         assert environment["EARMARK_HOST"] == "0.0.0.0"  # noqa: S104 - the in-container bind
         assert environment["EARMARK_PORT"] == "8787"
         assert environment["EARMARK_ASR_MODEL_DIR"] == ""
         assert SERVICES[name]["env_file"] == ".env"
+    worker_env = SERVICES["worker"]["environment"]
+    assert worker_env["EARMARK_ASR_DEVICE"] == "cuda"
+    assert worker_env["EARMARK_ASR_COMPUTE_TYPE"] == "${EARMARK_ASR_COMPUTE_TYPE:-float16}"
 
 
 def test_compose_worker_stop_grace() -> None:
@@ -280,19 +282,16 @@ def test_compose_hardening() -> None:
         assert service.get("ipc") != "host", name
 
 
-def test_compose_gpu_profile() -> None:
-    asr = SERVICES["asr"]
-    assert asr["profiles"] == ["gpu"]
-    assert PINNED_IMAGE.match(asr["image"])
-    [device] = asr["deploy"]["resources"]["reservations"]["devices"]
-    assert device["driver"] == "nvidia"
-    assert "gpu" in device["capabilities"]
-    environment = asr["environment"]
-    assert environment["VLLM_API_KEY"] == "${EARMARK_ASR_API_KEY:-}"
-    assert int(environment["VLLM_MAX_AUDIO_CLIP_FILESIZE_MB"]) > 25
-    assert int(environment["VLLM_MAX_AUDIO_DECODE_DURATION_S"]) > 600
-    assert int(environment["VLLM_MAX_AUDIO_DECODE_BYTES"]) > 268435456
-    assert [n for n, s in SERVICES.items() if "profiles" in s] == ["asr"]
+def test_compose_worker_gpu() -> None:
+    assert SERVICES["worker"]["gpus"] == "all"
+    assert "gpus" not in SERVICES["api"]
+    for name, service in SERVICES.items():
+        for key in ("profiles", "deploy", "runtime"):
+            assert key not in service, (name, key)
+    assert "asr" not in SERVICES
+    lowered = COMPOSE_TEXT.lower()
+    for banned in ("vllm", "asr-models", "profiles"):
+        assert banned not in lowered, banned
 
 
 def test_compose_earmark_variables_are_settings() -> None:
@@ -317,7 +316,6 @@ def test_compose_only_variables_documented() -> None:
         "APP_UID",
         "APP_GID",
         "EXTRAS",
-        "ASR_GPU_MEMORY_UTILIZATION",
         "HF_HUB_DISABLE_TELEMETRY",
     }
     deploy = read_doc("docs/deploy.md")
@@ -327,7 +325,7 @@ def test_compose_only_variables_documented() -> None:
         assert re.search(rf"^# {name}=", example, re.MULTILINE), name
 
 
-@pytest.mark.parametrize("name", ["api", "worker", "asr"])
+@pytest.mark.parametrize("name", ["api", "worker"])
 def test_compose_disables_hf_telemetry(name: str) -> None:
     value = SERVICES[name]["environment"]["HF_HUB_DISABLE_TELEMETRY"]
     assert value == "${HF_HUB_DISABLE_TELEMETRY:-1}"
@@ -411,6 +409,7 @@ def test_proxy_token_stays_out_of_earmark() -> None:
         ROOT / ".env.example",
         ROOT / "compose.yaml",
         ROOT / "Dockerfile",
+        ROOT / "Dockerfile.gpu",
         *sorted((ROOT / "deploy" / "systemd").glob("*.service")),
         *sorted((ROOT / "src" / "earmark").rglob("*.py")),
     ]
@@ -444,6 +443,7 @@ def test_systemd_services_disable_hf_telemetry(path: Path) -> None:
 def test_deploy_files_leave_xet_logs_alone() -> None:
     files = [
         ROOT / "Dockerfile",
+        ROOT / "Dockerfile.gpu",
         ROOT / "compose.yaml",
         *sorted((ROOT / "deploy" / "systemd").glob("*")),
     ]
@@ -451,3 +451,33 @@ def test_deploy_files_leave_xet_logs_alone() -> None:
         text = path.read_text()
         for name in ("HF_XET_LOG_DEST", "RUST_LOG"):
             assert name not in text, (path.name, name)
+
+
+# --- the GPU image (step 26) --------------------------------------------------------------
+
+
+def test_env_example_leaves_compute_type_to_compose() -> None:
+    example = (ROOT / ".env.example").read_text()
+    assert re.search(r"^EARMARK_ASR_COMPUTE_TYPE=", example, re.MULTILINE) is None
+    assert "ASR_GPU_MEMORY_UTILIZATION" not in example
+
+
+def _uv_run_without_no_sync(command: str) -> bool:
+    return bool(re.search(r"\buv\s+run\b", command)) and "--no-sync" not in command
+
+
+def test_deploy_runtime_never_syncs() -> None:
+    commands: list[str] = []
+    for text in DOCKERFILES.values():
+        for name in ("ENTRYPOINT", "CMD"):
+            commands += instructions(text, name)
+    for service in SERVICES.values():
+        for key in ("command", "entrypoint", "healthcheck"):
+            if key in service:
+                commands.append(str(service[key]))
+    for path in SERVICE_FILES:
+        commands += _parse_unit(path)["Service"]["ExecStart"]
+    assert commands
+    for command in commands:
+        assert not re.search(r"\buv\s+sync\b", command), command
+        assert not _uv_run_without_no_sync(command), command

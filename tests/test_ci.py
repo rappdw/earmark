@@ -492,7 +492,7 @@ def test_container_workflow_job() -> None:
     assert type(timeout) is int
     assert 1 <= timeout <= 30
     steps = _steps(job)
-    assert [_action(s) for s in steps] == [CHECKOUT, "", "", ""]
+    assert [_action(s) for s in steps] == [CHECKOUT, "", "", "", ""]
     assert _job_remote_uses(job) == _remote_uses(_ci())[:1]
     [checkout] = [s for s in steps if _action(s) == CHECKOUT]
     assert checkout["with"] == _ci_step(CHECKOUT)["with"]
@@ -522,8 +522,10 @@ def test_container_workflow_checks_image() -> None:
 def test_container_workflow_validates_compose() -> None:
     runs = "\n".join(_container_runs())
     assert "docker compose config" in runs
-    assert "docker compose --profile gpu config" in runs
+    assert "--profile" not in runs
     assert "cp .env.example .env" in runs
+    assert "EARMARK_ASR_COMPUTE_TYPE" in runs
+    assert "float16" in runs
 
 
 def test_container_workflow_checks_hf_telemetry() -> None:
@@ -531,6 +533,32 @@ def test_container_workflow_checks_hf_telemetry() -> None:
     assert "--entrypoint printenv earmark:ci HF_HUB_DISABLE_TELEMETRY" in runs
     assert "config --format json" in runs
     assert "HF_HUB_DISABLE_TELEMETRY=0 docker compose" in runs
+
+
+def test_container_workflow_checks_gpu_dockerfile() -> None:
+    runs = _container_runs()
+    assert "docker build --check -f Dockerfile.gpu ." in runs
+    for line in "\n".join(runs).splitlines():
+        if "Dockerfile.gpu" in line:
+            assert line.strip() == "docker build --check -f Dockerfile.gpu .", line
+    steps = _steps(_only_job(_container()))
+    names = [s["name"] for s in steps]
+    assert names.index("Check Dockerfile.gpu (not built here)") < names.index("Build the image")
+    assert names.index("Validate compose.yaml") < names.index(
+        "Check Dockerfile.gpu (not built here)"
+    )
+
+
+def test_container_workflow_cpu_build_unchanged() -> None:
+    by_name = {s["name"]: s["run"] for s in _steps(_only_job(_container())) if "run" in s}
+    assert by_name["Build the image"] == "docker build --tag earmark:ci ."
+    assert by_name["Check the image"] == (
+        "docker run --rm earmark:ci --version\n"
+        'docker run --rm --entrypoint python earmark:ci -c "import ctranslate2, faster_whisper"\n'
+        'test "$(docker run --rm --entrypoint id earmark:ci -u)" = 1000\n'
+        'test "$(docker run --rm --entrypoint printenv earmark:ci HF_HUB_DISABLE_TELEMETRY)" = 1\n'
+        "docker image ls earmark:ci\n"
+    )
 
 
 def test_container_workflow_read_only() -> None:

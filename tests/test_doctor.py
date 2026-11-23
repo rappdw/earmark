@@ -17,7 +17,7 @@ from pydantic import SecretStr
 from earmark.config import Settings
 from earmark.db import APPLICATION_ID, MIGRATIONS, SCHEMA_VERSION, open_database
 from earmark.doctor import ONLINE_TIMEOUT_S, Probes, run_doctor
-from earmark.doctor.report import CheckResult, exit_code, render, summary
+from earmark.doctor.report import CheckResult, Status, exit_code, render, summary
 from earmark.fetch import GuardedFetcher
 from earmark.jobs import open_job_store
 from earmark.transcribe.compat import Installed
@@ -232,7 +232,14 @@ def test_doctor_database_corrupt_fails(tmp_path: Path) -> None:
 class WhisperStubs:
     """Stand-ins for faster_whisper, its utils module, and ctranslate2."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, cuda: int = 0) -> None:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        cuda: int = 0,
+        cuda_types: tuple[str, ...] = (),
+        types_error: Exception | None = None,
+    ) -> None:
         self.downloads: list[dict[str, Any]] = []
         self.models_built = 0
         self.behaviour: Any = "/cache/snapshot"
@@ -252,6 +259,13 @@ class WhisperStubs:
         utils.download_model = download_model  # type: ignore[attr-defined]  # stub modules
         fw.WhisperModel = whisper_model  # type: ignore[attr-defined]
         ct2.get_cuda_device_count = lambda: cuda  # type: ignore[attr-defined]
+
+        def supported_compute_types(device: str) -> list[str]:
+            if types_error is not None:
+                raise types_error
+            return list(cuda_types)
+
+        ct2.get_supported_compute_types = supported_compute_types  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "faster_whisper", fw)
         monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
         monkeypatch.setitem(sys.modules, "ctranslate2", ct2)
@@ -305,6 +319,116 @@ def test_doctor_whisper_ok_with_stub_runtime(
     assert unknown.status == "fail"
     assert "EARMARK_ASR_MODEL" in unknown.detail
     assert stubs.models_built == 0
+
+
+CUDA_CASES = [
+    # (device, compute, devices, types, error, status, detail)
+    ("cpu", "auto", 0, (), None, "ok", "no CUDA device (EARMARK_ASR_DEVICE=cpu)"),
+    ("auto", "auto", 0, (), None, "ok", "no CUDA device; transcribing on CPU"),
+    (
+        "cpu",
+        "auto",
+        1,
+        ("float16",),
+        None,
+        "ok",
+        "1 CUDA device, float16 supported; EARMARK_ASR_DEVICE=cpu leaves them unused",
+    ),
+    ("auto", "auto", 2, ("float16", "int8"), None, "ok", "2 CUDA devices, float16 supported"),
+    ("cuda", "float16", 1, ("float16",), None, "ok", "1 CUDA device, float16 supported"),
+    (
+        "cuda",
+        "auto",
+        1,
+        (),
+        ValueError("x"),
+        "fail",
+        "1 CUDA device; CTranslate2 could not list the CUDA compute types (ValueError)",
+    ),
+    (
+        "cpu",
+        "auto",
+        1,
+        (),
+        ValueError("x"),
+        "warn",
+        "1 CUDA device; CTranslate2 could not list the CUDA compute types (ValueError)",
+    ),
+    (
+        "auto",
+        "auto",
+        1,
+        ("int8", "float32"),
+        None,
+        "warn",
+        "1 CUDA device, float16 not supported (CUDA compute types: float32, int8)",
+    ),
+    (
+        "cuda",
+        "float16",
+        1,
+        ("int8", "float32"),
+        None,
+        "fail",
+        "1 CUDA device, float16 not supported (CUDA compute types: float32, int8); "
+        "set EARMARK_ASR_COMPUTE_TYPE to one of them",
+    ),
+    (
+        "cpu",
+        "float16",
+        1,
+        ("int8",),
+        None,
+        "warn",
+        "1 CUDA device, float16 not supported (CUDA compute types: int8)",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("device", "compute", "devices", "types", "error", "status", "detail"), CUDA_CASES
+)
+def test_doctor_asr_cuda(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    compute: str,
+    devices: int,
+    types: tuple[str, ...],
+    error: Exception | None,
+    status: Status,
+    detail: str,
+) -> None:
+    WhisperStubs(monkeypatch, cuda=devices, cuda_types=types, types_error=error)
+    settings = whisper_settings(tmp_path, asr_device=device, asr_compute_type=compute)
+    results = check(settings)
+    if device == "cuda" and devices == 0:
+        pytest.skip("asr fails first")
+    assert results["asr cuda"] == CheckResult("asr cuda", status, detail)
+
+
+def test_doctor_asr_cuda_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    WhisperStubs(monkeypatch)
+    names = [r.name for r in run_doctor(whisper_settings(tmp_path))]
+    start = names.index("asr")
+    assert names[start : start + 4] == ["asr", "asr libraries", "asr model", "asr cuda"]
+
+
+def test_doctor_asr_cuda_absent_when_asr_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WhisperStubs(monkeypatch, cuda=0)
+    results = check(whisper_settings(tmp_path, asr_device="cuda"))
+    assert results["asr"].status == "fail"
+    assert "asr cuda" not in results
+
+
+def test_doctor_asr_detail_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    WhisperStubs(monkeypatch)
+    results = check(whisper_settings(tmp_path, asr_batch_size=8))
+    assert results["asr"].detail == (
+        "faster_whisper, model small, device cpu, compute auto, batch size 8"
+    )
 
 
 def _lookup(fw: str | None, av: str | None) -> Callable[[str], Installed | None]:
