@@ -3,7 +3,8 @@
 How to run the API and the worker on one machine (a DGX Spark in the examples), and how
 the iPhone and the Mac reach the API. The examples use the placeholders `spark` (the
 host), `earmark.example.com` (the name of the API), `192.168.1.10` (the host's address on
-the home network), and `tailnet-name`.
+the home network), `example.org` (your mail domain), `pka-personal@example.net` and
+`pka-work@example.net` (the two destinations), and `tailnet-name`.
 
 For a first setup on a DGX Spark, [docs/runbook-spark.md](runbook-spark.md) walks
 through this guide in order, with a check after each phase.
@@ -16,8 +17,11 @@ through this guide in order, with a check after each phase.
   container, because the build sandbox has no Docker.
 - The GPU image is untested: CI only runs `docker build --check` on `Dockerfile.gpu`, and it
   has never been built or run. The Spark smoke test in section 7 is the only real check.
-- The systemd units and timer are examples, reviewed but never run. The compose command
-  for the weekly digest (section 14) has not run either.
+- The systemd units are examples, reviewed but never run.
+- Email delivery is tested only against an in-process SMTP stub. TLS against your server,
+  DMARC at the recipient, and a PKA reading the attachments are operator checks (runbook
+  phases 5 and 6).
+- The Shortcut has never run on a phone.
 - The reachability setup is not verified by the earmark build. That covers the DNS-only
   Cloudflare record, the WireGuard split tunnel, Caddy with the DNS-01 challenge,
   Tailscale Serve, and ntfy self-hosting, all described from their documentation. Only the
@@ -26,9 +30,9 @@ through this guide in order, with a check after each phase.
 
 ## 2. Overview
 
-- The API and the worker run on one host and share one data directory.
-- The vault folder is on the same host. Whatever you already use to sync the vault to the
-  phone does that; earmark only writes files.
+- The API and the worker run on one host and share one data volume.
+- The worker sends mail through your provider's submission server, and pushes through
+  ntfy.
 - **The API is never exposed publicly.** It listens on `127.0.0.1:8787`, and a reverse
   proxy on the host's LAN interface serves it over HTTPS as `earmark.example.com`. That
   name resolves, through public DNS, to a private address that is reachable only at home
@@ -38,18 +42,25 @@ through this guide in order, with a check after each phase.
 iPhone / Mac ──(home Wi-Fi, or WireGuard split tunnel)──► 192.168.1.10:443
   Caddy (TLS for earmark.example.com) ──► 127.0.0.1:8787 earmark API
 Cloudflare DNS: earmark.example.com A 192.168.1.10 (DNS only, never proxied)
+worker ──(SMTP submission, TLS)──► smtp.example.org ──► PKA mailboxes
 ```
 
 ## 3. Requirements
 
 - aarch64 or x86_64 Linux. The image builds for the host's architecture; CI checks
   arm64.
-- Docker Engine with Compose v2.24 or later, or uv for a native install.
+- Docker Engine with Compose 2.30 or later for the GPU worker (`gpus: all`), or uv for a
+  native, CPU-only install.
 - `EARMARK_DATA_DIR` on a local filesystem. SQLite's write-ahead log needs shared memory,
   so no NFS or SMB. A Docker named volume is fine.
-- A vault folder that exists.
-- Disk: the image is about 1 GB, Whisper `large-v3` about 3 GB, and the embedding model
-  65 MB. The `index` extra adds about 440 MB to the image.
+- A sending mailbox on a domain you control (section 8).
+- Disk:
+  - the CPU image is about 1 GB;
+  - the GPU build pulls a CUDA devel base of about 6 GB compressed;
+  - the runtime base is about 3 GB compressed;
+  - Whisper `large-v3` is about 3 GB.
+
+  The total build footprint was not measured.
 
 ## 4. Install with Docker Compose
 
@@ -63,13 +74,10 @@ Edit `.env`:
 
 - `EARMARK_API_TOKEN`: generate one with
   `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`.
-- `EARMARK_LLM_API_KEY`: your Anthropic key (or point earmark at a local LLM, section 8).
-- `VAULT_PATH`: the vault folder on this host.
-- `APP_UID` and `APP_GID`: the numeric user and group of the vault's owner (`ls -ln` on the
-  vault shows them, and `id -u` and `id -g` show yours).
-- `EARMARK_TZ`: your time zone, such as `Europe/Berlin`. Without it, note dates use the
-  container's zone, UTC.
-- Optionally `EARMARK_OBSIDIAN_VAULT_NAME` and the ntfy settings (section 10).
+- `EARMARK_ALLOWED_RECIPIENTS`: who may receive transcripts (section 9).
+- The `EARMARK_SMTP_*` settings: the sending mailbox (section 8).
+- Optionally the ntfy settings (section 10).
+- `APP_UID` and `APP_GID` are only needed if 1000 is unsuitable.
 
 Then build, check, and start:
 
@@ -80,55 +88,51 @@ docker compose up -d
 docker compose logs -f worker
 ```
 
-[`compose.yaml`](../compose.yaml) defines `api` (`earmark serve`) and `worker`
-(`earmark worker`), which share one image, a named volume `data` at `/data`, and the
-vault as a bind mount at `/vault`.
+[`compose.yaml`](../compose.yaml) defines `api` (`earmark serve`, the CPU image
+`earmark:local`) and `worker` (`earmark worker`, the GPU image `earmark:gpu`, `gpus: all`,
+section 7). Both share the named volume `data` at `/data`.
 
 **Compose-only variables.** These are unprefixed, so earmark itself ignores them. Set them
 in `.env`, which compose also reads.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `VAULT_PATH` | none, required | The vault folder on the host, mounted at `/vault`. |
 | `API_BIND` | `127.0.0.1:8787` | Host address and port the API is published on. Leave it at the default. |
-| `APP_UID` | `1000` | User id the image runs as. Set it to the vault owner's id before building. |
-| `APP_GID` | `1000` | Group id the image runs as. |
-| `EXTRAS` | `transcribe` | Optional extras installed in the API's CPU image. |
+| `APP_UID` | `1000` | User id both images run as; the data volume belongs to it. |
+| `APP_GID` | `1000` | Group id both images run as. |
+| `EXTRAS` | `transcribe` | Optional extras in the CPU image (`api`). `serve` needs none, but a CPU-only worker (7.2) needs `transcribe`. |
 | `HF_HUB_DISABLE_TELEMETRY` | `1` | Hugging Face telemetry in the containers; `0` turns it back on (section 17). Read by Hugging Face's libraries, not by earmark. |
 
 Things to know:
 
-- **What compose overrides.** It forces the in-container values of `EARMARK_DATA_DIR`,
-  `EARMARK_VAULT_DIR`, `EARMARK_HOST`, `EARMARK_PORT`, and the two model directories
-  (empty, so the defaults apply), whatever `.env` says. A `.env` shared with a native
-  install keeps working.
-- **Data and models live in the `data` volume**: the database, the episodes, the index,
-  and the downloaded models (`/data/huggingface`, `/data/models/embed`). A restart does not
-  download them again.
+- **What compose overrides.** `EARMARK_DATA_DIR`, `EARMARK_HOST`, `EARMARK_PORT` and
+  `EARMARK_ASR_MODEL_DIR` (empty, so the default applies) for both services, whatever
+  `.env` says. For the worker, also `EARMARK_ASR_DEVICE=cuda` (forced) and
+  `EARMARK_ASR_COMPUTE_TYPE` (default `float16`). A `.env` shared with a native install
+  keeps working.
+- **The data volume** holds the database, the transcript cache, `uploads/`, `downloads/`,
+  `outbox/` (the fake mailer only) and `huggingface/` (the Whisper models). A restart does
+  not download the models again.
 - **Ownership.** The image bakes the user id in at build time, so rebuild after changing
   `APP_UID`. A named volume takes its ownership from the image the first time it is used.
   A volume created under another id needs a one-time fix:
   `docker run --rm -v earmark_data:/data --user 0 --entrypoint chown earmark:local -R 1000:1000 /data`
-  (with your ids). The vault is a bind mount, so its host ownership must let `APP_UID`
-  write. Files earmark creates there belong to that user on the host.
+  (with your ids).
 - **Rootless Docker and `userns-remap` shift user ids.** This guide does not cover them.
-- **Values in `.env` must not contain `$`.** Compose interpolates them.
+- **Values in `.env` must not contain `$`.** Compose interpolates them. **Single-quote a
+  value that has spaces**, such as an app password.
 - **The environment is exported.** Under compose, `env_file` puts every `.env` line into
-  the container's environment. So, unlike a native run, an `ANTHROPIC_API_KEY` line in
-  `.env` is seen by the Anthropic SDK. Prefer `EARMARK_LLM_API_KEY`.
+  both containers' environments, the SMTP password included. The Cloudflare token must
+  never be in this file.
 - **`API_BIND` stays `127.0.0.1:8787`.** The reverse proxy (or `tailscale serve`) runs on
   the host and reaches the API there. Nothing in the default setup binds the API to a
   non-loopback host address: `EARMARK_HOST=0.0.0.0` exists only inside the container's own
   network namespace. Docker's published ports bypass ufw, so never set `API_BIND` to
   `0.0.0.0` or a LAN address. That would serve plain http to the whole LAN and skip the
   proxy's TLS.
-- **Slimmer images.** `EXTRAS=index` with remote ASR, `EXTRAS=transcribe` with
-  `EARMARK_INDEX_BACKEND=none`, or `EXTRAS=` for neither. Selecting a backend whose extra
-  is missing makes the worker refuse to start, with a message that names the extra.
 
-`api` runs the CPU image (`Dockerfile`) and `worker` runs the GPU image (`Dockerfile.gpu`,
-section 7). Both entrypoints are `earmark`, and the default command is `serve`. It runs as a non-root user, has no health check
-of its own (the same image runs the worker; compose checks the API), and reads no `.env` file.
+Both images run as the non-root user `earmark`, have no health check of their own (compose
+checks the API), and contain no `.env` file; compose passes the settings in.
 
 ## 5. Install natively with systemd
 
@@ -137,15 +141,14 @@ of its own (the same image runs the worker; compose checks the API), and reads n
 
    ```bash
    sudo -u earmark env UV_PYTHON_INSTALL_DIR=/srv/earmark/.python \
-     uv sync --locked --no-dev --extra transcribe --extra index
+     uv sync --locked --no-dev --extra transcribe
    ```
 
 3. Create `/srv/earmark/.env` (mode 0600, owned by `earmark`) with the settings from
    section 4, and `EARMARK_HOST=127.0.0.1` and `EARMARK_DATA_DIR=/srv/earmark/data`.
-4. Copy the units from [`deploy/systemd/`](../deploy/systemd/earmark-api.service) to
-   `/etc/systemd/system/`, and edit the vault path in
-   [`earmark-worker.service`](../deploy/systemd/earmark-worker.service)'s
-   `ReadWritePaths=`. Then:
+4. Copy the units from [`deploy/systemd/`](../deploy/systemd/earmark-api.service) and
+   [`earmark-worker.service`](../deploy/systemd/earmark-worker.service) to
+   `/etc/systemd/system/`. Then:
 
    ```bash
    sudo systemctl daemon-reload
@@ -162,6 +165,10 @@ of its own (the same image runs the worker; compose checks the API), and reads n
    ```
 
 Run one worker per host.
+
+A native worker runs on the CPU, because the PyPI CTranslate2 wheel for linux/aarch64 has
+no CUDA. Set `EARMARK_ASR_DEVICE=cpu` and a smaller `EARMARK_ASR_MODEL` such as `small`, or
+use the container for the GPU.
 
 ## 6. Reaching the API from the iPhone and the Mac
 
@@ -290,7 +297,7 @@ A local DNS override for the name is an alternative. Caddy then still needs
   `curl https://earmark.example.com/healthz` prints `{"status":"ok"}`, with a valid
   certificate.
 - From a host outside both, the name resolves but the connection fails. That is correct.
-- The Shortcut URL is `https://earmark.example.com/ingest`
+- The Shortcut URL is `https://earmark.example.com/transcriptions`
   ([docs/shortcut.md](shortcut.md)).
 
 ### 6.2 Tailscale Serve (the shorter alternative)
@@ -299,9 +306,27 @@ A local DNS override for the name is an alternative. Caddy then still needs
   certificates in the admin console.
 - Run `sudo tailscale serve --bg http://127.0.0.1:8787` and check it with
   `tailscale serve status`. The Shortcut URL is then
-  `https://spark.tailnet-name.ts.net/ingest`.
+  `https://spark.tailnet-name.ts.net/transcriptions`.
 - The Tailscale VPN must be on in the phone for the Shortcut to work.
 - **Never use `tailscale funnel`.** It makes the service public.
+
+### 6.3 Uploads through the proxy
+
+The Shortcut uploads audio files, which can be large. From Caddy's documentation
+(2026-11-23; none of it was run here):
+
+- Caddy's defaults set no body size limit and no timeout for reading the request body or
+  writing the response, and its reverse proxy streams the request body to earmark. The
+  example Caddyfile adds nothing that limits uploads.
+- The limit is `EARMARK_MAX_UPLOAD_MB` (default 1024 MiB). earmark answers 413 above it.
+- The API answers only after the whole file has arrived, so a large voice memo on
+  cellular takes as long as the upload does. How long the Shortcut waits is not
+  documented.
+- A Caddy `request_body { max_size … }` lower than the earmark cap would turn big uploads
+  into proxy errors. Do not add one, or keep it at or above `EARMARK_MAX_UPLOAD_MB`.
+- Tailscale Serve's limits are not verified.
+
+Runbook phase 7 checks an upload through the proxy.
 
 ## 7. Transcription on the DGX Spark
 
@@ -333,12 +358,38 @@ Notes:
   worker. The `api` container uses the CPU image.
 - `hf_xet` writes its own logs under `$HF_HOME/xet/logs/`, and Hugging Face telemetry is off
   by default (section 17).
+- Record the build time and the image size; runbook phase 3 asks for them.
 
 ### 7.2 Without a GPU
 
-Use the CPU image, or the `remote` backend ([docs/asr.md](asr.md)) for a server elsewhere.
-On such a host, `gpus: all` must be taken out of the worker. That is one line, and step 27
-covers it fully. The worker with `EARMARK_ASR_DEVICE=cuda` and no GPU refuses to start.
+- **Remote.** The `remote` backend sends the audio to a GPU server elsewhere
+  ([docs/asr.md](asr.md)).
+- **The CPU image.** For a worker on a host without a GPU, create `compose.override.yaml`
+  next to `compose.yaml`. Compose reads it automatically.
+
+<!-- cpu-worker-override -->
+```yaml
+services:
+  worker:
+    image: earmark:local
+    build:
+      dockerfile: Dockerfile
+    gpus: !reset null
+    environment:
+      EARMARK_ASR_DEVICE: cpu
+      EARMARK_ASR_COMPUTE_TYPE: int8
+```
+
+The worker then uses the CPU image (set `EXTRAS` to include `transcribe`, which is the
+default) and `int8` on the CPU. Use a smaller `EARMARK_ASR_MODEL` on a CPU, such as `small`
+or `distil-large-v3`. Without the override, a worker with `EARMARK_ASR_DEVICE=cuda` and no
+GPU refuses to start.
+
+**Check:** `docker compose config` shows the worker with `image: earmark:local` and no
+`gpus`.
+
+This has not been run. `!reset` needs a recent Compose, and the worker's GPU setup already
+needs 2.30.
 
 ### 7.3 The Spark smoke test
 
@@ -380,7 +431,7 @@ docker compose run --rm --no-deps -v "$PWD/jfk.flac:/tmp/jfk.flac:ro" worker tra
 
 Step 2's device count proves only that CUDA and the device are visible. Step 4 proves the
 build, because a wrong architecture fails there. Record the result, the build time and the
-image size (`docker image ls earmark:gpu`). Step 27's runbook carries them on.
+image size (`docker image ls earmark:gpu`). The runbook's phase 3 asks for them.
 
 ### 7.4 If the smoke test fails
 
@@ -393,18 +444,116 @@ image size (`docker image ls earmark:gpu`). Step 27's runbook carries them on.
 | "Error 804: forward compatibility was attempted on non supported HW" | The base's `cuda-compat-12-9` is being used. Add `apt-get purge -y cuda-compat-12-9` to the runtime stage, as upstream CTranslate2's Dockerfile does, and report it. |
 | Compose rejects `gpus` | Compose older than 2.30. Upgrade the Docker Compose plugin. |
 
-## 8. Analysis
-Analysis was removed in step 22; earmark now only transcribes. Step 27 rewrites this guide.
+## 8. Email delivery
 
-## 9. Search
+### 8.1 What earmark sends
 
-- Search needs the `index` extra (about 440 MB).
-- The embedding model (`BAAI/bge-small-en-v1.5`, 65 MB) downloads to
-  `<EARMARK_DATA_DIR>/models/embed` (`/data/models/embed` in compose) on the worker's first
-  index write, or when you run `earmark reindex`.
-- Until then `GET /search` answers 503 and `earmark search` exits 1. The API never
-  downloads models.
-- Changing `EARMARK_EMBED_MODEL` needs `earmark reindex`.
+- One message per job, to the one `to` of the request, from `EARMARK_SMTP_FROM`.
+- Two Markdown attachments: the transcript note (`YYYY-MM-DD-<slug>.md`) and the
+  instructions (`YYYY-MM-DD-<slug>.instructions.md`).
+- A body that earmark generates. It names both files and the job id.
+- The subject is `[earmark] <title>`.
+- Delivery is at-least-once. A resend keeps the `Message-ID` and the job id, and the PKA
+  ignores a duplicate.
+
+The mail contract is in "Delivering" in [docs/ARCHITECTURE.md](ARCHITECTURE.md). It is
+**DRAFT** until you approve the PKA's receiving procedure.
+
+### 8.2 A sending mailbox on your domain
+
+- Create `earmark@example.org` at a provider that offers SMTP submission (587 with
+  STARTTLS, or 465 with TLS) and per-app passwords.
+- Use a dedicated mailbox, not your personal one: the PKAs allowlist this sender.
+
+### 8.3 SPF, DKIM and DMARC
+
+Each PKA's runtime reads attachments only from an allowlisted sender whose mail passes
+DMARC. The provider supplies the exact values. The records have this shape:
+
+- SPF: `example.org TXT "v=spf1 include:<provider's SPF domain> -all"`. Keep one SPF
+  record per domain, merged with any existing one.
+- DKIM: the provider's records at `<selector>._domainkey.example.org`, usually CNAMEs.
+- DMARC: `_dmarc.example.org TXT "v=DMARC1; p=quarantine; rua=mailto:<reports address>"`.
+  Use `p=none` only while testing, and move to `quarantine` or `reject` once a test
+  passes.
+
+earmark uses `EARMARK_SMTP_FROM` as both the `From` header and the envelope sender. DMARC
+passes when the provider signs with a DKIM key for the From domain (DKIM alignment). SPF
+alignment depends on whether the provider uses your domain as the envelope sender, and many
+rewrite it, so rely on DKIM. This is general knowledge about email, not something the
+earmark build tested.
+
+**Check:** `dig +short TXT example.org`, `dig +short TXT _dmarc.example.org` and
+`dig +short CNAME <selector>._domainkey.example.org` show the records. Then, after a real
+send (runbook phase 5), the received message's `Authentication-Results` header shows
+`dkim=pass` with `header.d=example.org` and `dmarc=pass`.
+
+### 8.4 The app password and the settings
+
+```bash
+EARMARK_MAIL_BACKEND=smtp
+EARMARK_SMTP_HOST=smtp.example.org
+EARMARK_SMTP_SECURITY=starttls
+EARMARK_SMTP_USERNAME=earmark@example.org
+EARMARK_SMTP_PASSWORD='<app password>'
+EARMARK_SMTP_FROM=earmark@example.org
+```
+
+- `EARMARK_SMTP_PORT` defaults to 587 for `starttls` and 465 for `tls`.
+- `EARMARK_SMTP_TIMEOUT_S` defaults to 60 and is at most 90.
+- `EARMARK_MAX_ATTACHMENT_MB` defaults to 10 MiB. A three-hour transcript is about 300 KB.
+  Set it at or below any attachment cap the PKAs' mail lane has.
+- The password is printable ASCII, and spaces are allowed: single-quote it in `.env`.
+- TLS is always verified, AUTH happens only after TLS, and there is no plaintext mode. A
+  server without STARTTLS fails delivery.
+
+**Check:** `docker compose run --rm worker doctor` shows `ok mail smtp to
+smtp.example.org:587 (starttls), from @example.org, timeout 60 s`. `doctor --online` shows
+`ok smtp smtp.example.org:587: TLSv1.3, login accepted, nothing sent` (the TLS version is
+the server's). Doctor never sends mail.
+
+### 8.5 The PKA side
+
+- Ask each PKA to allowlist `earmark@example.org` at its runtime. You arrange this with
+  those agents. earmark cannot do it, and cannot see whether it was done: SMTP's 250 reply
+  is all it learns.
+- The test is a PKA confirming that it read both attachments.
+
+### 8.6 Reading a message without sending
+
+- `EARMARK_MAIL_BACKEND=fake` writes each message to `data/outbox/<job_id>.eml` (mode
+  0600) and sends nothing.
+- Under compose, copy them out while `api` runs:
+  `docker compose cp api:/data/outbox ./outbox`.
+- Read them with the Python reader in the [README quickstart](../README.md#quickstart-fake-backends),
+  run with `python3` on the host.
+
+## 9. Recipients: EARMARK_ALLOWED_RECIPIENTS
+
+- Every request names one `to`, and earmark never defaults it.
+- The setting is a comma-separated list of exact addresses. The local part is
+  case-sensitive and the domain is not, so `Pka-Work@example.net` is a different address.
+- Unset refuses every request with `no recipients are allowed yet: set
+  EARMARK_ALLOWED_RECIPIENTS on the server`, and doctor FAILs.
+
+<!-- allowlist-example -->
+```bash
+EARMARK_ALLOWED_RECIPIENTS=pka-personal@example.net,pka-work@example.net
+```
+
+**`all`.** It accepts any single, syntactically valid address (ASCII, at most 254
+characters). It is your written acceptance of a risk: anyone holding the API token can
+have earmark mail anyone from your domain, which costs your domain's reputation, and can
+instruct both PKAs. `serve` logs a WARNING at startup, and doctor warns. There is no
+send-rate cap (backlog). `all` cannot be mixed with addresses.
+
+**Changing it.** Recreate both containers (`docker compose up -d`): the API checks `to` at
+request time, and the worker checks again at delivery. A job queued for an address you
+removed fails with "the destination is no longer allowed by EARMARK_ALLOWED_RECIPIENTS;
+nothing was sent".
+
+Logs and pushes show addresses masked (`p…@example.net`). `GET /jobs` shows them in full to
+token holders.
 
 ## 10. Notifications (ntfy)
 
@@ -417,13 +566,19 @@ Analysis was removed in step 22; earmark now only transcribes. Step 27 rewrites 
   ntfy.sh then only relays a poll request with the message id; the phone fetches the
   message from your server, so it must reach it (home Wi-Fi, WireGuard, or the tailnet).
   Include its address in the tunnel's `AllowedIPs`.
-- `EARMARK_OBSIDIAN_VAULT_NAME` adds an `obsidian://` link that opens the note.
+- A push says:
+  - `Sent: <title>` with `To: <masked address>` and the duration;
+  - `Failed: <title>` with the stage and the reason, and "The email may already have been
+    delivered." when that applies;
+  - "Resent after an interruption." after a retry;
+  - never a URL path, the instructions, a full address or a feed guid.
 - Earmark redacts the topic URL, and topics of 12 or more characters on their own, from
   logs and notifications.
 - `earmark doctor --online` checks the server without publishing a message.
 
 ## 11. Fetching and DNS filtering
 
+- Direct audio URLs from requests go through the same guard as enclosures.
 - Enclosure URLs usually start at a tracker (`dts.podtrac.com` and similar).
 - A Pi-hole-style resolver that answers `0.0.0.0` for the tracker makes the download fail
   with a refused non-public address. The job error names the host and
@@ -431,36 +586,93 @@ Analysis was removed in step 22; earmark now only transcribes. Step 27 rewrites 
 - Allow-list the host in the resolver (preferred). Containers use the host's resolver. Or
   set `EARMARK_ALLOW_PRIVATE_FETCH=true`, which turns off the private-address guard for
   every feed and enclosure, so it is not recommended.
-- The remote ASR, local LLM, and ntfy servers do not need it.
+- The remote ASR, SMTP and ntfy servers do not need it.
 
 ## 12. Stopping, restarts, and leases
 
 - SIGTERM (`docker compose stop`, `systemctl stop`) releases the running job back to the
   queue. The worker gets 2 minutes under compose and 120 seconds under the unit, enough to
-  reach its next interruption point.
+  reach its next interruption point. A delivery in progress finishes first, within
+  `EARMARK_SMTP_TIMEOUT_S`, and both grace periods cover it.
 - A SIGKILL or a crash leaves the job `running` until `EARMARK_JOB_LEASE_SECONDS` (900 s).
   Then it is requeued, and the attempt counts.
 
 ## 13. Checking the setup
 
-`earmark doctor` checks the configuration, directories, database, and credentials.
-`earmark doctor --online` also checks that the servers answer. Under compose:
+`earmark doctor` checks the configuration, directories, database, credentials, and the
+`recipients`, `mail` and `asr cuda` lines. It never sends mail.
+`earmark doctor --online` also checks that the servers answer, including the `smtp` login. Under compose:
 `docker compose run --rm worker doctor --online`.
 
 Exit code 0 means nothing failed (warnings are allowed), 1 means a check failed, and 2
 means the settings did not load.
 
-## 14. Weekly digest
-The weekly digest was removed in step 22. Step 27 rewrites this guide.
+## 14. Upgrading from v0.1.0
+
+<!-- upgrade-v0.1.0:begin -->
+**What changed.** earmark no longer analyses, writes a vault, indexes or digests. It
+refuses a v0.1.0 database and does not migrate it. **The vault is no longer touched:** your
+notes stay as they are, and nothing reads or writes the vault.
+
+**Compose:**
+
+```bash
+docker compose down --remove-orphans
+git pull && docker compose build
+docker compose run --rm --no-deps --entrypoint sh api -c '
+  cd /data && mkdir -p v0.1.0 &&
+  for f in earmark.db earmark.db-wal earmark.db-shm; do [ ! -e "$f" ] || mv "$f" v0.1.0/; done &&
+  rm -rf episodes/*/analyses lancedb models/embed digests vault.lock index.lock &&
+  ls -A /data /data/v0.1.0'
+docker volume rm earmark_asr-models 2>/dev/null || true
+```
+
+- The old database moves aside with its `-wal` and `-shm` files, into `v0.1.0/`.
+- `analyses/`, the `lancedb/` index, the `models/embed/` embedding model, `digests/` and the
+  lock files are deleted.
+- `huggingface/` (the Whisper models) stays.
+- The `asr-models` volume came from the old `gpu` profile.
+
+Transcripts cached by v0.1.0 carry no ASR profile and are never reused. Delete `episodes/`
+too if you do not want their text.
+
+**Native:** the same under `/srv/earmark/data`, with `sudo -u earmark sh -c '…'`, plus:
+
+- `sudo systemctl disable --now earmark-digest.timer`;
+- delete `/etc/systemd/system/earmark-digest.service` and `.timer`;
+- copy the two new units;
+- `sudo systemctl daemon-reload`.
+
+**`.env`.** Delete these lines. They are ignored, but some now mislead:
+
+- `EARMARK_LLM_*` and `ANTHROPIC_API_KEY`;
+- `EARMARK_VAULT_DIR`, `EARMARK_VAULT_SUBDIR` and `EARMARK_OBSIDIAN_VAULT_NAME`;
+- `EARMARK_STORE_BACKEND`, `EARMARK_INDEX_BACKEND`, `EARMARK_EMBED_MODEL` and
+  `EARMARK_EMBED_MODEL_DIR`;
+- `EARMARK_TZ`, `VAULT_PATH`, `COMPOSE_PROFILES` and `ASR_GPU_MEMORY_UTILIZATION`;
+- the vLLM lines: `EARMARK_ASR_BACKEND=remote`, `EARMARK_ASR_BASE_URL=http://asr:8000/v1`,
+  `EARMARK_ASR_MODEL=openai/…`, `EARMARK_ASR_API_KEY` and `EARMARK_ASR_MAX_UPLOAD_MB`. They
+  would send the worker to a server that no longer exists.
+
+Then add the new settings (sections 8 and 9).
+
+**Check:** `docker compose run --rm worker doctor` no longer shows `FAIL database … was
+created by earmark 0.1.0`. The `database` line reads "not created yet" until the first
+start. This `grep` prints nothing:
+
+```bash
+grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PATH|COMPOSE_PROFILES|ASR_GPU)' .env
+```
+<!-- upgrade-v0.1.0:end -->
 
 ## 15. Backups and upgrades
 
-- Back up the vault, and the data directory's `episodes/` (transcripts and analyses;
-  `entities rebuild` and `reindex` need them). `lancedb/`, `models/`, and `huggingface/`
-  can be recreated. `digests/` is a cache of digest themes and need not be backed up.
-- Upgrade with `git pull`, `docker compose build`, and `docker compose up -d` (or
-  `uv sync --locked …` and `systemctl restart`). Database migrations run on start.
-- Run `earmark entities rebuild` after changing `EARMARK_TZ`.
+- **Back up `.env`** (it holds secrets) somewhere safe.
+- earmark holds no system of record: the notes live with the PKAs. The data volume holds
+  the job history and a transcript cache, which can be recreated by transcribing again.
+- **Upgrade** with `git pull`, `docker compose build` (the GPU image rebuilds CTranslate2,
+  so it takes long), and `docker compose up -d`. Migrations run on start. After a rebuild,
+  repeat smoke steps 2 and 4 (section 7.3).
 
 ## 16. Troubleshooting
 
@@ -471,11 +683,20 @@ The weekly digest was removed in step 22. Step 27 rewrites this guide.
 | Connection timeout away from home | WireGuard is not active (check the on-demand rules and `AllowedIPs`), or Tailscale is off. |
 | A certificate error | Caddy has no certificate yet. Check `journalctl -u caddy` for the DNS-01 errors in 6.1.4. |
 | Works on cellular, fails at home | The home resolver drops the record (6.1.6). |
-| The worker keeps restarting | `docker compose logs worker`: usually a `ConfigError` naming the setting (no LLM key, vault missing). |
-| Permission denied in the vault | `APP_UID` and `APP_GID` do not match the vault's owner (section 4). |
+| The worker keeps restarting | `docker compose logs worker`: usually a `ConfigError` naming the setting. |
+| 422 `to is not an allowed recipient` | The address is not in `EARMARK_ALLOWED_RECIPIENTS` (section 9). |
+| 422 `no recipients are allowed yet` | `EARMARK_ALLOWED_RECIPIENTS` is unset (section 9). |
+| doctor `FAIL mail` naming `EARMARK_SMTP_*` | A missing setting (section 8.4). |
+| job failed, naming `EARMARK_SMTP_USERNAME` and `EARMARK_SMTP_PASSWORD` | The login was refused: check the app password. |
+| job failed, naming `EARMARK_SMTP_HOST` | The certificate was not verified. |
+| job failed: the server does not offer STARTTLS | Use `EARMARK_SMTP_SECURITY=tls` if the provider uses port 465. |
+| job failed, naming `EARMARK_MAX_ATTACHMENT_MB` | The attachments are over the cap. |
+| mail arrives, but the PKA does not file it | The sender is not allowlisted there, or DMARC fails (the 8.3 check). |
+| a PKA got the same message twice | Delivery is at-least-once; the PKA's dedupe drops it. |
+| doctor or startup: `was created by earmark 0.1.0` | Section 14. |
+| the worker exits "sees no CUDA device" | Section 7.4. |
 | "refused non-public address" | A resolver answered a tracker with `0.0.0.0` (section 11). |
 | "You are sending unauthenticated requests to the HF Hub" in the worker log | Informational, shown once per process on a model download. Public models need no token, and earmark never reads one; `huggingface_hub` uses `HF_TOKEN` if you set it in the service environment. |
-| `/search` answers 503 | The embedding model is not downloaded yet (section 9). |
 
 ## 17. Hugging Face telemetry and logs
 
@@ -489,15 +710,15 @@ with a real model download (hf_xet 1.8.0, huggingface_hub 1.33.0), outside a con
 **Turning it back on:**
 
 - compose: `HF_HUB_DISABLE_TELEMETRY=0` in `.env`, then `docker compose up -d`;
-- systemd: `sudo systemctl edit earmark-worker` (and `earmark-api`, `earmark-digest`) with
+- systemd: `sudo systemctl edit earmark-worker` (and `earmark-api`) with
   `[Service]` and `Environment=HF_HUB_DISABLE_TELEMETRY=0`, then restart. A line in
   `/srv/earmark/.env` has no effect, because earmark reads that file itself;
 - `docker run`: `-e HF_HUB_DISABLE_TELEMETRY=0`.
 
 It stays off while `DO_NOT_TRACK=1` or `DISABLE_TELEMETRY=1` is set in the environment.
 
-**Commands run by hand** on a native install, such as `earmark reindex` (which downloads the
-embedding model), do not get the unit's environment. Prefix them with
+**Commands run by hand** on a native install, such as `earmark transcribe` (which downloads the
+Whisper model), do not get the unit's environment. Prefix them with
 `env HF_HUB_DISABLE_TELEMETRY=1`. `docker compose run` gets it from compose.
 
 **hf_xet logs.** They live in `$HF_HOME/xet/logs/` (`/data/huggingface/xet/logs` in the

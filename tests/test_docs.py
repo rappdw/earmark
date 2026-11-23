@@ -1,19 +1,23 @@
-"""The README, Shortcut guide and deployment guide are tested against the code they describe."""
+"""The README, Shortcut guide, deployment guide and runbook are tested against the code."""
 
+import itertools
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from earmark.api.app import create_app
+from earmark import sources
+from earmark.api.app import STORE_UNAVAILABLE_DETAIL, create_app
 from earmark.config import Settings, env_var
 from earmark.db import open_database
 from earmark.jobs import JobStore
-from earmark.models import TranscriptionRequest
+from earmark.models import FORM_FIELDS, TranscriptionRequest, UploadFields
 from earmark.recipients import RecipientPolicy
 from earmark.resolve.apple import UnsupportedUrlError, parse_apple_url
 from earmark.staging import Staging
@@ -21,26 +25,47 @@ from earmark.submission import Intake
 from tests.doc_helpers import (
     ROOT,
     after_marker,
+    anchored_links,
     between_markers,
     fences,
     first_fence,
+    heading_anchors,
     read_doc,
     relative_links,
+    section,
+    table_rows,
     table_variables,
+    without_blocks,
 )
+from tests.multipart_helpers import Part, audio, content_type, multipart_body
 
 TOKEN = "docs-test-token-91c"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-DOCS = ["README.md", "docs/deploy.md", "docs/shortcut.md"]
+PLAN = "docs/steps/27-docs-runbook-shortcut.md"
+DOCS = [
+    "README.md",
+    "docs/deploy.md",
+    "docs/shortcut.md",
+    "docs/runbook-spark.md",
+    "docs/asr.md",
+]
 SECRET_FIELDS = ("api_token", "asr_api_key", "ntfy_url", "ntfy_token", "smtp_password")
 ACTIONS = [
     "Receive input from Share Sheet",
+    "Choose from Menu",
+    "Ask for Input",
+    "Format Date",
+    "Get Type",
+    "If",
+    "Get Contents of URL",
+    "Otherwise",
     "Get URLs from Input",
     "Get Item from List",
-    "Ask for Input",
     "Get Contents of URL",
+    "End If",
     "Show Result",
 ]
+ISO_8601 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
 
 
 def _quickstart() -> str:
@@ -48,17 +73,44 @@ def _quickstart() -> str:
     return first_fence(block, "bash").body
 
 
-def _post(body: str, tmp_path: Path) -> tuple[int, dict[str, Any], JobStore]:
-    settings = Settings(
-        _env_file=None,
-        api_token=SecretStr(TOKEN),
-        data_dir=tmp_path / "data",
-        allowed_recipients=("you@example.org",),
-    )
+def _allowlist() -> tuple[str, ...]:
+    text = after_marker(read_doc("docs/deploy.md"), "allowlist-example")
+    [line] = first_fence(text, "bash").body.splitlines()
+    name, _, value = line.partition("=")
+    assert name == "EARMARK_ALLOWED_RECIPIENTS"
+    return tuple(a.strip() for a in value.split(","))
+
+
+ALLOWLIST = _allowlist()
+
+
+def _settings(tmp_path: Path, **overrides: Any) -> Settings:
+    values: dict[str, Any] = {
+        "api_token": SecretStr(TOKEN),
+        "data_dir": tmp_path / "data",
+        "allowed_recipients": (*ALLOWLIST, "you@example.org"),
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def _post(
+    body: bytes,
+    tmp_path: Path,
+    content_type: str = "application/json",
+    *,
+    settings_overrides: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    max_upload_bytes: int | None = None,
+) -> tuple[int, dict[str, Any], JobStore]:
+    settings = _settings(tmp_path, **(settings_overrides or {}))
     store = JobStore(open_database(tmp_path / "earmark.db"))
-    with TestClient(create_app(settings, store=store), headers=AUTH) as client:
+    app = create_app(settings, store=store, max_upload_bytes=max_upload_bytes)
+    with TestClient(app) as client:
         response = client.post(
-            "/transcriptions", content=body.encode(), headers={"Content-Type": "application/json"}
+            "/transcriptions",
+            content=body,
+            headers={"Content-Type": content_type, **(AUTH if headers is None else headers)},
         )
     return response.status_code, response.json(), store
 
@@ -80,24 +132,78 @@ def test_quickstart_uses_fake_backends() -> None:
         assert re.search(rf"\b{env_var(name)}=fake\b", script), name
 
 
-def test_quickstart_request_body_valid() -> None:
+def test_quickstart_exports_only_settings() -> None:
+    known = {env_var(name) for name in Settings.model_fields}
+    assigned = re.findall(r"\b(EARMARK_[A-Z0-9_]+)=", _quickstart())
+    assert assigned
+    assert sorted(set(assigned) - known) == []
+
+
+def test_quickstart_commands_exist() -> None:
+    from earmark.cli import app
+
+    registered = {c.name for c in app.registered_commands if c.name} | {"--version"}
+    used = re.findall(r"\buv run earmark (\S+)", _quickstart())
+    assert {"doctor", "serve", "worker", "jobs"} <= set(used)
+    assert sorted(set(used) - registered) == []
+
+
+def _quickstart_body() -> str:
     match = re.search(r"-d '(?P<body>\{.*\})'", _quickstart())
     assert match
-    request = TranscriptionRequest.model_validate_json(match["body"])
+    return match["body"]
+
+
+def test_quickstart_request_body_valid() -> None:
+    body = _quickstart_body()
+    request = TranscriptionRequest.model_validate_json(body)
+    assert set(json.loads(body)) == {"url", "to", "instructions", "timestamp"}
     assert request.instructions
+    assert request.timestamp is not None
+    assert request.timestamp.utcoffset() is not None
     assert parse_apple_url(request.url).url.startswith("https://podcasts.apple.com/")
     assert "/transcriptions" in _quickstart()
     assert "/ingest" not in _quickstart()
 
 
-def test_quickstart_exports_allowed_recipients() -> None:
-    script = _quickstart()
-    export = re.search(r"^export EARMARK_ALLOWED_RECIPIENTS=(?P<value>\S+)$", script, re.MULTILINE)
-    body = re.search(r"-d '(?P<body>\{.*\})'", script)
+def _exported_allowlist() -> tuple[str, ...]:
+    export = re.search(
+        r"^export EARMARK_ALLOWED_RECIPIENTS=(?P<value>\S+)$", _quickstart(), re.MULTILINE
+    )
     assert export
-    assert body
-    settings = Settings(_env_file=None, allowed_recipients=(export["value"],))
-    assert settings.recipient_policy().allows(json.loads(body["body"])["to"])
+    return (export["value"],)
+
+
+def test_quickstart_upload_valid() -> None:
+    script = _quickstart().replace("\\\n", " ")
+    [upload] = [line for line in script.splitlines() if " -F " in line or "\t-F " in line]
+    words = shlex.split(upload)
+    fields: dict[str, str] = {}
+    for flag, value in itertools.pairwise(words):
+        if flag == "--form-string":
+            name, _, text = value.partition("=")
+            fields[name] = text
+    assert set(fields) <= set(FORM_FIELDS)
+    UploadFields.model_validate(fields)
+    settings = Settings(_env_file=None, allowed_recipients=_exported_allowlist())
+    assert settings.recipient_policy().allows(fields["to"])
+    [file_arg] = [w for w in words if w.startswith("file=@")]
+    assert sources.upload_extension(Path(file_arg.removeprefix("file=@")).name, None) is not None
+
+
+def test_quickstart_exports_allowed_recipients() -> None:
+    settings = Settings(_env_file=None, allowed_recipients=_exported_allowlist())
+    assert settings.recipient_policy().allows(json.loads(_quickstart_body())["to"])
+
+
+def test_quickstart_reads_outbox() -> None:
+    script = _quickstart()
+    assert re.search(r"\bEARMARK_MAIL_BACKEND=fake\b", script)
+    assert "outbox" in script
+    assert ".eml" in script
+    posts = script.count("http://127.0.0.1:8787/transcriptions")
+    assert posts == 2
+    assert script.count("worker --once") == posts
 
 
 def test_quickstart_runs_no_network_command() -> None:
@@ -135,40 +241,73 @@ def test_readme_settings_reference_marks_secrets() -> None:
 
 
 def _request_example() -> str:
-    return first_fence(
-        after_marker(read_doc("docs/shortcut.md"), "ingest-request-example"), "json"
-    ).body
+    return first_fence(after_marker(read_doc("docs/shortcut.md"), "request-example"), "json").body
 
 
 def _response_example() -> str:
-    text = after_marker(read_doc("docs/shortcut.md"), "ingest-response-example")
+    text = after_marker(read_doc("docs/shortcut.md"), "response-example")
     return first_fence(text, "json").body
+
+
+def _upload_table() -> list[list[str]]:
+    block = between_markers(read_doc("docs/shortcut.md"), "upload-fields")
+    return [[c.strip("`") for c in row] for row in table_rows(block)]
 
 
 def test_shortcut_request_example_validates() -> None:
     body = _request_example()
     request = TranscriptionRequest.model_validate_json(body)
-    assert set(json.loads(body)) == {"url", "to", "instructions"}
+    example = json.loads(body)
+    assert set(example) == {"url", "to", "instructions", "timestamp"}
     assert request.instructions
     parse_apple_url(request.url)
+    assert ISO_8601.match(example["timestamp"])
 
 
 def test_shortcut_request_example_accepted_by_api(tmp_path: Path) -> None:
-    status, payload, store = _post(_request_example(), tmp_path)
+    example = json.loads(_request_example())
+    status, payload, store = _post(_request_example().encode(), tmp_path)
     assert status == 202
     [job] = store.list_recent()
     assert job.status == "queued"
-    assert job.url == parse_apple_url(json.loads(_request_example())["url"]).url
+    assert job.url == parse_apple_url(example["url"]).url
+    assert job.to == example["to"]
+    assert job.instructions == example["instructions"]
+    assert job.utc_offset_min == -480
     assert payload["job_id"] == job.id
 
 
 def test_shortcut_response_example_matches_api(tmp_path: Path) -> None:
-    _, payload, _ = _post(_request_example(), tmp_path)
+    _, payload, _ = _post(_request_example().encode(), tmp_path)
     example = json.loads(_response_example())
     assert set(example) == set(payload)
     assert example["status"] == payload["status"]
     assert example["created"] is payload["created"]
     assert re.fullmatch(r"[0-9a-f]{32}", example["job_id"])
+
+
+def test_shortcut_upload_fields_match_api() -> None:
+    rows = _upload_table()
+    assert [r[0] for r in rows] == ["file", "to", "instructions", "timestamp"]
+    assert all(r[0] in ("file", *FORM_FIELDS) for r in rows)
+    UploadFields.model_validate({r[0]: r[3] for r in rows if r[0] != "file"})
+
+
+@pytest.mark.parametrize("file_first", [True, False], ids=["file_first", "file_last"])
+def test_shortcut_upload_example_accepted_by_api(tmp_path: Path, file_first: bool) -> None:
+    rows = {r[0]: r[3] for r in _upload_table()}
+    file_part = Part("file", audio(), filename=rows["file"])
+    text = [Part(name, value) for name, value in rows.items() if name != "file"]
+    parts = [file_part, *text] if file_first else [*text, file_part]
+    status, _, store = _post(multipart_body(parts), tmp_path, content_type())
+    assert status == 202
+    [job] = store.list_recent()
+    assert job.source == "upload"
+    assert job.upload_name == "Voice memo.m4a"
+    assert job.to == rows["to"]
+    assert job.instructions == rows["instructions"]
+    assert job.utc_offset_min == -480
+    assert len(list((tmp_path / "data" / "uploads").iterdir())) == 1
 
 
 def _action_items() -> list[str]:
@@ -178,36 +317,180 @@ def _action_items() -> list[str]:
     return [" ".join(item.split()) for item in items]
 
 
+def _item(number: int) -> str:
+    return _action_items()[number - 1]
+
+
 def test_shortcut_actions_in_order() -> None:
     names = [re.match(r"\*\*(.+?)\*\*", item) for item in _action_items()]
     assert [m[1] for m in names if m] == ACTIONS
 
 
-def test_shortcut_post_action_details() -> None:
-    items = dict(zip(ACTIONS, _action_items(), strict=True))
-    post = items["Get Contents of URL"]
-    for word in ("POST", "Authorization", "Bearer", "JSON", "`url`", "`to`", "`instructions`"):
-        assert word in post, word
-    assert "optional" in items["Ask for Input"].lower()
+def test_shortcut_menu_fills_to() -> None:
+    menu = _item(2)
+    for word in ("Personal", "Work", "Set Variable", "`Recipient`"):
+        assert word in menu, word
+    addresses = re.findall(r"`([^`@\s]+@[^`\s]+)`", menu)
+    assert len(addresses) == 2
+    assert set(addresses) <= set(ALLOWLIST)
+    assert json.loads(_request_example())["to"] in addresses
+    assert {r[0]: r[3] for r in _upload_table()}["to"] in addresses
+
+
+def test_shortcut_ask_for_input_optional() -> None:
+    ask = _item(3)
+    assert "optional" in ask.lower()
+    assert "Provided Input" in ask
+
+
+def test_shortcut_formats_timestamp() -> None:
+    date = _item(4)
+    for word in ("Current Date", "ISO 8601", "Include ISO 8601 Time"):
+        assert word in date, word
+
+
+def test_shortcut_branches_on_type() -> None:
+    assert "Shortcut Input" in _item(5)
+    assert "`File`" in _item(6)
+
+
+def test_shortcut_post_actions_send_fields() -> None:
+    form, as_json = _item(7), _item(11)
+    for item in (form, as_json):
+        assert "/transcriptions" in item
+        assert "POST" in item
+        for word in ("Recipient", "Provided Input", "Formatted Date", "`to`", "`instructions`"):
+            assert word in item, word
+        assert "`timestamp`" in item
+    assert "Form" in form
+    assert "`file`" in form
+    assert "JSON" in as_json
+    assert "`url`" in as_json
+    assert not any("/ingest" in item for item in _action_items())
+
+
+def test_shortcut_examples_match_actions() -> None:
+    def names(item: str) -> set[str]:
+        return set(re.findall(r"`(\w+)` (?:\([^)]*\) )?= ", item)) - {"Authorization"}
+
+    assert names(_item(11)) == set(json.loads(_request_example()))
+    assert names(_item(7)) == {r[0] for r in _upload_table()}
 
 
 def test_shortcut_sends_only_bearer_header() -> None:
-    post = _action_items()[ACTIONS.index("Get Contents of URL")]
-    assert "`Authorization` is the only header to add" in post
-    assert post.count("Authorization") == 2
-    assert "Content-Type" in post  # sent by Shortcuts itself, not added by the user
+    for item in (_item(7), _item(11)):
+        assert "`Authorization` is the only header to add" in item
+        assert "Content-Type" in item  # sent by Shortcuts itself, not added by the user
+    assert "Bearer" in _item(7)
 
 
-# --- shared checks over all three documents -----------------------------------------------
+ERROR_ROWS = [
+    (401, "missing or invalid API token"),
+    (413, "request body is larger than 64 KiB"),
+    (413, "the upload is larger than the <limit> limit (EARMARK_MAX_UPLOAD_MB)"),
+    (
+        415,
+        "send JSON (Content-Type: application/json) or a multipart form "
+        "(Content-Type: multipart/form-data)",
+    ),
+    (415, "the file does not look like audio: <…>"),
+    (422, "That is not a valid link. Share an episode from Apple Podcasts."),
+    (422, "This links to a whole show. Share a single episode instead."),
+    (422, "This Apple link is not a podcast episode."),
+    (422, "to must be one email address"),
+    (422, "to is not an allowed recipient (EARMARK_ALLOWED_RECIPIENTS)"),
+    (422, "no recipients are allowed yet: set EARMARK_ALLOWED_RECIPIENTS on the server"),
+    (422, "unknown field 'x' (allowed: url, to, instructions, title, timestamp)"),
+    (422, "request body is not valid JSON"),
+    (422, "the form must have exactly one file field named 'file'"),
+    (503, STORE_UNAVAILABLE_DETAIL),
+]
+
+
+def _error_table() -> list[tuple[int, str]]:
+    block = section(read_doc("docs/shortcut.md"), "## 4. ")
+    rows = [r for r in table_rows(block) if len(r) == 3]
+    return [(int(r[0]), r[1].strip("`")) for r in rows]
+
+
+def _placeholder_pattern(message: str) -> re.Pattern[str]:
+    parts = re.split(r"<[^>]+>", message)
+    return re.compile(".+".join(re.escape(p) for p in parts), re.DOTALL)
+
+
+def _json(**fields: Any) -> bytes:
+    return json.dumps({"to": "you@example.org", **fields}).encode()
+
+
+def _episode(url: str) -> bytes:
+    return _json(url=url)
+
+
+def _error_triggers(tmp_path: Path) -> list[tuple[int, dict[str, Any]]]:
+    tiny = 1024
+    upload = multipart_body(
+        [Part("file", audio(2 * tiny), filename="memo.m4a"), Part("to", "you@example.org")]
+    )
+    text_file = multipart_body(
+        [
+            Part("file", b"words", filename="notes.txt", content_type="text/plain"),
+            Part("to", "you@example.org"),
+        ]
+    )
+    no_file = multipart_body([Part("to", "you@example.org")])
+    show = "https://podcasts.apple.com/us/podcast/id1200361736"
+    good = "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981"
+    cases: list[tuple[bytes, str, dict[str, Any]]] = [
+        (_episode(good), "application/json", {"headers": {}}),
+        (b'{"pad": "' + b"a" * 65536 + b'"}', "application/json", {}),
+        (upload, content_type(), {"max_upload_bytes": tiny}),
+        (b"to=x", "application/x-www-form-urlencoded", {}),
+        (text_file, content_type(), {}),
+        (_episode("hello"), "application/json", {}),
+        (_episode(show), "application/json", {}),
+        (_episode("https://www.apple.com/podcasts/"), "application/json", {}),
+        (_json(url=good, to="not an address"), "application/json", {}),
+        (_json(url=good, to="stranger@example.com"), "application/json", {}),
+        (_episode(good), "application/json", {"settings_overrides": {"allowed_recipients": ()}}),
+        (_json(url=good, x=1), "application/json", {}),
+        (b"{", "application/json", {}),
+        (no_file, content_type(), {}),
+    ]
+    results: list[tuple[int, dict[str, Any]]] = []
+    for index, (body, ctype, extra) in enumerate(cases):
+        status, payload, _ = _post(body, tmp_path / str(index), ctype, **extra)
+        results.append((status, payload))
+    return results
+
+
+def test_shortcut_error_table_matches_api(tmp_path: Path) -> None:
+    assert _error_table() == ERROR_ROWS
+    answers = _error_triggers(tmp_path)
+    assert len(answers) == len(ERROR_ROWS) - 1  # the 503 is compared with the constant
+    for (status, message), (got_status, payload) in zip(ERROR_ROWS, answers, strict=False):
+        assert got_status == status, message
+        assert _placeholder_pattern(message).fullmatch(payload["detail"]), (message, payload)
+    assert ERROR_ROWS[-1] == (503, STORE_UNAVAILABLE_DETAIL)
+
+
+# --- shared checks over the documents -----------------------------------------------------
 
 
 @pytest.mark.parametrize("doc", DOCS)
 def test_doc_relative_links_resolve(doc: str) -> None:
     base = (ROOT / doc).parent
     links = relative_links(read_doc(doc))
-    assert links or doc == "docs/shortcut.md"
+    assert links, doc
     for target in links:
         assert (base / target).exists(), f"{doc} links to missing {target}"
+
+
+@pytest.mark.parametrize("doc", DOCS)
+def test_doc_anchors_resolve(doc: str) -> None:
+    text = read_doc(doc)
+    for path, anchor in anchored_links(text):
+        target = text if not path else (ROOT / doc).parent.joinpath(path).read_text("utf-8")
+        assert anchor in heading_anchors(target), f"{doc} links to missing {path}#{anchor}"
 
 
 def test_no_cloudflare_tunnel_or_access_headers() -> None:
@@ -215,6 +498,70 @@ def test_no_cloudflare_tunnel_or_access_headers() -> None:
         text = read_doc(doc).lower()
         for banned in ("cf-access", "cloudflared", "cloudflare tunnel"):
             assert banned not in text, f"{doc} mentions {banned}"
+
+
+REMOVED = [
+    r"\bvault\b",
+    r"obsidian",
+    r"/ingest\b",
+    r"reanalyze",
+    r"\bdigest",
+    r"\bentit(y|ies)\b",
+    r"lancedb",
+    r"fastembed",
+    r"embedding",
+    r"EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)",
+    r"anthropic",
+    r"\bclaude\b",
+    r"asr:8000",
+    r"COMPOSE_PROFILES",
+    r"profile gpu",
+    r"gpu profile",
+    r"GET /episodes",
+    r"/search\b",
+    r"earmark (episodes|search|reindex|analy[sz]e)",
+    r"--prompt",
+    r'"prompt"',
+    r"Note ready",
+    r"--extra index",
+]
+
+
+@pytest.mark.parametrize("doc", DOCS)
+def test_docs_describe_no_removed_behaviour(doc: str) -> None:
+    text = without_blocks(read_doc(doc), "upgrade-v0.1.0")
+    patterns = REMOVED if doc == "docs/asr.md" else [*REMOVED, r"\bvllm\b"]
+    for pattern in patterns:
+        hits = [m[0] for m in re.finditer(pattern, text, re.IGNORECASE)]
+        assert not hits, f"{doc} mentions removed behaviour: {hits[:3]!r}"
+
+
+EMAIL = re.compile(r"[\w.+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
+IPV4 = re.compile(r"\b(\d{1,3}\.){3}\d{1,3}\b")
+SECRET_LINE = re.compile(
+    r"^(export )?EARMARK_(API_TOKEN|SMTP_PASSWORD|NTFY_TOKEN|ASR_API_KEY)=(?P<value>.*)$"
+)
+
+
+@pytest.mark.parametrize("doc", [*DOCS, PLAN])
+def test_docs_use_placeholders_only(doc: str) -> None:
+    text = read_doc(doc)
+    for match in EMAIL.finditer(text):
+        domain = match[0].rsplit("@", 1)[1].lower()
+        assert domain in {"example.org", "example.net", "example.com"}, match[0]
+    # "0.0.0.0" is the documented example bind address, not a bind made here.
+    allowed_ips = {"127.0.0.1", "0.0.0.0", "1.1.1.1", "192.168.1.10", "192.168.1.0"}  # noqa: S104
+    for match in IPV4.finditer(text):
+        assert match[0] in allowed_ips, match[0]
+    for host in re.findall(r"[\w.-]+\.ts\.net\b", text):
+        assert host.endswith("tailnet-name.ts.net"), host
+    assert re.search(r"tk_[A-Za-z0-9]{8,}", text) is None
+    for fence in fences(text):
+        for line in fence.body.splitlines():
+            secret = SECRET_LINE.match(line.strip())
+            if secret:
+                value = secret["value"].strip("'\"")
+                assert value in ("", "demo-token") or "<" in value, line
 
 
 def test_deploy_doc_states_test_status() -> None:
@@ -247,7 +594,7 @@ def test_deploy_doc_gpu_smoke() -> None:
 def test_deploy_doc_has_no_gpu_profile() -> None:
     text = read_doc("docs/deploy.md")
     for banned in ("--profile gpu", "COMPOSE_PROFILES", "ASR_GPU_MEMORY_UTILIZATION"):
-        assert banned not in text, banned
+        assert banned not in without_blocks(text, "upgrade-v0.1.0"), banned
 
 
 def test_deploy_doc_reachability() -> None:
@@ -256,6 +603,159 @@ def test_deploy_doc_reachability() -> None:
         assert phrase in text, phrase
     assert "Zone:Read" in text or "Zone → Zone → Read" in text
     assert re.search(r"[Nn]ever use `tailscale funnel`", text)
+    reach = section(text, "## 6. ")
+    assert "/transcriptions" in reach
+    assert "/ingest" not in reach
+    assert "### 6.3 " in reach
+    assert "EARMARK_MAX_UPLOAD_MB" in section(text, "### 6.3 ")
+
+
+def test_deploy_doc_section_4_complete() -> None:
+    four = section(read_doc("docs/deploy.md"), "## 4. ")
+    assert "Both images run as the non-root user `earmark`" in four
+    stub = "It runs as a non-root user"
+    dangling = [ln for ln in four.splitlines() if ln.rstrip().endswith(stub)]
+    assert not dangling
+    for banned in ("VAULT_PATH", "/vault", "EARMARK_LLM", "EARMARK_TZ"):
+        assert banned not in four, banned
+
+
+def test_deploy_doc_mail_section() -> None:
+    mail = section(read_doc("docs/deploy.md"), "## 8. ")
+    names = [env_var(n) for n in Settings.model_fields if n.startswith("smtp_")]
+    assert len(names) == 7
+    for needle in (
+        *names,
+        "EARMARK_MAX_ATTACHMENT_MB",
+        "SPF",
+        "DKIM",
+        "DMARC",
+        "_dmarc.example.org",
+        "_domainkey",
+        "app password",
+        "Authentication-Results",
+        "allowlist",
+        "DRAFT",
+        "docker compose cp",
+    ):
+        assert needle in mail, needle
+
+
+def test_deploy_doc_recipients_section(tmp_path: Path) -> None:
+    text = section(read_doc("docs/deploy.md"), "## 9. ")
+    fence = first_fence(after_marker(text, "allowlist-example"), "bash")
+    [line] = fence.body.splitlines()
+    assert line.startswith("EARMARK_ALLOWED_RECIPIENTS=")
+    env_file = tmp_path / ".env"
+    env_file.write_text(line + "\n")
+    policy = Settings(_env_file=env_file).recipient_policy()
+    assert not policy.allow_all
+    assert len(policy.addresses) == 2
+    for needle in ("`all`", "API token", "WARNING", "no recipients are allowed yet"):
+        assert needle in text, needle
+
+
+def test_deploy_doc_upgrade_section() -> None:
+    block = between_markers(section(read_doc("docs/deploy.md"), "## 14. "), "upgrade-v0.1.0")
+    for needle in (
+        "earmark.db-wal",
+        "earmark.db-shm",
+        "analyses",
+        "lancedb",
+        "models/embed",
+        "digests",
+        "--remove-orphans",
+        "vault is no longer touched",
+        "VAULT_PATH",
+    ):
+        assert needle in block, needle
+
+
+class _Reset:
+    """What `!reset` loads as."""
+
+
+def _compose_loader() -> type[yaml.SafeLoader]:
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.add_constructor("!reset", lambda loader, node: _Reset())
+    Loader.add_constructor("!override", lambda loader, node: _Reset())
+    return Loader
+
+
+def test_deploy_doc_cpu_worker_override() -> None:
+    text = after_marker(read_doc("docs/deploy.md"), "cpu-worker-override")
+    loaded = yaml.load(first_fence(text, "yaml").body, Loader=_compose_loader())  # noqa: S506
+    worker = loaded["services"]["worker"]
+    assert isinstance(worker["gpus"], _Reset)
+    assert worker["image"] == "earmark:local"
+    assert worker["build"]["dockerfile"] == "Dockerfile"
+    assert worker["environment"]["EARMARK_ASR_DEVICE"] == "cpu"
+    known = {env_var(name) for name in Settings.model_fields}
+    assert {k for k in worker["environment"] if k.startswith("EARMARK_")} <= known
+
+
+# --- docs/runbook-spark.md ----------------------------------------------------------------
+
+
+def _phases() -> list[str]:
+    text = read_doc("docs/runbook-spark.md")
+    titles = re.findall(r"^## (Phase \d+|Send back)\b", text, re.MULTILINE)
+    assert titles == [f"Phase {n}" for n in range(11)] + ["Send back"]
+    parts = re.split(r"^## ", text, flags=re.MULTILINE)
+    return [p for p in parts if p.startswith("Phase ")]
+
+
+def test_runbook_phases_end_in_checks() -> None:
+    phases = _phases()
+    assert len(phases) == 11
+    for phase in phases:
+        title = phase.splitlines()[0]
+        assert phase.count("**Check:**") == 1, title
+        before, _, after = phase.partition("**Check:**")
+        body = before.split("\n", 1)[1].strip()
+        assert body, f"{title}: the check is the first paragraph"
+        assert "\n### " not in after, title
+
+
+def test_runbook_real_delivery_check() -> None:
+    needles = (
+        "you@example.org",
+        ".instructions.md",
+        "both attachments",
+        "body",
+        "Authentication-Results",
+        "dmarc=pass",
+    )
+    found = [
+        p
+        for p in _phases()
+        if all(n in p.partition("**Check:**")[2] for n in needles)
+        and ("EARMARK_MAIL_BACKEND=smtp" in p or "deploy.md#84-" in p)
+    ]
+    assert len(found) == 1
+
+
+def test_runbook_covers_the_brief() -> None:
+    text = read_doc("docs/runbook-spark.md")
+    for needle in (
+        "deploy.md#73-the-spark-smoke-test",
+        "SPF",
+        "DKIM",
+        "DMARC",
+        "app password",
+        "EARMARK_ALLOWED_RECIPIENTS",
+        "`all`",
+        "-wal",
+        "-shm",
+        "analyses/",
+        "lancedb/",
+        "models/embed/",
+        "vault is no longer touched",
+    ):
+        assert needle in text, needle
+    assert "Dockerfile.gpu" in text or "GPU image" in text
 
 
 # --- share-sheet captures -----------------------------------------------------------------
@@ -313,7 +813,7 @@ def test_share_sheet_fixture_shape() -> None:
 def test_recorded_share_sheet_captures(tmp_path: Path) -> None:
     for index, entry in enumerate(_fixture()["shares"]):
         assert check_share_capture(entry) == [], f"share {index}"
-        body = json.dumps({"url": entry["url"], "to": "you@example.org"})
+        body = json.dumps({"url": entry["url"], "to": "you@example.org"}).encode()
         status, _, store = _post(body, tmp_path / str(index))
         assert status == 202, f"share {index}"
         assert [j.url for j in store.list_recent()] == [entry["canonical"]]
@@ -322,7 +822,8 @@ def test_recorded_share_sheet_captures(tmp_path: Path) -> None:
 def test_share_capture_checker_accepts_known_shape(tmp_path: Path) -> None:
     entry = _synthetic_entry()
     assert check_share_capture(entry) == []
-    status, _, store = _post(json.dumps({"url": entry["url"], "to": "you@example.org"}), tmp_path)
+    body = json.dumps({"url": entry["url"], "to": "you@example.org"}).encode()
+    status, _, store = _post(body, tmp_path)
     assert status == 202
     assert [j.url for j in store.list_recent()] == [entry["canonical"]]
 

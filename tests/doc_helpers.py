@@ -136,3 +136,111 @@ def relative_links(text: str) -> list[str]:
         if target:
             targets.append(target)
     return targets
+
+
+_HEADING: Final = re.compile(r"^(?P<hashes>#{1,6})[ \t]+(?P<text>.+?)[ \t]*#*[ \t]*$")
+_ANCHORED_LINK: Final = re.compile(
+    r"!?\[[^\]\n]*\]\((?P<target>[^)\s]*#[^)\s]*)(?:\s+\"[^\"]*\")?\)"
+)
+
+
+def table_rows(text: str) -> list[list[str]]:
+    """Cells of every Markdown table row outside fences, stripped, header and separator
+    rows excluded (a separator row is all '-', ':' and spaces; the header is the row
+    directly above it)."""
+    rows: list[list[str]] = []
+    previous: list[str] | None = None  # the row above, which is a header if a separator follows
+    for line in _outside_fences(text).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            previous = None
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if all(re.fullmatch(r"[-: ]*", c) for c in cells) and any(cells):
+            if previous is not None and rows and rows[-1] is previous:
+                rows.pop()  # that row was the header
+            previous = None
+            continue
+        rows.append(cells)
+        previous = cells
+    return rows
+
+
+def _headings(text: str) -> list[tuple[int, str]]:
+    found: list[tuple[int, str]] = []
+    for line in _outside_fences(text).splitlines():
+        match = _HEADING.match(line)
+        if match:
+            found.append((len(match["hashes"]), match["text"]))
+    return found
+
+
+def heading_anchors(text: str) -> set[str]:
+    """GitHub anchors of the ATX headings outside fences: text lower-cased, every character
+    that is not a word character, '-' or ' ' removed, spaces replaced by '-'; a repeated
+    anchor gets '-1', '-2', ... in order."""
+    anchors: set[str] = set()
+    seen: dict[str, int] = {}
+    for _, title in _headings(text):
+        base = re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        anchors.add(base if count == 0 else f"{base}-{count}")
+    return anchors
+
+
+def anchored_links(text: str) -> list[tuple[str, str]]:
+    """(path, anchor) for inline links outside fences that carry a '#anchor' and no scheme;
+    path is '' for a same-document link."""
+    found: list[tuple[str, str]] = []
+    for match in _ANCHORED_LINK.finditer(_outside_fences(text)):
+        target = match["target"]
+        if _SCHEME.match(target):
+            continue
+        path, anchor = target.split("#", 1)
+        if anchor:
+            found.append((path, anchor))
+    return found
+
+
+def without_blocks(text: str, name: str) -> str:
+    """text with every '<!-- name:begin -->' ... '<!-- name:end -->' span removed (markers
+    included); AssertionError if they are unbalanced or nested."""
+    begin = f"<!-- {name}:begin -->"
+    end = f"<!-- {name}:end -->"
+    out: list[str] = []
+    rest = text
+    while True:
+        start = rest.find(begin)
+        stop = rest.find(end)
+        if start == -1 and stop == -1:
+            out.append(rest)
+            return "".join(out)
+        assert start != -1, f"unbalanced {name} markers: {end!r} without {begin!r}"
+        assert stop != -1, f"unbalanced {name} markers: {begin!r} without {end!r}"
+        assert start < stop, f"{end!r} comes before {begin!r}"
+        assert begin not in rest[start + len(begin) : stop], f"nested {name} markers"
+        out.append(rest[:start])
+        rest = rest[stop + len(end) :]
+
+
+def section(text: str, heading: str) -> str:
+    """From the heading line that starts with `heading` (for example '## 8. ') to the next
+    heading of the same or a higher level; AssertionError unless exactly one matches."""
+    lines = text.splitlines()
+    fenced = {
+        i
+        for fence in fences(text)
+        for i in range(fence.line - 1, fence.line + fence.body.count("\n") + 2)
+    }
+    starts = [i for i, line in enumerate(lines) if i not in fenced and line.startswith(heading)]
+    assert len(starts) == 1, f"{heading!r} matches {len(starts)} headings"
+    first = starts[0]
+    level = len(lines[first]) - len(lines[first].lstrip("#"))
+    end = len(lines)
+    for i in range(first + 1, len(lines)):
+        match = _HEADING.match(lines[i])
+        if i not in fenced and match and len(match["hashes"]) <= level:
+            end = i
+            break
+    return "\n".join(lines[first:end])

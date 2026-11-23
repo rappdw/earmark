@@ -14,7 +14,7 @@ image that compiles CTranslate2 with CUDA (step 26).
 How to read this document:
 
 - The sections before "Settled questions" describe the code as it is.
-- "Settled questions" records what the planners of steps 24–26 decided, and why.
+- "Settled questions" records what the planners of steps 24–27 decided, and why.
 - "History: removed in step 22" lists what step 22 removed.
 
 When a step changes a contract described here, it changes this file in the same commit.
@@ -1542,20 +1542,32 @@ Documents are tested against the code (step 16).
 - **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
   (`<!-- name:begin -->` … `<!-- name:end -->`, or a single `<!-- name -->` before a
   fence) and plain regular expressions; there is no Markdown library.
-- **What `tests/test_docs.py` checks.**
+- **What `tests/test_docs.py` checks** (rewritten in step 27; exact list in
+  `docs/steps/27-docs-runbook-shortcut.md` section 6).
   - The README's settings reference lists every `Settings` field exactly once, one
     variable per table row.
-  - The README quickstart sets all five backends to `fake`.
-  - `docs/shortcut.md`'s example request body validates against `TranscriptionRequest`
-    and is accepted by `POST /transcriptions`, and the example response matches the route
-    (step 24).
-  - The Shortcut's actions appear in a fixed order.
-  - Relative links in the README, `docs/deploy.md` and `docs/shortcut.md` resolve.
+  - The README quickstart sets all five backends to `fake`, exports only `Settings`
+    variables, runs only registered commands, posts a valid JSON request (with a
+    `timestamp`) and a valid upload, and reads the fake mailer's outbox.
+  - `docs/shortcut.md`'s JSON example and its upload field table are posted to
+    `POST /transcriptions` (JSON and multipart) and accepted, with the `timestamp` offset
+    stored. The example response matches the route. The error table matches what the API
+    answers.
+  - The Shortcut's actions appear in a fixed order, the menu's addresses are allowed by the
+    allowlist example in `docs/deploy.md`, and both POST actions send `timestamp`.
+  - Relative links and their `#anchors` in the README, `docs/deploy.md`,
+    `docs/shortcut.md`, `docs/runbook-spark.md` and `docs/asr.md` resolve.
+  - Those documents use placeholders only (addresses at `example.org`, `example.net` or
+    `example.com`, the listed example IPs, placeholder secrets), and outside their marked
+    "upgrading from v0.1.0" blocks name no removed feature, route, setting or service.
+  - Every runbook phase ends in a check, and one check is a real delivery to the
+    operator's own address.
   - The README's command table names every CLI command, and its HTTP API sentence names
     every route of `build_router` (step 17).
   - Real share-sheet captures in `tests/fixtures/share_sheet.json` canonicalise as
     recorded.
-  - The deploy guide's reachability and telemetry sections say what they should.
+  - The deploy guide's reachability, mail, allowlist, upgrade and telemetry sections say
+    what they should.
   - This file contains `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=0`.
 - **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,
   `compose.yaml`, and the two systemd units, including that each one sets
@@ -1719,6 +1731,12 @@ Step planners should check these against current documentation instead of assumi
    Caddyfile was checked, with `caddy validate`. What the iOS share sheet hands a Shortcut
    is also unverified (no iPhone);
    `docs/shortcut.md` says how to capture it into `tests/fixtures/share_sheet.json`.
+   The Shortcut itself has never run (step 27): its action names come from Apple's
+   Shortcuts User Guide and community references. Unverified on a phone: what `Get Type`
+   reports for a shared audio file, that a `Form` body with a file field is sent as
+   `multipart/form-data`, the file part's content type, whether `Ask for Input` accepts an
+   empty answer, and how long `Get Contents of URL` waits on a large upload. The CPU-only
+   worker override in `docs/deploy.md` section 7.2 (`gpus: !reset null`) has not run either.
 5. **The dev sandbox intercepts DNS.** Found in step 06 (2026-11-20): every name,
    including `.invalid` ones, resolves to `10.200.9.2`, so the address guard refuses
    every real fetch there. That is correct behaviour; `network` tests detect it and run
@@ -1808,7 +1826,7 @@ context. earmark's job is:
 
 ## Settled questions
 
-The planners of steps 24–26 settled these. Each step plan, section 8, has the reasons.
+The planners of steps 24–27 settled these. Each step plan, section 8, has the reasons.
 
 - **Settled by step 24** (see `docs/steps/24-transcription-requests.md` section 8):
   - the caps: `instructions` 4000 characters, `title` 200;
@@ -1821,7 +1839,8 @@ The planners of steps 24–26 settled these. Each step plan, section 8, has the 
 - **Settled by step 25** (see `docs/steps/25-delivery.md` section 8):
   - **The time zone.** It is the offset of the request's `timestamp`, stored as
     `utc_offset_min`, or UTC when there is none. No setting and no zone database. The
-    Shortcut must send `timestamp` (step 27), and `earmark submit` sends none.
+    Shortcut sends `timestamp` (step 27, `docs/shortcut.md`), and `earmark submit` sends
+    none.
   - **The `published` date** is shown in the requester's offset, with Apple's date-only
     values kept.
   - **The feed guid.** It is the matched feed item's `<guid>`, in the new
@@ -1855,6 +1874,19 @@ The planners of steps 24–26 settled these. Each step plan, section 8, has the 
     `EARMARK_ASR_DEVICE` forced to `cuda` and the compute type defaulting to `float16`.
   - **The cache key** gains `batch_size` only when batching is on.
   - **Doctor's check** is a new `asr cuda` line after `asr model`.
+- **Settled by step 27** (see `docs/steps/27-docs-runbook-shortcut.md` section 8):
+  - **One Shortcut** for links and files. It picks `to` with "Choose from Menu" and
+    `Set Variable`, asks for the instructions, formats the current date as ISO 8601 with
+    time for `timestamp`, and branches on `Get Type` of the share-sheet input: a file is
+    posted as a `Form` (multipart) upload, anything else as JSON with the first URL.
+  - **`docs/deploy.md` keeps its section numbers.** Sections 7 and 17 are named by
+    `Dockerfile.gpu`, `compose.yaml`, `.env.example` and the tests. The removed
+    sections 8, 9 and 14 now hold email delivery, recipients and upgrading from v0.1.0.
+  - **The runbook's order:** the GPU smoke and a real transcription into the fake outbox
+    first, then the sending mailbox and a real delivery to the operator's own address,
+    then the PKA recipients, reachability, ntfy and the Shortcut.
+  - **No worker without a GPU in `compose.yaml`.** A host without one uses a local
+    `compose.override.yaml`, documented in `docs/deploy.md` section 7.2.
 
 ## Not planned
 
@@ -1890,8 +1922,9 @@ async transcription API for other callers. None is designed here.
 - `EARMARK_TZ` and `tzdata` went because only the vault and digest used them (step 22
   section 5.8); the time zone for the note is step 25's to settle.
 - Left on disk by an old install and ignored: `episodes/<key>/analyses/`, `lancedb/`,
-  `models/embed/`, `digests/`, `vault.lock` and `index.lock` under the data dir. Step 27's
-  upgrade notes cover deleting them. The vault is never touched.
+  `models/embed/`, `digests/`, `vault.lock` and `index.lock` under the data dir.
+  `docs/deploy.md` section 14 and runbook phase 1 (step 27) cover moving the old database
+  aside and deleting them. The vault is never touched.
 - `huggingface-hub` stays at 1.33.0 in `uv.lock`; the fastembed constraint that held it
   below 2.0 left with the `index` extra.
 - The GitHub environment `llm` and its `ANTHROPIC_API_KEY` secret are no longer used by any

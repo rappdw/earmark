@@ -1,68 +1,50 @@
 # earmark
 
-Share an Apple Podcasts episode from your iPhone and get a Markdown research note in your
-Obsidian vault. Self-hosted: an iOS Shortcut posts the episode link (and an optional
-question) to a small API on your own machine, a worker transcribes the episode locally,
-analyzes the transcript with an LLM, writes the note, and indexes it for search. Python
-3.13.
+A self-hosted transcription and delivery service. An iOS Shortcut, curl or `earmark
+submit` sends an Apple Podcasts episode link, a direct audio URL or an audio file, plus a
+destination address and instructions. A worker transcribes it with faster-whisper, on the
+DGX Spark's GPU in the GPU image. The transcript note and the instructions are emailed to
+that address as two Markdown attachments, and an ntfy push follows. The operator's
+personal knowledge assistants (PKAs) do the analysis and filing. Python 3.13.
 
 ## How it works
 
 ```
-POST /ingest ─► jobs table (SQLite) ─► worker ─► Pipeline
-  resolve ─► fetch ─► transcribe ─► analyze ─► store ─► index ─► notify
+POST /transcriptions ─► jobs table (SQLite) ─► worker ─► Pipeline
+  resolve ─► fetch ─► transcribe ─► deliver ─► notify
 ```
 
 Every stage is a protocol with a real backend and a fake, chosen by configuration.
 
 - **resolve**: the `apple` resolver turns the Apple link into the show's feed and the
-  episode's audio URL (iTunes lookup, then the RSS feed).
+  episode's audio URL (iTunes lookup, then the RSS feed). A direct audio URL or an upload
+  needs no lookup. Fake: `fake`.
 - **fetch**: the `http` fetcher downloads the audio through a guarded client (scheme
-  check, private-address block, size cap).
+  check, private-address block, size cap). Fake: `fake`.
 - **transcribe**: `faster_whisper` in the worker, or `remote`, an OpenAI-compatible speech
-  server such as vLLM serving Whisper ([docs/asr.md](docs/asr.md)).
-- **store**: the `vault` store writes the episode note, a transcript note, and entity
-  notes for the people, papers, companies, tools and topics it finds.
-- **index**: `lancedb` with local embeddings, for `earmark search` and `GET /search`.
-- **notify**: `ntfy` sends a push notification when a job finishes or fails.
+  server ([docs/asr.md](docs/asr.md)). Fake: `fake`.
+- **deliver**: the `smtp` mailer sends the transcript note and the instructions through
+  your mail provider's submission server. Fake: `fake`, which writes
+  `data/outbox/<job id>.eml` and sends nothing.
+- **notify**: `ntfy` sends a push notification when a job is sent or fails. Fake: `fake`;
+  `none` turns it off.
 
-**Asking again.** `POST /episodes/{key}/analyze` or `earmark reanalyze <key> --prompt "…"`
-runs a new prompt on an episode that is already transcribed. It downloads and transcribes
-nothing, contacts neither Apple nor the feed, and adds a section to the note, with the
-entity notes and the search index updated. `GET /episodes` or `earmark episodes` lists the
-stored episodes with their keys and the prompts already run. A prompt already run with the
-same `EARMARK_LLM_MODEL` makes no LLM call, and the job only regenerates the note (a note
-whose managed region you edited by hand is backed up to `Backups/` first, as for any
-store). Sharing the episode again from the Shortcut with a new question also works; it
-looks the episode up again but does not re-download it.
+**The email.** One message per job goes to the one address in the request. It has two
+Markdown attachments, the transcript note (`YYYY-MM-DD-<slug>.md`) and the instructions
+(`YYYY-MM-DD-<slug>.instructions.md`). The body is earmark's own text: it names the job and
+both files. Delivery is at-least-once, so a PKA may see a message twice and must ignore
+the duplicate. Sharing the same item again is a new job that reuses the cached transcript.
+"Delivering" and the mail contract in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) have the
+details.
 
-The Markdown vault is the system of record. SQLite and the search index are derived and
-can be rebuilt from the files on disk. Earmark writes only inside
-`<vault>/<EARMARK_VAULT_SUBDIR>/`:
-
-```
-Earmark/
-  Podcasts/<Show>/<YYYY-MM-DD> <Title>.md
-  Podcasts/<Show>/transcripts/<YYYY-MM-DD> <Title> (transcript).md
-  Entities/{People,Papers,Companies,Tools,Topics}/<Name>.md
-  Digests/<year>-W<week>.md
-  Backups/
-  aliases.yaml          optional, yours: entity merges
-```
-
-See "Data layout" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-**Weekly digest.** `earmark digest` writes `Digests/<year>-W<week>.md`: the research leads
-of the episodes first shared that week, grouped into themes by the LLM. Each lead links to
-its episode note and to its moment in the transcript note. `--week 2026-W47` picks a week
-and `--since 7d` the last seven days. Running it again with nothing new makes no LLM call
-and changes nothing. Scheduling is in [docs/deploy.md](docs/deploy.md).
+**What earmark keeps.** The job table and a transcript cache, both under
+`EARMARK_DATA_DIR`. It is not a system of record: the notes live with the PKAs.
 
 ## Quickstart (fake backends)
 
-This runs the whole service with fake backends: no network, GPU, API key, or model
-download. It needs [uv](https://docs.astral.sh/uv/) and `curl`, and port 8787 free. Run it
-from a checkout of this repository.
+This runs the whole service with fake backends: no network, GPU, API key, mail server or
+model download. It needs [uv](https://docs.astral.sh/uv/) and `curl`, and port 8787 free.
+Run it from a checkout of this repository.
 
 <!-- quickstart:begin -->
 ```bash
@@ -70,12 +52,10 @@ uv sync
 uv run earmark --version
 
 demo=$(mktemp -d)
-mkdir "$demo/vault"
 export EARMARK_API_TOKEN=demo-token
 export EARMARK_ALLOWED_RECIPIENTS=you@example.org
-export EARMARK_DATA_DIR="$demo/data" EARMARK_VAULT_DIR="$demo/vault"
+export EARMARK_DATA_DIR="$demo/data"
 export EARMARK_RESOLVER_BACKEND=fake EARMARK_FETCH_BACKEND=fake EARMARK_ASR_BACKEND=fake \
-  EARMARK_LLM_PROVIDER=fake EARMARK_STORE_BACKEND=fake EARMARK_INDEX_BACKEND=fake \
   EARMARK_MAIL_BACKEND=fake EARMARK_NOTIFY_BACKEND=fake
 uv run earmark doctor
 
@@ -84,17 +64,39 @@ curl -s --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/hea
 curl -s http://127.0.0.1:8787/transcriptions \
   -H "Authorization: Bearer $EARMARK_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981", "to": "you@example.org", "instructions": "Which papers are mentioned?"}'
+  -d '{"url": "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981", "to": "you@example.org", "instructions": "Which papers are mentioned?", "timestamp": "2026-11-23T21:30:00-08:00"}'
+printf 'not really audio' > "$demo/memo.m4a"
+curl -s http://127.0.0.1:8787/transcriptions \
+  -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  -F "file=@$demo/memo.m4a" \
+  --form-string to=you@example.org \
+  --form-string instructions="File this under ideas."
+uv run earmark worker --once
 uv run earmark worker --once
 uv run earmark jobs
-uv run earmark episodes
-uv run earmark reanalyze "$(ls "$demo/data/episodes")" --prompt "Who is interviewed?"
-uv run earmark worker --once
-curl -s http://127.0.0.1:8787/episodes -H "Authorization: Bearer $EARMARK_API_TOKEN"
-cat "$demo"/vault/Earmark/Podcasts/*.md
-uv run earmark digest --since 7d
-uv run earmark digest --since 7d
-cat "$demo"/vault/Earmark/Digests/*.md
+ls "$demo/data/outbox"
+uv run python - "$demo"/data/outbox/*.eml <<'EOF'
+import email
+import email.policy
+import hashlib
+import re
+import sys
+
+for path in sys.argv[1:]:
+    with open(path, "rb") as f:
+        message = email.message_from_binary_file(f, policy=email.policy.default)
+    print("Subject:", message["Subject"])
+    print(message.get_body().get_content())
+    for part in message.iter_attachments():
+        data = part.get_payload(decode=True)
+        print("=====", part.get_filename())
+        print(data.decode())
+        claimed = re.search(rb'transcript_sha256: "([0-9a-f]{64})"', data)
+        if claimed:
+            body = data[data.index(b"\n---\n", 3) + 5 :]
+            ok = hashlib.sha256(body).hexdigest() == claimed[1].decode()
+            print("transcript_sha256", "ok" if ok else "MISMATCH")
+EOF
 kill %1
 wait
 ```
@@ -104,29 +106,31 @@ What you see:
 
 - `earmark doctor` passes, with warnings for the fake backends and the short token.
 - `{"status":"ok"}` from the health check, then
-  `{"job_id": …, "status": "queued", "created": true}` for the ingest.
-- `job <id> done` from `worker --once`, and the job listed as `done` by `earmark jobs`.
-- `earmark episodes` lists the fake episode with its prompt.
-- The reanalyze prints a second job id, and `worker --once` prints it as `done`.
-- `GET /episodes` shows both prompts.
-- The fake note's Markdown, with a section for each prompt.
-- The first `earmark digest --since 7d` writes the digest note, and the second says it is up
-  to date. The note groups the research leads by show.
+  `{"job_id": …, "status": "queued", "created": true}` for each of the two requests (202).
+- `job <id> done` from each `worker --once`.
+- `earmark jobs` lists two `done` jobs at stage `deliver`.
+- Two `.eml` files in the outbox, one per job. For each, the reader prints the subject
+  (`[earmark] <title>`), the body earmark generated, the transcript note with its
+  `[00:00:00]` paragraph and `transcript_sha256 ok`, and the instructions file.
 
-The episode URL is never fetched, because the resolver is fake. `kill %1` stops the
-server, and `wait` lets it finish shutting down. Everything lives in a temporary
-directory, so nothing is left in the repository.
+The podcast note's dates use the request's `-08:00` offset, from its `timestamp`. The upload
+sent none, so its dates are UTC. The fake
+resolver never fetches the Apple URL, and the fake transcriber accepts any bytes (a real
+one needs audio). `kill %1` stops the server, and `wait` lets it finish shutting down.
+Everything lives in a temporary directory, so nothing is left in the repository.
 
-**Real backends.** Install the heavy extras with `uv sync --extra transcribe --extra
-index`, point `EARMARK_VAULT_DIR` at an Obsidian vault, and set `EARMARK_LLM_API_KEY`.
-[docs/deploy.md](docs/deploy.md) covers the container, systemd, and how the phone
+**Real backends.** `uv sync --extra transcribe` installs local faster-whisper. Set
+`EARMARK_ALLOWED_RECIPIENTS` and the `EARMARK_SMTP_*` settings
+([docs/deploy.md](docs/deploy.md) section 8). On the Spark, use compose with the GPU image
+(section 7). [docs/deploy.md](docs/deploy.md) also covers systemd and how the phone
 reaches the API.
 
 ## Guides
 
 - [docs/deploy.md](docs/deploy.md): Docker Compose, systemd, reaching the API from the
-  iPhone, GPU transcription, search, notifications, backups.
-- [docs/shortcut.md](docs/shortcut.md): building the iOS Shortcut.
+  iPhone, GPU transcription, the sending mailbox, recipients, notifications, upgrading
+  from v0.1.0, backups.
+- [docs/shortcut.md](docs/shortcut.md): building the iOS Shortcut for links and files.
 - [docs/runbook-spark.md](docs/runbook-spark.md): a step-by-step first setup on a DGX
   Spark, with a check after each phase.
 - [docs/asr.md](docs/asr.md): remote transcription servers.
@@ -139,7 +143,7 @@ Run them as `uv run earmark <command>`.
 
 | Command | What it does |
 |---|---|
-| `serve` | Run the ingest API on `EARMARK_HOST:EARMARK_PORT`. |
+| `serve` | Run the API on `EARMARK_HOST:EARMARK_PORT`. |
 | `worker [--once]` | Run the job worker; `--once` processes at most one job and exits. |
 | `submit <url-or-file> --to <address> [--instructions] [--title]` | Enqueue a transcription, the same way `POST /transcriptions` does. |
 | `jobs [--status] [--limit] [--json]` | List recent jobs, newest first. |
@@ -171,11 +175,11 @@ Copy `.env.example` to start.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EARMARK_DATA_DIR` | `./data` | Jobs database, episode artifacts, index. A local filesystem. |
+| `EARMARK_DATA_DIR` | `./data` | Jobs database, transcript cache, upload and download staging, and the fake mailer's outbox. A local filesystem. |
 
 ### Backends
 
-`fake` exists for tests and demos; `none` disables the index or notifications.
+`fake` exists for tests and demos; `none` disables notifications.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -239,7 +243,7 @@ See "Notifications" in [docs/deploy.md](docs/deploy.md).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EARMARK_ALLOWED_RECIPIENTS` | unset | Who may receive transcripts: comma-separated addresses, or `all`. Unset refuses every request. |
+| `EARMARK_ALLOWED_RECIPIENTS` | unset | Who may receive transcripts: comma-separated exact addresses, or `all` (any address: see [docs/deploy.md](docs/deploy.md) section 9). Unset refuses every request. |
 | `EARMARK_MAX_UPLOAD_MB` | `1024` | Largest audio upload accepted. |
 | `EARMARK_DEDUPE_WINDOW_S` | `600` | Seconds a finished job answers a repeat of the same request. |
 
@@ -266,10 +270,8 @@ See "Notifications" in [docs/deploy.md](docs/deploy.md).
 | `EARMARK_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 <!-- settings:end -->
 
-For Claude, `EARMARK_LLM_API_KEY` is the API key. `ANTHROPIC_API_KEY` in the process
-environment also works, but a line for it in `.env` is not read. The variables that only
-Docker Compose uses (`VAULT_PATH`, `API_BIND`, and others) are listed in
-[docs/deploy.md](docs/deploy.md).
+The variables that only Docker Compose uses (`API_BIND`, `APP_UID`, `APP_GID`, `EXTRAS`,
+`HF_HUB_DISABLE_TELEMETRY`) are listed in [docs/deploy.md](docs/deploy.md) section 4.
 
 ## Development
 
@@ -279,16 +281,15 @@ make check                   # ruff, ruff format (including Markdown code blocks
 uv run pytest -m network     # opt-in: live Apple and feed endpoints
 ```
 
-The default suite blocks sockets and needs no GPU or API key. Other markers are `slow`
-(model downloads), `llm` (the real Claude API), `gpu`, and `index` (real LanceDB).
+The default suite blocks sockets and needs no GPU, API key or mail server. The markers are
+`network` (live Apple and feed endpoints), `slow` (model downloads), `gpu` and `smtp` (a
+real mail server).
 
 CI runs on GitHub Actions, on linux/arm64:
 
 - **CI** (`make check (linux/arm64)`): the only required check on `main`.
-- **Index tests**: the LanceDB tests with the `index` extra.
 - **Live tests** (`network.yml`): weekly and on demand, jobs `network` and `slow`.
-- **LLM test** (`llm.yml`): on demand only, in the `llm` environment.
-- **Container image** (`container.yml`): builds the image without pushing it and runs three
-  one-off checks in it. Not a required check.
+- **Container image** (`container.yml`): builds the CPU image, lints `Dockerfile.gpu` with
+  `docker build --check`, and runs one-off checks. Not a required check.
 
 Steps land on the `impl` branch, and `main` is fast-forwarded after green CI.

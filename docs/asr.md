@@ -4,8 +4,9 @@ Earmark can transcribe locally with faster-whisper, or send the audio to an
 OpenAI-compatible speech-to-text server you run yourself. This guide covers the second
 option (`EARMARK_ASR_BACKEND=remote`). It needs no optional extra.
 
-The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only, so on a DGX Spark the GPU path
-is a remote server on the Spark itself. Everything about the servers below comes from
+On the DGX Spark the worker transcribes on the GPU itself, from the GPU image
+(`Dockerfile.gpu`, [docs/deploy.md](deploy.md) section 7). A remote server is for a GPU on
+another machine, or for another engine. Everything about the servers below comes from
 their documentation and source as of 2026-11-20. **None of them was run by the earmark
 build, because the build sandbox has no GPU**; where a statement depends on a real run
 it says "not verified by the earmark build (no GPU)".
@@ -61,9 +62,9 @@ that protects feed and enclosure downloads does not apply to it.
 Test the setup with `earmark transcribe episode.mp3`, which uses the remote server when
 `EARMARK_ASR_BACKEND=remote`.
 
-## 3. On the DGX Spark: vLLM with Whisper (recommended)
+## 3. vLLM with Whisper
 
-vLLM serving Whisper returns `verbose_json` segments with absolute timestamps and has
+On a GPU host, for example another Spark, vLLM serving Whisper returns `verbose_json` segments with absolute timestamps and has
 API-key middleware. Run it from NVIDIA's arm64 CUDA 13 vLLM container
 (`nvcr.io/nvidia/vllm:<YY.MM>-py3`; find the current tag on NGC or in the playbook at
 build.nvidia.com/spark/vllm).

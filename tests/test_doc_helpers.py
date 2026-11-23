@@ -2,11 +2,16 @@ import pytest
 
 from tests.doc_helpers import (
     after_marker,
+    anchored_links,
     between_markers,
     fences,
     first_fence,
+    heading_anchors,
     relative_links,
+    section,
+    table_rows,
     table_variables,
+    without_blocks,
 )
 
 
@@ -101,3 +106,91 @@ def test_relative_links() -> None:
         "```\n[ignored](nowhere.md)\n```\n"
     )
     assert relative_links(text) == ["docs/a.md", "docs/b.md", "pics/p.png"]
+
+
+def test_table_rows() -> None:
+    text = (
+        "intro\n"
+        "| Status | Message |\n"
+        "|:---|---:|\n"
+        "| 401 | `missing` |\n"
+        "| 422 | `again` |\n"
+        "text\n"
+        "```\n| in | fence |\n```\n"
+        "| H2 | H3 |\n"
+        "| --- | --- |\n"
+        "| x | y |\n"
+    )
+    assert table_rows(text) == [
+        ["401", "`missing`"],
+        ["422", "`again`"],
+        ["x", "y"],
+    ]
+
+
+def test_heading_anchors() -> None:
+    text = (
+        "# Top\n"
+        "### 7.3 The Spark smoke test\n"
+        "## 14. Upgrading from v0.1.0\n"
+        "## Phase 2: Get the code and write .env\n"
+        "#### 6.1.6 DNS rebinding protection (a gotcha)\n"
+        "## Again\n"
+        "## Again\n"
+        "## Again\n"
+        "```bash\n# not a heading\n```\n"
+    )
+    assert heading_anchors(text) == {
+        "top",
+        "73-the-spark-smoke-test",
+        "14-upgrading-from-v010",
+        "phase-2-get-the-code-and-write-env",
+        "616-dns-rebinding-protection-a-gotcha",
+        "again",
+        "again-1",
+        "again-2",
+    }
+
+
+def test_anchored_links() -> None:
+    text = "[a](x.md#b) [c](#d) [e](https://h/#f) [g](plain.md)\n```\n[h](y.md#i)\n```\n"
+    assert anchored_links(text) == [("x.md", "b"), ("", "d")]
+
+
+def test_without_blocks() -> None:
+    one = "a\n<!-- x:begin -->\nmiddle\n<!-- x:end -->\nz"
+    assert without_blocks(one, "x") == "a\n\nz"
+    two = "1<!-- x:begin -->2<!-- x:end -->3<!-- x:begin -->4<!-- x:end -->5"
+    assert without_blocks(two, "x") == "135"
+    assert without_blocks("none", "x") == "none"
+    assert without_blocks(one, "y") == one
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<!-- x:begin -->only",
+        "only<!-- x:end -->",
+        "<!-- x:end --><!-- x:begin -->",
+        "<!-- x:begin --><!-- x:begin --><!-- x:end --><!-- x:end -->",
+    ],
+)
+def test_without_blocks_rejects_bad_markers(text: str) -> None:
+    with pytest.raises(AssertionError):
+        without_blocks(text, "x")
+
+
+def test_section() -> None:
+    text = (
+        "## 7. A\nseven\n### 7.1 Deeper\ndeep\n```\n## 8. in a fence\n```\n"
+        "## 8. B\neight\n# Top\ntop\n"
+    )
+    assert section(text, "## 7. ") == (
+        "## 7. A\nseven\n### 7.1 Deeper\ndeep\n```\n## 8. in a fence\n```"
+    )
+    assert section(text, "## 8. ") == "## 8. B\neight"
+    assert section(text, "### 7.1") == "### 7.1 Deeper\ndeep\n```\n## 8. in a fence\n```"
+    with pytest.raises(AssertionError):
+        section(text, "## 9. ")
+    with pytest.raises(AssertionError):
+        section(text + "## 8. again\n", "## 8. ")

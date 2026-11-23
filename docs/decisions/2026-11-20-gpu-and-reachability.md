@@ -1,5 +1,10 @@
 # Decisions, 2026-11-20: GPU placement and API reachability
 
+**Decision 1 superseded on 2026-11-23** by step 26: the worker now runs a GPU image with
+CTranslate2 built for `sm_121` (`docs/decisions/2026-11-23-gpu-build-recipe.md`,
+`docs/steps/26-gpu-image.md`), and the vLLM `asr` service and `gpu` profile are gone.
+Decision 2 stands.
+
 These were decided during step 16. The details are in `docs/steps/16-deploy-shortcut.md`
 and `docs/deploy.md`.
 
