@@ -89,6 +89,20 @@ pulling them is fine, but do not publish a built image without checking those te
 - A slim split, with an `nvidia/cuda` devel image for the build and a cuDNN runtime image
   to run, should work for faster-whisper alone, but nobody has tried it.
 
+## Pitfalls earshot flagged for earmark's build (2026-11-23, not hit by earshot itself)
+
+- **Python 3.13 headers.** Building the CTranslate2 bindings against the venv's 3.13
+  interpreter needs the 3.13 development headers (`Python.h`) and pybind11 in the build
+  stage. The NGC base likely ships Python 3.12, so check its version first. A uv-managed
+  3.13 includes the headers.
+- **uv putting the PyPI wheel back.** `uv sync` and `uv run` reconcile the venv to the
+  lockfile, so either can replace the swapped-in CUDA bindings with the locked PyPI
+  `ctranslate2` wheel. Avoid this with `uv run --no-sync`, with no uv commands at
+  runtime (the image already runs the venv's `earmark` directly), or by installing the
+  source build from a local path as the locked version. Check
+  `ctranslate2.__file__` and `get_cuda_device_count()` after a uv command, not only
+  after the swap.
+
 ## Differences from earmark, for step 26 to settle
 
 - **Python and the lock.** earmark locks `ctranslate2==4.9.0` and `faster-whisper==1.2.1`

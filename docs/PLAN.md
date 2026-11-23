@@ -962,6 +962,9 @@ orchestrator updates that section first.
   - stripping and the query-omission rule for `source_url`;
   - the `transcript_sha256` scope;
   - the paragraph merge.
+- **Time zone.** The contract dates files and `shared_at` in the requester's offset.
+  Step 22 removed `EARMARK_TZ`, so the planner decides where that offset comes from:
+  the request (the Shortcut can send it), a re-added setting, or UTC. It records why.
 - **SMTP settings.**
   - `EARMARK_SMTP_HOST` and `EARMARK_SMTP_PORT`.
   - `EARMARK_SMTP_SECURITY`, which is `starttls` or `tls`. There is no plaintext option.
@@ -1070,8 +1073,12 @@ service.
     nobody has tried, or the NGC base, which earshot proved. It records why.
   - The `CT2_VERSION` build argument defaults to the locked `ctranslate2` version.
     `v4.6.0` is the documented fallback if the Spark smoke fails.
+  - The build stage has the Python 3.13 headers and pybind11. Use a uv-managed 3.13
+    if the base ships an older Python.
   - A build-time check imports `ctranslate2` and `faster_whisper` and asserts the swapped
     version.
+  - Nothing at runtime invokes `uv sync` or `uv run` without `--no-sync`. Either would
+    put the locked PyPI wheel back. A static test pins this.
 - **The worker.**
   - It runs `faster_whisper` with `EARMARK_ASR_DEVICE=cuda`.
   - faster-whisper's batched pipeline is an option, `EARMARK_ASR_BATCH_SIZE`, with 0 or
@@ -1102,7 +1109,8 @@ service.
   roughly 14 GB of disk, and records why.
 - **Spark smoke.** The operator gets a documented smoke test for the Spark:
   1. build;
-  2. `ctranslate2.get_cuda_device_count() >= 1`;
+  2. `ctranslate2.get_cuda_device_count() >= 1`, with `ctranslate2.__file__` inside
+     the venv, checked after any uv command;
   3. `doctor`;
   4. transcribe a short public clip on `cuda`, and see `float16` in the log.
   
