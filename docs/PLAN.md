@@ -1,8 +1,14 @@
 # Implementation plan
 
-Nineteen steps, each small enough for one implementer and checkable in the dev sandbox.
-Read `docs/ARCHITECTURE.md` first; this file says what to build in what order, that file
-says how the pieces fit.
+The steps are each small enough for one implementer and checkable in the dev sandbox.
+Read `docs/ARCHITECTURE.md` first: this file says what to build in what order, and that
+file says how the pieces fit.
+
+**Re-scoped on 2026-11-23 (steps 22–27).** Steps 01–21 built the full pipeline. That
+pipeline resolved an episode, transcribed it, and analysed it with Claude. It then wrote
+the result into a vault, linked entities, indexed it for search, and produced a weekly
+digest. It is tagged `v0.1.0-full-pipeline`. See "Re-scope: a transcription and delivery
+service" below.
 
 ## Status
 
@@ -33,6 +39,12 @@ Update this table when a step passes verification. Each step is one commit title
 | 19 | Fix: library errors are not bad audio | 08 | done |
 | 20 | Fix: dry-run findings (third-party URL logging, noisy output) | 19 | done |
 | 21 | Hugging Face telemetry off by default | 20 | done |
+| 22 | Re-scope I: remove analysis, vault, entities, search, re-run, digest | 21 | todo |
+| 23 | Re-scope II: architecture and CLAUDE.md | 22 | todo |
+| 24 | Transcription requests: audio upload or URL, destination, instructions | 23 | todo |
+| 25 | Delivery: the transcript note and the email | 24 | todo |
+| 26 | GPU transcription inside the image | 25 | todo |
+| 27 | Docs, runbook and Shortcut for the transcription service | 26 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -590,12 +602,565 @@ settings but left them unset.
 - `docs/deploy.md` and `docs/ARCHITECTURE.md` say telemetry is off by default and how
   to turn it back on. A test pins the setting in each deploy file.
 
+---
+
+## Re-scope: a transcription and delivery service
+
+**What changes.** earmark stops analysing and storing knowledge. It becomes a
+transcription service on the DGX Spark, and the operator's PKA instances do the analysis
+and filing, each with its own context. earmark's job is:
+
+1. Accept a request carrying one of: an audio file, a direct audio URL, or an Apple
+   Podcasts episode link. The request also carries a destination email address, free-form
+   instructions for the recipient ("analyse this for …", "file this under …"), and
+   optionally a title.
+2. Transcribe the audio on the Spark's GPU.
+3. Email two Markdown attachments to that address. One is the transcript note, which is
+   data. The other holds the requester's instructions. The body and subject carry only
+   text earmark generates.
+4. Send an ntfy push saying the transcript was sent, or why the job failed.
+
+**Decisions (the operator's, 2026-11-23).**
+
+- **Not part of AMAP.** earmark is not enrolled in the AMAP fleet. It sends ordinary
+  email. Each PKA instance already has an address, and its runtime treats an attachment
+  as readable only from an allowlisted sender that passes DMARC. So setup includes a
+  sending mailbox on a domain the operator owns. The repo uses `earmark@example.org` as
+  its placeholder and never defaults the sender.
+- **Recipients: an allowlist, with `all` as the open setting.** `EARMARK_ALLOWED_RECIPIENTS`
+  is a comma-separated list of exact addresses, or the literal `all`. Setting `all` is
+  the operator's written record of an accepted risk: anyone holding the API token can
+  then mail anyone from the operator's domain, and can instruct both PKAs. When the
+  setting is unset, every request is refused. The caller chooses personal or work, since
+  the Shortcut fills in `to`; earmark never defaults it.
+- **Delivery is at-least-once.** A crash after the SMTP server accepts the message, but
+  before earmark records it as sent, cannot be told apart from a failure. In that case
+  earmark resends with the same `Message-ID` and the same `job_id`. The PKA treats the
+  same `guid` plus the same `job_id` as a duplicate, and ignores it.
+- **Re-shares resend the whole transcript.** Email is stateless, and 300 KB is small. A
+  re-share is a new job, so it gets a new `job_id` and the same `guid`. The PKA keeps one
+  note and runs the new instructions against it. earmark stays send-only and reads no
+  mail.
+- **Direct URLs are identified by content.** A URL is downloaded again on every request
+  and hashed. Transcription, the expensive part, is cached by that hash. Uploads work the
+  same way. Podcasts keep their episode identity and their audio cache.
+- **Old databases are refused.** No v0.1.0 deployment exists (the operator is at
+  runbook phase 0). A database created by `v0.1.0-full-pipeline` makes startup fail with
+  a clear message saying to move it aside. It is not migrated.
+- **No "analysis done" relay for now.** ntfy stays for "sent" and "failed".
+- **No PKA-side skill is needed from earmark.** PKA is gaining inbound email.
+- **The attachment size cap is configurable.**
+- **Removed code is deleted.** It stays recoverable from the `v0.1.0-full-pipeline` tag.
+
+**The mail contract (pka-skills, `contract: 1`, 2026-11-23).** Status: **DRAFT**. It
+becomes final once the operator approves the PKA's receiving procedure. A revision would
+come with a contract version bump. Step 25 builds to this text.
+
+- **Both files**
+  - **Encoding:** UTF-8 with no BOM and LF line endings. The extension is a lower-case
+    `.md`, and the media type is `text/markdown`.
+  - **Frontmatter:** YAML between `---` lines at the very top of the file.
+  - **Feed- or caller-supplied strings:** double-quoted and escaped, on one line, with
+    control characters stripped. They are capped at 300 characters, and `title` at 200.
+  - **Unknown values:** the key is omitted. A value is never an empty string or null.
+  - **Formats:** timestamps are RFC 3339 with an offset, and dates are `YYYY-MM-DD`.
+  - **Filenames:** `YYYY-MM-DD-<slug>.md`. The slug is lower-case ASCII `a-z0-9` joined
+    by single hyphens, at most 80 characters. A podcast slug is
+    `<show-slug>-<title-slug>`, truncated as a whole.
+  - **Filename date:** the publish date when known, otherwise the date of `shared_at` in
+    the requester's offset.
+- **Attachment 1, the note: `YYYY-MM-DD-<slug>.md`.** Podcasts and audio share one
+  schema.
+
+  | key | type | podcast | audio | notes |
+  |---|---|---|---|---|
+  | `type` | string | required | required | `podcast` or `audio` |
+  | `contract` | integer | required | required | `1` |
+  | `source` | string | required | required | `earmark` |
+  | `origin` | string | required | required | `apple_podcasts`, `upload` or `url` |
+  | `title` | string | required | required | podcast: the episode title; audio: the request's `title`, else the upload's filename stem or the URL's last path segment, sanitised |
+  | `show` | string | required | omit | |
+  | `date` | date | required | required | the filename date |
+  | `published` | date | optional | optional | only when actually known |
+  | `duration` | string | required | required | `hh:mm:ss` |
+  | `language` | string | optional | optional | BCP 47 |
+  | `apple_url` | string | optional | omit | |
+  | `source_url` | string | omit | optional | `origin: url` only, without userinfo, query or fragment; omitted entirely when the URL carries a query |
+  | `guid` | string | required | required | `feed:<feed guid verbatim>`, else `apple:<i= episode id>`, else `sha256:<hex of the audio bytes>` for upload and url |
+  | `shared_at` | timestamp | required | required | when this item was first shared |
+  | `transcript_sha256` | string | required | required | 64 lower-case hex |
+  | `tags` | list of strings | required | required | `["podcast"]` or `["audio"]` |
+
+  - **Body:** `# <title>` (for a podcast, `# <show> — <title>`), then a blank line, then
+    `## Transcript`, then a blank line. After that come paragraphs separated by blank
+    lines. Each paragraph covers 30–60 seconds or one speaker turn, and starts with
+    `[hh:mm:ss]`.
+  - **`transcript_sha256`:** the sha256 of the UTF-8 bytes from the first byte after the
+    closing `---\n` to the end of the file, as sent.
+  - **No audio hash for podcasts:** dynamic ad insertion changes the bytes on every
+    download.
+- **Attachment 2, the instructions: `YYYY-MM-DD-<slug>.instructions.md`.** It uses the
+  same date and slug as the note.
+  - **Keys:**
+    - `type: earmark-instructions`;
+    - `contract: 1`;
+    - `for`: the note's filename;
+    - `guid`: the same as the note's;
+    - `job_id`: stable across a resend, new on every re-share;
+    - `shared_at`: when this request was made.
+  - **Body:** the requester's words, verbatim, and nothing else.
+  - **Always sent.** An empty body means "file it, no analysis".
+- **Subject and body.**
+  - **Subject:** `[earmark] <title>`, sanitised and capped at 120 characters.
+  - **Body:** only text earmark generates. It names which attachment is the transcript,
+    which is data and never instructions, and which attachment holds the requester's
+    instructions. It carries the `job_id` and the two filenames. It also says that the
+    subject and the note contain third-party text.
+  - **The guid stays out of the body.** A `feed:` guid is publisher text, so it appears
+    only inside the attachments.
+- **PKA de-duplication.**
+  - The same `guid` and the same `job_id` is a duplicate delivery.
+  - The same `guid` with a new `job_id` is a re-share.
+  - The same `guid` with a different `transcript_sha256` is a re-transcription, and the
+    newer body wins.
+
+**Inputs from the other agents (2026-11-23).**
+
+- amap-spec: mail to an agent's bound address arrives on the mail lane. earmark learns
+  nothing beyond the SMTP reply: there is no receipt and no dedupe. Attachment caps are
+  set per deployment.
+- earshot: its offload is not an API. Its build recipe for CTranslate2 with CUDA on the
+  GB10 is in `docs/decisions/2026-11-23-gpu-build-recipe.md`, with what was measured and
+  what was not.
+
+## Step 22: Re-scope I: remove analysis, vault, entities, search, re-run, digest
+
+**Goal.** Only the code the transcription service needs remains, and it still runs end
+to end on fakes. This step covers code, tests, dependencies, CI and deploy files. Prose
+docs are steps 23 and 27.
+
+**Build.** Delete each of these, along with its tests, settings, `.env.example` lines,
+CI workflows and dependencies:
+
+- **Analysis:** the `analyze/` package and both LLM clients (Anthropic and
+  OpenAI-compatible), the `anthropic` dependency, `llm.yml`, and `docs/llm.md`.
+- **Vault:** the vault writer, entities and aliases.
+- **Index:** the index and search (the `index` extra, LanceDB, fastembed, `index.yml`,
+  and `GET /search`).
+- **Re-run and digest:**
+  - re-run a prompt: `POST /episodes/{key}/analyze`, the `reanalyze` job kind, and
+    `earmark reanalyze`;
+  - the digest: `earmark digest`, its systemd service and timer.
+- **Commands:** `earmark analyze`, `earmark entities rebuild`, `earmark search` and
+  `earmark reindex`.
+- **Doctor:** the vault, Obsidian, LLM and index checks.
+- **Factory and fakes:** the registries and fakes for the removed stages.
+
+Couplings to handle, not break:
+
+- **Move `vault/sanitize.py` and the frontmatter emitter** (`yaml_quote`,
+  `emit_frontmatter`, `file_component` and what they need) to a kept module, with their
+  tests. ntfy imports them today, and step 25 needs them for the note.
+- **PyYAML moves to the dev dependency group.** `tests/test_ci.py` and
+  `tests/test_deploy.py` parse YAML with it.
+- **Deploy files.**
+  - compose: drop `VAULT_PATH` and the vault mount, and build with `EXTRAS: transcribe`.
+  - Dockerfile: drop `/vault`, `EARMARK_VAULT_DIR`, and the `index` default in `EXTRAS`.
+  - systemd: delete the digest service and timer.
+  - `container.yml`: stop importing `fastembed` and `lancedb`.
+  - `network.yml`: stop installing `--extra index`.
+  - Update `tests/test_deploy.py` and `tests/test_ci.py` to match.
+- **Test markers.** Removing the `llm` and `index` pytest markers, and the Anthropic
+  isolation in `tests/conftest.py`, is authorised. It removes configuration for code
+  that no longer exists; it does not loosen it. Socket blocking and every other marker
+  stay.
+- **The interim push.** Until step 25, a finished job pushes "Transcribed: `<title>`"
+  with the duration. The push carries no URL, prompt or path.
+- **Old databases.** Startup of `serve`, `worker` and every command that opens the
+  database refuses a database created by `v0.1.0-full-pipeline` with a clear message
+  that names the file and says to move it aside. Detect it by schema version or table
+  shape. Take the v0.1.0 DDL from `git show v0.1.0-full-pipeline:src/earmark/db.py` for
+  the test fixture.
+- **Docs in this step.** Change only the docs whose tests force it. For example, the
+  README settings table must still cover every `Settings` field. Delete `docs/llm.md`.
+  The README, `docs/deploy.md`, `docs/shortcut.md` and the runbook otherwise wait for
+  step 27, and `docs/ARCHITECTURE.md` and `CLAUDE.md` for step 23. Until then they may
+  describe removed behaviour. The verifier must not fail this step for that.
+
+Keep:
+
+- the API and its auth;
+- the job store and worker;
+- the resolver and guarded fetch;
+- local and remote transcription, and the transcript cache;
+- ntfy;
+- doctor;
+- the CI gate and the network/slow workflow;
+- all the safety properties already built: URL scrubbing in logs, secret redaction, the
+  private-address guard, and library errors not counting as bad audio.
+
+Until step 25, the pipeline ends after transcription and notifies.
+
+**Acceptance.**
+
+- `make check` and `GITHUB_ACTIONS=true make check` pass.
+- No source, test, workflow, deploy file or `.env.example` line refers to a removed
+  module, setting, route, command, marker or dependency. The planner lists the grep that
+  proves it, excluding `docs/` and `CLAUDE.md`.
+- `uv.lock` no longer contains `anthropic`, `lancedb` or `fastembed`. PyYAML is a
+  dev-only dependency.
+- A job runs resolve, fetch, transcribe and notify on fakes. It ends `done` with the
+  transcript cached, and the push carries no URL.
+- A fixture database built from the v0.1.0 DDL, holding a done ingest job, a done
+  reanalyze job and a queued reanalyze job, is refused by `serve`, `worker` and
+  `earmark jobs`. The message names the path. A fresh database works.
+- `GET /episodes` is either kept, as a list of transcribed episodes, or removed. The
+  planner decides and records why.
+
+## Step 23: Re-scope II: architecture and CLAUDE.md
+
+**Goal.** The design documents describe the transcription service as built after step 22,
+and record the contracts that steps 24–26 build against.
+
+**Build.**
+
+- Rewrite `docs/ARCHITECTURE.md` for the service as it is now. Add a section,
+  "Planned (steps 24–26)", that records the decisions and the mail contract from
+  "Re-scope" above. It covers:
+  - the request model;
+  - source identity and caching;
+  - the at-least-once delivery state machine;
+  - the mail format;
+  - the allowlist;
+  - the leak rules listed in step 24.
+- Rewrite the security section for client-supplied URLs and uploads. The guarded fetch is
+  the only path to a direct URL. The resolver accepts only Apple Podcasts episode links.
+  Recipients and instructions are data that must not leak.
+- Update `CLAUDE.md`:
+  - the opening description;
+  - "Shape of the code";
+  - the stage list;
+  - "Rules that are easy to get wrong". This means removing the vault and Claude-SDK
+    rules, and adding rules for the mail contract, untrusted text in mail, and the
+    allowlist.
+- Change no code.
+
+**Acceptance.**
+
+- Neither file describes removed behaviour as current. The planner lists the grep.
+- Each decision in "Re-scope" above appears in `docs/ARCHITECTURE.md`.
+- `make check` passes, since the doc tests still apply.
+
+## Step 24: Transcription requests: audio upload or URL, destination, instructions
+
+**Goal.** One API call asks for a transcription and says where it goes.
+
+**Build.**
+
+- **The route.** `POST /transcriptions` replaces `POST /ingest`. It accepts either:
+  - JSON `{url, to, instructions?, title?}`;
+  - a multipart form with an audio file plus the same `to`, `instructions` and `title`
+    fields. This adds the `python-multipart` dependency.
+- **`url`.** An Apple Podcasts episode link goes through the resolver. A direct
+  http(s) audio URL goes through the guarded fetch. Nothing else reaches the resolver.
+- **`to`.** One email address, required, checked against `EARMARK_ALLOWED_RECIPIENTS`.
+  - The setting is a comma-separated list of exact addresses, or `all`.
+  - Matching is case-insensitive on the domain, and exact on the local part.
+  - Unset or empty means every request is refused.
+  - With `all`, startup logs a warning and doctor reports it.
+- **`instructions`.** Optional free text with a length cap.
+- **`title`.** Optional, with a cap. It names uploads and direct URLs, and is ignored
+  for podcasts.
+- **Uploads.**
+  - Stream to a staging directory on the data volume (`data/uploads/`), never the system
+    temp dir, under `EARMARK_MAX_UPLOAD_MB`.
+  - The route overrides the 64 KiB JSON body cap only for multipart.
+  - The byte limit is injectable, so tests stay small.
+  - Nothing is held in memory.
+  - The fields may arrive after the file part. A request that fails validation after
+    staging deletes its staged file.
+- **The audio check at the API** is the declared content type or extension only.
+  Decoding is the real test: undecodable audio ends the job as a permanent failure, with
+  a clear reason.
+- **Identity.**
+  - Podcasts keep their episode identity and their audio cache.
+  - Uploads and direct URLs are keyed by the sha256 of their bytes, reusing `file_key`
+    from the transcriber. A direct URL is downloaded again on each request.
+  - Generalise `Source` and `Episode`: new `Source` values `upload` and `url`, with a
+    synthetic show id and the `sha256:` guid. `Transcriber`, `AudioFetcher` and
+    `Notifier` keep working on an `Episode`.
+- **The transcript cache key** includes the ASR backend, model and options, so a `tiny`
+  dry-run transcript is never reused for `large-v3`.
+- **Retention.** Audio from uploads and direct URLs is deleted when its job reaches a
+  terminal state, `done` or `failed`. The transcript cache stays. Staging files left by a
+  crash are swept at startup. Podcast audio keeps today's behaviour.
+- **De-duplication.** The same source, `to` and `instructions` returns the existing
+  job while it is active, and for `EARMARK_DEDUPE_WINDOW_S` after it finishes (default
+  600), so a double tap sends one email. Any change to `to` or `instructions` makes a new
+  job that reuses the cached transcript.
+- **The job** stores the source, `to`, `instructions` and `title`.
+- **API view model.** `GET /jobs` and `GET /jobs/{id}` return a dedicated view model,
+  never the raw `Job`:
+  - `to` is shown in full;
+  - `instructions` is truncated to 200 characters;
+  - a direct URL is shown as scheme, host and path only;
+  - errors are scrubbed.
+- **The CLI.** `earmark submit` takes `--to`, `--instructions`, `--title`, and a URL or
+  a file.
+- **The Shortcut doc.** Update `docs/shortcut.md` and its example body only as far as
+  the doc tests need for the new route and fields. The full rewrite is step 27.
+
+**Acceptance.**
+
+- Each input form creates a job, and a test proves each one transcribes on fakes.
+- **Request errors.**
+  - A missing or invalid `to`, or a `to` not on the allowlist, gives 422 with a message
+    the Shortcut can show.
+  - A bad URL, or a show link with no episode, gives 422 with the existing messages.
+- **Upload limits.**
+  - An oversize upload gives 413. The size is checked against the declared length and
+    against the bytes actually read.
+  - A partial or rejected upload leaves nothing in staging.
+- Auth is checked before the body is read.
+- **De-duplication.**
+  - A repeat within the window returns the same job.
+  - A new `to` or new `instructions` makes a new job.
+  - That new job downloads a podcast once and transcribes once, and a direct URL is
+    downloaded again and not transcribed again.
+- Two different direct URLs serving the same bytes share one cached transcript.
+- Audio from a failed upload is deleted, and a test proves it.
+- **Leak rules.** Each rule has a test that captures the log, the push or the API
+  response:
+  - `instructions` never appears in logs or pushes;
+  - `to` appears in logs only masked, as the first character of the local part, then
+    `…@`, then the domain;
+  - a direct URL appears in logs and pushes host-only;
+  - pushes carry no instructions, no URL path or query, and no address except in
+    masked form.
+- `EARMARK_ALLOWED_RECIPIENTS=all` accepts any address and logs the warning at startup.
+
+## Step 25: Delivery: the transcript note and the email
+
+**Goal.** A finished transcription reaches the destination as an email a PKA can file.
+
+**Dispatch gate.** Build to the mail contract under "Re-scope" above. It is `contract: 1`
+and still a draft. If pka-skills sends a revision before this step is dispatched, the
+orchestrator updates that section first.
+
+**Build.**
+
+- **The mail backend.**
+  - `EARMARK_MAIL_BACKEND=smtp|fake` selects it, through a `Mailer` stage Protocol with a
+    fake, registered in the factory.
+  - An smtp backend that is missing any required setting is a `ConfigError` at startup.
+  - The fake records messages for tests and the quickstart.
+- **The note and the instructions file**, rendered exactly to the contract. This
+  covers:
+  - every key and its required or omit rule;
+  - slug and date rules;
+  - guid prefixes;
+  - stripping and the query-omission rule for `source_url`;
+  - the `transcript_sha256` scope;
+  - the paragraph merge.
+- **SMTP settings.**
+  - `EARMARK_SMTP_HOST` and `EARMARK_SMTP_PORT`.
+  - `EARMARK_SMTP_SECURITY`, which is `starttls` or `tls`. There is no plaintext option.
+  - `EARMARK_SMTP_USERNAME`.
+  - `EARMARK_SMTP_PASSWORD`, a secret. It has its own validator, which allows the
+    spaces app passwords contain and rejects control characters.
+  - `EARMARK_SMTP_FROM`, which has no default.
+  - `EARMARK_SMTP_TIMEOUT_S`, which must stay below the stop grace period.
+  - `EARMARK_MAX_ATTACHMENT_MB`.
+- **TLS and identity.**
+  - Use `ssl.create_default_context()` for both `SMTP_SSL(context=…)` and
+    `starttls(context=…)`, so the certificate and hostname are verified.
+  - If STARTTLS is not offered, delivery fails. It never continues in plaintext.
+  - AUTH happens only after TLS is up.
+  - Pass `local_hostname` explicitly, set to the domain of `SMTP_FROM`, so EHLO never
+    calls `socket.getfqdn()`.
+  - The debug level is never set.
+  - The envelope recipient is passed explicitly: the one validated `to`.
+- **The message.**
+  - `Message-ID` is deterministic per job, `<earmark.<job_id>@<from domain>>`, never
+    `make_msgid()`.
+  - The subject follows the contract, encoded by the email policy for non-ASCII text.
+  - The body is earmark-generated only, as the contract says.
+  - Both attachments are base64-encoded `text/markdown; charset=utf-8`, so the hash
+    survives transport.
+  - `EARMARK_MAX_ATTACHMENT_MB` caps the raw size of the two attachments together,
+    before encoding.
+- **Delivery state, at-least-once.**
+  - Delivery runs outside the worker's interruptible window. A SIGTERM waits for it,
+    bounded by `EARMARK_SMTP_TIMEOUT_S`, which is kept below compose's `stop_grace_period`
+    and systemd's `TimeoutStopSec`. A test pins that relation.
+  - A migration adds delivery columns: state `sending` with the `Message-ID` recorded
+    before DATA, then `sent` with a timestamp after the 250 reply. They are written
+    through lease-fenced updates.
+  - A job found in `sending` after a crash or lease expiry is resent with the same
+    `Message-ID` and `job_id`, and its push says "resent after an interruption".
+  - A `sent` job is never sent again.
+- **Failure classes.**
+  - A 4xx reply, or a connection error before DATA completes, is transient.
+  - A disconnect after DATA, with no reply, is ambiguous. It is retried, which is
+    at-least-once.
+  - A 5xx reply is permanent.
+  - An authentication failure is permanent, with a message naming the settings.
+  - Job errors store the reply code, the enhanced status code and an earmark-written
+    summary, never the server's reply text, which echoes addresses.
+- **Doctor.** `earmark doctor --online` connects, negotiates TLS, logs in and quits,
+  sending nothing.
+- **The ntfy push** says the transcript was sent, with the title and the masked
+  recipient, or says the job failed and why. The step-24 leak rules apply.
+
+**Acceptance.**
+
+- **The note.**
+  - The frontmatter parses as YAML and round-trips hostile titles.
+  - Unknown keys are omitted.
+  - Every contract key and rule has a test, including both guid fallbacks and the
+    `source_url` rules.
+  - The paragraphs carry absolute `[hh:mm:ss]` markers and cover every segment, and no
+    text is truncated.
+  - `transcript_sha256` matches a recomputation over the decoded attachment bytes.
+- **The message.**
+  - A title, guid or instructions text cannot inject email headers.
+  - Untrusted text never appears in the body.
+  - The subject is encoded correctly for non-ASCII text.
+- **Size cap.** A job over `EARMARK_MAX_ATTACHMENT_MB` fails permanently with a message
+  naming the setting. Nothing is truncated or split.
+- **Resends.**
+  - A crash simulated between DATA and the `sent` write resends with the same
+    `Message-ID`.
+  - A job already `sent` is not sent again on retry, restart or lease expiry.
+  - A SIGTERM during delivery lets it finish.
+- **TLS.**
+  - A test asserts `verify_mode == CERT_REQUIRED` and `check_hostname` on the context
+    used.
+  - A server without STARTTLS fails delivery.
+  - EHLO uses the configured hostname.
+- **Failure classes.**
+  - Each class above has a test.
+  - No job error contains the recipient address or the server's reply text.
+- **Secrets.** The SMTP password never appears in logs, job errors, `earmark config` or
+  doctor output.
+- **Tests.**
+  - They run against a hand-written SMTP stub on a socketpair or unix socket, after
+    `tests/uds_http.py`, with sockets blocked. The stdlib `smtpd` is gone in 3.13.
+  - They assert on the exact bytes of the message, with an injected clock, `Message-ID`
+    and MIME boundary.
+- **Live test.** An opt-in test under a new `smtp` marker sends one message to an
+  operator-supplied address. It never runs by default.
+- **Operator checks only:**
+  - TLS against the real server;
+  - DMARC passing at the recipient;
+  - the PKA reading both attachments.
+
+## Step 26: GPU transcription inside the image
+
+**Goal.** The worker transcribes on the Spark's GB10 GPU in-process, without the vLLM
+service.
+
+**Build.**
+
+- **The GPU image.** Add a GPU build of the image, for example `Dockerfile.gpu` or a
+  build target. It compiles CTranslate2 with CUDA for `sm_121` following
+  `docs/decisions/2026-11-23-gpu-build-recipe.md`, with the earshot attribution comment.
+  - Build against the venv's Python 3.13 and swap the built bindings into `/app/.venv`.
+    The planner chooses the base: the slim `nvidia/cuda` devel and runtime pair, which
+    nobody has tried, or the NGC base, which earshot proved. It records why.
+  - The `CT2_VERSION` build argument defaults to the locked `ctranslate2` version.
+    `v4.6.0` is the documented fallback if the Spark smoke fails.
+  - A build-time check imports `ctranslate2` and `faster_whisper` and asserts the swapped
+    version.
+- **The worker.**
+  - It runs `faster_whisper` with `EARMARK_ASR_DEVICE=cuda`.
+  - faster-whisper's batched pipeline is an option, `EARMARK_ASR_BATCH_SIZE`, with 0 or
+    unset meaning off. The option feeds the transcript cache key.
+- **Compose.** Remove the `asr` (vLLM) service and its `gpu` profile, and replace them
+  with the GPU image and `gpus: all`. Keep the `remote` backend as the generic option for
+  a server elsewhere.
+- **Tests and workflows.** Update the tests and the workflow that pin the old service:
+  `tests/test_deploy.py`, around the `asr` service and gpu profile, and
+  `.github/workflows/container.yml`.
+- **Settings.** New settings go in `Settings`, `.env.example` and the README settings
+  table.
+- **Doctor** reports the CUDA device count and whether `float16` is among
+  `ctranslate2.get_supported_compute_types("cuda")`.
+- Run this step after step 25, serially. It touches compose and the deploy docs.
+
+**Acceptance.**
+
+- The CPU image still builds in CI, unchanged in behaviour.
+- **Static tests** check the GPU build file:
+  - the cmake flags from the recipe;
+  - `CMAKE_CUDA_ARCHITECTURES` taken from the build argument;
+  - the version default matching `uv.lock`;
+  - the attribution comment;
+  - no `pip install` that could pull a CPU `ctranslate2` over the build.
+  
+  The planner decides whether CI builds the GPU image at all, given the free runner's
+  roughly 14 GB of disk, and records why.
+- **Spark smoke.** The operator gets a documented smoke test for the Spark:
+  1. build;
+  2. `ctranslate2.get_cuda_device_count() >= 1`;
+  3. `doctor`;
+  4. transcribe a short public clip on `cuda`, and see `float16` in the log.
+  
+  The plan says plainly that this smoke test is the only real check of the GPU path.
+- With `EARMARK_ASR_DEVICE=cuda` and no CUDA device, the worker refuses to start with a
+  clear message. That behaviour already exists and stays.
+
+## Step 27: Docs, runbook and Shortcut for the transcription service
+
+**Goal.** The operator can set up the service, the sender address and the Shortcut from
+the docs alone.
+
+**Build.** Rewrite the README, `docs/deploy.md`, `docs/shortcut.md` and
+`docs/runbook-spark.md` for the new service.
+
+- **The Shortcut.**
+  - A "Choose from Menu" gives personal or work and fills in `to`.
+  - "Ask for Input" provides `instructions`.
+  - It posts to `POST /transcriptions`.
+- **The runbook** drops the vLLM path and uses the GPU image from step 26. Its phases
+  each end in a check.
+- **Email setup:**
+  - a sending mailbox on the operator's domain, with SPF, DKIM and DMARC;
+  - an app password for SMTP submission;
+  - the sender being allowlisted at each PKA's runtime, which the operator arranges with
+    those agents;
+  - `EARMARK_ALLOWED_RECIPIENTS`, and what setting it to `all` accepts.
+- **Upgrading from v0.1.0:**
+  - move the old database aside;
+  - delete the old `analyses/`, index and embedding-model directories under the data
+    dir;
+  - the vault is no longer touched.
+- **Carried over:** reachability, ntfy and the share-sheet capture.
+- **Placeholders only:** no real addresses, hosts or tokens.
+
+**Acceptance.**
+
+- The doc-driven tests pass, updated for the new route, fields and settings. The README
+  settings table covers every `Settings` field.
+- The Shortcut example body validates against the new request model.
+- The runbook's phases end in checks. One check sends a real transcription to an
+  address the operator controls, and confirms that both attachments open and the body
+  names them.
+- Nothing in the docs describes removed behaviour.
+
 ## Backlog
 
 Not scheduled. The design leaves room for each.
 
-- Speaker diarization (pyannote). `Segment.speaker` already exists.
-- Other sources: YouTube, articles, PDFs. The seam is the source registry behind
-  `POST /ingest` and the `Resolver` protocol.
-- `earmark ask`: question answering over the index.
-- A Shortcut callback or a small status page.
+- **A send-rate cap.** It limits the damage of a leaked token when
+  `EARMARK_ALLOWED_RECIPIENTS=all`.
+- **Re-shares as a reference only.** Send `guid` plus the new instructions instead of
+  the whole transcript. This needs earmark to remember what it sent where, and to read
+  replies such as "not found".
+- **An "analysis done" push.** The PKA would reply, and earmark would relay the reply as
+  a push. This needs earmark to read mail.
+- **Speaker diarization.** earshot runs pyannote 3.1 on the GPU, and needs `HF_TOKEN`
+  with the gated licences accepted. `Segment.speaker` already exists, and the contract
+  allows a paragraph per speaker turn.
+- **Other sources:** YouTube, other podcast platforms, and video files.
+- **An async transcription API for other callers**, such as earshot.
