@@ -8,25 +8,21 @@ import types
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import httpx2
 import pytest
 from pydantic import SecretStr
 
 from earmark.config import Settings
-from earmark.db import MIGRATIONS, SCHEMA_VERSION, open_database
+from earmark.db import APPLICATION_ID, MIGRATIONS, SCHEMA_VERSION, open_database
 from earmark.doctor import ONLINE_TIMEOUT_S, Probes, run_doctor
 from earmark.doctor.report import CheckResult, exit_code, render, summary
 from earmark.fetch import GuardedFetcher
-from earmark.index import embed as embed_module
-from earmark.index.embed import ModelInfo
-from earmark.index.lancedb_index import META_DIM, META_MODEL, META_VERSION, LanceRuntime
 from earmark.jobs import open_job_store
 from earmark.transcribe.compat import Installed
-from tests.anthropic_stub import KEY, AnthropicStub, error_reply, model_info_body
 from tests.http_helpers import ScriptedNetwork, StaticResolver
-from tests.index_helpers import BGE, stub_extra_missing, stub_fastembed_runtime
+from tests.legacy_db import V010_SCHEMA_VERSION, make_v010_database
 from tests.ntfy_stub import (
     ACCOUNT_ANON,
     ACCOUNT_EXHAUSTED,
@@ -40,27 +36,21 @@ from tests.ntfy_stub import (
 
 TOKEN_OK = "t" * 40
 ASR_URL = "http://asr.test:8000/v1"
-LLM_URL = "http://llm.test:8000/v1"
 NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
 
 FAKES: dict[str, Any] = {
     "resolver_backend": "fake",
     "fetch_backend": "fake",
     "asr_backend": "fake",
-    "llm_provider": "fake",
-    "store_backend": "fake",
-    "index_backend": "none",
     "notify_backend": "none",
 }
 
 
 def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
-    (tmp_path / "vault").mkdir(exist_ok=True)
     values: dict[str, Any] = {
         **FAKES,
         "api_token": SecretStr(TOKEN_OK),
         "data_dir": tmp_path / "data",
-        "vault_dir": tmp_path / "vault",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -162,77 +152,6 @@ def test_doctor_data_dir_probe_leaves_nothing(tmp_path: Path) -> None:
     assert tree(tmp_path) == before
 
 
-# -- the vault ------------------------------------------------------------------------------------
-
-
-def vault_settings(tmp_path: Path, **overrides: Any) -> Settings:
-    return make_settings(tmp_path, store_backend="vault", **overrides)
-
-
-def test_doctor_vault_unset_fails(tmp_path: Path) -> None:
-    result = status(vault_settings(tmp_path, vault_dir=None), "vault")
-    assert result.status == "fail"
-    assert "EARMARK_VAULT_DIR: required" in result.detail
-
-
-def test_doctor_vault_missing_fails(tmp_path: Path) -> None:
-    result = status(vault_settings(tmp_path, vault_dir=tmp_path / "nope"), "vault")
-    assert result.status == "fail"
-    assert "does not exist" in result.detail
-
-
-def test_doctor_vault_subdir_missing_ok(tmp_path: Path) -> None:
-    settings = vault_settings(tmp_path)
-    result = status(settings, "vault")
-    assert result.status == "ok"
-    assert "does not exist yet" in result.detail
-    assert list((tmp_path / "vault").iterdir()) == []
-
-
-def test_doctor_vault_subdir_symlink_fails(tmp_path: Path) -> None:
-    (tmp_path / "vault").mkdir()
-    (tmp_path / "elsewhere").mkdir()
-    (tmp_path / "vault" / "Earmark").symlink_to(tmp_path / "elsewhere")
-    result = status(vault_settings(tmp_path), "vault")
-    assert result.status == "fail"
-    assert "symlink" in result.detail
-    assert list((tmp_path / "elsewhere").iterdir()) == []
-
-
-@NOT_ROOT
-def test_doctor_vault_readonly_fails(tmp_path: Path) -> None:
-    subdir = tmp_path / "vault" / "Earmark"
-    subdir.mkdir(parents=True)
-    subdir.chmod(0o500)
-    try:
-        existing = status(vault_settings(tmp_path), "vault")
-    finally:
-        subdir.chmod(0o700)
-    assert existing.status == "fail"
-    assert "is not writable" in existing.detail
-    subdir.rmdir()
-    (tmp_path / "vault").chmod(0o500)
-    try:
-        missing = status(vault_settings(tmp_path), "vault")
-    finally:
-        (tmp_path / "vault").chmod(0o700)
-    assert (missing.status, missing.detail) == ("fail", "EARMARK_VAULT_DIR is not writable")
-
-
-def test_doctor_vault_probe_leaves_nothing(tmp_path: Path) -> None:
-    subdir = tmp_path / "vault" / "Earmark"
-    subdir.mkdir(parents=True)
-    before = tree(tmp_path)
-    result = status(vault_settings(tmp_path), "vault")
-    assert result.status == "ok"
-    assert "is writable" in result.detail
-    assert tree(tmp_path) == before
-
-
-def test_doctor_fake_store_warns(tmp_path: Path) -> None:
-    assert status(make_settings(tmp_path), "vault").status == "warn"
-
-
 # -- the database ---------------------------------------------------------------------------------
 
 
@@ -269,12 +188,12 @@ def test_doctor_database_newer_fails(tmp_path: Path) -> None:
 
 
 def test_doctor_database_older_warns_and_is_not_migrated(tmp_path: Path) -> None:
-    open_database(db_path(tmp_path), migrations=MIGRATIONS[:1])
+    open_database(db_path(tmp_path), migrations=())
     result = status(make_settings(tmp_path), "database")
     assert result.status == "warn"
-    assert "schema version 1" in result.detail
+    assert "schema version 0" in result.detail
     with closing(sqlite3.connect(db_path(tmp_path))) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
 
 
 def test_doctor_database_not_wal_warns(tmp_path: Path) -> None:
@@ -283,6 +202,7 @@ def test_doctor_database_not_wal_warns(tmp_path: Path) -> None:
         for migration in MIGRATIONS:
             for statement in migration.statements:
                 conn.execute(statement)
+        conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     result = status(make_settings(tmp_path), "database")
     assert result.status == "warn"
@@ -454,160 +374,16 @@ def test_doctor_cuda_unavailable_fails(tmp_path: Path, monkeypatch: pytest.Monke
     assert "asr model" not in results
 
 
-def test_doctor_index_extra_missing_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    stub_extra_missing(monkeypatch, "lancedb")
-    results = check(make_settings(tmp_path, index_backend="lancedb"))
-    assert results["index"].status == "fail"
-    assert "uv sync --extra index" in results["index"].detail
-    assert "embed model" not in results
-    assert "search index" not in results
-
-
 def test_doctor_unselected_backends_not_imported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setitem(sys.modules, "faster_whisper", None)
-    stub_extra_missing(monkeypatch, "lancedb", "fastembed", "faster_whisper")
-    settings = make_settings(
-        tmp_path, asr_backend="remote", asr_base_url=ASR_URL, index_backend="none"
-    )
+    settings = make_settings(tmp_path, asr_backend="remote", asr_base_url=ASR_URL)
     results = run_doctor(settings)
     assert not [r for r in results if r.status == "fail" and r.name != "api token"]
-    assert next(r for r in results if r.name == "index").detail.startswith("search is off")
-
-
-class MemoryTable:
-    def __init__(self, meta: Mapping[str, str], dim: int) -> None:
-        self._meta, self._dim = dict(meta), dim
-
-    def metadata(self) -> Mapping[str, str]:
-        return self._meta
-
-    def vector_dim(self) -> int | None:
-        return self._dim
-
-
-class MemoryDb:
-    def __init__(self, table: MemoryTable | None) -> None:
-        self.table = table
-
-    def has_table(self) -> bool:
-        return self.table is not None
-
-    def open_table(self) -> MemoryTable | None:
-        return self.table
-
-
-def index_settings(tmp_path: Path) -> Settings:
-    return make_settings(tmp_path, index_backend="lancedb")
-
-
-def stub_index(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    table: MemoryTable | None,
-    cached: object,
-) -> None:
-    info = ModelInfo(BGE, 384, "Qdrant/bge-small", "model.onnx")
-    stub_fastembed_runtime(monkeypatch, [info])
-    runtime = LanceRuntime(connect=lambda path: cast(Any, MemoryDb(table)))
-    monkeypatch.setattr("earmark.index.lancedb_index.load_lance_runtime", lambda: runtime)
-    hub = types.ModuleType("huggingface_hub")
-    hub.try_to_load_from_cache = lambda *a, **k: cached  # type: ignore[attr-defined]  # stub
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    (tmp_path / "data" / "lancedb").mkdir(parents=True)
-
-
-def test_doctor_index_rows_with_stub_runtimes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    meta = {META_VERSION: "1", META_MODEL: BGE, META_DIM: "384"}
-    stub_index(monkeypatch, tmp_path, table=MemoryTable(meta, 384), cached="/c/model.onnx")
-    results = check(index_settings(tmp_path))
-    assert results["index"].detail == f"lancedb, embedding model {BGE} (384 dimensions)"
-    assert results["embed model"] == CheckResult("embed model", "ok", "downloaded")
-    assert results["search index"].status == "ok"
-    assert results["search index"].detail == f"built with {BGE}"
-
-
-def test_doctor_index_empty_and_model_not_downloaded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stub_index(monkeypatch, tmp_path, table=None, cached=None)
-    results = check(index_settings(tmp_path))
-    assert results["embed model"].status == "warn"
-    assert "GET /search answers 503" in results["embed model"].detail
-    assert results["search index"].status == "ok"
-    assert results["search index"].detail.startswith("empty")
-
-
-def test_doctor_index_mismatch_fails_naming_reindex(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    meta = {META_VERSION: "1", META_MODEL: "other-model", META_DIM: "384"}
-    stub_index(monkeypatch, tmp_path, table=MemoryTable(meta, 384), cached="/c")
-    result = check(index_settings(tmp_path))["search index"]
-    assert result.status == "fail"
-    assert "earmark reindex" in result.detail
-
-
-def test_doctor_embed_model_unknown_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    stub_index(monkeypatch, tmp_path, table=None, cached=None)
-    result = status(
-        make_settings(tmp_path, index_backend="lancedb", embed_model="nope-model"), "index"
-    )
-    assert result.status == "fail"
-    assert "EARMARK_EMBED_MODEL" in result.detail
-    assert embed_module.load_fastembed_runtime is not None
 
 
 # -- credentials and the other backends -----------------------------------------------------------
-
-
-def test_doctor_anthropic_no_credential_fails(tmp_path: Path) -> None:
-    from earmark.analyze.llm.anthropic import NO_CREDENTIALS
-
-    result = status(make_settings(tmp_path, llm_provider="anthropic"), "llm")
-    assert result == CheckResult("llm", "fail", NO_CREDENTIALS)
-
-
-def test_doctor_anthropic_key_from_setting(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, llm_provider="anthropic", llm_api_key=SecretStr(KEY))
-    result = status(settings, "llm")
-    assert result.status == "ok"
-    assert result.detail == (
-        "anthropic, model claude-opus-5-5, effort medium, credential from EARMARK_LLM_API_KEY"
-    )
-    assert KEY not in result.detail
-
-
-def test_doctor_anthropic_key_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-sentinel")
-    result = status(make_settings(tmp_path, llm_provider="anthropic"), "llm")
-    assert result.status == "ok"
-    assert "credential from ANTHROPIC_API_KEY" in result.detail
-    assert "sentinel" not in result.detail
-
-
-def test_doctor_openai_compat_missing_base_url_fails(tmp_path: Path) -> None:
-    result = status(make_settings(tmp_path, llm_provider="openai_compat"), "llm")
-    assert result.status == "fail"
-    assert "EARMARK_LLM_BASE_URL" in result.detail
-
-
-def test_doctor_openai_compat_ok(tmp_path: Path) -> None:
-    settings = make_settings(
-        tmp_path,
-        llm_provider="openai_compat",
-        llm_base_url=LLM_URL,
-        llm_model="qwen",
-        llm_context_tokens=32768,
-    )
-    result = status(settings, "llm")
-    assert result == CheckResult(
-        "llm", "ok", "openai_compat at llm.test:8000, model qwen, context 32768 tokens, no API key"
-    )
 
 
 def test_doctor_remote_asr_missing_base_url_fails(tmp_path: Path) -> None:
@@ -629,7 +405,6 @@ def test_doctor_ntfy_unset_warns(tmp_path: Path) -> None:
     result = status(make_settings(tmp_path, notify_backend="ntfy"), "notify")
     assert result.status == "warn"
     assert "EARMARK_NTFY_URL is not set" in result.detail
-    assert "obsidian link" not in check(make_settings(tmp_path, notify_backend="ntfy"))
 
 
 def test_doctor_ntfy_token_without_url_warns(tmp_path: Path) -> None:
@@ -660,26 +435,9 @@ def ntfy_settings(tmp_path: Path, **overrides: Any) -> Settings:
     return make_settings(tmp_path, **values)
 
 
-def test_doctor_obsidian_name_states(tmp_path: Path) -> None:
-    unset = status(ntfy_settings(tmp_path), "obsidian link")
-    assert unset.status == "warn"
-    assert "EARMARK_OBSIDIAN_VAULT_NAME is not set" in unset.detail
-    wrong = status(ntfy_settings(tmp_path, obsidian_vault_name="Other"), "obsidian link")
-    assert wrong.status == "warn"
-    assert "EARMARK_VAULT_DIR is 'vault'" in wrong.detail
-    right = status(ntfy_settings(tmp_path, obsidian_vault_name="vault"), "obsidian link")
-    assert right == CheckResult("obsidian link", "ok", "links open vault 'vault'")
-
-
-def test_doctor_obsidian_name_mismatch_warns(tmp_path: Path) -> None:
-    result = status(ntfy_settings(tmp_path, obsidian_vault_name="My Vault"), "obsidian link")
-    assert result.status == "warn"
-    assert "Obsidian names vaults after their folder" in result.detail
-
-
 def test_doctor_fakes_and_http_fetch(tmp_path: Path) -> None:
     results = check(make_settings(tmp_path))
-    for name in ("resolver", "fetch", "asr", "llm", "vault", "notify"):
+    for name in ("resolver", "fetch", "asr", "notify"):
         assert results[name].status in ("warn", "ok")
     assert results["resolver"].status == "warn"
     real = check(make_settings(tmp_path, resolver_backend="apple", fetch_backend="http"))
@@ -718,7 +476,6 @@ def test_offline_makes_no_requests(tmp_path: Path) -> None:
 
     probes = Probes(
         http_transport=httpx2.MockTransport(refuse),
-        anthropic_http_client=httpx2.Client(transport=httpx2.MockTransport(refuse)),
         fetcher=GuardedFetcher(transport=httpx2.MockTransport(refuse)),
     )
     settings = make_settings(
@@ -727,23 +484,19 @@ def test_offline_makes_no_requests(tmp_path: Path) -> None:
         fetch_backend="http",
         asr_backend="remote",
         asr_base_url=ASR_URL,
-        llm_provider="anthropic",
-        llm_api_key=SecretStr(KEY),
         notify_backend="ntfy",
         ntfy_url=SecretStr(TOPIC_URL),
     )
     results = run_doctor(settings, online=False, probes=probes)
     assert hits == []
-    assert {r.name for r in results} >= {"asr", "llm", "notify", "resolver"}
+    assert {r.name for r in results} >= {"asr", "notify", "resolver"}
     assert not [r for r in results if r.name.endswith(("server", "api", "lookup"))]
 
 
 def test_offline_creates_nothing(tmp_path: Path) -> None:
     (tmp_path / "data").mkdir()
-    (tmp_path / "vault" / "Earmark").mkdir(parents=True)
     before = tree(tmp_path)
-    settings = make_settings(tmp_path, store_backend="vault")
-    run_doctor(settings)
+    run_doctor(make_settings(tmp_path))
     assert tree(tmp_path) == before
 
 
@@ -894,30 +647,23 @@ def models_body(*ids: str) -> bytes:
 
 
 def server_settings(tmp_path: Path, kind: str, **overrides: Any) -> tuple[Settings, str, str]:
-    if kind == "asr":
-        values: dict[str, Any] = {
-            "asr_backend": "remote",
-            "asr_base_url": ASR_URL,
-            "asr_model": "whisper-1",
-        }
-        return make_settings(tmp_path, **{**values, **overrides}), "asr.test", "asr server"
-    values = {
-        "llm_provider": "openai_compat",
-        "llm_base_url": LLM_URL,
-        "llm_model": "qwen",
-        "llm_context_tokens": 32768,
+    assert kind == "asr"
+    values: dict[str, Any] = {
+        "asr_backend": "remote",
+        "asr_base_url": ASR_URL,
+        "asr_model": "whisper-1",
     }
-    return make_settings(tmp_path, **{**values, **overrides}), "llm.test", "llm server"
+    return make_settings(tmp_path, **{**values, **overrides}), "asr.test", "asr server"
 
 
-@pytest.fixture(params=["asr", "llm"])
+@pytest.fixture(params=["asr"])
 def kind(request: pytest.FixtureRequest) -> str:
     return str(request.param)
 
 
 def test_online_models_listed_ok(tmp_path: Path, kind: str) -> None:
     settings, host, name = server_settings(tmp_path, kind)
-    model = "whisper-1" if kind == "asr" else "qwen"
+    model = "whisper-1"
     handler = routed({(host, "/v1/models"): lambda r: json_reply(200, models_body(model, "z"))})
     result = status(settings, name, online=True, probes=probes_for(handler))
     assert result.status == "ok"
@@ -957,7 +703,7 @@ def test_online_models_401_fails_and_key_is_sent_only_when_set(tmp_path: Path, k
         seen.append(request)
         return json_reply(401, b'{"error": "bad key sentinel-model-key"}')
 
-    key_name = "asr_api_key" if kind == "asr" else "llm_api_key"
+    key_name = "asr_api_key"
     settings, host, name = server_settings(
         tmp_path, kind, **{key_name: SecretStr("sentinel-model-key")}
     )
@@ -1000,85 +746,6 @@ def test_online_models_unreachable_and_timeout(tmp_path: Path, kind: str) -> Non
     assert (down.status, "could not reach" in down.detail) == ("fail", True)
     late = status(settings, name, online=True, probes=probes_for(slow))
     assert (late.status, "did not answer within 10 s" in late.detail) == ("fail", True)
-
-
-def anthropic_probes(stub: AnthropicStub) -> Probes:
-    return Probes(anthropic_http_client=httpx2.Client(transport=httpx2.MockTransport(stub)))
-
-
-def anthropic_settings(tmp_path: Path) -> Settings:
-    return make_settings(tmp_path, llm_provider="anthropic", llm_api_key=SecretStr(KEY))
-
-
-def test_online_anthropic_active_ok(tmp_path: Path) -> None:
-    stub = AnthropicStub()
-    result = status(
-        anthropic_settings(tmp_path), "anthropic api", online=True, probes=anthropic_probes(stub)
-    )
-    assert result == CheckResult(
-        "anthropic api", "ok", "claude-opus-5-5 (Claude Opus 5.5) is available"
-    )
-    [request] = stub.requests
-    assert (request.method, request.url.path) == ("GET", "/v1/models/claude-opus-5-5")
-    assert stub.message_requests() == []
-    assert stub.count_requests() == []
-
-
-def test_online_anthropic_deprecated_warns_and_retired_fails(tmp_path: Path) -> None:
-    stub = AnthropicStub()
-    stub.model_reply = httpx2.Response(
-        200, json=model_info_body(lifecycle="deprecated", retires_at="2026-12-31T00:00:00Z")
-    )
-    warn = status(
-        anthropic_settings(tmp_path), "anthropic api", online=True, probes=anthropic_probes(stub)
-    )
-    assert warn.status == "warn"
-    assert warn.detail == "claude-opus-5-5 is deprecated; retires 2026-12-31"
-    stub.model_reply = httpx2.Response(200, json=model_info_body(lifecycle="retired"))
-    fail = status(
-        anthropic_settings(tmp_path), "anthropic api", online=True, probes=anthropic_probes(stub)
-    )
-    assert fail.status == "fail"
-    assert "is retired; set EARMARK_LLM_MODEL" in fail.detail
-
-
-@pytest.mark.parametrize(
-    ("code", "kind_", "needle"),
-    [
-        (404, "not_found_error", "EARMARK_LLM_MODEL"),
-        (401, "authentication_error", "EARMARK_LLM_API_KEY"),
-    ],
-)
-def test_online_anthropic_errors_fail(tmp_path: Path, code: int, kind_: str, needle: str) -> None:
-    stub = AnthropicStub()
-    stub.model_reply = error_reply(code, kind_, "nope")
-    result = status(
-        anthropic_settings(tmp_path), "anthropic api", online=True, probes=anthropic_probes(stub)
-    )
-    assert result.status == "fail"
-    assert needle in result.detail
-
-
-def test_online_anthropic_no_retry_on_500(tmp_path: Path) -> None:
-    stub = AnthropicStub()
-    stub.model_reply = error_reply(500, "api_error", "boom")
-    result = status(
-        anthropic_settings(tmp_path), "anthropic api", online=True, probes=anthropic_probes(stub)
-    )
-    assert result.status == "fail"
-    assert len(stub.requests) == 1
-
-
-def test_online_anthropic_skipped_without_credential(tmp_path: Path) -> None:
-    stub = AnthropicStub()
-    results = check(
-        make_settings(tmp_path, llm_provider="anthropic"),
-        online=True,
-        probes=anthropic_probes(stub),
-    )
-    assert results["llm"].status == "fail"
-    assert results["anthropic api"] == CheckResult("anthropic api", "skip", "offline check failed")
-    assert stub.requests == []
 
 
 def apple_settings(tmp_path: Path) -> Settings:
@@ -1134,7 +801,7 @@ def test_online_timeouts_are_10s(tmp_path: Path) -> None:
             timeouts[request.url.path] = dict(request.extensions["timeout"])
             if request.url.path.endswith("health"):
                 return json_reply(200, HEALTH_OK)
-            return json_reply(200, models_body("whisper-1", "qwen"))
+            return json_reply(200, models_body("whisper-1"))
 
         return reply
 
@@ -1142,7 +809,6 @@ def test_online_timeouts_are_10s(tmp_path: Path) -> None:
         {
             ("ntfy.test", "/v1/health"): record("ntfy.test"),
             ("asr.test", "/v1/models"): record("asr.test"),
-            ("llm.test", "/v1/models"): record("llm.test"),
         }
     )
     settings = make_settings(
@@ -1150,42 +816,29 @@ def test_online_timeouts_are_10s(tmp_path: Path) -> None:
         asr_backend="remote",
         asr_base_url=ASR_URL,
         asr_model="whisper-1",
-        llm_provider="openai_compat",
-        llm_base_url=LLM_URL,
-        llm_model="qwen",
-        llm_context_tokens=32768,
         notify_backend="ntfy",
         ntfy_url=SecretStr(TOPIC_URL),
     )
     results = check(settings, online=True, probes=probes_for(handler))
-    assert {results[n].status for n in ("asr server", "llm server", "ntfy server")} == {"ok"}
+    assert {results[n].status for n in ("asr server", "ntfy server")} == {"ok"}
     for path in ("/v1/health", "/v1/models"):
         assert timeouts[path]["connect"] == 5.0
         assert timeouts[path]["read"] == 10.0
-
-    stub = AnthropicStub()
-    status(
-        anthropic_settings(tmp_path), "anthropic api", online=True, probes=anthropic_probes(stub)
-    )
-    assert stub.requests[0].extensions["timeout"]["read"] == 10.0
 
 
 def test_online_skipped_after_offline_failure(tmp_path: Path) -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         raise AssertionError("a skipped check must not send a request")
 
-    settings = make_settings(
-        tmp_path, llm_provider="openai_compat", asr_backend="remote", resolver_backend="apple"
-    )
+    settings = make_settings(tmp_path, asr_backend="remote", resolver_backend="apple")
     results = check(settings, online=True, probes=probes_for(handler))
-    assert results["llm server"] == CheckResult("llm server", "skip", "offline check failed")
-    assert results["asr server"].status == "skip"
+    assert results["asr server"] == CheckResult("asr server", "skip", "offline check failed")
     assert results["apple lookup"].status in ("skip", "fail", "ok", "warn")
 
 
 def test_online_checks_only_for_selected_backends(tmp_path: Path) -> None:
     results = check(make_settings(tmp_path), online=True, probes=Probes())
-    online_names = {"apple lookup", "asr server", "llm server", "anthropic api", "ntfy server"}
+    online_names = {"apple lookup", "asr server", "ntfy server"}
     assert not online_names & set(results)
 
 
@@ -1221,3 +874,28 @@ def test_render_redacts_cleans_and_caps() -> None:
     assert "\x1b" not in line
     assert len(line.split(" ", 2)[2]) <= 300 + 20
     assert line.endswith("…")
+
+
+def test_doctor_check_names_in_order(tmp_path: Path) -> None:
+    results = run_doctor(make_settings(tmp_path))
+    assert [r.name for r in results] == [
+        "api token",
+        "data dir",
+        "database",
+        "resolver",
+        "fetch",
+        "asr",
+        "notify",
+    ]
+
+
+def test_doctor_database_v010_fails(tmp_path: Path) -> None:
+    db_path(tmp_path).parent.mkdir()
+    path = make_v010_database(db_path(tmp_path))
+    result = status(make_settings(tmp_path), "database")
+    assert result.status == "fail"
+    assert "Move it aside" in result.detail
+    assert "0.1.0" in result.detail
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == V010_SCHEMA_VERSION
+        assert conn.execute("PRAGMA application_id").fetchone()[0] == 0

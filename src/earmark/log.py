@@ -2,20 +2,16 @@
 
 Earmark logs hosts only. Third-party libraries do not: HTTP clients log full request
 URLs (paths and query strings that can carry session ids), uvicorn logs the query of
-every request, and the anthropic SDK logs request bodies (the transcript). So the one
-handler does three things on top of secret redaction:
+every request. So the one handler does three things on top of secret redaction:
 
 - It drops records below WARNING from the wire loggers in ``QUIET_LOGGERS``, whatever
-  level a library or an environment variable (``ANTHROPIC_LOG``, ``HF_HUB_VERBOSITY``)
-  gave them. The price is that ``LOG_LEVEL=DEBUG`` does not show their DEBUG output.
+  level a library or an environment variable (``HF_HUB_VERBOSITY``) gave them. The price is
+  that ``LOG_LEVEL=DEBUG`` does not show their DEBUG output.
 - It rewrites URLs in third-party records, and in every traceback, to
   ``scheme://host[:port]/...``, and drops the query from HTTP request lines.
 - It is the only handler: ``huggingface_hub``'s own stderr handler is removed.
 
-Not covered: urllib3's WARNING ``Retrying ...`` can carry a relative URL the scrubber
-cannot see (earmark's only urllib3 path uses ``max_retries=0``, so it cannot emit it);
-fastembed's ``print`` of its model-archive URL in its GCS fallback goes to stdout; hf_xet
-writes its own log files (see docs/deploy.md).
+Not covered: hf_xet writes its own log files (see docs/deploy.md).
 """
 
 import contextlib
@@ -30,8 +26,7 @@ from earmark.config import REDACTED
 
 HANDLER_NAME: Final = "earmark"
 # Wire loggers: HTTP clients print every request URL at INFO and response headers at
-# DEBUG; the anthropic SDK logs whole request bodies (the transcript) at DEBUG; the
-# huggingface_hub client logs request URLs. Their levels are set to WARNING, and the
+# DEBUG; the huggingface_hub client logs request URLs. Their levels are set to WARNING, and the
 # handler's filter drops what is below WARNING even if a library resets the level.
 QUIET_LOGGERS: Final = (
     "httpx",
@@ -39,7 +34,6 @@ QUIET_LOGGERS: Final = (
     "httpx2",
     "httpcore2",
     "urllib3",
-    "anthropic",
     "huggingface_hub",
 )
 LIBRARY_HANDLER_LOGGERS: Final = ("huggingface_hub",)

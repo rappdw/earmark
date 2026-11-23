@@ -16,12 +16,37 @@ from pathlib import Path
 from typing import Final
 
 DB_FILENAME: Final = "earmark.db"
+APPLICATION_ID: Final = 0x45524D4B  # b"ERMK": marks the post-step-22 lineage
 DEFAULT_BUSY_TIMEOUT_S: Final = 10.0
 _BUSY_SLEEP_S: Final = 0.01
 
 
 class DatabaseSetupError(Exception):
-    """The database cannot be used: newer schema than this code, or WAL unavailable."""
+    """The database cannot be used: newer schema than this code, another lineage, or no WAL."""
+
+
+class LegacyDatabaseError(DatabaseSetupError):
+    """The file was made by earmark v0.1.0 (or a pre-release build of it)."""
+
+
+class ForeignDatabaseError(DatabaseSetupError):
+    """The file belongs to another application."""
+
+
+def identity_error(path: Path, application_id: int, user_version: int) -> DatabaseSetupError | None:
+    """Why this file cannot be an earmark database of the current lineage, or None."""
+    if application_id == APPLICATION_ID or (application_id == 0 and user_version == 0):
+        return None
+    if application_id == 0:
+        return LegacyDatabaseError(
+            f"{path} was created by earmark 0.1.0 (schema version {user_version}), which this "
+            "version cannot use and does not migrate. Move it aside, with its -wal and -shm "
+            "files if present, and start again."
+        )
+    return ForeignDatabaseError(
+        f"{path} is not an earmark database (application id {application_id:#x}). Move it "
+        "aside or set EARMARK_DATA_DIR to another directory."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +57,8 @@ class Migration:
 
 # Migration rules: append only; never edit or reorder an entry that has shipped. Use plain
 # CREATE TABLE / CREATE INDEX without IF NOT EXISTS, so an accidental rerun fails loudly
-# instead of silently passing.
+# instead of silently passing. The list restarted in step 22, with APPLICATION_ID marking the
+# new lineage; databases from before are refused (identity_error), never migrated.
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     Migration(
         "0001_jobs",
@@ -41,7 +67,7 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             CREATE TABLE jobs (
                 seq INTEGER PRIMARY KEY,
                 id TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL CHECK (kind IN ('ingest', 'reanalyze')),
+                kind TEXT NOT NULL CHECK (kind IN ('ingest')),
                 status TEXT NOT NULL
                     CHECK (status IN ('queued', 'running', 'done', 'failed', 'skipped')),
                 stage TEXT,
@@ -66,60 +92,6 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
                 WHERE status IN ('queued', 'running')
             """,
             "CREATE INDEX jobs_by_status ON jobs (status, created_at, seq)",
-        ),
-    ),
-    Migration(
-        "0002_entities",
-        (
-            """
-            CREATE TABLE episodes (
-                episode_key TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                show_title TEXT NOT NULL,
-                published_at TEXT,
-                first_shared_at TEXT NOT NULL,
-                analyses TEXT NOT NULL CHECK (json_valid(analyses)),
-                note_path TEXT,
-                transcript_note_path TEXT,
-                links_digest TEXT
-            ) STRICT
-            """,
-            """
-            CREATE TABLE mentions (
-                episode_key TEXT NOT NULL REFERENCES episodes (episode_key) ON DELETE CASCADE,
-                prompt_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN ('person', 'paper', 'company', 'tool', 'topic')),
-                name_key TEXT NOT NULL CHECK (name_key <> ''),
-                position INTEGER NOT NULL CHECK (position >= 0),
-                name TEXT NOT NULL,
-                context TEXT NOT NULL,
-                timestamps TEXT NOT NULL CHECK (json_valid(timestamps)),
-                PRIMARY KEY (episode_key, prompt_hash, kind, name_key)
-            ) STRICT
-            """,
-            "CREATE INDEX mentions_by_name ON mentions (kind, name_key)",
-            """
-            CREATE TABLE aliases (
-                kind TEXT NOT NULL CHECK (kind IN ('person', 'paper', 'company', 'tool', 'topic')),
-                alias_key TEXT NOT NULL CHECK (alias_key <> ''),
-                canonical_key TEXT NOT NULL CHECK (canonical_key <> ''),
-                canonical_name TEXT NOT NULL,
-                PRIMARY KEY (kind, alias_key)
-            ) STRICT
-            """,
-            """
-            CREATE TABLE entities (
-                entity_id TEXT PRIMARY KEY,
-                kind TEXT CHECK (
-                    kind IS NULL OR kind IN ('person', 'paper', 'company', 'tool', 'topic')
-                ),
-                entity_key TEXT,
-                name TEXT,
-                note_path TEXT NOT NULL,
-                content_digest TEXT NOT NULL
-            ) STRICT
-            """,
         ),
     ),
 )
@@ -199,10 +171,26 @@ class Database:
         with self.connect() as conn:
             return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
+    def identity(self) -> tuple[int, int]:
+        """``(application_id, user_version)``; read-only."""
+        with self.connect() as conn:
+            app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        return app_id, version
+
+    def check_identity(self) -> None:
+        error = identity_error(self._path, *self.identity())
+        if error is not None:
+            raise error
+
     def migrate(self, migrations: Sequence[Migration] = MIGRATIONS) -> int:
         target = len(migrations)
         with self.transaction() as conn:
+            app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
             current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            error = identity_error(self._path, app_id, current)
+            if error is not None:
+                raise error
             if current > target:
                 raise DatabaseSetupError(
                     f"database schema version {current} is newer than this earmark "
@@ -211,6 +199,8 @@ class Database:
             for migration in migrations[current:]:
                 for statement in migration.statements:
                     conn.execute(statement)
+            if app_id == 0:
+                conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
             conn.execute(f"PRAGMA user_version = {int(target)}")
             return target - current
 
@@ -227,6 +217,7 @@ def open_database(
 ) -> Database:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = Database(path, busy_timeout_s=busy_timeout_s)
+    db.check_identity()
     db.ensure_wal()
     db.migrate(migrations)
     return db

@@ -391,14 +391,14 @@ def test_network_workflow_is_not_the_gate() -> None:
     expression = addopts[addopts.index("-m") + 1]
     assert "not network" in expression
     assert "not slow" in expression
-    assert "not llm" in expression
+    assert "not gpu" in expression
 
 
 # --- slow job (step 08) --------------------------------------------------------------------
 
 SLOW_COMMANDS = [
-    "uv sync --locked --extra transcribe --extra index",
-    "uv run --locked --extra transcribe --extra index pytest -m slow -v -rs",
+    "uv sync --locked --extra transcribe",
+    "uv run --locked --extra transcribe pytest -m slow -v -rs",
 ]
 CACHE_ACTION = "actions/cache"
 CACHE_PIN = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
@@ -440,114 +440,6 @@ def test_slow_job_caches_test_assets() -> None:
     [cache] = [s for s in _steps(job) if _action(s) == CACHE_ACTION]
     assert cache["with"]["path"] == "~/" + DEFAULT_CACHE_DIR.relative_to(Path.home()).as_posix()
     assert "hashFiles('tests/slow_assets.py')" in cache["with"]["key"]
-
-
-# --- llm workflow (step 10) ----------------------------------------------------------------
-
-LLM_WORKFLOW = WORKFLOWS_DIR / "llm.yml"
-LLM_COMMANDS = ["uv sync --locked", "uv run --locked pytest -m llm -v -rs"]
-
-
-def _llm() -> dict[Any, Any]:
-    return _load_yaml(LLM_WORKFLOW)
-
-
-def test_llm_workflow_triggers() -> None:
-    assert set(_triggers(_llm())) == {"workflow_dispatch"}
-
-
-def test_llm_workflow_job() -> None:
-    jobs = _jobs(_llm())
-    assert set(jobs) == {"llm"}
-    job = jobs["llm"]
-    assert job["runs-on"] == ARM64_RUNNER
-    timeout = job["timeout-minutes"]
-    assert type(timeout) is int
-    assert 1 <= timeout <= 30
-    assert job["environment"] == "llm"
-    assert job["if"] == "github.event_name == 'workflow_dispatch'"
-    steps = _steps(job)
-    assert [_action(s) for s in steps] == [CHECKOUT, SETUP_UV, "", ""]
-    assert [s["run"].strip() for s in steps if "run" in s] == LLM_COMMANDS
-    assert _job_remote_uses(job) == _remote_uses(_ci())
-    [llm_uv] = [s for s in steps if _action(s) == SETUP_UV]
-    assert llm_uv["with"] == _ci_step(SETUP_UV)["with"]
-
-
-def test_llm_workflow_secret_scope() -> None:
-    workflow = _llm()
-    assert workflow["permissions"] == {"contents": "read"}
-    assert "env" not in workflow
-    job = _jobs(workflow)["llm"]
-    assert "permissions" not in job
-    assert "env" not in job
-    steps = _steps(job)
-    assert all("env" not in s for s in steps[:-1])
-    assert steps[-1]["env"] == {"ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}"}
-    assert LLM_WORKFLOW.read_text().count("secrets.") == 1
-    [checkout] = [s for s in steps if _action(s) == CHECKOUT]
-    assert checkout["with"]["persist-credentials"] is False
-
-
-def test_only_llm_workflow_references_secrets() -> None:
-    for path in _workflow_files():
-        if path != LLM_WORKFLOW:
-            assert re.search(r"\bsecrets\b", path.read_text()) is None, path.name
-
-
-# --- index workflow (step 14) --------------------------------------------------------------
-
-INDEX_WORKFLOW = WORKFLOWS_DIR / "index.yml"
-INDEX_COMMANDS = [
-    "uv sync --locked --extra index",
-    "uv run --locked --extra index pytest -m index -v -rs",
-]
-
-
-def _index() -> dict[Any, Any]:
-    return _load_yaml(INDEX_WORKFLOW)
-
-
-def test_index_workflow_triggers() -> None:
-    triggers = _triggers(_index())
-    assert set(triggers) == {"push", "pull_request"}
-    assert set(triggers["push"]["branches"]) == {"main", "impl"}
-    pr = triggers["pull_request"]
-    assert pr is None or pr == {}
-
-
-def test_index_workflow_job() -> None:
-    workflow = _index()
-    assert set(_jobs(workflow)) == {"index"}
-    job = _only_job(workflow)
-    assert job["runs-on"] == ARM64_RUNNER
-    timeout = job["timeout-minutes"]
-    assert type(timeout) is int
-    assert 1 <= timeout <= 30
-    steps = _steps(job)
-    assert [_action(s) for s in steps] == [CHECKOUT, SETUP_UV, "", ""]
-    assert [s["run"].strip() for s in steps if "run" in s] == INDEX_COMMANDS
-    assert _job_remote_uses(job) == _remote_uses(_ci())
-    [uv_step] = [s for s in steps if _action(s) == SETUP_UV]
-    assert uv_step["with"] == {**_ci_step(SETUP_UV)["with"], "cache-suffix": "index"}
-    [checkout] = [s for s in steps if _action(s) == CHECKOUT]
-    assert checkout["with"]["persist-credentials"] is False
-
-
-def test_index_workflow_read_only_no_secrets() -> None:
-    workflow = _index()
-    assert workflow["permissions"] == {"contents": "read"}
-    job = _only_job(workflow)
-    assert "permissions" not in job
-    assert "env" not in workflow
-    assert "env" not in job
-    assert all("env" not in s for s in _steps(job))
-    assert re.search(r"\bsecrets\b", INDEX_WORKFLOW.read_text()) is None
-
-
-def test_index_workflow_concurrency() -> None:
-    assert _index()["concurrency"] == _ci()["concurrency"]
-    assert _index()["concurrency"]["cancel-in-progress"] is True
 
 
 # --- dependabot docker (step 16) -----------------------------------------------------------
@@ -612,7 +504,7 @@ def test_container_workflow_builds_without_push() -> None:
 def test_container_workflow_checks_image() -> None:
     runs = "\n".join(_container_runs())
     assert "--version" in runs
-    for module in ("ctranslate2", "faster_whisper", "fastembed", "lancedb"):
+    for module in ("ctranslate2", "faster_whisper"):
         assert module in runs
     assert "--entrypoint id earmark:ci -u" in runs
     assert "= 1000" in runs
@@ -623,7 +515,6 @@ def test_container_workflow_validates_compose() -> None:
     assert "docker compose config" in runs
     assert "docker compose --profile gpu config" in runs
     assert "cp .env.example .env" in runs
-    assert "VAULT_PATH" in runs
 
 
 def test_container_workflow_checks_hf_telemetry() -> None:
@@ -645,3 +536,12 @@ def test_container_workflow_read_only() -> None:
 
 def test_container_workflow_concurrency() -> None:
     assert _container()["concurrency"] == _ci()["concurrency"]
+
+
+def test_no_workflow_references_secrets() -> None:
+    for path in _workflow_files():
+        assert re.search(r"\bsecrets\b", path.read_text()) is None, path.name
+
+
+def test_workflow_files_are_the_known_three() -> None:
+    assert {p.name for p in _workflow_files()} == {"ci.yml", "container.yml", "network.yml"}

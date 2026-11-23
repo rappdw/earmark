@@ -39,7 +39,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 19 | Fix: library errors are not bad audio | 08 | done |
 | 20 | Fix: dry-run findings (third-party URL logging, noisy output) | 19 | done |
 | 21 | Hugging Face telemetry off by default | 20 | done |
-| 22 | Re-scope I: remove analysis, vault, entities, search, re-run, digest | 21 | todo |
+| 22 | Re-scope I: remove analysis, vault, entities, search, re-run, digest | 21 | done |
 | 23 | Re-scope II: architecture and CLAUDE.md | 22 | todo |
 | 24 | Transcription requests: audio upload or URL, destination, instructions | 23 | todo |
 | 25 | Delivery: the transcript note and the email | 24 | todo |

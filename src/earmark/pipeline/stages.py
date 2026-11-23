@@ -4,13 +4,11 @@ Every parameter is positional-only, so implementations may name them freely and 
 runner must call stages positionally.
 """
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from earmark.models import Analysis, Episode, Job, StoreResult, Transcript
+from earmark.models import Episode, Job, Transcript
 
 
 class Resolver(Protocol):
@@ -41,47 +39,6 @@ class Transcriber(Protocol):
         ...
 
 
-class Analyzer(Protocol):
-    def analyze(self, episode: Episode, transcript: Transcript, prompt: str | None, /) -> Analysis:
-        """Return the cached analysis for ``prompt_hash(prompt, model)`` without an LLM call.
-
-        Otherwise analyze and write it. ``prompt`` is already normalised (None = default).
-        """
-        ...
-
-
-class Store(Protocol):
-    def store(
-        self,
-        episode: Episode,
-        transcript: Transcript,
-        analyses: Sequence[Analysis],
-        shared_at: datetime,
-        /,
-    ) -> StoreResult:
-        """Write the notes for the episode from all its analyses, deterministically.
-
-        ``shared_at`` is the episode's share time for the frontmatter.
-        """
-        ...
-
-
-class Indexer(Protocol):
-    def index(
-        self,
-        episode: Episode,
-        transcript: Transcript,
-        analyses: Sequence[Analysis],
-        stored: StoreResult,
-        /,
-    ) -> None:
-        """Replace the episode's rows in the search index.
-
-        The runner records failures as job warnings; they never fail the job.
-        """
-        ...
-
-
 class Notifier(Protocol):
     def notify(self, job: Job, episode: Episode | None, /) -> None:
         """Called with the job in a terminal state, and the episode if resolution got that far.
@@ -93,12 +50,9 @@ class Notifier(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Backends:
-    """The seven stage implementations the runner drives."""
+    """The four stage implementations the runner drives."""
 
     resolver: Resolver
     fetcher: AudioFetcher
     transcriber: Transcriber
-    analyzer: Analyzer
-    store: Store
-    indexer: Indexer | None  # None when EARMARK_INDEX_BACKEND=none
     notifier: Notifier | None  # None when EARMARK_NOTIFY_BACKEND=none

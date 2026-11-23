@@ -2,9 +2,9 @@ import importlib.metadata
 import io
 import json
 import re
+import sqlite3
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,18 +12,14 @@ import httpx2
 import pytest
 import uvicorn
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import earmark
-from earmark import cli
-from earmark.artifacts import ArtifactStore
 from earmark.cli import app
-from earmark.config import ConfigError, Settings, env_var
+from earmark.config import Settings, env_var
+from earmark.db import APPLICATION_ID
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import FakeResolver, FakeSearcher, FakeStore
-from earmark.index.embed import IndexExtraMissing
-from earmark.index.search import IndexMismatchError, SearchQuery
+from earmark.fakes import FakeResolver
 from earmark.jobs import open_job_store
 from earmark.log import configure_logging
 from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
@@ -32,10 +28,8 @@ from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from earmark.transcribe import faster_whisper as fw
 from earmark.transcribe.faster_whisper import AudioDecodeError
-from tests.digest_helpers import put_episode
-from tests.factories import make_analysis, make_episode, make_transcript
-from tests.index_helpers import RecordingTarget, make_docs, stub_extra_missing
-from tests.test_index_search import make_hit
+from tests.factories import make_episode
+from tests.legacy_db import V010_SCHEMA_VERSION, make_v010_database
 from tests.uds_http import asgi_on_uds
 from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
 
@@ -77,11 +71,10 @@ def test_no_args_shows_help() -> None:
 def test_config_never_prints_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("EARMARK_API_TOKEN", "sentinel-api-7f3a9c")
     monkeypatch.setenv("EARMARK_ASR_API_KEY", "sentinel-asr-1b2c3d")
-    monkeypatch.setenv("EARMARK_LLM_API_KEY", "sentinel-llm-4e5f6a")
     (tmp_path / ".env").write_text("EARMARK_NTFY_TOKEN=sentinel-ntfy-8d9e0f\n")
     result = runner.invoke(app, ["config"])
     assert result.exit_code == 0
-    for s in ("api-7f3a9c", "asr-1b2c3d", "llm-4e5f6a", "ntfy-8d9e0f"):
+    for s in ("api-7f3a9c", "asr-1b2c3d", "ntfy-8d9e0f"):
         assert f"sentinel-{s}" not in result.stdout + result.stderr
     lines = result.stdout.splitlines()
     assert "EARMARK_API_TOKEN=**********" in lines
@@ -130,8 +123,7 @@ def test_import_earmark_is_light() -> None:
     code = (
         "import sys, earmark\n"
         "heavy = {'pydantic', 'pydantic_settings', 'typer', 'fastapi', 'uvicorn', 'httpx2',\n"
-        "         'faster_whisper', 'ctranslate2', 'lancedb', 'fastembed', 'anthropic',\n"
-        "         'pyarrow', 'onnxruntime', 'numpy', 'loguru'}\n"
+        "         'faster_whisper', 'ctranslate2', 'onnxruntime', 'numpy'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
@@ -208,11 +200,10 @@ def test_serve_runs_uvicorn(
 
 
 @pytest.mark.usefixtures("restore_root_logging", "restore_library_loggers")
-def test_serve_access_log_drops_search_query(
+def test_serve_access_log_drops_query(
     monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls
 ) -> None:
     monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
-    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "none")
     assert runner.invoke(app, ["serve"]).exit_code == 0
     args, kwargs = fake_uvicorn.calls[0]
     stream = io.StringIO()
@@ -224,13 +215,13 @@ def test_serve_access_log_drops_search_query(
             transport=httpx2.HTTPTransport(uds=str(path)), base_url="http://earmark.test"
         ) as client,
     ):
-        url = "/search?q=private-sentinel&limit=3"
+        url = "/jobs?limit=3&private-sentinel=1"
         auth = {"Authorization": f"Bearer {SERVE_TOKEN}"}
-        assert client.get(url, headers=auth).status_code == 503
+        assert client.get(url, headers=auth).status_code == 200
         assert client.get(url).status_code == 401
     out = stream.getvalue()
-    assert '"GET /search HTTP/1.1" 503' in out
-    assert '"GET /search HTTP/1.1" 401' in out
+    assert '"GET /jobs HTTP/1.1" 200' in out
+    assert '"GET /jobs HTTP/1.1" 401' in out
     assert "private-sentinel" not in out
     assert "limit=" not in out
 
@@ -268,9 +259,6 @@ BACKEND_VARS = (
     "RESOLVER_BACKEND",
     "FETCH_BACKEND",
     "ASR_BACKEND",
-    "LLM_PROVIDER",
-    "STORE_BACKEND",
-    "INDEX_BACKEND",
     "NOTIFY_BACKEND",
 )
 
@@ -279,7 +267,6 @@ BACKEND_VARS = (
 def fake_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_root_logging: None) -> Path:
     for name in BACKEND_VARS:
         monkeypatch.setenv(f"EARMARK_{name}", "fake")
-    monkeypatch.setenv("EARMARK_VAULT_DIR", str(tmp_path / "vault"))
     return tmp_path
 
 
@@ -300,7 +287,7 @@ def test_submit_then_worker_once(fake_env: Path) -> None:
     listed = runner.invoke(app, ["jobs", "--json"])
     [job] = json.loads(listed.stdout)["jobs"]
     assert (job["id"], job["status"]) == (job_id, "done")
-    assert list((fake_env / "vault" / "Earmark" / "Podcasts").glob("*.md"))
+    assert len(list((fake_env / "data").glob("episodes/*/transcript.json"))) == 1
 
 
 def test_worker_once_empty(fake_env: Path) -> None:
@@ -328,7 +315,6 @@ def test_worker_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.usefixtures("restore_root_logging")
 def test_worker_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from earmark.pipeline import factory
 
     monkeypatch.setattr(
         factory, "NOTIFIERS", {k: v for k, v in factory.NOTIFIERS.items() if k != "ntfy"}
@@ -378,7 +364,7 @@ def test_jobs_text_output(fake_env: Path) -> None:
     lines = runner.invoke(app, ["jobs"]).stdout.splitlines()
     assert [ln.split("  ")[0] for ln in lines] == [second, first]
     assert lines[0].split("  ")[1] == "queued"
-    assert lines[1].split("  ")[1:4] == ["done", "index", "1"]
+    assert lines[1].split("  ")[1:4] == ["done", "transcribe", "1"]
     assert lines[1].endswith("  https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981")
     done = runner.invoke(app, ["jobs", "--status", "done"]).stdout.splitlines()
     assert [ln.split("  ")[0] for ln in done] == [first]
@@ -410,7 +396,6 @@ CANONICAL_SHARE = "https://podcasts.apple.com/us/podcast/id1200361736?i=10008029
 
 
 def _use_resolver(monkeypatch: pytest.MonkeyPatch, resolver: object) -> None:
-    from earmark.pipeline import factory
 
     monkeypatch.setattr(factory, "build_resolver", lambda settings: resolver)
 
@@ -491,7 +476,6 @@ def test_resolve_unsupported_url_exits_2(fake_env: Path) -> None:
 
 
 def test_resolve_unbuilt_backend_exits_2(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from earmark.pipeline import factory
 
     monkeypatch.delenv("EARMARK_RESOLVER_BACKEND")
     monkeypatch.setattr(factory, "RESOLVERS", {"fake": factory.RESOLVERS["fake"]})
@@ -743,488 +727,12 @@ def test_worker_remote_without_url_exits_2(fake_env: Path, monkeypatch: pytest.M
     assert not (fake_env / "data").exists()
 
 
-# -- analyze ------------------------------------------------------------------------------
-
-ANALYZE_SENTINEL = "sk-ant-cli-sentinel-91ab"
-
-
-def _stored_episode(root: Path) -> Episode:
-    from earmark.artifacts import ArtifactStore
-
-    store = ArtifactStore(root / "data")
-    episode = make_episode()
-    store.write_episode(episode)
-    store.write_transcript(make_transcript())
-    return episode
-
-
-def _analyze_env(
-    fake_env: Path, monkeypatch: pytest.MonkeyPatch, provider: str = "fake"
-) -> Episode:
-    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
-    monkeypatch.setenv("EARMARK_LLM_PROVIDER", provider)
-    return _stored_episode(fake_env)
-
-
-def test_analyze_prints_rendered_analysis(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from earmark.analyze.render import render_analysis
-    from earmark.artifacts import ArtifactStore
-    from earmark.models import prompt_hash
-
-    episode = _analyze_env(fake_env, monkeypatch)
-    result = runner.invoke(app, ["analyze", episode.key])
-    assert result.exit_code == 0, result.stderr
-    store = ArtifactStore(fake_env / "data")
-    analysis = store.read_analysis(episode.key, prompt_hash(None, "fake-llm"))
-    assert analysis is not None
-    assert result.stdout.splitlines() == render_analysis(analysis).splitlines()
-    assert result.stdout.startswith("## Default analysis")
-
-
-def test_analyze_json(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    episode = _analyze_env(fake_env, monkeypatch)
-    result = runner.invoke(app, ["analyze", episode.key, "--json"])
-    assert result.exit_code == 0, result.stderr
-    assert json.loads(result.stdout)["episode_key"] == episode.key
-
-
-def test_analyze_reuses_cache(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from earmark.artifacts import ArtifactStore
-    from earmark.models import prompt_hash
-
-    episode = _analyze_env(fake_env, monkeypatch)
-    assert runner.invoke(app, ["analyze", episode.key]).exit_code == 0
-    path = ArtifactStore(fake_env / "data").analysis_path(
-        episode.key, prompt_hash(None, "fake-llm")
-    )
-    before = (path.read_bytes(), path.stat().st_mtime_ns)
-    assert runner.invoke(app, ["analyze", episode.key]).exit_code == 0
-    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
-
-
-def test_analyze_prompt(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from earmark.artifacts import ArtifactStore
-    from earmark.models import prompt_hash
-
-    episode = _analyze_env(fake_env, monkeypatch)
-    result = runner.invoke(app, ["analyze", episode.key, "--prompt", "  Why?  "])
-    assert result.exit_code == 0, result.stderr
-    store = ArtifactStore(fake_env / "data")
-    analysis = store.read_analysis(episode.key, prompt_hash("Why?", "fake-llm"))
-    assert analysis is not None
-    assert analysis.prompt == "Why?"
-
-
-def test_analyze_openai_compat_missing_settings(
-    fake_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    episode = _analyze_env(fake_env, monkeypatch, provider="openai_compat")
-    result = runner.invoke(app, ["analyze", episode.key])
-    assert result.exit_code == 2
-    assert "EARMARK_LLM_BASE_URL" in result.stderr
-    assert "EARMARK_LLM_CONTEXT_TOKENS" in result.stderr
-
-
-def test_analyze_bad_key(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _analyze_env(fake_env, monkeypatch)
-    result = runner.invoke(app, ["analyze", "nothex"])
-    assert result.exit_code == 2
-    assert "earmark analyze: not an episode key: nothex" in result.stderr
-
-
-def test_analyze_prompt_too_long(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    episode = _analyze_env(fake_env, monkeypatch)
-    result = runner.invoke(app, ["analyze", episode.key, "--prompt", "x" * (MAX_PROMPT_CHARS + 1)])
-    assert result.exit_code == 2
-    assert "prompt is too long" in result.stderr
-
-
-def test_analyze_missing_transcript(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
-    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "fake")
-    key = make_episode().key
-    result = runner.invoke(app, ["analyze", key])
-    assert result.exit_code == 1
-    assert key in result.stderr
-    assert "share the episode first" in result.stderr
-
-
-def test_analyze_anthropic_without_credentials(
-    fake_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from earmark.analyze.llm.anthropic import NO_CREDENTIALS
-
-    episode = _analyze_env(fake_env, monkeypatch, provider="anthropic")
-    result = runner.invoke(app, ["analyze", episode.key])
-    assert result.exit_code == 2
-    assert NO_CREDENTIALS in result.stderr
-
-
-@pytest.mark.parametrize(
-    ("error", "exit_code", "temporary"),
-    [(TransientError("api is down"), 1, True), (PermanentError("api said no"), 1, False)],
-)
-def test_analyze_transient_and_permanent(
-    fake_env: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    error: Exception,
-    exit_code: int,
-    temporary: bool,
-) -> None:
-    from earmark.analyze.llm.anthropic import AnthropicClient
-    from earmark.analyze.llm.base import LLMRequest
-
-    def boom(self: AnthropicClient, request: LLMRequest, /) -> int:
-        raise error
-
-    monkeypatch.setattr(AnthropicClient, "count_tokens", boom)
-    monkeypatch.setenv("EARMARK_LLM_API_KEY", ANALYZE_SENTINEL)
-    episode = _analyze_env(fake_env, monkeypatch, provider="anthropic")
-    result = runner.invoke(app, ["analyze", episode.key])
-    assert result.exit_code == exit_code
-    assert f"earmark analyze: {error}" in result.stderr
-    assert ("(temporary; try again later)" in result.stderr) is temporary
-    assert ANALYZE_SENTINEL not in result.stdout + result.stderr
-
-
-def test_analyze_never_prints_key(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EARMARK_LLM_API_KEY", ANALYZE_SENTINEL)
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
-    episode = _analyze_env(fake_env, monkeypatch, provider="anthropic")
-    monkeypatch.setenv("EARMARK_LOG_LEVEL", "DEBUG")
-    result = runner.invoke(app, ["analyze", episode.key])
-    assert result.exit_code == 1
-    assert "could not reach the Anthropic API" in result.stderr
-    assert ANALYZE_SENTINEL not in result.stdout + result.stderr
-
-
-def test_analyze_warnings_on_stderr(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from earmark.artifacts import ArtifactStore
-    from earmark.models import prompt_hash
-
-    episode = _analyze_env(fake_env, monkeypatch)
-    store = ArtifactStore(fake_env / "data")
-    warned = make_analysis(prompt=None, model="fake-llm")
-    warned = warned.model_copy(
-        update={"episode_key": episode.key, "warnings": ("something\x07odd happened",)}
-    )
-    assert warned.prompt_hash == prompt_hash(None, "fake-llm")
-    store.write_analysis(warned)
-    result = runner.invoke(app, ["analyze", episode.key])
-    assert result.exit_code == 0, result.stderr
-    assert "earmark analyze: warning: something?odd happened" in result.stderr
-    assert "warning" not in result.stdout
-
-
-def _vault_share(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    vault = fake_env / "vault"
-    vault.mkdir(exist_ok=True)
-    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
-    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
-    _submit(SHARE)
-    assert runner.invoke(app, ["worker", "--once"]).exit_code == 0
-    return vault
-
-
-def test_entities_rebuild(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    vault = _vault_share(fake_env, monkeypatch)
-    (vault / "Earmark" / "aliases.yaml").write_text("foods: {}\n")
-    result = runner.invoke(app, ["entities", "rebuild"])
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout == "rebuilt the entity registry: 1 episodes, 5 entities; 0 notes written\n"
-    assert result.stderr.startswith(
-        "earmark entities rebuild: warning: aliases.yaml line 1: unknown kind"
-    )
-
-
-def test_entities_rebuild_needs_vault_dir(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("EARMARK_VAULT_DIR")
-    result = runner.invoke(app, ["entities", "rebuild"])
-    assert result.exit_code == 2
-    assert "EARMARK_VAULT_DIR" in result.stderr
-
-
-def test_entities_rebuild_bad_aliases(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    vault = _vault_share(fake_env, monkeypatch)
-    (vault / "Earmark" / "aliases.yaml").write_text("people: [oops\n")
-    result = runner.invoke(app, ["entities", "rebuild"])
-    assert result.exit_code == 1
-    assert "earmark entities rebuild: aliases.yaml is not valid YAML at line 2" in result.stderr
-
-
-def test_entities_rebuild_refused(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import shutil
-
-    _vault_share(fake_env, monkeypatch)
-    shutil.rmtree(fake_env / "data" / "episodes")
-    result = runner.invoke(app, ["entities", "rebuild"])
-    assert result.exit_code == 1
-    assert "--prune" in result.stderr
-    assert runner.invoke(app, ["entities", "rebuild", "--prune"]).exit_code == 0
-
-
-# -- search, reindex, and serve's searcher ------------------------------------------------
-
-KEY = "a" * 20
-
-
-def _patch_searcher(monkeypatch: pytest.MonkeyPatch, searcher: FakeSearcher | None) -> None:
-    monkeypatch.setattr("earmark.pipeline.factory.build_searcher", lambda settings: searcher)
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_prints_hits(monkeypatch: pytest.MonkeyPatch) -> None:
-    searcher = FakeSearcher(
-        [
-            make_hit(1),
-            make_hit(2, kind="summary", start_s=None, timestamp=None, note_path=None),
-        ]
-    )
-    _patch_searcher(monkeypatch, searcher)
-    result = runner.invoke(app, ["search", "fake claim", "--limit", "5", "--kind", "claim"])
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "1. 0.8312  Fake Show \u2014 Fake episode  [00:01:05]  claim",
-        "   The fake episode makes a claim.",
-        "   Earmark/Podcasts/x.md",
-        "2. 0.8312  Fake Show \u2014 Fake episode  summary",
-        "   The fake episode makes a claim.",
-    ]
-    assert searcher.calls == [SearchQuery("fake claim", 5, ("claim",), None)]
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    searcher = FakeSearcher([make_hit(1)])
-    _patch_searcher(monkeypatch, searcher)
-    result = runner.invoke(app, ["search", "x", "--json", "--episode", KEY])
-    assert result.exit_code == 0
-    data = json.loads(result.stdout)
-    assert data["index_exists"] is True
-    assert data["hits"][0]["timestamp"] == "00:01:05"
-    assert searcher.calls[0].episode_key == KEY
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_no_results_and_empty_index(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_searcher(monkeypatch, FakeSearcher())
-    assert runner.invoke(app, ["search", "x"]).stdout == "no results\n"
-    _patch_searcher(monkeypatch, FakeSearcher(index_exists=False))
-    out = runner.invoke(app, ["search", "x"]).stdout
-    assert out.startswith("the search index is empty")
-    assert "`earmark reindex`" in out
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_cleans_terminal_escapes(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_searcher(
-        monkeypatch, FakeSearcher([make_hit(1, snippet="evil \x1b[31mred", show_title="a\x07b")])
-    )
-    result = runner.invoke(app, ["search", "x"])
-    assert "\x1b" not in result.stdout
-    assert "\x07" not in result.stdout
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_mismatch_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
-    searcher = FakeSearcher()
-    searcher.fail_next(IndexMismatchError("built with another model; run `earmark reindex`"))
-    _patch_searcher(monkeypatch, searcher)
-    result = runner.invoke(app, ["search", "x"])
-    assert result.exit_code == 1
-    assert "earmark reindex" in result.stderr
-    assert result.stdout == ""
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_transient_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
-    searcher = FakeSearcher()
-    searcher.fail_next(TransientError("the embedding model is not downloaded yet"))
-    _patch_searcher(monkeypatch, searcher)
-    result = runner.invoke(app, ["search", "x"])
-    assert result.exit_code == 1
-    assert "temporary; try again later" in result.stderr
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-@pytest.mark.parametrize(
-    "args", [["  "], ["x", "--limit", "0"], ["x", "--kind", "entity"], ["x", "--episode", "ZZ"]]
-)
-def test_search_invalid_input_exits_2(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> None:
-    searcher = FakeSearcher()
-    _patch_searcher(monkeypatch, searcher)
-    result = runner.invoke(app, ["search", *args])
-    assert result.exit_code == 2
-    assert searcher.calls == []
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_off_and_config_errors_exit_2(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_searcher(monkeypatch, None)
-    off = runner.invoke(app, ["search", "x"])
-    assert (off.exit_code, "EARMARK_INDEX_BACKEND=none" in off.stderr) == (2, True)
-
-    def boom(settings: Settings) -> None:
-        raise ConfigError(["EARMARK_EMBED_MODEL: 'x' is not a fastembed text embedding model"])
-
-    monkeypatch.setattr("earmark.pipeline.factory.build_searcher", boom)
-    bad = runner.invoke(app, ["search", "x"])
-    assert bad.exit_code == 2
-    assert "EARMARK_EMBED_MODEL" in bad.stderr
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_search_without_extra_exits_2_and_creates_nothing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    stub_extra_missing(monkeypatch, "lancedb")
-    result = runner.invoke(app, ["search", "x"])
-    assert result.exit_code == 2
-    assert "uv sync --extra index" in result.stderr
-    assert not (tmp_path / "data").exists()
-
-
-@pytest.fixture
-def reindex_env(monkeypatch: pytest.MonkeyPatch, fake_env: Path) -> RecordingTarget:
-    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "lancedb")
-    target = RecordingTarget()
-    monkeypatch.setattr(
-        "earmark.index.lancedb_index.build_lancedb_index",
-        lambda settings, *, allow_download=True, embedder=None: target,
-    )
-    return target
-
-
-def test_reindex_requires_lancedb(fake_env: Path) -> None:
-    result = runner.invoke(app, ["reindex"])
-    assert result.exit_code == 2
-    assert "EARMARK_INDEX_BACKEND is 'fake'" in result.stderr
-
-
-def test_reindex_reports(
-    reindex_env: RecordingTarget, fake_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
-    (fake_env / "vault").mkdir()  # empty: no note is found for either episode
-    store = ArtifactStore(fake_env / "data")
-    for guid in ("urn:c:1", "urn:c:2"):
-        docs = make_docs(guid=guid)
-        store.write_episode(docs.episode)
-        store.write_transcript(docs.transcript)
-        store.write_analysis(docs.analyses[0])
-    incomplete = make_docs(guid="urn:c:3")
-    store.write_episode(incomplete.episode)
-    result = runner.invoke(app, ["reindex"])
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout == "reindexed 2 episodes (6 rows); skipped 1 incomplete episodes\n"
-    assert result.stderr.count("earmark reindex: warning: ") == 2
-    assert reindex_env.calls[0] == "reset"
-    assert reindex_env.calls[-1] == "optimize"
-
-
-def test_reindex_bad_episode_exits_2(reindex_env: RecordingTarget) -> None:
-    result = runner.invoke(app, ["reindex", "--episode", "nope"])
-    assert result.exit_code == 2
-    assert "--episode" in result.stderr
-
-
-def test_reindex_missing_episode_exits_1(reindex_env: RecordingTarget) -> None:
-    result = runner.invoke(app, ["reindex", "--episode", KEY])
-    assert result.exit_code == 1
-    assert "has no transcript or analyses" in result.stderr
-
-
-def test_reindex_errors(
-    reindex_env: RecordingTarget, fake_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ArtifactStore(fake_env / "data")
-    docs = make_docs()
-    store.write_episode(docs.episode)
-    store.write_transcript(docs.transcript)
-    store.write_analysis(docs.analyses[0])
-    key = docs.episode.key
-    reindex_env.fail_on[key] = TransientError("the search index disk is full")
-    transient = runner.invoke(app, ["reindex", "--episode", key])
-    assert transient.exit_code == 1
-    assert "(temporary; try again later)" in transient.stderr
-    reindex_env.fail_on[key] = IndexMismatchError(
-        "the search index was built with x; run `earmark reindex` to rebuild it"
-    )
-    mismatch = runner.invoke(app, ["reindex", "--episode", key])
-    assert mismatch.exit_code == 1
-    assert "`earmark reindex` (without --episode) to rebuild it" in mismatch.stderr
-    reindex_env.fail_on[key] = OSError("disk exploded")
-    assert runner.invoke(app, ["reindex", "--episode", key]).exit_code == 1
-
-
-def test_reindex_without_vault_exits_2(
-    reindex_env: RecordingTarget, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
-    monkeypatch.delenv("EARMARK_VAULT_DIR")
-    result = runner.invoke(app, ["reindex"])
-    assert result.exit_code == 2
-    assert "EARMARK_VAULT_DIR" in result.stderr
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_serve_starts_when_search_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-    fake_uvicorn: _UvicornCalls,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    def missing(settings: Settings) -> None:
-        raise IndexExtraMissing(["EARMARK_INDEX_BACKEND: needs the 'index' extra"])
-
-    monkeypatch.setattr("earmark.pipeline.factory.build_searcher", missing)
-    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
-    result = runner.invoke(app, ["serve"])
-    assert result.exit_code == 0, result.stderr
-    assert len(fake_uvicorn.calls) == 1
-    assert any("search is unavailable" in r.getMessage() for r in caplog.records)
-    api = fake_uvicorn.calls[0][0][0]
-    with TestClient(api, headers={"Authorization": f"Bearer {SERVE_TOKEN}"}) as client:
-        response = client.get("/search", params={"q": "x"})
-    assert response.status_code == 503
-    assert "needs the 'index' extra" in response.json()["detail"]
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_serve_with_index_none(
-    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls
-) -> None:
-    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
-    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "none")
-    assert runner.invoke(app, ["serve"]).exit_code == 0
-    with TestClient(
-        fake_uvicorn.calls[0][0][0], headers={"Authorization": f"Bearer {SERVE_TOKEN}"}
-    ) as client:
-        response = client.get("/search", params={"q": "x"})
-    assert response.status_code == 503
-    assert response.json() == {"detail": "search is turned off (EARMARK_INDEX_BACKEND=none)"}
-
-
-@pytest.mark.usefixtures("restore_root_logging")
-def test_serve_wires_the_searcher(
-    monkeypatch: pytest.MonkeyPatch, fake_uvicorn: _UvicornCalls
-) -> None:
-    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
-    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "fake")
-    assert runner.invoke(app, ["serve"]).exit_code == 0
-    with TestClient(
-        fake_uvicorn.calls[0][0][0], headers={"Authorization": f"Bearer {SERVE_TOKEN}"}
-    ) as client:
-        assert client.get("/search", params={"q": "x"}).json() == {"hits": []}
-
-
 # -- doctor ------------------------------------------------------------------------------------
 
 
 @pytest.fixture
 def doctor_env(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    (fake_env / "vault").mkdir()
     monkeypatch.setenv("EARMARK_API_TOKEN", "d" * 40)
-    monkeypatch.setenv("EARMARK_INDEX_BACKEND", "none")
     monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "none")
     return fake_env
 
@@ -1236,7 +744,6 @@ def test_doctor_all_fake_exit_0(doctor_env: Path) -> None:
     assert lines[-1].startswith("doctor: all checks passed")
     assert any(line.startswith("warn  resolver") for line in lines)
     assert not (doctor_env / "data").exists()
-    assert list((doctor_env / "vault").iterdir()) == []
 
 
 def test_doctor_failure_exit_1(doctor_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1244,7 +751,7 @@ def test_doctor_failure_exit_1(doctor_env: Path, monkeypatch: pytest.MonkeyPatch
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1
     assert "FAIL  api token" in result.stdout
-    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 5 warnings"
+    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 3 warnings"
 
 
 def test_doctor_bad_settings_exit_2_no_echo(
@@ -1261,7 +768,6 @@ def test_doctor_never_prints_secrets(doctor_env: Path, monkeypatch: pytest.Monke
     secrets = {
         "EARMARK_API_TOKEN": "sentinel-api-token-" + "a" * 30,
         "EARMARK_ASR_API_KEY": "sentinel-asr-key-77",
-        "EARMARK_LLM_API_KEY": "sentinel-llm-key-88",
         "EARMARK_NTFY_TOKEN": "sentinel-ntfy-token-99",
         "EARMARK_NTFY_URL": "https://ntfy.test/sentinel-topic-91x",
     }
@@ -1269,10 +775,6 @@ def test_doctor_never_prints_secrets(doctor_env: Path, monkeypatch: pytest.Monke
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
     monkeypatch.setenv("EARMARK_ASR_BASE_URL", "http://asr.test:8000/v1")
-    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "openai_compat")
-    monkeypatch.setenv("EARMARK_LLM_BASE_URL", "http://llm.test:8000/v1")
-    monkeypatch.setenv("EARMARK_LLM_MODEL", "qwen")
-    monkeypatch.setenv("EARMARK_LLM_CONTEXT_TOKENS", "32768")
     monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "ntfy")
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0, result.output
@@ -1312,413 +814,76 @@ def test_doctor_online_cli_unreachable(doctor_env: Path, monkeypatch: pytest.Mon
     assert "sentinel-topic-12" not in result.stdout + result.stderr
 
 
-# -- reanalyze and episodes --------------------------------------------------------------
+# -- the command set and the old database (step 22) --------------------------------------
 
 
-def _ingest_one(prompt: str | None = None) -> str:
-    args = [SHARE] if prompt is None else [SHARE, "--prompt", prompt]
-    _submit(*args)
-    assert runner.invoke(app, ["worker", "--once"]).exit_code == 0
-    keys = ArtifactStore(Path("data")).list_episode_keys()
-    assert len(keys) == 1
-    return keys[0]
+def test_cli_commands_are_exactly() -> None:
+    names = {c.name or (c.callback.__name__ if c.callback else "") for c in app.registered_commands}
+    assert names == {
+        "config",
+        "doctor",
+        "serve",
+        "worker",
+        "submit",
+        "jobs",
+        "resolve",
+        "transcribe",
+    }
+    assert app.registered_groups == []
 
 
-def test_reanalyze_then_worker_once(fake_env: Path) -> None:
-    key = _ingest_one()
-    result = runner.invoke(app, ["reanalyze", key, "--prompt", "q2"])
-    assert result.exit_code == 0, result.stderr
-    match = re.fullmatch(r"([0-9a-f]{32}) queued\n", result.stdout)
-    assert match
-    worked = runner.invoke(app, ["worker", "--once"])
-    assert worked.stdout == f"job {match.group(1)} done\n"
-    assert len(ArtifactStore(Path("data")).list_analyses(key)) == 2
-    [note] = (fake_env / "vault" / "Earmark" / "Podcasts").glob("*.md")
-    assert note.read_text().count("\n## ") == 2
+def _row_count(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return int(conn.execute("SELECT count(*) FROM jobs").fetchone()[0])
+    finally:
+        conn.close()
 
 
-def test_reanalyze_existing_job(fake_env: Path) -> None:
-    key = _ingest_one()
-    first = runner.invoke(app, ["reanalyze", key]).stdout.split()[0]
-    assert runner.invoke(app, ["reanalyze", key]).stdout == f"{first} queued (existing job)\n"
-
-
-def test_reanalyze_bad_key_exits_2(fake_env: Path) -> None:
-    result = runner.invoke(app, ["reanalyze", "nothex\x1b"])
-    assert result.exit_code == 2
-    assert result.stdout == ""
-    assert result.stderr == "earmark reanalyze: not an episode key: nothex?\n"
-    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
-
-
-def test_reanalyze_prompt_too_long_exits_2(fake_env: Path) -> None:
-    key = _ingest_one()
-    result = runner.invoke(app, ["reanalyze", key, "--prompt", "x" * (MAX_PROMPT_CHARS + 1)])
-    assert result.exit_code == 2
-    assert result.stdout == ""
-    assert f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)" in result.stderr
-    assert "queued" not in runner.invoke(app, ["jobs"]).stdout
-
-
-def test_reanalyze_unknown_episode_exits_1(fake_env: Path) -> None:
-    result = runner.invoke(app, ["reanalyze", "0" * 20])
-    assert result.exit_code == 1
-    assert result.stdout == ""
-    assert result.stderr == (
-        f"earmark reanalyze: no episode {'0' * 20} under EARMARK_DATA_DIR; see `earmark episodes`\n"
-    )
-    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
-
-
-def test_reanalyze_no_transcript_exits_1(fake_env: Path) -> None:
-    ArtifactStore(Path("data")).write_episode(make_episode())
-    key = make_episode().key
-    result = runner.invoke(app, ["reanalyze", key])
-    assert result.exit_code == 1
-    assert result.stdout == ""
-    assert result.stderr == (
-        f"earmark reanalyze: episode {key}: this episode has no transcript yet; "
-        "share it again, or wait for its job to finish\n"
-    )
-    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
-
-
-def test_reanalyze_store_error_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    key = _ingest_one()
-    blocker = fake_env / "file"
-    blocker.write_text("x")
-    monkeypatch.setenv("EARMARK_DATA_DIR", str(blocker))
-    result = runner.invoke(app, ["reanalyze", key])
-    assert result.exit_code == 1
-    assert result.stdout == ""
-
-
-def test_episodes_text(fake_env: Path) -> None:
-    key = _ingest_one()
-    runner.invoke(app, ["reanalyze", key, "--prompt", "  who\n is   here? "])
-    runner.invoke(app, ["worker", "--once"])
-    other = ArtifactStore(Path("data"))
-    bare = make_episode(guid="urn:bare", title="Bare")
-    other.write_episode(bare)
-    other.record_share(bare.key, make_analysis().created_at.replace(year=2020))
-    out = runner.invoke(app, ["episodes"])
-    assert out.exit_code == 0
-    lines = out.stdout.splitlines()
-    assert re.fullmatch(rf"{key}  \d{{4}}-\d\d-\d\d  .+ — .+", lines[0])
-    assert sum(ln.endswith("  fake-llm  (default analysis)") for ln in lines[1:3]) == 1
-    assert any(ln.endswith("  fake-llm  who is here?") for ln in lines)
-    assert lines[-2].startswith(bare.key)
-    assert lines[-1] == "  no transcript yet"
-    paged = runner.invoke(app, ["episodes", "--limit", "1"]).stdout.splitlines()
-    assert paged[-1] == "showing 1-1 of 2; next: --offset 1"
-    last = runner.invoke(app, ["episodes", "--limit", "1", "--offset", "1"]).stdout.splitlines()
-    assert last[-1] == "showing 2-2 of 2"
-    assert (
-        runner.invoke(app, ["episodes", "--offset", "5"]).stdout
-        == "no episodes at offset 5 (total 2)\n"
-    )
-
-
-def test_episodes_json(fake_env: Path) -> None:
-    from earmark.episodes import list_episodes
-
-    _ingest_one("p")
-    result = runner.invoke(app, ["episodes", "--json"])
-    expected = list_episodes(ArtifactStore(Path("data"))).model_dump_json()
-    assert result.stdout == expected + "\n"
-
-
-def test_episodes_empty(fake_env: Path) -> None:
-    result = runner.invoke(app, ["episodes"])
-    assert result.stdout == "no episodes\n"
-    assert not Path("data/episodes").exists()
-
-
-def test_episodes_cleans_control_chars(fake_env: Path) -> None:
-    ArtifactStore(Path("data")).write_episode(make_episode(title="red \x1b[31mtext"))
-    out = runner.invoke(app, ["episodes"]).stdout
-    assert "\x1b" not in out
-    assert "red ?[31mtext" in out
-
-
-@pytest.mark.parametrize("limit", ["0", "201"])
-def test_episodes_bad_limit_exits_2(fake_env: Path, limit: str) -> None:
-    assert runner.invoke(app, ["episodes", "--limit", limit]).exit_code == 2
-
-
-def test_episodes_unreadable_root_exits_1(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def boom(self: ArtifactStore) -> list[str]:
-        raise PermissionError("no")
-
-    monkeypatch.setattr(ArtifactStore, "list_episode_keys", boom)
-    result = runner.invoke(app, ["episodes"])
-    assert result.exit_code == 1
-    assert result.stderr.startswith("earmark episodes: the episode files")
-    assert result.stderr.endswith("(temporary; try again later)\n")
-
-
-def test_episodes_module_is_light() -> None:
-    code = (
-        "import sys, earmark.episodes\n"
-        "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2', 'anthropic'}\n"
-        "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
-    )
-    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    assert proc.stdout.strip() == "[]"
-
-
-# -- digest ------------------------------------------------------------------------------------
-
-DIGEST_SHARED = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)  # in 2026-W47
-DIGEST_NOW = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
-
-
-class _Notifier:
-    """Stands in for the ntfy client: records what would have been published."""
-
-    def __init__(self, fail: Exception | None = None) -> None:
-        self.published: list[Any] = []
-        self.closed = False
-        self._fail = fail
-        self.options = type("Options", (), {"vault_name": "My Vault"})()
-
-    def publish(self, notification: Any) -> None:
-        if self._fail is not None:
-            raise self._fail
-        self.published.append(notification)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-@pytest.fixture
-def digest_env(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))
-    monkeypatch.setenv("EARMARK_TZ", "UTC")
-    monkeypatch.setattr(cli, "_digest_now", lambda: DIGEST_NOW)
-    artifacts = ArtifactStore(fake_env / "data")
-    ep = put_episode(artifacts, "g", DIGEST_SHARED, analyses=[["a lead"]])
-    transcript = artifacts.read_transcript(ep.key)
-    assert transcript is not None
-    FakeStore(fake_env / "vault", "Earmark").store(
-        ep, transcript, artifacts.list_analyses(ep.key), DIGEST_SHARED
-    )
-    return fake_env
-
-
-def _digest(*args: str) -> Any:
-    return runner.invoke(app, ["digest", *args])
-
-
-def test_digest_week_writes_and_prints(digest_env: Path) -> None:
-    result = _digest("--week", "2026-W47", "--no-notify")
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout == (
-        "wrote Earmark/Digests/2026-W47.md: 1 episode, 1 research lead, 1 theme "
-        "(0 model requests); the window is not over yet\n"
-    )
-    note = (digest_env / "vault/Earmark/Digests/2026-W47.md").read_text()
-    assert "## Show A" in note
-
-
-def test_digest_rerun_up_to_date(digest_env: Path) -> None:
-    assert _digest("--week", "2026-W47").exit_code == 0
-    again = _digest("--week", "2026-W47")
-    assert again.exit_code == 0
-    assert again.stdout == (
-        "Earmark/Digests/2026-W47.md is up to date: 1 episode, 1 research lead, 1 theme "
-        "(themes from cache); the window is not over yet\n"
-    )
-
-
-def test_digest_default_is_last_complete_week(
-    digest_env: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.usefixtures("restore_root_logging")
+@pytest.mark.parametrize(
+    "args", [["serve"], ["worker", "--once"], ["jobs"], ["submit", SHARE]], ids=lambda a: a[0]
+)
+def test_v010_database_refused_by_commands(
+    fake_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_uvicorn: _UvicornCalls,
+    args: list[str],
 ) -> None:
-    monkeypatch.setattr(cli, "_digest_now", lambda: datetime(2026, 11, 23, 7, 0, tzinfo=UTC))
-    result = _digest()
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout.startswith("wrote Earmark/Digests/2026-W47.md: 1 episode")
-    assert "not over yet" not in result.stdout
-
-
-def test_digest_since_names_range_note(digest_env: Path) -> None:
-    result = _digest("--since", "7d")
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout.startswith("wrote Earmark/Digests/2026-11-14 to 2026-11-20.md: ")
-    assert "not over yet" not in result.stdout
-    assert (digest_env / "vault/Earmark/Digests/2026-11-14 to 2026-11-20.md").is_file()
-
-
-def test_digest_since_rerun_no_tail(digest_env: Path) -> None:
-    assert _digest("--since", "7d").exit_code == 0
-    again = _digest("--since", "7d")
-    assert again.exit_code == 0
-    assert "is up to date: " in again.stdout
-    assert "not over yet" not in again.stdout
-
-
-def test_digest_since_empty_no_tail(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_digest_now", lambda: datetime(2027, 1, 15, 12, 0, tzinfo=UTC))
-    result = _digest("--since", "1d")
-    assert result.exit_code == 0, result.stderr
-    assert result.stdout.startswith("no episodes were first shared in 2027-01-15 to 2027-01-15 (")
-    assert result.stdout.rstrip().endswith("; nothing written")
-
-
-def test_digest_empty_window_exit_0(digest_env: Path) -> None:
-    result = _digest("--week", "2020-W01")
-    assert result.exit_code == 0
-    assert result.stdout == (
-        "no episodes were first shared in 2020-W01 (2019-12-30 to 2020-01-05, UTC); "
-        "nothing written\n"
-    )
-    assert not (digest_env / "vault/Earmark/Digests").exists()
-
-
-def test_digest_bad_week_exit_2(digest_env: Path) -> None:
-    result = _digest("--week", "2025-W53")
-    assert result.exit_code == 2
-    assert result.stderr == "earmark digest: 2025 has no ISO week 53\n"
-    assert _digest("--week", "nonsense").exit_code == 2
-    assert _digest("--since", "0d").exit_code == 2
-
-
-def test_digest_both_options_exit_2(digest_env: Path) -> None:
-    result = _digest("--week", "2026-W47", "--since", "7d")
-    assert result.exit_code == 2
-    assert "use either --week or --since" in result.stderr
-
-
-def test_digest_missing_vault_dir_exit_2(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EARMARK_STORE_BACKEND", "vault")
-    monkeypatch.delenv("EARMARK_VAULT_DIR")
-    result = _digest("--since", "7d")
-    assert result.exit_code == 2
-    assert "EARMARK_VAULT_DIR" in result.stderr
-
-
-def test_digest_no_credential_exit_2_even_for_empty_window(
-    digest_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "anthropic")
-    result = _digest("--week", "2020-W01")
-    assert result.exit_code == 2
-
-
-class _FailingThemer:
-    model = "failing"
-
-    def __init__(self, exc: Exception) -> None:
-        self.exc = exc
-        self.closed = False
-
-    def themes(self, request: Any, /) -> Any:
-        raise self.exc
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def test_digest_model_failure_exit_1(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    themer = _FailingThemer(PermanentError("the model declined to analyze the research leads"))
-    monkeypatch.setattr(factory, "build_themer", lambda settings, cache: themer)
-    result = _digest("--week", "2026-W47")
+    monkeypatch.setenv("EARMARK_API_TOKEN", SERVE_TOKEN)
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(fake_env / "data"))  # absolute, so the path shows
+    (fake_env / "data").mkdir()
+    path = make_v010_database(fake_env / "data" / "earmark.db")
+    before = _row_count(path)
+    result = runner.invoke(app, args)
     assert result.exit_code == 1
-    assert result.stderr == "earmark digest: the model declined to analyze the research leads\n"
-    assert themer.closed
-    assert not (digest_env / "vault/Earmark/Digests").exists()
+    assert str(path) in result.stderr
+    assert "Move it aside" in result.stderr
+    assert "cannot open the job store" in result.stderr
+    assert fake_uvicorn.calls == []
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == V010_SCHEMA_VERSION
+        assert conn.execute("PRAGMA application_id").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert _row_count(path) == before
 
 
-def test_digest_transient_exit_1_says_temporary(
-    digest_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    themer = _FailingThemer(TransientError("the server is busy"))
-    monkeypatch.setattr(factory, "build_themer", lambda settings, cache: themer)
-    result = _digest("--week", "2026-W47")
-    assert result.exit_code == 1
-    assert result.stderr == "earmark digest: the server is busy (temporary; try again later)\n"
-
-
-def test_digest_warnings_on_stderr(digest_env: Path) -> None:
-    ArtifactStore(digest_env / "data").analysis_path(
-        next(iter(ArtifactStore(digest_env / "data").list_episode_keys())), "0" * 16
-    ).write_text("{broken")
-    result = _digest("--week", "2026-W47")
+@pytest.mark.usefixtures("restore_root_logging")
+def test_fresh_database_after_moving_v010_aside(fake_env: Path) -> None:
+    (fake_env / "data").mkdir()
+    path = make_v010_database(fake_env / "data" / "earmark.db")
+    assert runner.invoke(app, ["jobs"]).exit_code == 1
+    for suffix in ("", "-wal", "-shm"):
+        old = Path(f"{path}{suffix}")
+        if old.exists():
+            old.rename(Path(f"{path}.v010{suffix}"))
+    result = runner.invoke(app, ["jobs"])
     assert result.exit_code == 0
-    assert "earmark digest: warning: episode " in result.stderr
-    assert "is unreadable" in result.stderr
-    assert "warning" not in result.stdout
-
-
-def test_digest_window_in_progress_note(digest_env: Path) -> None:
-    assert "the window is not over yet" in _digest("--week", "2026-W47").stdout
-    assert "not over yet" not in _digest("--week", "2026-W46").stdout
-
-
-def _patch_notifier(monkeypatch: pytest.MonkeyPatch, notifier: _Notifier) -> list[int]:
-    built: list[int] = []
-
-    def build(settings: Settings) -> _Notifier:
-        built.append(1)
-        return notifier
-
-    monkeypatch.setattr(factory, "build_digest_notifier", build)
-    return built
-
-
-def test_digest_notifies_when_written(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    notifier = _Notifier()
-    _patch_notifier(monkeypatch, notifier)
-    result = _digest("--week", "2026-W47")
-    assert result.exit_code == 0, result.stderr
-    [sent] = notifier.published
-    assert sent.title == "Digest ready: 2026-W47"
-    assert sent.message == "1 episode · 1 research lead · 1 theme"
-    assert sent.click is not None
-    assert sent.click.startswith("obsidian://open?vault=My%20Vault&file=")
-    assert notifier.closed
-
-
-def test_digest_no_notify_when_unchanged(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _digest("--week", "2026-W47").exit_code == 0
-    notifier = _Notifier()
-    _patch_notifier(monkeypatch, notifier)
-    assert _digest("--week", "2026-W47").exit_code == 0
-    assert notifier.published == []
-    assert notifier.closed
-
-
-def test_digest_no_notify_when_empty(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    notifier = _Notifier()
-    _patch_notifier(monkeypatch, notifier)
-    assert _digest("--week", "2020-W01").exit_code == 0
-    assert notifier.published == []
-
-
-def test_digest_no_notify_flag(digest_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    notifier = _Notifier()
-    built = _patch_notifier(monkeypatch, notifier)
-    assert _digest("--week", "2026-W47", "--no-notify").exit_code == 0
-    assert notifier.published == []
-    assert built == []
-
-
-def test_digest_notify_failure_is_warning_exit_0(
-    digest_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    notifier = _Notifier(fail=TransientError("ntfy is down"))
-    _patch_notifier(monkeypatch, notifier)
-    result = _digest("--week", "2026-W47")
-    assert result.exit_code == 0
-    assert "earmark digest: warning: notify failed: ntfy is down" in result.stderr
-    assert result.stdout.startswith("wrote ")
-    assert notifier.closed
-
-
-def test_digest_registered_in_help() -> None:
-    result = runner.invoke(app, ["digest", "--help"])
-    assert result.exit_code == 0
-    # Rich may colour the help (GITHUB_ACTIONS forces a terminal) and split option names.
-    plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout)
-    for option in ("--week", "--since", "--refresh", "--no-notify"):
-        assert option in plain
+    assert result.stdout == "no jobs\n"
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
+    finally:
+        conn.close()

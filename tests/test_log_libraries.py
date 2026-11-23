@@ -1,32 +1,24 @@
-"""Real huggingface_hub, httpx/httpcore, urllib3, fastembed, and LanceDB logging (``-m index``).
+"""Real huggingface_hub and httpx/httpcore logging (``-m slow``, needs the transcribe extra).
 
-Every request is answered in-process (a mock transport or a unix-socket server), so TCP
-sockets stay blocked. The point: with earmark's handler installed, no library prints a URL
+Every request is answered in-process (a mock transport or a unix-socket server), so nothing
+leaves the machine. The point: with earmark's handler installed, no library prints a URL
 path or query, and nothing but earmark's handler prints.
 """
 
 import importlib
 import io
 import logging
-import re
-import subprocess
-import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from earmark.fakes import FakeEmbedder
-from earmark.index.embed import load_fastembed_runtime
-from earmark.index.lancedb_index import LanceIndex, load_lance_runtime
-from earmark.index.search import parse_query
-from earmark.log import QUIET_LOGGERS, configure_logging
-from tests.test_lancedb_index import stored_for, telephone_docs
-from tests.uds_http import UdsHttpServer, UdsReply, uds_connection_class
+from earmark.log import QUIET_LOGGERS, adopt_library_loggers, configure_logging
+from tests.uds_http import UdsHttpServer, UdsReply
 
 pytestmark = [
-    pytest.mark.index,
+    pytest.mark.slow,
     pytest.mark.usefixtures("restore_root_logging", "restore_library_loggers"),
 ]
 
@@ -103,7 +95,7 @@ def test_hf_download_logs_no_urls(
     hub_downloads: Callable[[str], Path],
 ) -> None:
     stream = io.StringIO()
-    load_fastembed_runtime()  # imports huggingface_hub.utils.logging and adopts
+    adopt_library_loggers()  # imports huggingface_hub.utils.logging and strips its handler
     configure_logging("DEBUG", stream=stream)
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.DEBUG)
@@ -119,7 +111,7 @@ def test_hf_download_logs_no_urls(
 
 def test_hf_hint_logged_once(hub_downloads: Callable[[str], Path]) -> None:
     stream = io.StringIO()
-    load_fastembed_runtime()
+    adopt_library_loggers()
     configure_logging("INFO", stream=stream)
     hub_downloads("config.json")
     hub_downloads("other.json")
@@ -153,87 +145,3 @@ def test_httpx_httpcore_over_uds_log_no_paths() -> None:
     out = stream.getvalue()
     for leaked in ("sid=", "/start", "/next"):
         assert leaked not in out
-
-
-def test_urllib3_over_uds_logs_no_path() -> None:
-    urllib3 = importlib.import_module("urllib3")
-    connection = importlib.import_module("urllib3.connection")
-    stream = io.StringIO()
-    configure_logging("DEBUG", stream=stream)
-    logging.getLogger("urllib3").setLevel(logging.DEBUG)
-    with UdsHttpServer(lambda m, t: UdsReply(200, body=b"ok")) as server:
-        pool = urllib3.HTTPConnectionPool("models.example", 80)
-        pool.ConnectionCls = uds_connection_class(connection.HTTPConnection, server.socket_path)
-        response = pool.request("GET", "/secret/path?sid=1")
-        assert response.status == 200
-        pool.close()
-    out = stream.getvalue()
-    assert "secret/path" not in out
-    assert "sid=" not in out
-
-
-def test_fastembed_loguru_stays_disabled(tmp_path: Path) -> None:
-    loguru = importlib.import_module("loguru")
-    stream = io.StringIO()
-    configure_logging("DEBUG", stream=stream)
-    runtime = load_fastembed_runtime()
-    records: list[str] = []
-    sink = loguru.logger.add(lambda m: records.append(m.record["name"] or ""), level="TRACE")
-    try:
-        model = runtime.supported()[0].name
-        with pytest.raises((ValueError, OSError)):
-            runtime.load(model, tmp_path / "empty", False)
-    finally:
-        loguru.logger.remove(sink)
-    assert not [r for r in records if r.startswith("fastembed")]
-    assert "fastembed" not in stream.getvalue()
-
-
-def test_lancedb_local_ops_log_no_urls(tmp_path: Path) -> None:
-    stream = io.StringIO()
-    configure_logging("DEBUG", stream=stream)
-    index = LanceIndex(
-        tmp_path / "lancedb",
-        FakeEmbedder(),
-        lock_path=tmp_path / "index.lock",
-        runtime=load_lance_runtime(),
-    )
-    docs = telephone_docs()
-    index.index(docs.episode, docs.transcript, docs.analyses, stored_for(docs))
-    assert index.search(parse_query("telephone")).hits
-    assert not re.search(r"://\S*/", stream.getvalue())
-
-
-def test_adopt_does_not_import_huggingface_hub() -> None:
-    code = (
-        "import sys, earmark.log as log\n"
-        "log.configure_logging()\n"
-        "log.adopt_library_loggers()\n"
-        "print('huggingface_hub' in sys.modules)\n"
-    )
-    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    assert proc.stdout.strip() == "False"
-
-
-def test_index_libraries_install_no_handlers() -> None:
-    for name in (
-        "fastembed",
-        "lancedb",
-        "pyarrow",
-        "huggingface_hub.utils.logging",
-        "requests",
-        "urllib3",
-        "onnxruntime",
-        "tokenizers",
-        "loguru",
-    ):
-        importlib.import_module(name)
-    configure_logging("INFO", stream=io.StringIO())
-    offenders = [
-        f"{name}: {handler!r}"
-        for name, logger in logging.Logger.manager.loggerDict.items()
-        if isinstance(logger, logging.Logger)
-        for handler in logger.handlers
-        if not isinstance(handler, logging.NullHandler)
-    ]
-    assert offenders == []

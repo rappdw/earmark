@@ -104,7 +104,7 @@ def test_dockerfile_default_extras_exist() -> None:
     [arg] = [line for line in _instructions("ARG") if line.startswith("ARG EXTRAS=")]
     default = arg.split("=", 1)[1].strip('"')
     extras = _pyproject()["project"]["optional-dependencies"]
-    assert default.split()
+    assert default == "transcribe"
     assert set(default.split()) <= set(extras)
 
 
@@ -138,10 +138,22 @@ def test_dockerfile_environment() -> None:
     for expected in (
         "EARMARK_HOST=0.0.0.0",
         "EARMARK_DATA_DIR=/data",
-        "EARMARK_VAULT_DIR=/vault",
         "HF_HOME=/data/huggingface",
     ):
         assert expected in env
+    runtime_env = " ".join(
+        line for line in _runtime_stage_lines() if line.split()[0].upper() == "ENV"
+    )
+    assert set(re.findall(r"\b(EARMARK_[A-Z_]+)=", runtime_env)) == {
+        "EARMARK_HOST",
+        "EARMARK_DATA_DIR",
+    }
+
+
+def test_dockerfile_runtime_dirs() -> None:
+    runs = [line for line in _runtime_stage_lines() if line.split()[0].upper() == "RUN"]
+    [run] = [line for line in runs if "install -d" in line]
+    assert run.endswith("install -d -o earmark -g earmark -m 0750 /data")
 
 
 def _runtime_stage_lines() -> list[str]:
@@ -206,25 +218,30 @@ def test_compose_worker_and_asr_publish_nothing() -> None:
     assert "0.0.0.0:" not in COMPOSE_TEXT
 
 
-def test_compose_shared_data_and_vault() -> None:
+def test_compose_shared_data() -> None:
     for name in ("api", "worker"):
-        volumes = SERVICES[name]["volumes"]
-        assert "data:/data" in volumes
-        assert any(v.startswith("${VAULT_PATH:?") and v.endswith("}:/vault") for v in volumes), (
-            volumes
-        )
-    assert "data" in COMPOSE["volumes"]
+        assert SERVICES[name]["volumes"] == ["data:/data"]
+    assert set(COMPOSE["volumes"]) == {"data", "asr-models"}
+
+
+def test_compose_builds_transcribe_extra() -> None:
+    assert SERVICES["api"]["build"]["args"]["EXTRAS"] == "${EXTRAS:-transcribe}"
 
 
 def test_compose_forces_container_paths() -> None:
     for name in ("api", "worker"):
         environment = SERVICES[name]["environment"]
+        assert set(environment) == {
+            "EARMARK_DATA_DIR",
+            "EARMARK_HOST",
+            "EARMARK_PORT",
+            "EARMARK_ASR_MODEL_DIR",
+            "HF_HUB_DISABLE_TELEMETRY",
+        }
         assert environment["EARMARK_DATA_DIR"] == "/data"
-        assert environment["EARMARK_VAULT_DIR"] == "/vault"
         assert environment["EARMARK_HOST"] == "0.0.0.0"  # noqa: S104 - the in-container bind
         assert environment["EARMARK_PORT"] == "8787"
         assert environment["EARMARK_ASR_MODEL_DIR"] == ""
-        assert environment["EARMARK_EMBED_MODEL_DIR"] == ""
         assert SERVICES[name]["env_file"] == ".env"
 
 
@@ -282,7 +299,6 @@ def _compose_only_variables() -> set[str]:
 def test_compose_only_variables_documented() -> None:
     names = _compose_only_variables()
     assert names == {
-        "VAULT_PATH",
         "API_BIND",
         "APP_UID",
         "APP_GID",
@@ -337,11 +353,10 @@ def test_systemd_units(role: str, filename: str) -> None:
     assert service["ProtectSystem"] == ["strict"]
     assert service["WorkingDirectory"] == ["/srv/earmark"]
     write_paths = " ".join(service["ReadWritePaths"]).split()
-    assert "/srv/earmark/data" in write_paths
+    assert write_paths == ["/srv/earmark/data"]
     [timeout] = service["TimeoutStopSec"]
     if role == "worker":
         assert int(timeout) >= 60
-        assert len(write_paths) >= 2  # the vault
     assert unit["Install"]["WantedBy"] == ["multi-user.target"]
 
 
@@ -390,42 +405,19 @@ def test_proxy_token_stays_out_of_earmark() -> None:
         assert re.search(r"\bCF_[A-Z_]*TOKEN|CLOUDFLARE", text, re.IGNORECASE) is None, path
 
 
-def test_digest_service_unit() -> None:
-    unit = _parse_unit(ROOT / "deploy" / "systemd" / "earmark-digest.service")
-    service = unit["Service"]
-    assert service["Type"] == ["oneshot"]
-    [exec_start] = service["ExecStart"]
-    assert exec_start.startswith("/srv/earmark/.venv/bin/earmark ")
-    assert exec_start.endswith(" digest")
-    assert service["User"] == ["earmark"]
-    assert service["ProtectSystem"] == ["strict"]
-    assert service["NoNewPrivileges"] == ["yes"]
-    assert service["WorkingDirectory"] == ["/srv/earmark"]
-    write_paths = " ".join(service["ReadWritePaths"]).split()
-    assert "/srv/earmark/data" in write_paths
-    assert len(write_paths) >= 2  # the vault
-    assert "Install" not in unit  # the timer starts it
-    assert "Restart" not in service
-
-
-def test_digest_timer_unit() -> None:
-    unit = _parse_unit(ROOT / "deploy" / "systemd" / "earmark-digest.timer")
-    [calendar] = unit["Timer"]["OnCalendar"]
-    assert calendar.startswith("Mon ")
-    assert unit["Timer"]["Persistent"] == ["true"]
-    assert unit["Install"]["WantedBy"] == ["timers.target"]
-
-
 # --- Hugging Face telemetry (step 21) -----------------------------------------------------
 
 SERVICE_FILES = sorted((ROOT / "deploy" / "systemd").glob("*.service"))
 
 
-def test_systemd_service_files_are_the_known_three() -> None:
-    assert {p.name for p in SERVICE_FILES} == {
+def test_systemd_service_files_are_the_known_two() -> None:
+    assert {p.name for p in SERVICE_FILES} == {"earmark-api.service", "earmark-worker.service"}
+
+
+def test_systemd_dir_has_only_the_two_services() -> None:
+    assert {p.name for p in (ROOT / "deploy" / "systemd").iterdir()} == {
         "earmark-api.service",
         "earmark-worker.service",
-        "earmark-digest.service",
     }
 
 

@@ -5,7 +5,6 @@ import pytest
 from earmark.config import ConfigError
 from earmark.errors import (
     EarmarkError,
-    NeedsChunking,
     PermanentError,
     SkipEpisode,
     TransientError,
@@ -44,15 +43,3 @@ def test_skip_reason() -> None:
 
 def test_config_error_is_separate() -> None:
     assert not issubclass(ConfigError, EarmarkError)
-
-
-def test_needs_chunking_is_permanent() -> None:
-    exc = NeedsChunking(model="m", input_tokens=9000, limit_tokens=8000)
-    assert isinstance(exc, PermanentError)
-    assert not isinstance(exc, TransientError)
-    assert (exc.model, exc.input_tokens, exc.limit_tokens) == ("m", 9000, 8000)
-    assert "9000" in exc.message
-    assert "8000" in exc.message
-    assert "EARMARK_LLM_CONTEXT_TOKENS" in exc.message
-    assert "not truncated" in exc.message
-    assert str(exc) == exc.message

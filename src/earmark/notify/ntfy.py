@@ -2,7 +2,7 @@
 
 The ntfy server comes only from operator configuration (it may be public ntfy.sh or a
 self-hosted server on a private address), so this client has its own small httpx2 client
-and no private-address guard, like the remote ASR and local LLM clients. It never follows
+and no private-address guard, like the remote ASR client. It never follows
 redirects, ignores proxy environment variables, keeps no cookies, caps the response, and
 sends the token only as a per-request bearer header. Everything that varies (title,
 message, tags, priority, link) travels in the JSON body; no untrusted text reaches a
@@ -18,7 +18,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Self
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import httpx2
 from pydantic import SecretStr
@@ -28,8 +28,8 @@ from earmark.endpoint import error_detail, host_label
 from earmark.errors import PermanentError, TransientError
 from earmark.fetch import USER_AGENT, parse_retry_after
 from earmark.log import redact
-from earmark.models import Episode, Job, JobStatus, utc_now
-from earmark.vault.sanitize import clean_unicode, fit_bytes
+from earmark.models import Episode, Job, JobStatus, format_hms, utc_now
+from earmark.sanitize import clean_unicode, fit_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +39,7 @@ MAX_RESPONSE_BYTES: Final = 64 * 1024
 TITLE_MAX_BYTES: Final = 250
 NAME_MAX_BYTES: Final = 200  # the episode-title part of a title
 MESSAGE_MAX_BYTES: Final = 2000
-LINE_MAX_BYTES: Final = 600  # any one message line (reason, prompt, warning)
-PROMPT_MAX_BYTES: Final = 300
-MAX_CLICK_CHARS: Final = 2000
+LINE_MAX_BYTES: Final = 600  # any one message line (reason, warning)
 PRIORITY_DEFAULT: Final = 3
 PRIORITY_HIGH: Final = 4
 TAGS: Final[Mapping[JobStatus, str]] = {
@@ -50,17 +48,10 @@ TAGS: Final[Mapping[JobStatus, str]] = {
     "skipped": "fast_forward",
 }
 TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
-    "done": "Note ready",
+    "done": "Transcribed",
     "failed": "Failed",
     "skipped": "Skipped",
 }
-REANALYZE_TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
-    "done": "Analysis ready",
-    "failed": "Analysis failed",
-    "skipped": "Analysis skipped",
-}
-DIGEST_TAG: Final = "newspaper"
-DEFAULT_ANALYSIS_LINE: Final = "Default analysis"
 UNKNOWN_EPISODE: Final = "podcast episode"
 UNKNOWN_SHOW: Final = "Apple Podcasts episode"
 _JOINERS: Final = frozenset({"‌", "‍"})
@@ -79,15 +70,6 @@ def split_topic_url(url: str) -> tuple[str, str]:
     if not parts.scheme or not parts.netloc or not NTFY_TOPIC_PATTERN.fullmatch(topic):
         raise ValueError("not an ntfy topic URL")
     return f"{parts.scheme}://{parts.netloc}{prefix}/", topic
-
-
-def obsidian_url(vault_name: str, note_path: str) -> str | None:
-    """obsidian://open?vault=…&file=…, both quote(…, safe=""); None if unusable."""
-    vault = vault_name.strip()
-    if not vault or not note_path or "#" in note_path:
-        return None
-    url = f"obsidian://open?vault={quote(vault, safe='')}&file={quote(note_path, safe='')}"
-    return url if len(url) <= MAX_CLICK_CHARS else None
 
 
 def clean_field(text: str, max_bytes: int) -> str:
@@ -111,10 +93,9 @@ class Notification:
     message: str
     tags: tuple[str, ...]
     priority: int
-    click: str | None
 
     def payload(self, topic: str) -> dict[str, object]:
-        """The JSON publish body: topic, title, message, tags, priority, and click if set."""
+        """The JSON publish body: topic, title, message, tags and priority."""
         body: dict[str, object] = {
             "topic": topic,
             "title": self.title,
@@ -122,19 +103,16 @@ class Notification:
             "tags": list(self.tags),
             "priority": self.priority,
         }
-        if self.click is not None:
-            body["click"] = self.click
         return body
 
 
 def compose(
-    job: Job,
-    episode: Episode | None,
-    *,
-    vault_name: str | None,
-    secrets: Sequence[str] = (),
+    job: Job, episode: Episode | None, *, secrets: Sequence[str] = ()
 ) -> Notification | None:
-    """The notification for a terminal job; None for queued or running."""
+    """The notification for a terminal job; None for queued or running.
+
+    It never carries a URL, a prompt or a path.
+    """
     status = job.status
     if status not in TAGS:
         return None
@@ -143,40 +121,18 @@ def compose(
         return clean_field(redact(text, secrets), limit)
 
     name = field(episode.title, NAME_MAX_BYTES) if episode is not None else ""
-    reanalyze = job.kind == "reanalyze"
-    prefix = REANALYZE_TITLE_PREFIX[status] if reanalyze else TITLE_PREFIX[status]
-    title = fit_bytes(f"{prefix}: {name or UNKNOWN_EPISODE}", TITLE_MAX_BYTES)
+    title = fit_bytes(f"{TITLE_PREFIX[status]}: {name or UNKNOWN_EPISODE}", TITLE_MAX_BYTES)
     show = field(episode.show_title, LINE_MAX_BYTES) if episode is not None else ""
 
-    def prompt_line() -> str | None:
-        if job.prompt:
-            prompt = field(job.prompt, PROMPT_MAX_BYTES)
-            return f"Prompt: {prompt}" if prompt else None
-        return DEFAULT_ANALYSIS_LINE if reanalyze else None
-
-    lines: list[str] = []
-    click: str | None = None
+    lines: list[str] = [show or UNKNOWN_SHOW]
     if status == "done":
-        lines.append(show or UNKNOWN_SHOW)
-        if (line := prompt_line()) is not None:
-            lines.append(line)
+        if job.result is not None:
+            lines.append(f"Duration: {format_hms(job.result.duration_s)}")
         if job.warnings:
             first = field(job.warnings[0], LINE_MAX_BYTES)
             count = len(job.warnings)
             lines.append(f"{count} warning{'' if count == 1 else 's'}: {first}")
-        note_path = job.result.note_path if job.result is not None else None
-        if note_path:
-            if vault_name:
-                click = obsidian_url(vault_name, note_path)
-            if click is None:
-                lines.append(f"Note: {field(note_path, LINE_MAX_BYTES)}")
     else:
-        if reanalyze:
-            lines.append(show or f"Episode {job.episode_key}")
-            if (line := prompt_line()) is not None:
-                lines.append(line)
-        else:
-            lines.append(show or field(job.url or "", LINE_MAX_BYTES) or UNKNOWN_SHOW)
         if status == "failed" and job.stage:
             lines.append(f"Stage: {field(job.stage, LINE_MAX_BYTES)}")
         reason = field(job.error or "", LINE_MAX_BYTES)
@@ -190,43 +146,6 @@ def compose(
         message=redact(message, secrets),
         tags=(TAGS[status],),
         priority=PRIORITY_HIGH if status == "failed" else PRIORITY_DEFAULT,
-        click=click,
-    )
-
-
-def compose_digest(
-    *,
-    label: str,
-    note_path: str,
-    episodes: int,
-    leads: int,
-    themes: int,
-    vault_name: str | None,
-    secrets: Sequence[str] = (),
-) -> Notification:
-    """The notification for a written digest: the label, counts, and the note link. No lead,
-    theme, or model text goes into it."""
-
-    def field(text: str, limit: int) -> str:
-        return clean_field(redact(text, secrets), limit)
-
-    def count(n: int, noun: str) -> str:
-        return f"{n} {noun}{'' if n == 1 else 's'}"
-
-    title = fit_bytes(f"Digest ready: {field(label, NAME_MAX_BYTES)}", TITLE_MAX_BYTES)
-    lines = [
-        f"{count(episodes, 'episode')} · {count(leads, 'research lead')} · {count(themes, 'theme')}"
-    ]
-    click = obsidian_url(vault_name, note_path) if vault_name else None
-    if click is None:
-        lines.append(f"Note: {field(note_path, LINE_MAX_BYTES)}")
-    message = fit_bytes("\n".join(lines), MESSAGE_MAX_BYTES)
-    return Notification(
-        title=redact(title, secrets),
-        message=redact(message, secrets),
-        tags=(DIGEST_TAG,),
-        priority=PRIORITY_DEFAULT,
-        click=click,
     )
 
 
@@ -235,7 +154,6 @@ class NtfyOptions:
     root_url: str  # ends in "/"
     topic: str
     token: SecretStr | None
-    vault_name: str | None
     secrets: tuple[str, ...]  # Settings.secret_values(), for redaction
 
     @property
@@ -252,7 +170,6 @@ class NtfyOptions:
             root_url=root,
             topic=topic,
             token=settings.ntfy_token,
-            vault_name=settings.obsidian_vault_name,
             secrets=tuple(settings.secret_values()),
         )
 
@@ -429,7 +346,7 @@ class NtfyNotifier:
 
     def notify(self, job: Job, episode: Episode | None, /) -> None:
         options = self._client.options
-        notification = compose(job, episode, vault_name=options.vault_name, secrets=options.secrets)
+        notification = compose(job, episode, secrets=options.secrets)
         if notification is None:
             logger.debug("job %s is %s; not notifying", job.id, job.status)
             return

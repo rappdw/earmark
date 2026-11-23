@@ -49,7 +49,6 @@ Cloudflare DNS: earmark.example.com A 192.168.1.10 (DNS only, never proxied)
 - A vault folder that exists.
 - Disk: the image is about 1 GB, Whisper `large-v3` about 3 GB, and the embedding model
   65 MB. The `index` extra adds about 440 MB to the image.
-- An Anthropic API key, or a local LLM ([docs/llm.md](llm.md)).
 
 ## 4. Install with Docker Compose
 
@@ -364,15 +363,7 @@ open.
   ```
 
 ## 8. Analysis
-
-- Claude is the default: set `EARMARK_LLM_API_KEY`, and optionally `EARMARK_LLM_MODEL` and
-  `EARMARK_LLM_EFFORT`.
-- A local server works too, as described in [docs/llm.md](llm.md). Note its warning:
-  Ollama's OpenAI-compatible API silently truncates over-long prompts, so
-  `OLLAMA_CONTEXT_LENGTH` must be at least `EARMARK_LLM_CONTEXT_TOKENS`.
-- A local LLM is not part of `compose.yaml`. Run it as its own service and point
-  `EARMARK_LLM_BASE_URL` at it. From inside compose, use the host's address, not
-  `localhost`.
+Analysis was removed in step 22; earmark now only transcribes. Step 27 rewrites this guide.
 
 ## 9. Search
 
@@ -429,46 +420,7 @@ Exit code 0 means nothing failed (warnings are allowed), 1 means a check failed,
 means the settings did not load.
 
 ## 14. Weekly digest
-
-`earmark digest` writes one note, `Digests/2026-W47.md`, with the research leads of every
-episode first shared in that ISO week, grouped into themes and linked to the episode notes
-and to their moments in the transcript notes. With no option it covers the last complete
-week, so a run on Monday morning covers the week that just ended. It uses the same LLM
-settings as the analysis and never runs in the worker, so it must be scheduled.
-
-Run it by hand to catch up: `earmark digest --week 2026-W47`, or `earmark digest --since 7d`
-(the last seven local days, written to `Digests/<first day> to <last day>.md`). A second run
-with the same episodes and analyses makes no LLM call and changes nothing. `--refresh` asks
-the model again. When ntfy is configured, a written or changed digest sends one
-notification; `--no-notify` turns that off.
-
-**Natively with systemd.** Copy
-[`earmark-digest.service`](../deploy/systemd/earmark-digest.service) and
-[`earmark-digest.timer`](../deploy/systemd/earmark-digest.timer) to `/etc/systemd/system/`,
-edit the vault path in the service's `ReadWritePaths=`, then:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now earmark-digest.timer
-systemctl list-timers earmark-digest.timer
-journalctl -u earmark-digest
-```
-
-The timer fires on Mondays at 07:00 host time and, with `Persistent=true`, runs once after
-the host was off. A failed run is retried with `sudo systemctl start earmark-digest`.
-
-**Under compose.** Compose has no scheduler. Run the command from a host cron line or a host
-systemd timer, for example every Monday at 07:07:
-
-```text
-7 7 * * 1 cd /path/to/earmark && docker compose run --rm --no-deps worker digest
-```
-
-Keep `EARMARK_TZ` equal to the host's time zone (or set the zone in the timer's
-`OnCalendar=`). Otherwise, shortly after Monday midnight, "the last complete week" can still
-be the week before. `DATA_DIR/digests/` is a cache; delete it at any time and the next
-digest asks the model again. The units and the compose command are examples: they have not
-been run in the build sandbox.
+The weekly digest was removed in step 22. Step 27 rewrites this guide.
 
 ## 15. Backups and upgrades
 

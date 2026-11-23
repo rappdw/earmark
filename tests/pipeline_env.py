@@ -30,7 +30,6 @@ class PipelineEnv:
     fakes: FakeBackends
     pipeline: Pipeline
     worker: Worker
-    vault: Path
 
 
 def make_env(
@@ -46,11 +45,10 @@ def make_env(
     clock = MutableClock()
     db = open_database(tmp_path / "data" / "earmark.db")
     jobs = store_type(db, clock=clock, max_attempts=max_attempts, lease=timedelta(seconds=lease_s))
-    vault = tmp_path / "vault"
-    fakes = fakes or make_fake_backends(tmp_path / "data", vault_dir=vault)
+    fakes = fakes or make_fake_backends(tmp_path / "data")
     pipeline = Pipeline(backends or fakes.backends(), fakes.artifacts, jobs, secrets=(SECRET,))
     worker = Worker(jobs, pipeline, poll_seconds=0.01, heartbeat_seconds=heartbeat_s)
-    return PipelineEnv(clock, jobs, fakes, pipeline, worker, vault)
+    return PipelineEnv(clock, jobs, fakes, pipeline, worker)
 
 
 class BlockingTranscriber:
@@ -125,7 +123,7 @@ def make_blocking_env(
 ) -> PipelineEnv:
     """An env whose transcriber runs ``make_callback(env)()`` before transcribing."""
     holder: list[PipelineEnv] = []
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     transcriber = BlockingTranscriber(fakes.transcriber, lambda: make_callback(holder[0])())
     env = make_env(
         tmp_path, fakes=fakes, backends=replace(fakes.backends(), transcriber=transcriber), **kwargs

@@ -8,16 +8,21 @@ from pathlib import Path
 import pytest
 
 from earmark.db import (
+    APPLICATION_ID,
     SCHEMA_VERSION,
     Database,
     DatabaseSetupError,
+    ForeignDatabaseError,
+    LegacyDatabaseError,
     Migration,
+    identity_error,
     open_database,
     retry_on_busy,
 )
 from earmark.jobs import JobStore
 from tests import db_helpers
 from tests.factories import MutableClock
+from tests.legacy_db import V010_JOB_COUNT, V010_SCHEMA_VERSION, make_v010_database
 
 URL = "https://podcasts.apple.com/us/podcast/x/id1?i=2"
 
@@ -272,28 +277,109 @@ def test_killed_writer_leaves_no_trace(tmp_path: Path) -> None:
     assert store.list_recent() == []
 
 
-def test_entities_migration_tables(tmp_path: Path) -> None:
-    db = open_database(tmp_path / "x.db")
-    assert db.schema_version() == SCHEMA_VERSION >= 2
-    with db.connect() as conn:
-        names = {
-            r[0]
-            for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
+def pragmas(path: Path) -> dict[str, int | str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            "application_id": conn.execute("PRAGMA application_id").fetchone()[0],
+            "user_version": conn.execute("PRAGMA user_version").fetchone()[0],
+            "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
         }
-        assert {"episodes", "mentions", "aliases", "entities", "mentions_by_name"} <= names
-        conn.execute(
-            "INSERT INTO episodes (episode_key, title, show_title, first_shared_at, analyses) "
-            "VALUES ('k', 't', 's', 'x', '[]')"
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO mentions VALUES ('k', 'h', 'c', 'robot', 'n', 0, 'N', '', '[]')"
-            )
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO mentions VALUES ('k', 'h', 'c', 'person', '', 0, 'N', '', '[]')"
-            )
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO aliases VALUES ('robot', 'a', 'b', 'B')")
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO aliases VALUES ('person', '', 'b', 'B')")
+    finally:
+        conn.close()
+
+
+def job_count(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return int(conn.execute("SELECT count(*) FROM jobs").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def test_v010_database_refused(tmp_path: Path) -> None:
+    path = make_v010_database(tmp_path / "earmark.db")
+    with pytest.raises(LegacyDatabaseError) as info:
+        open_database(path)
+    assert str(path) in str(info.value)
+    assert "Move it aside" in str(info.value)
+    assert pragmas(path) == {
+        "application_id": 0,
+        "user_version": V010_SCHEMA_VERSION,
+        "journal_mode": "wal",
+    }
+    assert job_count(path) == V010_JOB_COUNT
+
+
+def test_v010_rollback_journal_not_switched_to_wal(tmp_path: Path) -> None:
+    path = make_v010_database(tmp_path / "earmark.db", wal=False)
+    assert journal_mode(path) == "delete"
+    with pytest.raises(LegacyDatabaseError):
+        open_database(path)
+    assert journal_mode(path) == "delete"
+    assert job_count(path) == V010_JOB_COUNT
+
+
+def test_pre_rescope_dev_database_refused(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE jobs (id TEXT)")
+    conn.execute("PRAGMA user_version = 1")
+    conn.close()
+    with pytest.raises(LegacyDatabaseError):
+        open_database(path)
+    assert pragmas(path)["application_id"] == 0
+    assert pragmas(path)["user_version"] == 1
+
+
+def test_foreign_application_id_refused(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA application_id = 0x12345678")
+    conn.execute("PRAGMA user_version = 1")
+    conn.close()
+    with pytest.raises(ForeignDatabaseError) as info:
+        open_database(path)
+    assert "0x12345678" in str(info.value)
+    assert str(path) in str(info.value)
+
+
+def test_fresh_database_identity(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    db = open_database(path)
+    assert db.identity() == (APPLICATION_ID, SCHEMA_VERSION)
+    assert SCHEMA_VERSION == 1
+    with db.connect() as conn:
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert names == {"jobs"}
+    assert Database(path).migrate() == 0
+    assert open_database(path).identity() == (APPLICATION_ID, SCHEMA_VERSION)
+
+
+def test_empty_migrations_still_stamp(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    db = open_database(path, migrations=())
+    assert db.identity() == (APPLICATION_ID, 0)
+    assert open_database(path).identity() == (APPLICATION_ID, SCHEMA_VERSION)
+
+
+@pytest.mark.parametrize(
+    ("application_id", "user_version", "expected"),
+    [
+        (0, 0, None),
+        (0, 2, LegacyDatabaseError),
+        (APPLICATION_ID, 0, None),
+        (APPLICATION_ID, 7, None),
+        (0x12345678, 0, ForeignDatabaseError),
+        (0x12345678, 3, ForeignDatabaseError),
+    ],
+)
+def test_identity_error_table(
+    tmp_path: Path, application_id: int, user_version: int, expected: type[Exception] | None
+) -> None:
+    error = identity_error(tmp_path / "x.db", application_id, user_version)
+    if expected is None:
+        assert error is None
+    else:
+        assert type(error) is expected
+        assert isinstance(error, DatabaseSetupError)

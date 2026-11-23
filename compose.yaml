@@ -8,24 +8,21 @@ x-earmark: &earmark
   build:
     context: .
     args:
-      EXTRAS: ${EXTRAS:-transcribe index}
+      EXTRAS: ${EXTRAS:-transcribe}
       UID: ${APP_UID:-1000}
       GID: ${APP_GID:-1000}
   env_file: .env
   environment:
     # In-container paths win over host paths that .env may hold for a native install.
     EARMARK_DATA_DIR: /data
-    EARMARK_VAULT_DIR: /vault
     EARMARK_HOST: 0.0.0.0
     EARMARK_PORT: "8787"
-    # Empty means unset: models go to the volume (HF_HOME and DATA_DIR defaults).
+    # Empty means unset: models go to the volume (`HF_HOME`).
     EARMARK_ASR_MODEL_DIR: ""
-    EARMARK_EMBED_MODEL_DIR: ""
     # Hugging Face telemetry off; HF_HUB_DISABLE_TELEMETRY=0 in .env turns it back on.
     HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}
   volumes:
     - data:/data
-    - ${VAULT_PATH:?set VAULT_PATH in .env to the vault folder on this host}:/vault
   init: true
   restart: unless-stopped
   security_opt:

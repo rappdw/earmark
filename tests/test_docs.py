@@ -29,7 +29,7 @@ from tests.doc_helpers import (
 TOKEN = "docs-test-token-91c"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 DOCS = ["README.md", "docs/deploy.md", "docs/shortcut.md"]
-SECRET_FIELDS = ("api_token", "asr_api_key", "llm_api_key", "ntfy_url", "ntfy_token")
+SECRET_FIELDS = ("api_token", "asr_api_key", "ntfy_url", "ntfy_token")
 ACTIONS = [
     "Receive input from Share Sheet",
     "Get URLs from Input",
@@ -66,8 +66,8 @@ def test_quickstart_block_present() -> None:
 
 def test_quickstart_uses_fake_backends() -> None:
     script = _quickstart()
-    fields = [n for n in Settings.model_fields if n.endswith("_backend")] + ["llm_provider"]
-    assert len(fields) == 7
+    fields = [n for n in Settings.model_fields if n.endswith("_backend")]
+    assert len(fields) == 4
     for name in fields:
         assert re.search(rf"\b{env_var(name)}=fake\b", script), name
 
@@ -351,11 +351,9 @@ def test_readme_http_api_lists_every_route(tmp_path: Path) -> None:
     from fastapi.routing import APIRoute
 
     from earmark.api.routes import build_router
-    from earmark.artifacts import ArtifactStore
-    from earmark.fakes import FakeSearcher
 
     store = JobStore(open_database(tmp_path / "earmark.db"))
-    router = build_router(store, FakeSearcher(), ArtifactStore(tmp_path / "data"))
+    router = build_router(store)
     actual = {
         (method, re.sub(r"\{[^}]*\}", "{}", route.path))
         for route in router.routes
@@ -364,18 +362,6 @@ def test_readme_http_api_lists_every_route(tmp_path: Path) -> None:
     }
     assert actual
     assert _readme_routes() == actual
-
-
-def test_deploy_doc_digest_section() -> None:
-    text = read_doc("docs/deploy.md")
-    start = text.index("## 14. Weekly digest")
-    section = text[start : text.index("\n## ", start + 1)]
-    assert "earmark-digest.timer" in section
-    assert "docker compose run --rm --no-deps worker digest" in section
-    assert "EARMARK_TZ" in section
-    assert "systemctl enable --now earmark-digest.timer" in section
-    assert text.index("## 15. Backups and upgrades") > start
-    assert "## 16. Troubleshooting" in text
 
 
 def test_deploy_doc_hf_telemetry_section() -> None:
@@ -396,11 +382,3 @@ def test_deploy_doc_hf_telemetry_section() -> None:
     architecture = read_doc("docs/ARCHITECTURE.md")
     assert "HF_HUB_DISABLE_TELEMETRY=1" in architecture
     assert "HF_HUB_DISABLE_TELEMETRY=0" in architecture
-
-
-def test_readme_documents_digest() -> None:
-    text = read_doc("README.md")
-    assert "Planned: a weekly digest" not in text
-    assert "**Weekly digest.**" in text
-    assert "Digests/<year>-W<week>.md" in text
-    assert "earmark digest --since 7d" in _quickstart()

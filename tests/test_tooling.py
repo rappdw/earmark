@@ -40,8 +40,10 @@ def test_unix_socketpair_allowed() -> None:
 
 def test_live_markers_registered(pytestconfig: pytest.Config) -> None:
     markers = pytestconfig.getini("markers")
-    for name in ("network", "slow", "llm", "gpu", "index"):
+    for name in ("network", "slow", "gpu"):
         assert any(m.startswith(f"{name}:") for m in markers), name
+    declared = _pyproject()["tool"]["pytest"]["markers"]
+    assert {m.split(":", 1)[0] for m in declared} == {"network", "slow", "gpu"}
 
 
 def _make_inner(pytester: pytest.Pytester, inner_test: str) -> None:
@@ -67,16 +69,8 @@ def test_network():
 def test_slow():
     pass
 
-@pytest.mark.llm
-def test_llm():
-    pass
-
 @pytest.mark.gpu
 def test_gpu():
-    pass
-
-@pytest.mark.index
-def test_index():
     pass
 """
 
@@ -84,28 +78,28 @@ def test_index():
 def test_live_markers_deselected_by_default(pytester: pytest.Pytester) -> None:
     _make_inner(pytester, _INNER_MARKERS)
     result = pytester.runpytest_subprocess()
-    result.assert_outcomes(passed=1, deselected=5)
+    result.assert_outcomes(passed=1, deselected=3)
 
 
 def test_network_opt_in_reenables_sockets(pytester: pytest.Pytester) -> None:
     _make_inner(pytester, _INNER_MARKERS)
     result = pytester.runpytest_subprocess("-m", "network")
-    result.assert_outcomes(passed=1, deselected=5)
+    result.assert_outcomes(passed=1, deselected=3)
 
 
-_INNER_INDEX = """
+_INNER_GPU = """
 import socket
 import pytest
 
-@pytest.mark.index
-def test_index_opens_socket():
+@pytest.mark.gpu
+def test_gpu_opens_socket():
     socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 """
 
 
-def test_index_marker_keeps_sockets_blocked(pytester: pytest.Pytester) -> None:
-    _make_inner(pytester, _INNER_INDEX)
-    result = pytester.runpytest_subprocess("-m", "index")
+def test_gpu_marker_keeps_sockets_blocked(pytester: pytest.Pytester) -> None:
+    _make_inner(pytester, _INNER_GPU)
+    result = pytester.runpytest_subprocess("-m", "gpu")
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*SocketBlockedError*"])
 
@@ -141,32 +135,3 @@ def test_ruff_lint_groups() -> None:
 def test_required_environments_include_aarch64() -> None:
     envs = _pyproject()["tool"]["uv"]["required-environments"]
     assert any("aarch64" in e and "linux" in e for e in envs)
-
-
-_INNER_ENV = """
-import os
-from pathlib import Path
-import pytest
-
-def test_plain():
-    assert "ANTHROPIC_API_KEY" not in os.environ
-    assert "ANTHROPIC_BASE_URL" not in os.environ
-    directory = Path(os.environ["ANTHROPIC_CONFIG_DIR"])
-    assert directory.is_dir()
-    assert list(directory.iterdir()) == []
-
-@pytest.mark.llm
-def test_llm():
-    assert os.environ["ANTHROPIC_API_KEY"] == "outer-secret-key"
-    assert os.environ["ANTHROPIC_BASE_URL"] == "https://outer.example"
-"""
-
-
-def test_anthropic_env_isolated(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
-    _make_inner(pytester, _INNER_ENV)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "outer-secret-key")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://outer.example")
-    plain = pytester.runpytest_subprocess()
-    plain.assert_outcomes(passed=1, deselected=1)
-    live = pytester.runpytest_subprocess("-m", "llm")
-    live.assert_outcomes(passed=1, deselected=1)

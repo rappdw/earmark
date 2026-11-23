@@ -3,26 +3,9 @@ from pathlib import Path
 from mypy import api
 
 from earmark.artifacts import ArtifactStore
-from earmark.fakes import (
-    FakeAnalyzer,
-    FakeAudioFetcher,
-    FakeIndexer,
-    FakeNotifier,
-    FakeResolver,
-    FakeStore,
-    FakeTranscriber,
-)
-from earmark.pipeline.stages import (
-    Analyzer,
-    AudioFetcher,
-    Indexer,
-    Notifier,
-    Resolver,
-    Store,
-    Transcriber,
-)
-from earmark.vault.notes import VaultStore
-from tests.factories import T0, make_job
+from earmark.fakes import FakeAudioFetcher, FakeNotifier, FakeResolver, FakeTranscriber
+from earmark.pipeline.stages import AudioFetcher, Notifier, Resolver, Transcriber
+from tests.factories import make_job
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -32,22 +15,13 @@ def test_fakes_satisfy_protocols(tmp_path: Path) -> None:
     resolver: Resolver = FakeResolver()
     fetcher: AudioFetcher = FakeAudioFetcher(artifacts)
     transcriber: Transcriber = FakeTranscriber(artifacts)
-    analyzer: Analyzer = FakeAnalyzer(artifacts)
-    store: Store = FakeStore()
-    indexer: Indexer = FakeIndexer()
     notifier: Notifier = FakeNotifier()
 
     episode = resolver.resolve("https://example.com/e")
     audio = fetcher.fetch(episode)
     transcript = transcriber.transcribe(episode, audio)
-    analysis = analyzer.analyze(episode, transcript, None)
-    stored = store.store(episode, transcript, [analysis], T0)
-    indexer.index(episode, transcript, [analysis], stored)
     notifier.notify(make_job(), episode)
-    assert stored.note_path.endswith(f"{episode.key}.md")
-
-    vault_store: Store = VaultStore(tmp_path / "vault", "Earmark", data_dir=tmp_path / "data")
-    assert vault_store is not None
+    assert transcript.episode_key == episode.key
 
 
 SNIPPET = """\

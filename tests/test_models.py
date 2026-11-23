@@ -1,6 +1,7 @@
 import math
 import subprocess
 import sys
+import typing
 from datetime import UTC, datetime
 from typing import Any
 
@@ -9,31 +10,24 @@ from pydantic import ValidationError
 
 import earmark.models
 from earmark.models import (
-    ANALYSIS_SCHEMA_VERSION,
     INGEST_ERROR_TYPES,
     MAX_PROMPT_CHARS,
     MAX_URL_CHARS,
-    Analysis,
-    Claim,
-    Entity,
     Episode,
     EpisodeRef,
     IngestRequest,
     Job,
+    JobKind,
     JobResult,
     Model,
-    ReanalyzeRequest,
-    ResearchLead,
     Segment,
     ShareRecord,
-    StoreResult,
     Transcript,
     episode_key,
     format_hms,
     is_episode_key,
-    prompt_hash,
 )
-from tests.factories import PST, T0, make_analysis, make_episode, make_job, make_transcript
+from tests.factories import PST, T0, make_episode, make_job, make_transcript
 
 KEY = "3848d011be9e28df3ac6"
 
@@ -70,8 +64,6 @@ def _minimal_episode() -> Episode:
 
 
 CASES: list[Model] = [
-    ReanalyzeRequest(),
-    ReanalyzeRequest(prompt="p"),
     IngestRequest(url="u"),
     IngestRequest(url="u", prompt="p", timestamp=T0),
     EpisodeRef(source="apple_podcasts", show_id="1", episode_id="2", country="us", url="u"),
@@ -81,21 +73,10 @@ CASES: list[Model] = [
     Segment(start=0.0, end=1.0, text="t", speaker="A"),
     make_transcript(),
     Transcript(episode_key=KEY, language=None, duration_s=0.0, model="m"),
-    Claim(text="c"),
-    Claim(text="c", timestamp_s=1.5),
-    Entity(name="n"),
-    Entity(name="n", context="c", timestamps_s=(1.0,)),
-    ResearchLead(text="t"),
-    ResearchLead(text="t", rationale="r", timestamp_s=2.0),
-    make_analysis(),
-    make_analysis(prompt=None),
-    StoreResult(note_path="a.md"),
-    StoreResult(note_path="a.md", transcript_note_path="b.md", warnings=("w",)),
     ShareRecord(episode_key=KEY, first_shared_at=T0),
-    JobResult(),
-    JobResult(note_path="a.md", transcript_note_path="b.md", analysis_hash="a" * 16),
+    JobResult(duration_s=0.0),
+    JobResult(duration_s=3600.5),
     make_job(),
-    make_job(kind="reanalyze"),
     _minimal_job(),
 ]
 
@@ -203,35 +184,6 @@ def test_format_hms_rejects(bad: float) -> None:
         format_hms(bad)
 
 
-def test_prompt_hash_golden() -> None:
-    m = "claude-opus-5-5"
-    assert prompt_hash(None, m, schema_version=1) == "c416a435201e0e94"
-    assert prompt_hash("What papers are cited?", m, schema_version=1) == "b26ea955c101e2dc"
-    assert prompt_hash("", m, schema_version=1) == "d986cc9161e3bbc9"
-    assert prompt_hash("What papers are cited?", "fake-llm", schema_version=1) == "9fc6ff2750517634"
-    assert prompt_hash("What papers are cited?", m, schema_version=2) == "c30c4e2ff7a8345b"
-
-
-def test_prompt_hash_changes() -> None:
-    base = prompt_hash("p", "m", 1)
-    assert prompt_hash("q", "m", 1) != base
-    assert prompt_hash("p", "n", 1) != base
-    assert prompt_hash("p", "m", 2) != base
-    assert prompt_hash(None, "m", 1) != prompt_hash("", "m", 1)
-
-
-def test_prompt_hash_stable() -> None:
-    assert prompt_hash("p", "m") == prompt_hash("p", "m")
-    assert prompt_hash("p", "m") == prompt_hash("p", "m", ANALYSIS_SCHEMA_VERSION)
-
-
-def test_prompt_hash_rejects_bad_args() -> None:
-    with pytest.raises(ValueError, match="model"):
-        prompt_hash("p", "")
-    with pytest.raises(ValueError, match="schema_version"):
-        prompt_hash("p", "m", schema_version=0)
-
-
 def test_episode_key_must_match() -> None:
     good = make_episode()
     bad = good.model_dump(mode="json") | {"key": "0" * 20}
@@ -241,12 +193,6 @@ def test_episode_key_must_match() -> None:
 
     with pytest.raises(ValidationError, match="key does not match"):
         Episode.model_validate_json(json.dumps(bad))
-
-
-def test_analysis_hash_must_match() -> None:
-    data = make_analysis().model_dump(mode="json") | {"prompt_hash": "0" * 16}
-    with pytest.raises(ValidationError, match="prompt_hash does not match"):
-        Analysis.model_validate(data)
 
 
 def test_segment_end_before_start_rejected() -> None:
@@ -260,10 +206,6 @@ def test_negative_and_nan_seconds_rejected(bad: float) -> None:
         Segment(start=bad, end=10.0, text="t")
     with pytest.raises(ValidationError):
         make_episode(duration_s=bad)
-    with pytest.raises(ValidationError):
-        Claim(text="c", timestamp_s=bad)
-    with pytest.raises(ValidationError):
-        Entity(name="n", timestamps_s=(1.0, bad))
 
 
 def test_naive_datetime_rejected() -> None:
@@ -286,24 +228,7 @@ def test_job_kind_requirements() -> None:
     base: dict[str, Any] = _minimal_job().model_dump(mode="json")
     with pytest.raises(ValidationError, match="requires url"):
         Job.model_validate(base | {"url": None})
-    with pytest.raises(ValidationError, match="requires episode_key"):
-        Job.model_validate(base | {"kind": "reanalyze", "url": None})
-    ok = Job.model_validate(base | {"kind": "reanalyze", "url": None, "episode_key": KEY})
-    assert ok.url is None
-
-
-@pytest.mark.parametrize("path", ["/abs.md", "../x.md", "a/../b.md", "a\\b.md", ""])
-def test_store_result_paths_relative(path: str) -> None:
-    with pytest.raises(ValidationError, match="relative"):
-        StoreResult(note_path=path)
-    with pytest.raises(ValidationError, match="relative"):
-        StoreResult(note_path="ok.md", transcript_note_path=path)
-    with pytest.raises(ValidationError, match="relative"):
-        JobResult(note_path=path)
-
-
-def test_store_result_accepts_relative() -> None:
-    assert StoreResult(note_path="Earmark/Podcasts/Show/x.md").note_path.endswith("x.md")
+    assert typing.get_args(JobKind) == ("ingest",)
 
 
 def test_bad_ids_rejected() -> None:
@@ -323,8 +248,7 @@ def test_contract_modules_import_light() -> None:
     code = (
         "import sys, earmark.models, earmark.errors, earmark.artifacts, "
         "earmark.pipeline.stages, earmark.fakes\n"
-        "heavy = ['fastapi','uvicorn','httpx2','typer','faster_whisper','ctranslate2',"
-        "'lancedb','fastembed','anthropic']\n"
+        "heavy = ['fastapi','uvicorn','httpx2','typer','faster_whisper','ctranslate2']\n"
         "print(sorted(m for m in heavy if m in sys.modules))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
@@ -402,55 +326,16 @@ def test_normalize_prompt() -> None:
     assert str(info.value) == f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)"
 
 
-def test_entity_key() -> None:
-    from earmark.models import entity_key
-
-    assert entity_key("C++") == "c++"
-    assert entity_key("C#") == "c#"
-    assert entity_key("C") == "c"
-    assert len({entity_key("C"), entity_key("C++"), entity_key("C#")}) == 3
-    assert entity_key("F#") == "f#"
-    assert entity_key("#MeToo") == "metoo"
-    assert entity_key("C++ & Rust") == "c++ rust"
-    assert entity_key("AT&T") == "at t"
-    assert entity_key("GPT-4") == entity_key("GPT 4") == "gpt 4"
-    assert entity_key("!!!") == ""
-    assert entity_key("\uff21\uff22\uff23") == "abc"  # full-width, NFKC
-    assert entity_key("Ada  LOVELACE.") == "ada lovelace"
-    assert entity_key("+x") == "x"
-
-
-def test_entity_id_golden() -> None:
-    from earmark.vault.entities import entity_id
-
-    assert entity_id("person", "ada lovelace") == "82a355902603f38e"
-    assert entity_id("person", "zoë") == "ebd1f8ca95b62ffe"
-    assert entity_id("tool", "c++") == "bcbf1db2e4124478"
-
-
 def test_lone_surrogates_replaced() -> None:
     bad = "a\ud800b\udfff"
     good = "a\ufffdb\ufffd"
     episode = make_episode(title=bad)
     assert episode.title == good
     assert Segment(start=0, end=1, text=bad).text == good
-    assert Entity(name=bad, context=bad, timestamps_s=()).name == good
-    analysis = make_analysis().model_copy()
-    rebuilt = Analysis.model_validate(
-        {
-            **analysis.model_dump(),
-            "summary": bad,
-            "open_questions": (bad, "ok"),
-            "key_claims": ({"text": bad},),
-        }
-    )
-    assert rebuilt.summary == good
-    assert rebuilt.open_questions == (good, "ok")
-    assert rebuilt.key_claims[0].text == good
     job = make_job()
     job2 = Job.model_validate({**job.model_dump(), "warnings": (bad,)})
     assert job2.warnings == (good,)
-    for model in (episode, rebuilt, job2):
+    for model in (episode, job2):
         dumped = model.model_dump_json()
         assert type(model).model_validate_json(dumped) == model
 
@@ -461,18 +346,3 @@ def test_scrub_keeps_valid_text_identical() -> None:
     text = "emoji \U0001f600 pair and caf\u00e9"
     assert scrub_surrogates(text) is text
     assert scrub_surrogates("x\ud800") == "x\ufffd"
-
-
-def test_reanalyze_request_prompt_rules() -> None:
-    assert ReanalyzeRequest().prompt is None
-    assert ReanalyzeRequest.model_validate_json("{}").prompt is None
-    assert ReanalyzeRequest(prompt="  \n").prompt is None
-    assert ReanalyzeRequest(prompt=" why? ").prompt == "why?"
-    ok = "x" * MAX_PROMPT_CHARS
-    assert ReanalyzeRequest(prompt=f" {ok}\n").prompt == ok
-    with pytest.raises(ValidationError) as exc:
-        ReanalyzeRequest(prompt=ok + "x")
-    assert _error_types(exc) == {"prompt_too_long"}
-    with pytest.raises(ValidationError) as extra:
-        ReanalyzeRequest.model_validate_json('{"promt": "x"}')
-    assert _error_types(extra) == {"extra_forbidden"}

@@ -12,25 +12,15 @@ from fastapi.responses import JSONResponse
 from earmark import __version__
 from earmark.api.auth import BearerAuthMiddleware, require_api_token
 from earmark.api.routes import build_router
-from earmark.artifacts import ArtifactStore
 from earmark.config import Settings
-from earmark.errors import EarmarkError, TransientError
-from earmark.index.search import IndexMismatchError, InvalidQuery, Searcher, UnavailableSearcher
 from earmark.jobs import JobStore, open_job_store
-from earmark.models import INGEST_ERROR_TYPES, IngestRequest, ReanalyzeRequest
+from earmark.models import INGEST_ERROR_TYPES, IngestRequest
 
 logger = logging.getLogger(__name__)
 
 MAX_DETAIL_CHARS: Final = 300
 STORE_UNAVAILABLE_DETAIL: Final = "the job store is unavailable; try again shortly"
 _OBJECT_TYPES: Final = frozenset({"model_attributes_type", "model_type", "dict_type"})
-
-
-REANALYZE_ROUTE: Final = "/episodes/{key}/analyze"
-REANALYZE_MISSING_BODY: Final = (
-    'request body is missing; send a JSON object such as {"prompt": "..."}, '
-    "or {} for the default analysis"
-)
 
 
 def _describe(error: Mapping[str, Any], body_fields: Sequence[str], missing_body: str) -> str:
@@ -73,15 +63,7 @@ def describe_validation_errors(
 async def _on_validation_error(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, RequestValidationError):
         raise TypeError("unexpected exception type")
-    if getattr(request.scope.get("route"), "path", None) == REANALYZE_ROUTE:
-        detail = describe_validation_errors(
-            exc.errors(),
-            body_fields=tuple(ReanalyzeRequest.model_fields),
-            missing_body=REANALYZE_MISSING_BODY,
-        )
-    else:
-        detail = describe_validation_errors(exc.errors())
-    return JSONResponse({"detail": detail}, status_code=422)
+    return JSONResponse({"detail": describe_validation_errors(exc.errors())}, status_code=422)
 
 
 async def _on_store_error(request: Request, exc: Exception) -> JSONResponse:
@@ -93,37 +75,9 @@ async def _on_store_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-async def _on_invalid_query(request: Request, exc: Exception) -> JSONResponse:
-    if not isinstance(exc, InvalidQuery):
-        raise TypeError("unexpected exception type")
-    return JSONResponse({"detail": str(exc)}, status_code=422)
-
-
-async def _on_index_mismatch(request: Request, exc: Exception) -> JSONResponse:
-    if not isinstance(exc, IndexMismatchError):
-        raise TypeError("unexpected exception type")
-    return JSONResponse({"detail": exc.message}, status_code=409)
-
-
-async def _on_search_error(request: Request, exc: Exception) -> JSONResponse:
-    if not isinstance(exc, EarmarkError):
-        raise TypeError("unexpected exception type")
-    headers = {"Retry-After": "5"} if isinstance(exc, TransientError) else None
-    return JSONResponse({"detail": exc.message}, status_code=503, headers=headers)
-
-
-def create_app(
-    settings: Settings,
-    *,
-    store: JobStore | None = None,
-    searcher: Searcher | None = None,
-    artifacts: ArtifactStore | None = None,
-) -> FastAPI:
+def create_app(settings: Settings, *, store: JobStore | None = None) -> FastAPI:
     token = require_api_token(settings)
-    if searcher is None:
-        searcher = UnavailableSearcher("search is not configured in this process")
     store = store if store is not None else open_job_store(settings)
-    artifacts = artifacts if artifacts is not None else ArtifactStore(settings.data_dir)
     app = FastAPI(
         title="earmark",
         version=__version__,
@@ -139,11 +93,8 @@ def create_app(
             "auto_configure": False,
         },
     )
-    app.include_router(build_router(store, searcher, artifacts))
+    app.include_router(build_router(store))
     app.add_exception_handler(RequestValidationError, _on_validation_error)
     app.add_exception_handler(sqlite3.Error, _on_store_error)
-    app.add_exception_handler(InvalidQuery, _on_invalid_query)
-    app.add_exception_handler(IndexMismatchError, _on_index_mismatch)
-    app.add_exception_handler(EarmarkError, _on_search_error)
     app.add_middleware(BearerAuthMiddleware, token=token)
     return app

@@ -1,4 +1,4 @@
-"""Helpers shared by the clients of operator-configured endpoints (remote ASR, local LLM).
+"""Helpers shared by the clients of operator-configured endpoints (remote ASR, ntfy).
 
 Standard library plus ``earmark.log`` only, so it is safe to import anywhere.
 """

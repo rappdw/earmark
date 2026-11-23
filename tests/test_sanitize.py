@@ -1,18 +1,19 @@
 import random
+import subprocess
+import sys
 import unicodedata
+from datetime import UTC, date, datetime
 
 import pytest
 import yaml
 
-from earmark.vault.sanitize import (
+from earmark.sanitize import (
     ELLIPSIS,
     MAX_NAME_BYTES,
-    escape_markdown,
+    emit_frontmatter,
     file_component,
     fit_bytes,
-    fold_key,
     is_safe_component,
-    wikilink_target_ok,
     yaml_quote,
 )
 
@@ -115,13 +116,6 @@ def test_fit_bytes_edges() -> None:
     assert fit_bytes("abcdefghij. . .k", 12) == "abcdefghi" + ELLIPSIS
 
 
-def test_fold_key() -> None:
-    assert fold_key("AI") == fold_key("ai")
-    assert fold_key("Café") == fold_key("Cafe\u0301")
-    assert fold_key("ﬁ") == fold_key("fi")
-    assert fold_key("a") != fold_key("b")
-
-
 def test_is_safe_component() -> None:
     assert is_safe_component("Épisode 1 - «Tests».md")
     assert is_safe_component("a\u200db")
@@ -150,35 +144,6 @@ def test_is_safe_component() -> None:
         "a\ud800b",
     ]:
         assert not is_safe_component(bad), repr(bad)
-
-
-def test_escape_markdown() -> None:
-    assert escape_markdown("$5 and $10 #ad [[x]] <b>") == r"\$5 and \$10 \#ad \[\[x\]\] &lt;b>"
-    assert escape_markdown("a\n\n  b\tc") == "a b c"
-    assert escape_markdown(r"a\b `c` *d* _e_ |f| ~g~ =h= %i ^j") == (
-        r"a\\b \`c\` \*d\* \_e\_ \|f\| \~g\~ \=h\= \%i \^j"
-    )
-    assert escape_markdown("   ") == ""
-
-
-@pytest.mark.parametrize(
-    ("target", "ok"),
-    [
-        ("Earmark/Podcasts/Show/Note", True),
-        ("", False),
-        ("a#b", False),
-        ("a|b", False),
-        ("a^b", False),
-        ("a:b", False),
-        ("a[b", False),
-        ("a]b", False),
-        ("a%%b", False),
-        ("a\nb", False),
-        ("a\rb", False),
-    ],
-)
-def test_wikilink_target_ok(target: str, ok: bool) -> None:
-    assert wikilink_target_ok(target) is ok
 
 
 YAML_CASES = [
@@ -234,19 +199,40 @@ def test_yaml_quote_lone_surrogate_and_escapes() -> None:
     assert yaml_quote('a"b\\') == '"a\\"b\\\\"'
 
 
-def test_wikilink_label() -> None:
-    from earmark.vault.sanitize import wikilink_label
+def test_emit_frontmatter_shapes() -> None:
+    lines = emit_frontmatter(
+        [
+            ("a", 'x: "y"'),
+            ("b", None),
+            ("c", date(2026, 1, 2)),
+            ("d", datetime(2026, 1, 2, 3, 4, 5, 999)),  # noqa: DTZ001  # naive by design
+            ("e", ()),
+            ("f", ("p", "q")),
+        ]
+    )
+    assert lines == [
+        'a: "x: \\"y\\""\n',
+        "b: null\n",
+        "c: 2026-01-02\n",
+        "d: 2026-01-02T03:04:05\n",
+        "e: []\n",
+        "f:\n",
+        '  - "p"\n',
+        '  - "q"\n',
+    ]
+    with pytest.raises(ValueError, match="naive"):
+        emit_frontmatter([("a", datetime(2026, 1, 1, tzinfo=UTC))])
+    for bad in ("A", "1a", "a-b", "", "a b"):
+        with pytest.raises(ValueError, match="key"):
+            emit_frontmatter([(bad, "x")])
 
-    assert wikilink_label("a  [b]|c\\d <e>\n f") == "a (b)-c/d &lt;e> f"
-    assert wikilink_label("x %%%% y") == "x % y"
-    for hostile in ("]]", "a]]b", "| |", "\n\n", "[[x]]"):
-        out = wikilink_label(hostile)
-        assert "]]" not in out
-        assert "|" not in out
-        assert "\n" not in out
-    assert wikilink_label("a\ud800") == "a\ufffd"
 
-
-def test_escape_markdown_cleans_surrogates() -> None:
-    assert escape_markdown("a\ud800b") == "a\ufffdb"
-    assert escape_markdown("e\u0301") == "\u00e9"
+def test_sanitize_is_stdlib_only() -> None:
+    code = (
+        "import sys\n"
+        "import earmark.sanitize\n"
+        "heavy = {'pydantic', 'httpx2', 'fastapi', 'yaml'}\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"

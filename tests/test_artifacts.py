@@ -12,7 +12,7 @@ from earmark.artifacts import (
     atomic_writer,
 )
 from earmark.errors import PermanentError
-from tests.factories import T0, make_analysis, make_episode, make_transcript
+from tests.factories import T0, make_episode, make_transcript
 
 KEY = make_episode().key
 
@@ -114,22 +114,10 @@ def test_rejects_bad_keys(tmp_path: Path, key: str) -> None:
         store.transcript_json_path,
         store.find_audio,
         store.read_episode,
-        lambda k: store.analysis_path(k, "0" * 16),
     ):
         with pytest.raises(ValueError, match="not an episode key"):
             call(key)
     assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize(
-    "bad", ["", "0" * 15, "0" * 17, "A" * 16, "0" * 15 + "\n", "../" + "0" * 13]
-)
-def test_rejects_bad_prompt_hash(tmp_path: Path, bad: str) -> None:
-    store = ArtifactStore(tmp_path)
-    with pytest.raises(ValueError, match="prompt hash"):
-        store.analysis_path(KEY, bad)
-    with pytest.raises(ValueError, match="prompt hash"):
-        store.read_analysis(KEY, bad)
 
 
 @pytest.mark.parametrize("ext", ["MP3", ".mp3", "mp3/x", "", "abcdef"])
@@ -146,8 +134,6 @@ def test_layout_paths(tmp_path: Path) -> None:
     assert s.episode_path(KEY) == d / "episode.json"
     assert s.transcript_json_path(KEY) == d / "transcript.json"
     assert s.transcript_text_path(KEY) == d / "transcript.txt"
-    assert s.analyses_dir(KEY) == d / "analyses"
-    assert s.analysis_path(KEY, "a" * 16) == d / "analyses" / ("a" * 16 + ".json")
     assert s.audio_path(KEY, "m4a") == d / "audio.m4a"
 
 
@@ -174,18 +160,10 @@ def test_transcript_round_trip(tmp_path: Path) -> None:
     assert s.read_transcript(KEY) == tr
 
 
-def test_analysis_round_trip(tmp_path: Path) -> None:
-    s = ArtifactStore(tmp_path)
-    an = make_analysis()
-    assert s.write_analysis(an) == s.analysis_path(KEY, an.prompt_hash)
-    assert s.read_analysis(KEY, an.prompt_hash) == an
-
-
 def test_read_missing_returns_none(tmp_path: Path) -> None:
     s = ArtifactStore(tmp_path)
     assert s.read_episode(KEY) is None
     assert s.read_transcript(KEY) is None
-    assert s.read_analysis(KEY, "a" * 16) is None
 
 
 @pytest.mark.parametrize("content", ["not json SENTINEL", '{"SENTINEL": 1}'])
@@ -209,29 +187,11 @@ def test_mismatched_key_is_permanent(tmp_path: Path) -> None:
     (target / "episode.json").write_bytes((other_dir / "episode.json").read_bytes())
     with pytest.raises(PermanentError, match="corrupt artifact"):
         s.read_episode(KEY)
-    # transcript and analysis likewise
+    # the transcript likewise
     s.write_transcript(make_transcript(guid="urn:other"))
     (target / "transcript.json").write_bytes((other_dir / "transcript.json").read_bytes())
     with pytest.raises(PermanentError, match="corrupt artifact"):
         s.read_transcript(KEY)
-    an = make_analysis(guid="urn:other")
-    s.write_analysis(an)
-    (target / "analyses").mkdir()
-    (target / "analyses" / f"{an.prompt_hash}.json").write_bytes(
-        s.analysis_path(other.key, an.prompt_hash).read_bytes()
-    )
-    with pytest.raises(PermanentError, match="corrupt artifact"):
-        s.read_analysis(KEY, an.prompt_hash)
-
-
-def test_mismatched_analysis_hash_is_permanent(tmp_path: Path) -> None:
-    s = ArtifactStore(tmp_path)
-    an = make_analysis()
-    s.write_analysis(an)
-    wrong = s.analysis_path(KEY, "f" * 16)
-    wrong.write_bytes(s.analysis_path(KEY, an.prompt_hash).read_bytes())
-    with pytest.raises(PermanentError, match="corrupt artifact"):
-        s.read_analysis(KEY, "f" * 16)
 
 
 def test_find_and_delete_audio(tmp_path: Path) -> None:
@@ -249,20 +209,6 @@ def test_find_and_delete_audio(tmp_path: Path) -> None:
     assert s.delete_audio(KEY) is False
     assert s.find_audio(KEY) is None
     assert (d / "audio.mp3.part").exists()
-
-
-def test_list_analyses_sorted_and_filtered(tmp_path: Path) -> None:
-    s = ArtifactStore(tmp_path)
-    a = make_analysis(prompt="a", created_at=T0 + timedelta(hours=2))
-    b = make_analysis(prompt="b", created_at=T0)
-    c = make_analysis(prompt=None, created_at=T0 + timedelta(hours=1))
-    for an in (a, b, c):
-        s.write_analysis(an)
-    d = s.analyses_dir(KEY)
-    (d / "notes.json").write_text("{}")
-    (d / f".{a.prompt_hash}.json.abc.tmp").write_text("junk")
-    assert s.list_analyses(KEY) == [b, c, a]
-    assert s.list_analyses(make_episode(guid="urn:none").key) == []
 
 
 def test_list_episode_keys(tmp_path: Path) -> None:
@@ -327,42 +273,6 @@ def test_read_share_garbage_is_corrupt(tmp_path: Path) -> None:
         store.read_share(KEY)
 
 
-def test_analysis_parts_paths(tmp_path: Path) -> None:
-    s = ArtifactStore(tmp_path)
-    analysis = make_analysis(prompt="a")
-    digest = analysis.prompt_hash
-    part = "0123456789abcdef"
-    assert s.analysis_parts_dir(KEY, digest) == s.analyses_dir(KEY) / f"{digest}.parts"
-    for bad in ("short", "0123456789ABCDEF", "../../etc/passwd0", "0123456789abcdef0"):
-        with pytest.raises(ValueError, match="part id"):
-            s.write_analysis_part(KEY, digest, bad, b"x")
-        with pytest.raises(ValueError, match="part id"):
-            s.read_analysis_part(KEY, digest, bad)
-    with pytest.raises(ValueError, match="prompt hash"):
-        s.analysis_parts_dir(KEY, "nope")
-
-    s.clear_analysis_parts(KEY, digest)  # a missing directory is fine
-    assert s.read_analysis_part(KEY, digest, part) is None
-    s.delete_analysis_part(KEY, digest, part)  # also fine
-
-    path = s.write_analysis_part(KEY, digest, part, b'{"a": 1}')
-    assert path == s.analysis_parts_dir(KEY, digest) / f"{part}.json"
-    assert s.read_analysis_part(KEY, digest, part) == b'{"a": 1}'
-    s.write_analysis_part(KEY, digest, part, b"two")  # replaces atomically
-    assert s.read_analysis_part(KEY, digest, part) == b"two"
-    assert _files(s.analysis_parts_dir(KEY, digest)) == [f"{part}.json"]
-
-    s.write_analysis(analysis)
-    assert s.list_analyses(KEY) == [analysis]  # the .parts directory is skipped
-
-    s.delete_analysis_part(KEY, digest, part)
-    assert s.read_analysis_part(KEY, digest, part) is None
-    s.write_analysis_part(KEY, digest, part, b"x")
-    s.clear_analysis_parts(KEY, digest)
-    assert not s.analysis_parts_dir(KEY, digest).exists()
-    assert s.read_analysis(KEY, digest) == analysis
-
-
 def test_has_episode(tmp_path: Path) -> None:
     s = ArtifactStore(tmp_path)
     assert not s.has_episode(KEY)
@@ -372,19 +282,3 @@ def test_has_episode(tmp_path: Path) -> None:
     assert s.has_episode(KEY)
     with pytest.raises(ValueError, match="episode key"):
         s.has_episode("../etc")
-
-
-def test_list_analysis_hashes(tmp_path: Path) -> None:
-    s = ArtifactStore(tmp_path)
-    assert s.list_analysis_hashes(KEY) == []
-    a = make_analysis(prompt="a")
-    b = make_analysis(prompt="b")
-    s.write_analysis(a)
-    s.write_analysis(b)
-    s.write_analysis_part(KEY, a.prompt_hash, "0" * 16, b"{}")
-    d = s.analyses_dir(KEY)
-    (d / "notes.json").write_text("{}")
-    (d / f".{a.prompt_hash}.json.abc.tmp").write_text("junk")
-    corrupt = "f" * 16
-    (d / f"{corrupt}.json").write_text("not json")
-    assert s.list_analysis_hashes(KEY) == sorted([a.prompt_hash, b.prompt_hash, corrupt])

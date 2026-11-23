@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from pytest_socket import SocketBlockedError
@@ -21,13 +22,14 @@ from earmark.api.auth import (
     token_digest,
     token_matches,
 )
-from earmark.api.routes import MAX_BODY_BYTES
+from earmark.api.routes import MAX_BODY_BYTES, build_router
 from earmark.config import Settings
-from earmark.db import open_database
+from earmark.db import LegacyDatabaseError, open_database
 from earmark.jobs import JobStore
 from earmark.models import MAX_PROMPT_CHARS, Job
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from tests.factories import T0, MutableClock
+from tests.legacy_db import V010_JOB_COUNT, V010_SCHEMA_VERSION, make_v010_database
 
 TOKEN = "test-token-6b1f0e"
 SHOW = "1200361736"
@@ -477,3 +479,33 @@ def test_store_error_503(settings: Settings, tmp_path: Path) -> None:
     assert r.status_code == 503
     assert r.headers["Retry-After"] == "5"
     assert r.json() == {"detail": "the job store is unavailable; try again shortly"}
+
+
+def test_routes_are_exactly_the_kept_ones(store: JobStore) -> None:
+    routes = {
+        (route.path, frozenset(route.methods or ()))
+        for route in build_router(store).routes
+        if isinstance(route, APIRoute)
+    }
+    assert routes == {
+        ("/ingest", frozenset({"POST"})),
+        ("/jobs/{job_id}", frozenset({"GET"})),
+        ("/jobs", frozenset({"GET"})),
+        ("/healthz", frozenset({"GET", "HEAD"})),
+    }
+    assert len(build_router(store).routes) == 4
+
+
+def test_create_app_refuses_v010_database(settings: Settings, tmp_path: Path) -> None:
+    settings.data_dir.mkdir()
+    path = make_v010_database(settings.data_dir / "earmark.db")
+    with pytest.raises(LegacyDatabaseError, match="Move it aside") as info:
+        create_app(settings)
+    assert str(path) in str(info.value)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == V010_SCHEMA_VERSION
+        assert conn.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == V010_JOB_COUNT
+    finally:
+        conn.close()

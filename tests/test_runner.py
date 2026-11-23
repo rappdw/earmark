@@ -9,10 +9,10 @@ from pydantic import SecretStr
 
 from earmark.config import REDACTED, Settings
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import FakeAnalyzer, FakeTranscriber, make_fake_backends
-from earmark.models import Analysis, Episode, Job, Transcript, prompt_hash
+from earmark.fakes import FakeTranscriber, make_fake_backends
+from earmark.models import Episode, Job, JobResult, Segment, Transcript
 from earmark.pipeline.runner import MAX_ERROR_CHARS, describe_error
-from tests.factories import T0, make_analysis, make_episode, make_transcript
+from tests.factories import T0, make_transcript
 from tests.pipeline_env import (
     CANON,
     SECRET,
@@ -44,37 +44,18 @@ def _stored(env: PipelineEnv, job: Job) -> Job:
 # -- A2: caching ------------------------------------------------------------------------
 
 
-def test_same_prompt_reuses_everything(tmp_path: Path) -> None:
+def test_reshare_reuses_transcript(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    first = _enqueue_and_run(env, "q?")
+    first = _enqueue_and_run(env)
     assert first.status == "done"
     assert first.result is not None
-    assert first.result.note_path is not None
-    note = env.vault / first.result.note_path
-    first_bytes = note.read_bytes()
-    second = _enqueue_and_run(env, "q?")
+    second = _enqueue_and_run(env)
     assert second.status == "done"
+    assert second.result == first.result
     f = env.fakes
-    assert f.fetcher.call_count == 1
-    assert f.transcriber.call_count == 1
-    assert f.analyzer.computed == 1
+    assert f.fetcher.call_count == f.fetcher.computed == 1
+    assert f.transcriber.call_count == f.transcriber.computed == 1
     assert f.resolver.call_count == 2
-    assert f.store.call_count == 2
-    assert note.read_bytes() == first_bytes
-
-
-def test_new_prompt_runs_only_analyzer(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    _enqueue_and_run(env, None)
-    _enqueue_and_run(env, "What papers are cited?")
-    f = env.fakes
-    assert f.fetcher.call_count == 1
-    assert f.transcriber.call_count == 1
-    assert f.analyzer.computed == 2
-    analyses = f.store.calls[1].analyses
-    assert len(analyses) == 2
-    assert list(analyses) == sorted(analyses, key=lambda a: (a.created_at, a.prompt_hash))
-    assert {a.prompt for a in analyses} == {None, "What papers are cited?"}
 
 
 def test_cached_transcript_skips_fetch_even_without_audio(tmp_path: Path) -> None:
@@ -136,12 +117,12 @@ def test_transient_exhausted_fails_and_notifies(tmp_path: Path) -> None:
 
 def test_permanent_fails(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    env.fakes.analyzer.fail_next(PermanentError("bad transcript"))
+    env.fakes.transcriber.fail_next(PermanentError("bad transcript"))
     job = _enqueue_and_run(env)
     assert (job.status, job.error, job.stage, job.attempts) == (
         "failed",
         "bad transcript",
-        "analyze",
+        "transcribe",
         1,
     )
     [call] = env.fakes.notifier.calls
@@ -179,26 +160,6 @@ def test_unexpected_exception_is_transient(
 # -- A7: indexer and notifier failures ---------------------------------------------------
 
 
-def test_index_failure_is_warning(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    env.fakes.indexer.fail_next(RuntimeError("index down"))
-    job = _enqueue_and_run(env)
-    assert job.status == "done"
-    assert job.result is not None
-    [warning] = job.warnings
-    assert warning.startswith("index failed: unexpected error: RuntimeError: index down")
-    [call] = env.fakes.notifier.calls
-    assert warning in call.job.warnings
-
-
-def test_index_transient_is_warning(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    env.fakes.indexer.fail_next(TransientError("index busy"))
-    job = _enqueue_and_run(env)
-    assert job.status == "done"
-    assert job.warnings == ("index failed: index busy",)
-
-
 def test_notify_failure_is_warning(tmp_path: Path) -> None:
     env = make_env(tmp_path)
     env.fakes.notifier.fail_next(RuntimeError("ntfy down"))
@@ -211,7 +172,7 @@ def test_notify_failure_is_warning(tmp_path: Path) -> None:
 
 def test_notify_failure_on_failed_job(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    env.fakes.analyzer.fail_next(PermanentError("bad"))
+    env.fakes.transcriber.fail_next(PermanentError("bad"))
     env.fakes.notifier.fail_next(RuntimeError("ntfy down"))
     job = _enqueue_and_run(env)
     stored = _stored(env, job)
@@ -256,20 +217,11 @@ def test_stage_order_and_inputs(tmp_path: Path) -> None:
     env = make_env(tmp_path, store_type=CountingJobStore)
     env.jobs.enqueue(CANON, prompt="why?")
     job = _run(env)
-    assert counting_store(env).stages == [
-        "resolve",
-        "fetch",
-        "transcribe",
-        "analyze",
-        "store",
-        "index",
-    ]
+    assert counting_store(env).stages == ["resolve", "fetch", "transcribe"]
     key = job.episode_key
     assert key is not None
     assert env.fakes.transcriber.calls[0].audio == env.fakes.artifacts.find_audio(key)
-    assert env.fakes.analyzer.calls[0].prompt == "why?"
-    assert env.fakes.analyzer.calls[0].prompt == job.prompt
-    assert job.stage == "index"
+    assert job.stage == "transcribe"
 
 
 def test_stage_order_cached_transcript(tmp_path: Path) -> None:
@@ -278,19 +230,11 @@ def test_stage_order_cached_transcript(tmp_path: Path) -> None:
     store = counting_store(env)
     store.stages.clear()
     _enqueue_and_run(env, "again?")
-    assert store.stages == ["resolve", "analyze", "store", "index"]
-
-
-def test_index_none_skips_index(tmp_path: Path) -> None:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
-    env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), indexer=None))
-    job = _enqueue_and_run(env)
-    assert (job.status, job.stage) == ("done", "store")
-    assert fakes.indexer.call_count == 0
+    assert store.stages == ["resolve"]
 
 
 def test_notifier_none(tmp_path: Path) -> None:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), notifier=None))
     assert _enqueue_and_run(env).status == "done"
     assert fakes.notifier.call_count == 0
@@ -300,13 +244,11 @@ def test_notifier_none(tmp_path: Path) -> None:
 
 
 def test_stage_warnings_copied(tmp_path: Path) -> None:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     fakes.transcriber = FakeTranscriber(fakes.artifacts, warnings=("no segments",))
-    fakes.analyzer = FakeAnalyzer(fakes.artifacts, warnings=("dropped 2 timestamps",))
     env = make_env(tmp_path, fakes=fakes)
-    expected = ("no segments", "dropped 2 timestamps")
-    assert _enqueue_and_run(env).warnings == expected
-    assert _enqueue_and_run(env).warnings == expected
+    assert _enqueue_and_run(env).warnings == ("no segments",)
+    assert _enqueue_and_run(env).warnings == ("no segments",)
 
 
 # -- B3: shared_at -----------------------------------------------------------------------
@@ -317,11 +259,16 @@ def test_shared_at_is_first_share(tmp_path: Path) -> None:
     _enqueue_and_run(env, None)
     env.clock.advance(3600)
     _enqueue_and_run(env, "second?")
-    assert [c.shared_at for c in env.fakes.store.calls] == [T0, T0]
+    key = env.fakes.resolver.resolve(CANON).key
+    share = env.fakes.artifacts.read_share(key)
+    assert share is not None
+    assert share.first_shared_at == T0
     earlier = T0 - timedelta(days=1)
     env.jobs.enqueue(CANON, prompt="third?", shared_at=earlier)
     _run(env)
-    assert env.fakes.store.calls[2].shared_at == earlier
+    share = env.fakes.artifacts.read_share(key)
+    assert share is not None
+    assert share.first_shared_at == earlier
 
 
 # -- B4: lease lost ----------------------------------------------------------------------
@@ -335,7 +282,7 @@ def test_lease_lost_mid_run(tmp_path: Path, caplog: pytest.LogCaptureFixture) ->
         env.clock.advance(901)
         assert len(env.jobs.requeue_stale()) == 1
 
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     backends = replace(fakes.backends(), transcriber=BlockingTranscriber(fakes.transcriber, steal))
     env = make_env(tmp_path, heartbeat_s=100, fakes=fakes, backends=backends)
     holder.append(env)
@@ -349,8 +296,6 @@ def test_lease_lost_mid_run(tmp_path: Path, caplog: pytest.LogCaptureFixture) ->
     assert job.error is not None
     assert job.error.startswith("worker stopped responding")
     assert job.result is None
-    assert fakes.analyzer.call_count == 0
-    assert fakes.store.call_count == 0
     assert fakes.notifier.call_count == 0
     assert any(job.id in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
 
@@ -402,190 +347,14 @@ class _WrongTranscriber:
         return make_transcript(guid="urn:example:other")
 
 
-class _ForgetfulAnalyzer:
-    def analyze(self, episode: Episode, transcript: Transcript, prompt: str | None, /) -> Analysis:
-        return make_analysis(prompt=prompt, model="fake-llm").model_copy(
-            update={"episode_key": episode.key}
-        )
-
-
 def test_transcript_for_other_episode_fails(tmp_path: Path) -> None:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     backends = replace(fakes.backends(), transcriber=_WrongTranscriber())
     env = make_env(tmp_path, fakes=fakes, backends=backends)
     job = _enqueue_and_run(env)
     assert job.status == "failed"
     assert job.attempts == 1
     assert job.error == "transcriber returned a transcript for another episode"
-
-
-def test_analysis_not_written_still_stored(tmp_path: Path) -> None:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
-    env = make_env(
-        tmp_path, fakes=fakes, backends=replace(fakes.backends(), analyzer=_ForgetfulAnalyzer())
-    )
-    job = _enqueue_and_run(env, "q?")
-    assert job.status == "done"
-    [call] = fakes.store.calls
-    assert len(call.analyses) == 1
-    assert call.analyses[0].prompt_hash == prompt_hash("q?", "fake-llm")
-    assert fakes.artifacts.list_analyses(call.episode.key) == []
-
-
-# -- reanalyze --------------------------------------------------------------------------
-
-
-class Exploding:
-    """Stands in for a stage a reanalyze job must never call."""
-
-    def resolve(self, url: str, /) -> Episode:
-        raise AssertionError("must not be called")
-
-    def fetch(self, episode: Episode, /) -> Path:
-        raise AssertionError("must not be called")
-
-    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
-        raise AssertionError("must not be called")
-
-
-def _seed(env: PipelineEnv, *, transcript: bool = True, share: bool = True) -> Episode:
-    artifacts = env.fakes.artifacts
-    episode = make_episode()
-    artifacts.write_episode(episode)
-    if share:
-        artifacts.record_share(episode.key, T0 - timedelta(days=3))
-    if transcript:
-        artifacts.write_transcript(make_transcript())
-    return episode
-
-
-def _reanalyze(env: PipelineEnv, key: str, prompt: str | None = None) -> Job:
-    env.jobs.enqueue_reanalyze(key, prompt=prompt)
-    return _run(env)
-
-
-def test_reanalyze_never_calls_input_stages(tmp_path: Path) -> None:
-    exploding = Exploding()
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
-    backends = replace(
-        fakes.backends(), resolver=exploding, fetcher=exploding, transcriber=exploding
-    )
-    env = make_env(tmp_path, fakes=fakes, backends=backends, store_type=CountingJobStore)
-    episode = _seed(env)
-    fakes.analyzer.analyze(episode, make_transcript(), None)
-    job = _reanalyze(env, episode.key, "Who is quoted?")
-    assert job.status == "done"
-    assert counting_store(env).stages == ["analyze", "store", "index"]
-    assert job.stage == "index"
-    assert fakes.analyzer.calls[-1].prompt == "Who is quoted?"
-
-
-def test_reanalyze_after_ingest_uses_artifacts(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    first = _enqueue_and_run(env, None)
-    assert first.episode_key is not None
-    f = env.fakes
-    counts = (f.resolver.call_count, f.fetcher.call_count, f.transcriber.call_count)
-    job = _reanalyze(env, first.episode_key, "Any numbers?")
-    assert job.status == "done"
-    assert (f.resolver.call_count, f.fetcher.call_count, f.transcriber.call_count) == counts
-    assert f.analyzer.call_count == 2
-    assert f.analyzer.calls[-1].prompt == "Any numbers?"
-    assert f.analyzer.computed == 2
-    assert job.result is not None
-    assert job.result.analysis_hash == prompt_hash("Any numbers?", "fake-llm")
-
-
-def test_reanalyze_store_and_index_get_all_analyses(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    first = _enqueue_and_run(env, None)
-    assert first.episode_key is not None
-    job = _reanalyze(env, first.episode_key, "q2")
-    f = env.fakes
-    store_call, index_call = f.store.calls[-1], f.indexer.calls[-1]
-    assert len(store_call.analyses) == 2
-    assert index_call.analyses == store_call.analyses
-    assert list(store_call.analyses) == sorted(
-        store_call.analyses, key=lambda a: (a.created_at, a.prompt_hash)
-    )
-    assert job.result is not None
-    assert job.result.note_path == index_call.stored.note_path
-
-
-def test_reanalyze_missing_episode_fails(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    key = make_episode().key
-    job = _reanalyze(env, key)
-    assert job.status == "failed"
-    assert job.error == f"episode {key} is not stored; share it again"
-    assert job.stage == "analyze"
-    assert [(c.job.id, c.episode) for c in env.fakes.notifier.calls] == [(job.id, None)]
-    f = env.fakes
-    assert f.resolver.call_count == f.transcriber.call_count == f.analyzer.call_count == 0
-
-
-def test_reanalyze_missing_transcript_fails(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    episode = _seed(env, transcript=False)
-    job = _reanalyze(env, episode.key)
-    assert job.status == "failed"
-    assert job.error == f"episode {episode.key} has no transcript; share it again to transcribe it"
-    assert [c.episode for c in env.fakes.notifier.calls] == [episode]
-    assert env.fakes.analyzer.call_count == 0
-
-
-def test_reanalyze_transient_analyzer_error_requeues(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    episode = _seed(env)
-    env.fakes.analyzer.fail_next(TransientError("llm busy"))
-    job = _reanalyze(env, episode.key, "p")
-    assert job.status == "queued"
-    assert env.fakes.notifier.call_count == 0
-    env.clock.advance(60)
-    assert _run(env).status == "done"
-
-
-def test_reanalyze_same_prompt_is_cache_hit(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    first = _enqueue_and_run(env, "p")
-    assert first.episode_key is not None
-    f = env.fakes
-    job = _reanalyze(env, first.episode_key, "p")
-    assert job.status == "done"
-    assert f.analyzer.computed == 1
-    assert f.store.call_count == 2
-    assert f.indexer.call_count == 2
-    assert len(f.store.calls[-1].analyses) == 1
-    assert job.result is not None
-    assert job.result.analysis_hash == prompt_hash("p", "fake-llm")
-
-
-def test_reanalyze_keeps_first_share_time(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    episode = _seed(env)
-    share_path = env.fakes.artifacts.share_path(episode.key)
-    before = share_path.read_bytes()
-    _reanalyze(env, episode.key)
-    assert env.fakes.store.calls[-1].shared_at == T0 - timedelta(days=3)
-    assert share_path.read_bytes() == before
-
-
-def test_reanalyze_without_share_record_writes_one(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    episode = _seed(env, share=False)
-    job = _reanalyze(env, episode.key)
-    assert env.fakes.store.calls[-1].shared_at == job.shared_at
-    share = env.fakes.artifacts.read_share(episode.key)
-    assert share is not None
-    assert share.first_shared_at == job.shared_at
-
-
-def test_reanalyze_copies_warnings(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    episode = _seed(env)
-    env.fakes.analyzer.warnings = ("an analysis warning",)
-    job = _reanalyze(env, episode.key, "p")
-    assert job.warnings == ("a transcript warning", "an analysis warning")
 
 
 def test_describe_error_scrubs_surrogates() -> None:
@@ -619,3 +388,19 @@ def test_describe_error_scrubs_library_urls() -> None:
 def test_describe_error_keeps_earmark_text() -> None:
     exc = PermanentError("see https://example.org/docs/x")
     assert describe_error(exc) == "see https://example.org/docs/x"
+
+
+def test_done_result_is_transcript_duration(tmp_path: Path) -> None:
+    from earmark.fakes import FakeResolver
+    from tests.factories import make_episode
+
+    episode = make_episode(duration_s=None)
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.resolver = FakeResolver({CANON: episode})
+    fakes.transcriber = FakeTranscriber(
+        fakes.artifacts, segments=(Segment(start=0.0, end=42.0, text="x"),)
+    )
+    env = make_env(tmp_path, fakes=fakes)
+    job = _enqueue_and_run(env)
+    assert job.status == "done"
+    assert job.result == JobResult(duration_s=42.0)

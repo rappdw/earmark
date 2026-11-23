@@ -1,7 +1,7 @@
 [project]
 name = "earmark"
 version = "0.1.0"
-description = "Share a podcast episode, get a research note."
+description = "Share a podcast episode, get its transcript."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -12,10 +12,7 @@ dependencies = [
   "httpx2>=2.16.2",
   "httpcore2>=2.16.2",
   "typer>=0.29.2",
-  "tzdata>=2026.6",
   "defusedxml>=0.7.1",
-  "anthropic>=2.11.0",
-  "pyyaml>=6.0.3",
 ]
 
 [project.optional-dependencies]
@@ -24,10 +21,6 @@ transcribe = [
   # faster-whisper 1.2.1 breaks with PyAV 19 (av.open lost metadata_errors); drop this
   # bound once a faster-whisper release after 1.2.1 ships the fix. See docs/steps/08-transcribe.md 2.2.
   "av>=18.1,<19",
-]
-index = [
-  "lancedb>=0.41.0",
-  "fastembed>=0.9.1",
 ]
 
 [project.scripts]
@@ -40,6 +33,7 @@ dev = [
   "ruff>=0.17.6",
   "mypy>=2.4.1",
   "actionlint-py>=1.7.12.25",
+  "pyyaml>=6.0.3",
   "types-pyyaml>=6.0.12.20261113",
   "types-defusedxml>=0.7.0.20260504",
 ]
@@ -62,15 +56,13 @@ addopts = [
   "--disable-socket",
   "--allow-unix-socket",          # asyncio/TestClient need an AF_UNIX socketpair
   # NOTE: a command-line -m REPLACES this expression (last -m wins). `-m network` runs only
-  # network tests, but `-m "not slow"` would also include network, llm, gpu, and index tests.
-  "-m", "not network and not slow and not llm and not gpu and not index",
+  # network tests, but `-m "not slow"` would also include network and gpu tests.
+  "-m", "not network and not slow and not gpu",
 ]
 markers = [
   "network: hits real external endpoints (Apple, podcast feeds)",
-  "slow: downloads a model or does CPU-heavy work",
-  "llm: calls the real analysis model",
+  "slow: downloads a model, does CPU-heavy work, or needs the transcribe extra",
   "gpu: needs CUDA",
-  "index: needs the index extra; real LanceDB, fastembed, or huggingface_hub offline in a temp directory, no network",
 ]
 filterwarnings = [
   "error",

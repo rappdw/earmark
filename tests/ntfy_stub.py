@@ -1,7 +1,7 @@
 """Test doubles for the ntfy client: a unix-socket ntfy server and the recorded ntfy.sh bodies.
 
 The default suite blocks TCP sockets but allows unix sockets, so ``NtfyStub`` gives the
-client a real HTTP/1.1 round trip without a network (like ``llm_stub.LlmStub``). The bodies
+client a real HTTP/1.1 round trip without a network (like ``asr_stub.AsrStub``). The bodies
 are what ntfy.sh answered on 2026-11-20 (docs/steps/15-notify-doctor.md 2.1).
 """
 

@@ -32,10 +32,6 @@ def model_dir() -> Path:
     return cache_dir() / "whisper"
 
 
-def embed_model_dir() -> Path:
-    return cache_dir() / "fastembed"
-
-
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

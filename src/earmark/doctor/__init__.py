@@ -22,9 +22,8 @@ ONLINE_TIMEOUT_S: Final = 10.0
 class Probes:
     """Injection points for tests; production uses the defaults."""
 
-    http_transport: httpx2.BaseTransport | None = None  # ntfy, ASR, LLM
+    http_transport: httpx2.BaseTransport | None = None  # ntfy, ASR
     fetcher: GuardedFetcher | None = None  # the iTunes lookup
-    anthropic_http_client: httpx2.Client | None = None
     timeout_s: float = ONLINE_TIMEOUT_S
     installed: Lookup = installed  # package metadata, for the asr libraries check
 

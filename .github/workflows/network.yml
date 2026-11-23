@@ -60,12 +60,12 @@ jobs:
           prune-cache: true
           cache-python: true
           cache-suffix: slow
-      - name: Cache the Whisper and embedding models and the test clip
+      - name: Cache the Whisper model and the test clip
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/earmark-tests
           key: slow-assets-${{ hashFiles('tests/slow_assets.py') }}
-      - name: Install dependencies with the transcribe and index extras
-        run: uv sync --locked --extra transcribe --extra index
+      - name: Install dependencies with the transcribe extra
+        run: uv sync --locked --extra transcribe
       - name: Slow tests
-        run: uv run --locked --extra transcribe --extra index pytest -m slow -v -rs
+        run: uv run --locked --extra transcribe pytest -m slow -v -rs

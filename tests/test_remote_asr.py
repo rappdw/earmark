@@ -345,7 +345,7 @@ def test_long_text_not_truncated() -> None:
 
 def test_text_only_warning_reaches_job(tmp_path: Path) -> None:
     server = Server(_json(200, {"text": "hello there"}))
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     transcriber = CachedTranscriber(
         fakes.artifacts, RemoteAsrEngine(_options(), transport=server.transport()), keep_audio=False
     )
@@ -728,7 +728,7 @@ def test_audio_kept_on_failure(tmp_path: Path) -> None:
 
 def test_pipeline_with_remote(tmp_path: Path) -> None:
     server = Server()
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     settings = _settings()
     transcriber = build_remote_transcriber(settings, fakes.artifacts, transport=server.transport())
     env = make_env(
@@ -757,7 +757,7 @@ def test_heartbeat_fresh_during_remote_wait(tmp_path: Path) -> None:
         stale.append(env.jobs.requeue_stale())
         return httpx2.Response(200, content=THREE)
 
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     transcriber = CachedTranscriber(
         fakes.artifacts,
         RemoteAsrEngine(_options(), transport=httpx2.MockTransport(handler)),
@@ -815,12 +815,8 @@ def test_shutdown_during_remote_wait(tmp_path: Path) -> None:
 def test_factory_builds_remote(tmp_path: Path) -> None:
     settings = _settings(
         tmp_path,
-        vault_dir=tmp_path / "vault",
         resolver_backend="fake",
         fetch_backend="fake",
-        llm_provider="fake",
-        store_backend="fake",
-        index_backend="fake",
         notify_backend="fake",
         asr_api_key="k-1",
     )
@@ -858,9 +854,6 @@ def test_missing_base_url_is_config_error(tmp_path: Path) -> None:
         asr_base_url=None,
         resolver_backend="fake",
         fetch_backend="fake",
-        llm_provider="fake",
-        store_backend="fake",
-        index_backend="fake",
         notify_backend="fake",
     )
     with pytest.raises(ConfigError) as info:

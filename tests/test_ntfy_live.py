@@ -15,7 +15,7 @@ from pydantic import SecretStr
 from earmark.config import Settings
 from earmark.fetch import USER_AGENT
 from earmark.models import JobResult
-from earmark.notify.ntfy import NtfyClient, NtfyNotifier, NtfyOptions, obsidian_url
+from earmark.notify.ntfy import NtfyClient, NtfyNotifier, NtfyOptions
 from tests.factories import make_episode, make_job
 
 pytestmark = pytest.mark.network
@@ -28,17 +28,15 @@ def test_ntfy_publish_round_trip() -> None:
         _env_file=None,
         ntfy_url=SecretStr(url),
         ntfy_token=SecretStr(token) if token else None,
-        obsidian_vault_name="My Vault",
     )
     options = NtfyOptions.from_settings(settings)
     assert options is not None
-    note = "Earmark/Podcasts/Show/Live test.md"
     job = make_job().model_copy(
         update={
             "status": "done",
             "warnings": (),
             "prompt": None,
-            "result": JobResult(note_path=note),
+            "result": JobResult(duration_s=125.5),
         }
     )
     episode = make_episode(title="Live: Café\r\nX-Evil: 1 =?UTF-8?B?4pyT?=")
@@ -55,8 +53,8 @@ def test_ntfy_publish_round_trip() -> None:
     assert response.status_code == 200
     messages = [json.loads(line) for line in response.text.splitlines() if line.strip()]
     [message] = [m for m in messages if m.get("event") == "message"]
-    assert message["title"] == "Note ready: Live: Café X-Evil: 1 = ?UTF-8?B?4pyT?="
-    assert message["message"] == "Le Podcast ☕"
+    assert message["title"] == "Transcribed: Live: Café X-Evil: 1 = ?UTF-8?B?4pyT?="
+    assert message["message"] == "Le Podcast ☕\nDuration: 00:02:05"
     assert message["tags"] == ["white_check_mark"]
     assert message["priority"] == 3
-    assert message["click"] == obsidian_url("My Vault", note)
+    assert "click" not in message

@@ -247,7 +247,7 @@ FENCED: list[tuple[str, FencedCall]] = [
     ("heartbeat", lambda s, c: s.heartbeat(c)),
     ("set_stage", lambda s, c: s.set_stage(c, "fetch")),
     ("set_episode_key", lambda s, c: s.set_episode_key(c, KEY)),
-    ("complete", lambda s, c: s.complete(c, JobResult(note_path="a.md"))),
+    ("complete", lambda s, c: s.complete(c, JobResult(duration_s=12.5))),
     ("fail", lambda s, c: s.fail(c, "e", transient=True)),
     ("skip", lambda s, c: s.skip(c, "r")),
     ("release", lambda s, c: s.release(c)),
@@ -358,14 +358,6 @@ def test_dedupe_concurrent_threads(store: JobStore) -> None:
     assert len(store.list_recent()) == 1
 
 
-def test_reanalyze_dedupe(store: JobStore) -> None:
-    a = store.enqueue_reanalyze(KEY, prompt="p")
-    assert store.enqueue_reanalyze(KEY, prompt="p").job.id == a.job.id
-    assert store.enqueue_reanalyze(KEY, prompt="q").created
-    assert store.enqueue(KEY, prompt="p").created
-    assert store.enqueue(URL, prompt="p").job.id != a.job.id
-
-
 # --- A6: ordering --------------------------------------------------------------------
 
 
@@ -446,7 +438,7 @@ def test_complete_stores_result(store: JobStore, clock: MutableClock) -> None:
     retry = store.fail(claim, "transient", transient=True)
     assert retry.error == "transient"
     clock.now = retry.run_after
-    result = JobResult(note_path="Earmark/x.md", transcript_note_path="Earmark/y.md")
+    result = JobResult(duration_s=12.5)
     job = store.complete(claim_one(store), result)
     assert job.status == "done"
     assert job.error is None
@@ -555,17 +547,6 @@ def test_list_recent_limit_bounds(store: JobStore) -> None:
         with pytest.raises(ValueError, match="limit"):
             store.list_recent(bad)
     store.list_recent(LIST_LIMIT_MAX)
-
-
-# --- B8: reanalyze -------------------------------------------------------------------
-
-
-def test_enqueue_reanalyze(store: JobStore) -> None:
-    job = store.enqueue_reanalyze(KEY, prompt="again").job
-    assert (job.kind, job.url, job.episode_key, job.prompt) == ("reanalyze", None, KEY, "again")
-    with pytest.raises(ValueError, match="episode_key"):
-        store.enqueue_reanalyze("bad")
-    assert claim_one(store).job.id == job.id
 
 
 def test_enqueue_blank_url_refused(store: JobStore) -> None:

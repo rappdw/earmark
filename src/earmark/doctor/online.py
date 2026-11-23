@@ -41,13 +41,13 @@ def probe_models(
     api_key: SecretStr | None,
     model: str,
     *,
-    setting: str,  # "EARMARK_ASR" or "EARMARK_LLM", used in messages
+    setting: str,  # "EARMARK_ASR", used in messages
     transport: httpx2.BaseTransport | None,
     timeout_s: float,
     secrets: Sequence[str],
 ) -> CheckResult:
     """``GET {base_url}/models``; never raises."""
-    name = "asr server" if setting == "EARMARK_ASR" else "llm server"
+    name = "asr server"
     host = host_label(base_url)
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     secret_list = list(secrets)
@@ -177,30 +177,6 @@ def run_online(
             )
         else:
             results.append(skipped("asr server"))
-    if s.llm_provider == "openai_compat":
-        if _needs_ok(offline, "llm") and s.llm_base_url is not None:
-            llm_base = s.llm_base_url
-            results.append(
-                guarded(
-                    "llm server",
-                    lambda: probe_models(
-                        llm_base,
-                        s.llm_api_key,
-                        s.llm_model,
-                        setting="EARMARK_LLM",
-                        transport=probes.http_transport,
-                        timeout_s=probes.timeout_s,
-                        secrets=secrets,
-                    ),
-                )
-            )
-        else:
-            results.append(skipped("llm server"))
-    if s.llm_provider == "anthropic":
-        if checks.anthropic is not None and _needs_ok(offline, "llm"):
-            results.append(guarded("anthropic api", lambda: anthropic_api(checks, probes)))
-        else:
-            results.append(skipped("anthropic api"))
     if s.notify_backend == "ntfy" and s.ntfy_url is not None:
         if _needs_ok(offline, "notify"):
             server, token = ntfy_checks(s, probes)
@@ -243,22 +219,6 @@ def apple_lookup(settings: Settings, probes: Probes) -> CheckResult:
     if isinstance(data, dict) and "resultCount" in data:
         return CheckResult(name, "ok", "itunes.apple.com is reachable")
     return CheckResult(name, "warn", "itunes.apple.com answered, but not with the expected JSON")
-
-
-def anthropic_api(checks: OfflineChecks, probes: Probes) -> CheckResult:
-    name = "anthropic api"
-    client = checks.anthropic
-    try:
-        info = client.check_model(timeout_s=probes.timeout_s)
-    except EarmarkError as exc:
-        return CheckResult(name, "fail", exc.message)
-    model = client.model
-    if info.lifecycle == "retired":
-        return CheckResult(name, "fail", f"{model} is retired; set EARMARK_LLM_MODEL")
-    if info.lifecycle == "deprecated":
-        when = info.retires_at or "at a date not yet set"
-        return CheckResult(name, "warn", f"{model} is deprecated; retires {when}")
-    return CheckResult(name, "ok", f"{model} ({info.display_name}) is available")
 
 
 def ntfy_checks(settings: Settings, probes: Probes) -> tuple[CheckResult, CheckResult | None]:

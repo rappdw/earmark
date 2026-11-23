@@ -1,9 +1,7 @@
 """Settings: EARMARK_* environment variables, then .env, then defaults."""
 
 import re
-import unicodedata
-import zoneinfo
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Final, Literal
 from urllib.parse import urlsplit
 
@@ -13,13 +11,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ResolverBackend = Literal["apple", "fake"]
 FetchBackend = Literal["http", "fake"]
 AsrBackend = Literal["faster_whisper", "remote", "fake"]
-LlmProvider = Literal["anthropic", "openai_compat", "fake"]
-StoreBackend = Literal["vault", "fake"]
-IndexBackend = Literal["lancedb", "fake", "none"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
-LlmEffort = Literal["low", "medium", "high", "xhigh", "max"]
-LlmResponseFormat = Literal["json_schema", "json_object"]
 AsrDevice = Literal["auto", "cpu", "cuda"]
 AsrComputeType = Literal[
     "auto",
@@ -37,7 +30,6 @@ AsrComputeType = Literal[
 ENV_PREFIX: Final = "EARMARK_"
 REDACTED: Final = "**********"
 NTFY_TOPIC_PATTERN: Final = re.compile(r"[-_A-Za-z0-9]{1,64}")
-OBSIDIAN_NAME_MAX: Final = 200
 # A shorter bare topic is not redacted on its own: masking a common word would corrupt logs.
 NTFY_TOPIC_SECRET_MIN_CHARS: Final = 12
 
@@ -68,15 +60,9 @@ class Settings(BaseSettings):
     host: str = Field("127.0.0.1", description="Address the API binds to.")
     port: int = Field(8787, ge=1, le=65535, description="Port the API binds to.")
     data_dir: Path = Field(Path("./data"), description="Working data (jobs DB, episode cache).")
-    vault_dir: Path | None = Field(None, description="Root of the Markdown vault.")
-    vault_subdir: str = Field("Earmark", description="Folder inside the vault earmark owns.")
-    obsidian_vault_name: str | None = Field(None, description="Vault name for obsidian:// links.")
     resolver_backend: ResolverBackend = Field("apple", description="Episode URL resolver.")
     fetch_backend: FetchBackend = Field("http", description="Audio/feed fetcher.")
     asr_backend: AsrBackend = Field("faster_whisper", description="Transcription backend.")
-    llm_provider: LlmProvider = Field("anthropic", description="Analysis model provider.")
-    store_backend: StoreBackend = Field("vault", description="Note store.")
-    index_backend: IndexBackend = Field("lancedb", description="Search index.")
     notify_backend: NotifyBackend = Field("ntfy", description="Notifier.")
     asr_model: str = Field("large-v3", description="Whisper model name.")
     asr_device: AsrDevice = Field("auto", description="Whisper device.")
@@ -96,44 +82,6 @@ class Settings(BaseSettings):
         10800.0, gt=0, description="How long to wait for the remote ASR server's answer."
     )
     keep_audio: bool = Field(False, description="Keep audio after transcription.")
-    llm_model: str = Field(
-        "claude-opus-5-5", description="Analysis model id (also part of the analysis cache key)."
-    )
-    llm_effort: LlmEffort = Field(
-        "medium", description="Claude effort level: low, medium, high, xhigh, max."
-    )
-    llm_fallbacks: bool = Field(
-        True,
-        description="Retry a refused Claude request on Anthropic's recommended fallback model.",
-    )
-    llm_base_url: str | None = Field(
-        None, description="OpenAI-compatible LLM base URL, ending in /v1 (openai_compat only)."
-    )
-    llm_api_key: SecretStr | None = Field(
-        None, description="Analysis API key (Anthropic, or the local endpoint)."
-    )
-    llm_context_tokens: int | None = Field(
-        None,
-        gt=0,
-        description=(
-            "Context window in tokens (Anthropic default 1,000,000; required for openai_compat)."
-        ),
-    )
-    llm_timeout_seconds: float = Field(
-        3600.0,
-        gt=0,
-        description="How long to wait for the local LLM server's answer (openai_compat).",
-    )
-    llm_response_format: LlmResponseFormat = Field(
-        "json_schema",
-        description=(
-            "openai_compat JSON request: json_schema (constrained) or json_object (JSON mode)."
-        ),
-    )
-    embed_model: str = Field("BAAI/bge-small-en-v1.5", description="Embedding model (fastembed).")
-    embed_model_dir: Path | None = Field(
-        None, description="Where embedding models are downloaded (default: DATA_DIR/models/embed)."
-    )
     ntfy_url: SecretStr | None = Field(None, description="ntfy topic URL (secret).")
     ntfy_token: SecretStr | None = Field(None, description="ntfy access token.")
     max_audio_mb: int = Field(1024, gt=0, description="Audio download size cap.")
@@ -142,33 +90,14 @@ class Settings(BaseSettings):
     job_max_attempts: int = Field(4, ge=1, description="Attempts before a job fails.")
     job_lease_seconds: int = Field(900, gt=0, description="Job lease duration.")
     worker_poll_seconds: float = Field(2.0, gt=0, description="Worker poll interval.")
-    tz: str | None = Field(None, description="IANA time zone for dates.")
     log_level: LogLevel = Field("INFO", description="Log level.")
-
-    @field_validator("vault_subdir")
-    @classmethod
-    def _check_vault_subdir(cls, v: str) -> str:
-        path = PurePosixPath(v)
-        if not v.strip() or path.is_absolute() or ".." in path.parts or "\\" in v:
-            raise ValueError("must be a relative path inside the vault without '..'")
-        return v
-
-    @field_validator("tz")
-    @classmethod
-    def _check_tz(cls, v: str | None) -> str | None:
-        if v is not None:
-            try:
-                zoneinfo.ZoneInfo(v)
-            except (zoneinfo.ZoneInfoNotFoundError, ValueError):
-                raise ValueError("unknown time zone") from None
-        return v
 
     @field_validator("log_level", mode="before")
     @classmethod
     def _upper_log_level(cls, v: object) -> object:
         return v.upper() if isinstance(v, str) else v
 
-    @field_validator("asr_model", "llm_model", "embed_model")
+    @field_validator("asr_model")
     @classmethod
     def _check_model_name(cls, v: str) -> str:
         v = v.strip()
@@ -176,9 +105,7 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty")
         return v
 
-    @field_validator(
-        "asr_device", "asr_compute_type", "llm_effort", "llm_response_format", mode="before"
-    )
+    @field_validator("asr_device", "asr_compute_type", mode="before")
     @classmethod
     def _lower_asr_choice(cls, v: object) -> object:
         return v.strip().lower() if isinstance(v, str) else v
@@ -195,7 +122,7 @@ class Settings(BaseSettings):
             raise ValueError("must be a language code such as 'en', or 'auto'")
         return v
 
-    @field_validator("asr_base_url", "llm_base_url")
+    @field_validator("asr_base_url")
     @classmethod
     def _check_base_url(cls, v: str | None, info: ValidationInfo) -> str | None:
         if v is None:
@@ -247,21 +174,7 @@ class Settings(BaseSettings):
             )
         return SecretStr(url[:-1] if url.endswith("/") else url)
 
-    @field_validator("obsidian_vault_name")
-    @classmethod
-    def _check_obsidian_vault_name(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        v = v.strip()
-        if not v:
-            return None
-        if any(unicodedata.category(c) in ("Cc", "Cf") for c in v):
-            raise ValueError("must not contain control characters")
-        if len(v) > OBSIDIAN_NAME_MAX:
-            raise ValueError(f"must be at most {OBSIDIAN_NAME_MAX} characters")
-        return v
-
-    @field_validator("asr_api_key", "llm_api_key", "ntfy_token")
+    @field_validator("asr_api_key", "ntfy_token")
     @classmethod
     def _check_api_key(cls, v: SecretStr | None) -> SecretStr | None:
         if v is None:

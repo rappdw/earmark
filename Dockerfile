@@ -11,8 +11,8 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv
 WORKDIR /src
-# Optional extras, space-separated: "transcribe index" (default), "index", "transcribe", "".
-ARG EXTRAS="transcribe index"
+# Optional extras, space-separated: "transcribe" (default) or "".
+ARG EXTRAS="transcribe"
 COPY pyproject.toml uv.lock .python-version README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project \
@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       $(for e in $EXTRAS; do printf -- '--extra %s ' "$e"; done)
 
 FROM python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime
-# The user that owns /data and writes the vault. Match the vault owner on the host.
+# The user that owns /data.
 ARG UID=1000
 ARG GID=1000
 RUN test "$UID" -ne 0 && test "$GID" -ne 0 \
@@ -33,13 +33,12 @@ RUN test "$UID" -ne 0 && test "$GID" -ne 0 \
  && groupadd --gid "$GID" --non-unique earmark \
  && useradd --uid "$UID" --gid "$GID" --non-unique --create-home \
       --home-dir /home/earmark --shell /usr/sbin/nologin earmark \
- && install -d -o earmark -g earmark -m 0750 /data /vault
+ && install -d -o earmark -g earmark -m 0750 /data
 COPY --from=build /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     EARMARK_HOST=0.0.0.0 \
     EARMARK_DATA_DIR=/data \
-    EARMARK_VAULT_DIR=/vault \
     HF_HOME=/data/huggingface \
     HF_HUB_DISABLE_TELEMETRY=1
 WORKDIR /home/earmark

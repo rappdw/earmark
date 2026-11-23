@@ -181,13 +181,9 @@ def test_factory_missing_extra_is_config_error(
     settings = Settings(
         _env_file=None,
         data_dir=tmp_path / "data",
-        vault_dir=tmp_path / "vault",
         resolver_backend="fake",
         fetch_backend="fake",
         asr_backend="faster_whisper",
-        llm_provider="fake",
-        store_backend="fake",
-        index_backend="fake",
         notify_backend="fake",
     )
     with pytest.raises(ConfigError) as info:
@@ -242,13 +238,9 @@ def test_worker_loads_model_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     settings = Settings(
         _env_file=None,
         data_dir=tmp_path / "data",
-        vault_dir=tmp_path / "vault",
         resolver_backend="fake",
         fetch_backend="fake",
         asr_backend="faster_whisper",
-        llm_provider="fake",
-        store_backend="fake",
-        index_backend="fake",
         notify_backend="fake",
     )
     worker = factory.build_worker(settings)
@@ -509,7 +501,7 @@ def test_heartbeat_fresh_during_transcription(tmp_path: Path) -> None:
         stale.append(env.jobs.requeue_stale())
 
     fake = _fake(on_segment=on_segment)
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     transcriber = CachedTranscriber(
         fakes.artifacts, FasterWhisperEngine(_options(), fake.runtime()), keep_audio=False
     )
@@ -542,7 +534,7 @@ def test_builder_passes_keep_audio(tmp_path: Path) -> None:
 
 def test_pipeline_with_faster_whisper(tmp_path: Path) -> None:
     fake = _fake()
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     transcriber = CachedTranscriber(
         fakes.artifacts, FasterWhisperEngine(_options(), fake.runtime()), keep_audio=False
     )
@@ -584,14 +576,10 @@ def test_factory_builds_faster_whisper(tmp_path: Path, monkeypatch: pytest.Monke
     settings = Settings(
         _env_file=None,
         data_dir=tmp_path / "data",
-        vault_dir=tmp_path / "vault",
         resolver_backend="fake",
         fetch_backend="fake",
         asr_backend="faster_whisper",
         asr_model="small",
-        llm_provider="fake",
-        store_backend="fake",
-        index_backend="fake",
         notify_backend="fake",
     )
     b = factory.build_backends(settings, ArtifactStore(settings.data_dir))
@@ -703,7 +691,7 @@ def test_no_speech_keeps_audio(
 
 def test_no_speech_fails_job_and_keeps_audio(tmp_path: Path) -> None:
     fake = _fake(())
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     transcriber = CachedTranscriber(
         fakes.artifacts, FasterWhisperEngine(_options(), fake.runtime()), keep_audio=False
     )
@@ -860,7 +848,7 @@ def test_pyav19_type_error_requeues_and_keeps_audio(
 
     stub = _stub_extra(decode)
     stub.install(monkeypatch)
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     settings = Settings(_env_file=None, data_dir=tmp_path / "data", asr_device="cpu")
     transcriber = build_faster_whisper_transcriber(settings, fakes.artifacts)
     env = make_env(
@@ -905,7 +893,7 @@ def test_pyav19_type_error_exhausted_keeps_audio(
 ) -> None:
     stub = _stub_extra(_raiser(TypeError("open() got an unexpected keyword argument")))
     stub.install(monkeypatch)
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     settings = Settings(_env_file=None, data_dir=tmp_path / "data", asr_device="cpu")
     transcriber = build_faster_whisper_transcriber(settings, fakes.artifacts)
     env = make_env(

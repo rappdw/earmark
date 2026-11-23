@@ -1,6 +1,8 @@
 import io
 import logging
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import httpx2
@@ -99,21 +101,9 @@ def test_http_client_loggers_do_not_log_urls_at_info() -> None:
         logging.getLogger("httpx2").info("HTTP Request: GET https://x.example/secret/path?sid=1")
         logging.getLogger("httpx2").warning("kept")
     finally:
-        for name in ("httpx2", "httpcore2", "anthropic"):
+        for name in ("httpx2", "httpcore2"):
             logging.getLogger(name).setLevel(logging.NOTSET)
     assert "secret/path" not in stream.getvalue()
-    assert "kept" in stream.getvalue()
-
-
-def test_anthropic_debug_suppressed() -> None:
-    stream = io.StringIO()
-    configure_logging("DEBUG", stream=stream)
-    try:
-        logging.getLogger("anthropic._base_client").debug("Request options: %s", "TRANSCRIPT-TEXT")
-        logging.getLogger("anthropic._base_client").warning("kept")
-    finally:
-        logging.getLogger("anthropic").setLevel(logging.NOTSET)
-    assert "TRANSCRIPT-TEXT" not in stream.getvalue()
     assert "kept" in stream.getvalue()
 
 
@@ -134,10 +124,10 @@ SECRET_URL = "https://x.example/secret/path?sid=1"
             "Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)",
         ),
         (
-            '127.0.0.1:5 - "GET /search?q=private+thoughts HTTP/1.1" 200',
-            '127.0.0.1:5 - "GET /search HTTP/1.1" 200',
+            '127.0.0.1:5 - "GET /jobs?status=failed&limit=5 HTTP/1.1" 200',
+            '127.0.0.1:5 - "GET /jobs HTTP/1.1" 200',
         ),
-        ('"GET /search?q=a"b&kind=x HTTP/1.1" 200', '"GET /search HTTP/1.1" 200'),
+        ('"GET /jobs?status=a"b&limit=5 HTTP/1.1" 200', '"GET /jobs HTTP/1.1" 200'),
         ('"GET /healthz HTTP/1.1" 200', '"GET /healthz HTTP/1.1" 200'),
         (
             "for url 'https://user:pw@h.example:8443/p?q=1#f'",
@@ -171,7 +161,7 @@ def test_quiet_loggers_gated_even_when_unquieted(name: str, child: bool) -> None
     stream = io.StringIO()
     configure_logging("DEBUG", stream=stream)
     logger = logging.getLogger(name + ".child" if child else name)
-    logging.getLogger(name).setLevel(logging.DEBUG)  # what ANTHROPIC_LOG and friends do
+    logging.getLogger(name).setLevel(logging.DEBUG)  # what a library's debug switch does
     logger.debug("debug %s", SECRET_URL)
     logger.info("info %s", SECRET_URL)
     logger.debug("header %r", b"/secret/path?sid=1")
@@ -310,3 +300,14 @@ def test_earmark_never_reads_hf_token() -> None:
             assert word not in text, f"{path} mentions {word}"
         assert not re.search(r"\bget_token\b", text), f"{path} mentions get_token"
     assert not [name for name in Settings.model_fields if "hf" in name.lower()]
+
+
+def test_adopt_does_not_import_huggingface_hub() -> None:
+    code = (
+        "import sys, earmark.log as log\n"
+        "log.configure_logging()\n"
+        "log.adopt_library_loggers()\n"
+        "print('huggingface_hub' in sys.modules)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "False"

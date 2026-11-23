@@ -28,7 +28,6 @@ jobs:
       - name: Validate compose.yaml
         run: |
           cp .env.example .env
-          printf 'VAULT_PATH=%s\n' "$RUNNER_TEMP/vault" >> .env
           docker compose config --quiet
           docker compose --profile gpu config --quiet
           check='import json, sys; s = json.load(sys.stdin)["services"]; v = {n: s[n]["environment"]["HF_HUB_DISABLE_TELEMETRY"] for n in ("api", "worker", "asr")}; assert set(v.values()) == {sys.argv[1]}, v'
@@ -39,7 +38,7 @@ jobs:
       - name: Check the image
         run: |
           docker run --rm earmark:ci --version
-          docker run --rm --entrypoint python earmark:ci -c "import ctranslate2, faster_whisper, fastembed, lancedb"
+          docker run --rm --entrypoint python earmark:ci -c "import ctranslate2, faster_whisper"
           test "$(docker run --rm --entrypoint id earmark:ci -u)" = 1000
           test "$(docker run --rm --entrypoint printenv earmark:ci HF_HUB_DISABLE_TELEMETRY)" = 1
           docker image ls earmark:ci

@@ -16,10 +16,9 @@ from typing import Any, Final
 
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
-from earmark.db import DB_FILENAME, SCHEMA_VERSION, Database
+from earmark.db import DB_FILENAME, SCHEMA_VERSION, Database, identity_error
 from earmark.doctor import Probes
 from earmark.doctor.report import CheckResult
-from earmark.errors import EarmarkError
 from earmark.models import utc_now
 
 logger = logging.getLogger(__name__)
@@ -76,9 +75,6 @@ class OfflineChecks:
     def __init__(self, settings: Settings, probes: Probes) -> None:
         self.settings = settings
         self.probes = probes
-        self.anthropic: Any = None  # AnthropicClient, kept for the online check
-        self._index: Any = None  # LanceIndex
-        self._index_info: Any = None  # ModelInfo
         self._closers: list[object] = []
 
     def close(self) -> None:
@@ -92,10 +88,7 @@ class OfflineChecks:
             guarded("api token", self.api_token),
             guarded("data dir", self.data_dir),
             guarded("database", self.database),
-            guarded("vault", self.vault),
         ]
-        if s.notify_backend == "ntfy" and s.ntfy_url is not None:
-            results.append(guarded("obsidian link", self.obsidian_link))
         results.append(guarded("resolver", self.resolver))
         results.append(guarded("fetch", self.fetch))
         asr = guarded("asr", self.asr)
@@ -103,12 +96,6 @@ class OfflineChecks:
         if s.asr_backend == "faster_whisper" and asr.status == "ok":
             results.append(guarded("asr libraries", self.asr_libraries))
             results.append(guarded("asr model", self.asr_model))
-        results.append(guarded("llm", self.llm))
-        index = guarded("index", self.index)
-        results.append(index)
-        if s.index_backend == "lancedb" and index.status == "ok":
-            results.append(guarded("embed model", self.embed_model))
-            results.append(guarded("search index", self.search_index))
         results.append(guarded("notify", self.notify))
         return results
 
@@ -163,6 +150,7 @@ class OfflineChecks:
         try:
             with Database(path, busy_timeout_s=5.0).connect() as conn:
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
                 journal = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
                 check = str(conn.execute("PRAGMA quick_check").fetchone()[0])
                 counts: dict[str, int] | None
@@ -173,6 +161,9 @@ class OfflineChecks:
                     counts = None
         except sqlite3.Error as exc:
             return CheckResult("database", "fail", f"{type(exc).__name__}: {collapse(exc)}")
+        identity = identity_error(path, app_id, version)
+        if identity is not None:
+            return CheckResult("database", "fail", str(identity))
         if version > SCHEMA_VERSION:
             return CheckResult(
                 "database",
@@ -203,62 +194,6 @@ class OfflineChecks:
                 f"running {counts.get('running', 0)}, failed {counts.get('failed', 0)})"
             )
         return CheckResult("database", "ok", detail)
-
-    def vault(self) -> CheckResult:
-        from earmark.vault.fs import SymlinkRefused, Vault
-        from earmark.vault.notes import build_vault_store
-
-        s = self.settings
-        if s.store_backend == "fake":
-            return CheckResult("vault", "warn", "fake store (for tests)")
-        try:
-            build_vault_store(s)
-        except ConfigError as exc:
-            return CheckResult("vault", "fail", config_text(exc))
-        vault_dir = (s.vault_dir or Path()).absolute()  # set: build_vault_store checked it
-        try:
-            opened = Vault(vault_dir, s.vault_subdir).open_existing_subdir()
-        except SymlinkRefused as exc:
-            return CheckResult("vault", "fail", exc.message)
-        except OSError as exc:
-            return CheckResult(
-                "vault", "fail", f"{s.vault_subdir} is not readable ({errno_name(exc)})"
-            )
-        if opened is None:
-            if os.access(vault_dir, os.W_OK | os.X_OK):
-                return CheckResult(
-                    "vault",
-                    "ok",
-                    f"{s.vault_subdir} does not exist yet; it is created on the first store",
-                )
-            return CheckResult("vault", "fail", "EARMARK_VAULT_DIR is not writable")
-        with opened:
-            try:
-                opened.probe_write()
-            except OSError as exc:
-                return CheckResult(
-                    "vault", "fail", f"{s.vault_subdir} is not writable ({errno_name(exc)})"
-                )
-        return CheckResult("vault", "ok", f"{vault_dir}/{s.vault_subdir} is writable")
-
-    def obsidian_link(self) -> CheckResult:
-        s = self.settings
-        name = s.obsidian_vault_name
-        if name is None:
-            return CheckResult(
-                "obsidian link",
-                "warn",
-                "EARMARK_OBSIDIAN_VAULT_NAME is not set; done notifications show the note "
-                "path instead of a link",
-            )
-        if s.vault_dir is not None and s.vault_dir.absolute().name != name:
-            return CheckResult(
-                "obsidian link",
-                "warn",
-                "Obsidian names vaults after their folder; EARMARK_VAULT_DIR is "
-                f"'{s.vault_dir.absolute().name}'",
-            )
-        return CheckResult("obsidian link", "ok", f"links open vault '{name}'")
 
     # -- backends ---------------------------------------------------------------------------
 
@@ -344,88 +279,6 @@ class OfflineChecks:
             f"{options.model} is not downloaded yet; the worker downloads it on the first "
             "transcription (into EARMARK_ASR_MODEL_DIR or the Hugging Face cache)",
         )
-
-    def llm(self) -> CheckResult:
-        s = self.settings
-        if s.llm_provider == "fake":
-            return CheckResult("llm", "warn", "fake analyzer (for tests)")
-        try:
-            if s.llm_provider == "anthropic":
-                from earmark.analyze.llm.anthropic import AnthropicClient, AnthropicOptions
-
-                options = AnthropicOptions.from_settings(s)
-                client = AnthropicClient(
-                    options, http_client=self.probes.anthropic_http_client, max_retries=0
-                )
-                self.anthropic = client
-                self._closers.append(client)
-                return CheckResult(
-                    "llm",
-                    "ok",
-                    f"anthropic, model {options.model}, effort {options.effort}, "
-                    f"credential from {client.credential_source}",
-                )
-            from earmark.analyze.llm.openai_compat import OpenAICompatOptions
-
-            oc = OpenAICompatOptions.from_settings(s)
-        except ConfigError as exc:
-            return CheckResult("llm", "fail", config_text(exc))
-        key = "API key set" if oc.api_key is not None else "no API key"
-        return CheckResult(
-            "llm",
-            "ok",
-            f"openai_compat at {oc.host}, model {oc.model}, context {oc.context_tokens} "
-            f"tokens, {key}",
-        )
-
-    def index(self) -> CheckResult:
-        from earmark.index import embed
-        from earmark.index.lancedb_index import build_lancedb_index
-
-        s = self.settings
-        if s.index_backend == "none":
-            return CheckResult("index", "ok", "search is off (EARMARK_INDEX_BACKEND=none)")
-        if s.index_backend == "fake":
-            return CheckResult("index", "warn", "fake index (for tests)")
-        try:
-            built = build_lancedb_index(s, allow_download=False)
-            info = embed.find_model(s, embed.load_fastembed_runtime())
-        except ConfigError as exc:
-            return CheckResult("index", "fail", config_text(exc))
-        self._index = built
-        self._index_info = info
-        return CheckResult(
-            "index", "ok", f"lancedb, embedding model {info.name} ({info.dim} dimensions)"
-        )
-
-    def embed_model(self) -> CheckResult:
-        from earmark.index.embed import default_model_dir, model_cached
-
-        info = self._index_info
-        cached = model_cached(info, default_model_dir(self.settings))
-        if cached is True:
-            return CheckResult("embed model", "ok", "downloaded")
-        if cached is False:
-            return CheckResult(
-                "embed model",
-                "warn",
-                f"{info.name} is not downloaded yet; the worker or `earmark reindex` downloads "
-                "it; until then GET /search answers 503",
-            )
-        return CheckResult("embed model", "warn", f"cannot tell whether {info.name} is downloaded")
-
-    def search_index(self) -> CheckResult:
-        try:
-            exists = self._index.check_existing()
-        except EarmarkError as exc:  # IndexMismatchError and TransientError
-            return CheckResult("search index", "fail", exc.message)
-        if not exists:
-            return CheckResult(
-                "search index",
-                "ok",
-                "empty; filled as episodes are indexed (or by `earmark reindex`)",
-            )
-        return CheckResult("search index", "ok", f"built with {self._index_info.name}")
 
     def notify(self) -> CheckResult:
         from earmark.notify.ntfy import NtfyOptions

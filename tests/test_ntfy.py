@@ -22,7 +22,6 @@ from earmark.notify.ntfy import (
     build_ntfy_notifier,
     clean_field,
     compose,
-    obsidian_url,
     split_topic_url,
 )
 from tests.factories import make_episode, make_job
@@ -42,17 +41,16 @@ from tests.ntfy_stub import (
 from tests.pipeline_env import CANON, SECRET, make_env
 
 Handler = Callable[[httpx2.Request], httpx2.Response]
-NOTE = "Earmark/Podcasts/Show/Episode.md"
 
 
 def _settings(**overrides: Any) -> Settings:
-    values: dict[str, Any] = {"ntfy_url": SecretStr(TOPIC_URL), "obsidian_vault_name": "My Vault"}
+    values: dict[str, Any] = {"ntfy_url": SecretStr(TOPIC_URL)}
     values.update(overrides)
     return Settings(_env_file=None, **values)
 
 
-def _options(*, token: bool = False, vault: str | None = "My Vault") -> NtfyOptions:
-    settings = _settings(ntfy_token=SecretStr(TOKEN) if token else None, obsidian_vault_name=vault)
+def _options(*, token: bool = False) -> NtfyOptions:
+    settings = _settings(ntfy_token=SecretStr(TOKEN) if token else None)
     options = NtfyOptions.from_settings(settings)
     assert options is not None
     return options
@@ -78,16 +76,14 @@ def _job(status: str = "done", **overrides: Any) -> Job:
         "error": "asr server said no",
         "prompt": None,
         "warnings": (),
-        "result": JobResult(note_path=NOTE),
+        "result": JobResult(duration_s=125.5),
     }
     values.update(overrides)
     return base.model_copy(update=values)
 
 
-def _compose(job: Job, *, vault: str | None = "My Vault", episode: bool = True) -> Notification:
-    result = compose(
-        job, make_episode() if episode else None, vault_name=vault, secrets=(TOKEN, TOPIC_URL)
-    )
+def _compose(job: Job, *, episode: bool = True) -> Notification:
+    result = compose(job, make_episode() if episode else None, secrets=(TOKEN, TOPIC_URL))
     assert result is not None
     return result
 
@@ -97,7 +93,7 @@ def _compose(job: Job, *, vault: str | None = "My Vault", episode: bool = True) 
 
 def test_compose_titles_distinct_per_status() -> None:
     done, failed, skipped = (_compose(_job(s)) for s in ("done", "failed", "skipped"))
-    assert done.title.startswith("Note ready: ")
+    assert done.title.startswith("Transcribed: ")
     assert failed.title.startswith("Failed: ")
     assert skipped.title.startswith("Skipped: ")
     assert len({done.title, failed.title, skipped.title}) == 3
@@ -128,11 +124,12 @@ def test_compose_skipped_includes_reason() -> None:
 def test_compose_done_has_no_reason_and_counts_warnings() -> None:
     plain = _compose(_job("done"))
     assert "Reason" not in plain.message
-    assert "Prompt:" not in plain.message
     assert "warning" not in plain.message
+    assert "Duration: 00:02:05" in plain.message
     job = _job("done", prompt="Who is cited?", warnings=("first problem", "second"))
     message = _compose(job).message
-    assert "Prompt: Who is cited?" in message
+    assert "Prompt:" not in message
+    assert "Who is cited?" not in message
     assert "2 warnings: first problem" in message
     assert "second" not in message
     assert "1 warning: only" in _compose(_job("done", warnings=("only",))).message
@@ -142,12 +139,14 @@ def test_compose_unknown_episode() -> None:
     job = _job("failed", stage="resolve")
     result = _compose(job, episode=False)
     assert result.title == "Failed: podcast episode"
-    assert result.message.splitlines()[0] == job.url
+    assert result.message.splitlines()[0] == "Apple Podcasts episode"
+    assert job.url is not None
+    assert job.url not in result.message
 
 
 @pytest.mark.parametrize("status", ["queued", "running"])
 def test_compose_non_terminal_is_none(status: str) -> None:
-    assert compose(_job(status), make_episode(), vault_name=None) is None
+    assert compose(_job(status), make_episode()) is None
 
 
 def test_notifier_sends_one_request_per_job() -> None:
@@ -156,7 +155,7 @@ def test_notifier_sends_one_request_per_job() -> None:
     [request] = seen
     assert (request.method, str(request.url)) == ("POST", ROOT_URL)
     body = json.loads(request.content)
-    assert set(body) == {"topic", "title", "message", "tags", "priority", "click"}
+    assert set(body) == {"topic", "title", "message", "tags", "priority"}
     assert body["topic"] == TOPIC
     assert body["tags"] == ["white_check_mark"]
     assert "markdown" not in body
@@ -177,66 +176,6 @@ def test_notifier_logs_job_and_host_only(caplog: pytest.LogCaptureFixture) -> No
     assert "ntfy.test" in text
     assert TOPIC not in text
     assert make_episode().title not in text
-
-
-# -- 6.2 the obsidian link ---------------------------------------------------------------
-
-
-def test_obsidian_url_golden() -> None:
-    assert obsidian_url("My Vault", "Earmark/Podcasts/Hard Fork/2026-11-20 Café & Co?.md") == (
-        "obsidian://open?vault=My%20Vault&file=Earmark%2FPodcasts%2FHard%20Fork%2F"
-        "2026-11-20%20Caf%C3%A9%20%26%20Co%3F.md"
-    )
-
-
-def test_obsidian_url_encodes_reserved() -> None:
-    url = obsidian_url("v", "a+b=c%d~e_f.g-h!'()*/ &?")
-    assert url == "obsidian://open?vault=v&file=a%2Bb%3Dc%25d~e_f.g-h%21%27%28%29%2A%2F%20%26%3F"
-    assert obsidian_url("v", "🎙.md") == "obsidian://open?vault=v&file=%F0%9F%8E%99.md"
-    nfd = "é.md"
-    assert obsidian_url("v", nfd) == "obsidian://open?vault=v&file=e%CC%81.md"
-
-
-def test_obsidian_url_refuses_hash_and_overlong() -> None:
-    assert obsidian_url("v", "a#b.md") is None
-    assert obsidian_url("v", "a/" + "x" * 2000 + ".md") is None
-    assert obsidian_url("", "a.md") is None
-    assert obsidian_url("v", "") is None
-
-
-def test_compose_done_click_with_vault_name() -> None:
-    result = _compose(_job("done"))
-    assert result.click == obsidian_url("My Vault", NOTE)
-    assert result.click is not None
-    assert "Note:" not in result.message
-
-
-def test_compose_done_without_vault_name_has_note_line() -> None:
-    result = _compose(_job("done"), vault=None)
-    assert result.click is None
-    assert f"Note: {NOTE}" in result.message
-
-
-def test_compose_done_hash_in_path_falls_back_to_note_line() -> None:
-    job = _job("done", result=JobResult(note_path="Earmark/a #1.md"))
-    result = _compose(job)
-    assert result.click is None
-    assert "Note: Earmark/a #1.md" in result.message
-
-
-def test_compose_failed_and_skipped_have_no_click() -> None:
-    assert _compose(_job("failed")).click is None
-    assert _compose(_job("skipped")).click is None
-
-
-def test_notifier_click_in_request_body() -> None:
-    client, seen = _client(lambda r: json_reply(200, PUBLISHED))
-    NtfyNotifier(client).notify(_job("done"), make_episode())
-    [request] = seen
-    expected = obsidian_url("My Vault", NOTE)
-    assert expected is not None
-    assert json.loads(request.content)["click"] == expected
-    assert all(expected not in v for v in request.headers.values())
 
 
 # -- 6.3 the token -----------------------------------------------------------------------
@@ -375,18 +314,18 @@ def _notifier_env(tmp_path: Path, handler: Handler) -> tuple[Any, list[httpx2.Re
 
     options = replace(_options(), secrets=(SECRET, TOPIC_URL))
     client = NtfyClient(options, transport=httpx2.MockTransport(record))
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     backends = replace(fakes.backends(), notifier=NtfyNotifier(client))
     return make_env(tmp_path, fakes=fakes, backends=backends), seen
 
 
-@pytest.mark.parametrize("fail", ["analyze", None])
+@pytest.mark.parametrize("fail", ["transcribe", None])
 def test_pipeline_ntfy_failure_is_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, fail: str | None
 ) -> None:
     env, seen = _notifier_env(tmp_path, lambda r: json_reply(500, b'{"error":"boom"}'))
     if fail:
-        env.fakes.analyzer.fail_next(PermanentError("bad transcript"))
+        env.fakes.transcriber.fail_next(PermanentError("bad audio"))
     env.jobs.enqueue(CANON)
     with caplog.at_level(logging.WARNING):
         job = env.worker.run_once()
@@ -419,14 +358,18 @@ def test_pipeline_unexpected_notifier_error_is_warning(tmp_path: Path) -> None:
 
 def test_pipeline_ntfy_success_no_warning(tmp_path: Path) -> None:
     env, seen = _notifier_env(tmp_path, lambda r: json_reply(200, PUBLISHED))
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(CANON, prompt="secret-prompt-7q")
     job = env.worker.run_once()
     assert job is not None
     stored = env.jobs.get(job.id)
     assert stored is not None
     assert (stored.status, stored.warnings) == ("done", ())
     [request] = seen
-    assert json.loads(request.content)["title"].startswith("Note ready: ")
+    body = json.loads(request.content)
+    assert body["title"].startswith("Transcribed: Fake episode ")
+    assert "Duration: 00:15:00" in body["message"]
+    for forbidden in (b"://", b"podcasts.apple.com", b"click", b"secret-prompt-7q"):
+        assert forbidden not in request.content
 
 
 # -- 6.6 untrusted text and splitting ------------------------------------------------------
@@ -455,7 +398,7 @@ def test_compose_title_and_message_caps() -> None:
     long = "é" * 10_000
     episode = make_episode(title=long)
     job = _job("failed", error=long, prompt=long, stage="x")
-    result = compose(job, episode, vault_name=None)
+    result = compose(job, episode)
     assert result is not None
     assert len(result.title.encode()) <= ntfy.TITLE_MAX_BYTES
     assert len(result.message.encode()) <= ntfy.MESSAGE_MAX_BYTES
@@ -479,7 +422,7 @@ def test_no_untrusted_text_in_headers() -> None:
     }
     assert "evil" not in " ".join(request.headers.values()).lower()
     title = json.loads(request.content)["title"]
-    assert title == "Note ready: x X-Evil: 1"
+    assert title == "Transcribed: x X-Evil: 1"
     assert "\r" not in title
     assert request.url.query == b""
 
@@ -492,7 +435,7 @@ def test_compose_redacts_secrets() -> None:
 
 
 def test_payload_shape() -> None:
-    note = Notification("t", "m", ("x",), 4, None)
+    note = Notification("t", "m", ("x",), 4)
     assert note.payload("topic") == {
         "topic": "topic",
         "title": "t",
@@ -549,110 +492,30 @@ def test_compose_reason_redacts_bare_topic_from_settings() -> None:
     options = NtfyOptions.from_settings(settings)
     assert options is not None
     job = _job("failed", error="HTTP 403 for sentinel-topic-404x")
-    result = compose(job, make_episode(), vault_name=None, secrets=options.secrets)
+    result = compose(job, make_episode(), secrets=options.secrets)
     assert result is not None
     assert "Reason: HTTP 403 for **********" in result.message
     assert "sentinel-topic-404x" not in result.message
 
 
-# -- reanalyze notifications ------------------------------------------------------------
+@pytest.mark.parametrize("status", ["done", "failed", "skipped"])
+def test_payload_never_has_click(status: str) -> None:
+    result = _compose(_job(status))
+    assert "click" not in result.payload(TOPIC)
 
 
-def _reanalyze_job(status: str = "done", **overrides: Any) -> Job:
-    values: dict[str, Any] = {"kind": "reanalyze", "url": None, "prompt": "Who is cited?"}
-    values.update(overrides)
-    return _job(status, **values)
+@pytest.mark.parametrize("status", ["done", "failed", "skipped"])
+@pytest.mark.parametrize("with_episode", [True, False])
+def test_compose_never_includes_url_prompt_or_path(status: str, with_episode: bool) -> None:
+    episode = make_episode()
+    job = _job(status, url=CANON, prompt="private-question-3k", stage="resolve")
+    result = _compose(job, episode=with_episode)
+    text = result.title + "\n" + result.message
+    assert "://" not in text
+    for secret in ("private-question-3k", CANON, episode.audio_url, episode.url):
+        assert secret not in text
 
 
-def test_compose_reanalyze_done() -> None:
-    n = _compose(_reanalyze_job("done", stage="index"))
-    assert n.title == "Analysis ready: Épisode 1: «Tests»"
-    assert n.message.splitlines()[:2] == ["Le Podcast ☕", "Prompt: Who is cited?"]
-    assert n.click == _compose(_job("done")).click
-    assert n.click is not None
-
-
-def test_compose_reanalyze_default_prompt() -> None:
-    n = _compose(_reanalyze_job("done", prompt=None))
-    assert n.message.splitlines()[:2] == ["Le Podcast ☕", "Default analysis"]
-
-
-def test_compose_reanalyze_failed_without_episode() -> None:
-    key = make_episode().key
-    n = _compose(_reanalyze_job("failed", stage="analyze", prompt=None), episode=False)
-    assert n.title == "Analysis failed: podcast episode"
-    assert n.message.splitlines() == [
-        f"Episode {key}",
-        "Default analysis",
-        "Stage: analyze",
-        "Reason: asr server said no",
-        "Gave up after 4 attempts.",
-    ]
-    with_prompt = _compose(_reanalyze_job("failed", stage="analyze"), episode=False)
-    assert with_prompt.message.splitlines()[:2] == [f"Episode {key}", "Prompt: Who is cited?"]
-
-
-def test_compose_ingest_unchanged_for_kind() -> None:
-    done = _compose(_job("done", prompt="p?"), vault=None)
-    assert done.title == "Note ready: Épisode 1: «Tests»"
-    assert done.message == f"Le Podcast ☕\nPrompt: p?\nNote: {NOTE}"
-    failed = _compose(_job("failed"), episode=False)
-    assert failed.title == "Failed: podcast episode"
-    assert failed.message == (
-        "https://podcasts.apple.com/us/podcast/x/id1?i=2\n"
-        "Stage: transcribe\nReason: asr server said no\nGave up after 4 attempts."
-    )
-
-
-# -- digest notification ------------------------------------------------------------------
-
-
-def test_compose_digest_title_message_link() -> None:
-    note = ntfy.compose_digest(
-        label="2026-W47",
-        note_path="Earmark/Digests/2026-W47.md",
-        episodes=3,
-        leads=1,
-        themes=2,
-        vault_name="My Vault",
-    )
-    assert note.title == "Digest ready: 2026-W47"
-    assert note.message == "3 episodes · 1 research lead · 2 themes"
-    assert note.tags == ("newspaper",)
-    assert note.priority == 3
-    assert note.click == "obsidian://open?vault=My%20Vault&file=Earmark%2FDigests%2F2026-W47.md"
-
-
-def test_compose_digest_no_vault_name_has_note_line() -> None:
-    note = ntfy.compose_digest(
-        label="2026-11-14 to 2026-11-20",
-        note_path="Earmark/Digests/2026-11-14 to 2026-11-20.md",
-        episodes=1,
-        leads=0,
-        themes=0,
-        vault_name=None,
-    )
-    assert note.click is None
-    assert note.message.splitlines() == [
-        "1 episode · 0 research leads · 0 themes",
-        "Note: Earmark/Digests/2026-11-14 to 2026-11-20.md",
-    ]
-
-
-def test_compose_digest_cleans_and_redacts() -> None:
-    note = ntfy.compose_digest(
-        label=f"=?utf-8?q?x?= {TOKEN}\n\x07",
-        note_path=f"Earmark/{TOKEN}/d.md\r\n",
-        episodes=1,
-        leads=1,
-        themes=1,
-        vault_name=None,
-        secrets=(TOKEN,),
-    )
-    assert TOKEN not in note.title
-    assert TOKEN not in note.message
-    assert "=?" not in note.title
-    assert "\n" not in note.title
-    assert "\r" not in note.message
-    assert len(note.title.encode()) <= ntfy.TITLE_MAX_BYTES
-    assert note.payload("t")["tags"] == ["newspaper"]
+def test_compose_done_without_result_has_no_duration_line() -> None:
+    result = _compose(_job("done", result=None))
+    assert "Duration" not in result.message

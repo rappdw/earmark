@@ -5,13 +5,10 @@ hashable and really immutable), datetimes are timezone-aware, and floats are fin
 """
 
 import hashlib
-import json
 import math
 import re
-import unicodedata
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import (
@@ -26,15 +23,13 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 Source = Literal["apple_podcasts"]
-JobKind = Literal["ingest", "reanalyze"]
+JobKind = Literal["ingest"]
 JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
-Stage = Literal["resolve", "fetch", "transcribe", "analyze", "store", "index", "notify"]
+Stage = Literal["resolve", "fetch", "transcribe", "notify"]  # "notify" is never set
 Clock = Callable[[], datetime]
 
 TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset({"done", "failed", "skipped"})
-ANALYSIS_SCHEMA_VERSION: Final = 1
 EPISODE_KEY_LENGTH: Final = 20
-PROMPT_HASH_LENGTH: Final = 16
 
 MAX_URL_CHARS: Final = 2048
 MAX_PROMPT_CHARS: Final = 4000
@@ -43,7 +38,6 @@ INGEST_ERROR_TYPES: Final = frozenset(
 )
 
 EpisodeKey = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{20}$")]
-PromptHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{16}$")]
 JobId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
 Seconds = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
@@ -63,29 +57,8 @@ def episode_key(source: str, show_id: str, guid: str) -> str:
     return digest[:EPISODE_KEY_LENGTH]
 
 
-def prompt_hash(
-    prompt: str | None, model: str, schema_version: int = ANALYSIS_SCHEMA_VERSION
-) -> str:
-    """16-hex-character cache key of an analysis. ``None`` (default prompt) differs from ``""``."""
-    if not model:
-        raise ValueError("model must not be empty")
-    if schema_version < 1:
-        raise ValueError("schema_version must be >= 1")
-    payload = json.dumps(
-        {"model": model, "prompt": prompt, "schema_version": schema_version},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:PROMPT_HASH_LENGTH]
-
-
 def is_episode_key(value: str) -> bool:
     return re.fullmatch("[0-9a-f]{20}", value) is not None
-
-
-def is_prompt_hash(value: str) -> bool:
-    return re.fullmatch("[0-9a-f]{16}", value) is not None
 
 
 def format_hms(seconds: float) -> str:
@@ -94,13 +67,6 @@ def format_hms(seconds: float) -> str:
         raise ValueError("seconds must be finite and non-negative")
     s = int(seconds)
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
-
-
-def _check_relative_posix(path: str) -> str:
-    pure = PurePosixPath(path)
-    if not path or pure.is_absolute() or "\\" in path or ".." in pure.parts:
-        raise ValueError("path must be a non-empty relative POSIX path without '..'")
-    return path
 
 
 def normalize_prompt(value: str | None) -> str | None:
@@ -123,22 +89,6 @@ def scrub_surrogates(text: str) -> str:
     if _LONE_SURROGATE.search(text) is None:
         return text
     return _LONE_SURROGATE.sub("\ufffd", text)
-
-
-def entity_key(name: str) -> str:
-    """NFKC, casefold; '+'/'#' kept right after a letter, digit, or kept '+'/'#'; every
-    other punctuation (P*) or symbol (S*) character becomes a space; whitespace collapsed."""
-    text = unicodedata.normalize("NFKC", name).casefold()
-    out: list[str] = []
-    for c in text:
-        prev = out[-1] if out else ""
-        if c in "+#" and (prev.isalnum() or prev in {"+", "#"}):
-            out.append(c)
-        elif unicodedata.category(c)[0] in "PS":
-            out.append(" ")
-        else:
-            out.append(c)
-    return " ".join("".join(out).split())
 
 
 def _scrub_value(value: object) -> object:
@@ -197,18 +147,6 @@ class IngestRequest(Model):
                     "timestamp_out_of_range", "timestamp is out of range"
                 ) from None
         return v
-
-
-class ReanalyzeRequest(Model):
-    prompt: str | None = None
-
-    @field_validator("prompt", mode="after")
-    @classmethod
-    def _normalise_prompt(cls, v: str | None) -> str | None:
-        try:
-            return normalize_prompt(v)
-        except ValueError as exc:
-            raise PydanticCustomError("prompt_too_long", str(exc)) from None
 
 
 class EpisodeRef(Model):
@@ -279,60 +217,6 @@ class Transcript(Model):
         return "".join(line + "\n" for line in lines)
 
 
-class Claim(Model):
-    text: str
-    timestamp_s: Seconds | None = None
-
-
-class Entity(Model):
-    name: Annotated[str, Field(min_length=1)]
-    context: str = ""
-    timestamps_s: tuple[Seconds, ...] = ()
-
-
-class ResearchLead(Model):
-    text: str
-    rationale: str = ""
-    timestamp_s: Seconds | None = None
-
-
-class Analysis(Model):
-    episode_key: EpisodeKey
-    prompt: str | None
-    prompt_hash: PromptHash
-    model: str
-    schema_version: Annotated[int, Field(ge=1)]
-    created_at: AwareDatetime
-    summary: str
-    key_claims: tuple[Claim, ...] = ()
-    people: tuple[Entity, ...] = ()
-    papers: tuple[Entity, ...] = ()
-    companies: tuple[Entity, ...] = ()
-    tools: tuple[Entity, ...] = ()
-    topics: tuple[Entity, ...] = ()
-    open_questions: tuple[str, ...] = ()
-    research_leads: tuple[ResearchLead, ...] = ()
-    prompt_response: str | None = None
-    warnings: tuple[str, ...] = ()
-
-    @model_validator(mode="after")
-    def _hash_matches(self) -> Self:
-        if self.prompt_hash != prompt_hash(self.prompt, self.model, self.schema_version):
-            raise ValueError("prompt_hash does not match prompt, model and schema_version")
-        return self
-
-
-class StoreResult(Model):
-    note_path: str
-    transcript_note_path: str | None = None
-    warnings: tuple[str, ...] = ()
-
-    @field_validator("note_path", "transcript_note_path")
-    @classmethod
-    def _relative(cls, value: str | None) -> str | None:
-        return None if value is None else _check_relative_posix(value)
-
-
 class ShareRecord(Model):
     """Content of ``shared.json``: the earliest time the episode was shared."""
 
@@ -341,14 +225,7 @@ class ShareRecord(Model):
 
 
 class JobResult(Model):
-    note_path: str | None = None
-    transcript_note_path: str | None = None
-    analysis_hash: PromptHash | None = None
-
-    @field_validator("note_path", "transcript_note_path")
-    @classmethod
-    def _relative(cls, value: str | None) -> str | None:
-        return None if value is None else _check_relative_posix(value)
+    duration_s: Seconds  # Transcript.duration_s of the finished job
 
 
 class Job(Model):
@@ -371,8 +248,6 @@ class Job(Model):
 
     @model_validator(mode="after")
     def _kind_requirements(self) -> Self:
-        if self.kind == "ingest" and self.url is None:
+        if self.url is None:
             raise ValueError("an ingest job requires url")
-        if self.kind == "reanalyze" and self.episode_key is None:
-            raise ValueError("a reanalyze job requires episode_key")
         return self

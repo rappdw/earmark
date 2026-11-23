@@ -1,12 +1,12 @@
-"""Untrusted text to file names, fold keys, Markdown and YAML. Standard library only."""
+"""Untrusted text to file names and YAML, and the frontmatter emitter. Standard library only."""
 
 import re
 import unicodedata
+from collections.abc import Sequence
+from datetime import date, datetime
 from typing import Final
 
 MAX_NAME_BYTES: Final = 200  # any file or directory name earmark creates
-TITLE_BYTES: Final = 120  # title part of a note name
-SHOW_BYTES: Final = 100  # show directory name
 ELLIPSIS: Final = "…"
 
 _ZWNJ: Final = "\u200c"
@@ -18,10 +18,13 @@ _DEVICE_NAMES: Final = frozenset(
     | {f"lpt{i}" for i in range(1, 10)}
 )
 _UNSAFE_NAME_CHARS: Final = frozenset(':*?"<>|#^[]')
-_MD_SPECIAL: Final = frozenset("`*_[]|~=$%^#")
 _YAML_ESCAPED: Final = frozenset(
     [*range(0x20), *range(0x7F, 0xA0), 0x2028, 0x2029, 0xFEFF, 0xFFFE, 0xFFFF]
 )
+
+type YamlValue = str | date | datetime | tuple[str, ...] | None  # datetime is naive local
+
+_KEY_NAME: Final = re.compile(r"[a-z][a-z0-9_]*")
 
 
 def _blen(text: str) -> int:
@@ -144,35 +147,6 @@ def file_component(text: str, *, max_bytes: int, fallback: str) -> str:
     return name
 
 
-def fold_key(name: str) -> str:
-    """Comparison key for names on case- and normalization-insensitive filesystems."""
-    nfkc = unicodedata.normalize("NFKC", name)
-    return unicodedata.normalize("NFKC", nfkc.casefold())
-
-
-def escape_markdown(text: str) -> str:
-    """Whitespace-collapse and Markdown-escape untrusted inline text."""
-    out: list[str] = []
-    for ch in " ".join(clean_unicode(text).split()):
-        if ch == "\\":
-            out.append("\\\\")
-        elif ch in _MD_SPECIAL:
-            out.append("\\" + ch)
-        elif ch == "<":
-            out.append("&lt;")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def wikilink_label(text: str) -> str:
-    """Text safe inside the display part of ``[[target|label]]``."""
-    label = " ".join(clean_unicode(text).split())
-    for ch, repl in (("[", "("), ("]", ")"), ("|", "-"), ("\\", "/"), ("<", "&lt;")):
-        label = label.replace(ch, repl)
-    return re.sub(r"%{2,}", "%", label)
-
-
 def yaml_quote(text: str) -> str:
     """A one-line YAML double-quoted scalar; only quote, backslash and control characters escape."""
     out: list[str] = []
@@ -188,7 +162,24 @@ def yaml_quote(text: str) -> str:
     return '"' + "".join(out) + '"'
 
 
-def wikilink_target_ok(target: str) -> bool:
-    if not target or "%%" in target:
-        return False
-    return not any(ch in target for ch in "#|^:[]\n\r")
+def emit_frontmatter(fields: Sequence[tuple[str, YamlValue]]) -> list[str]:
+    lines: list[str] = []
+    for key, value in fields:
+        if not _KEY_NAME.fullmatch(key):
+            raise ValueError(f"bad frontmatter key: {key!r}")
+        if value is None:
+            lines.append(f"{key}: null\n")
+        elif isinstance(value, str):
+            lines.append(f"{key}: {yaml_quote(value)}\n")
+        elif isinstance(value, datetime):
+            if value.tzinfo is not None:
+                raise ValueError("frontmatter date-times must be naive local time")
+            lines.append(f"{key}: {value.isoformat(timespec='seconds')}\n")
+        elif isinstance(value, date):
+            lines.append(f"{key}: {value.isoformat()}\n")
+        elif not value:
+            lines.append(f"{key}: []\n")
+        else:
+            lines.append(f"{key}:\n")
+            lines.extend(f"  - {yaml_quote(item)}\n" for item in value)
+    return lines

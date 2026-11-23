@@ -5,43 +5,16 @@ the stage Protocols is structural and is checked in ``tests/test_stages.py``.
 """
 
 import hashlib
-import math
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
-from typing import Final, Literal
+from pathlib import Path
+from typing import Final
 
-from earmark.artifacts import ArtifactStore, atomic_write_bytes, atomic_write_text
-from earmark.digest.model import (
-    DigestNote,
-    DigestWriteResult,
-    ThemeEntry,
-    ThemeRecord,
-    ThemeRequest,
-)
-from earmark.digest.prompts import DIGEST_SCHEMA_VERSION
+from earmark.artifacts import ArtifactStore, atomic_write_bytes
 from earmark.errors import PermanentError
-from earmark.index.chunks import NotePaths
-from earmark.index.search import SearchHit, SearchQuery, SearchResults
-from earmark.models import (
-    ANALYSIS_SCHEMA_VERSION,
-    Analysis,
-    Claim,
-    Clock,
-    Entity,
-    Episode,
-    Job,
-    ResearchLead,
-    Segment,
-    StoreResult,
-    Transcript,
-    episode_key,
-    prompt_hash,
-)
+from earmark.models import Clock, Episode, Job, Segment, Transcript, episode_key
 from earmark.pipeline.stages import Backends
-from earmark.vault.document import new_note
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -51,9 +24,6 @@ def fixed_clock(at: datetime = FAKE_NOW) -> Clock:
         return at
 
     return clock
-
-
-_DEFAULT_CLOCK: Final = fixed_clock()
 
 
 class FakeStage[C]:
@@ -92,29 +62,6 @@ class FetchCall:
 class TranscribeCall:
     episode: Episode
     audio: Path
-
-
-@dataclass(frozen=True)
-class AnalyzeCall:
-    episode: Episode
-    transcript: Transcript
-    prompt: str | None
-
-
-@dataclass(frozen=True)
-class StoreCall:
-    episode: Episode
-    transcript: Transcript
-    analyses: tuple[Analysis, ...]
-    shared_at: datetime
-
-
-@dataclass(frozen=True)
-class IndexCall:
-    episode: Episode
-    transcript: Transcript
-    analyses: tuple[Analysis, ...]
-    stored: StoreResult
 
 
 @dataclass(frozen=True)
@@ -215,238 +162,6 @@ class FakeTranscriber(FakeStage[TranscribeCall]):
         return transcript
 
 
-class FakeAnalyzer(FakeStage[AnalyzeCall]):
-    def __init__(
-        self,
-        artifacts: ArtifactStore,
-        *,
-        model: str = "fake-llm",
-        clock: Clock = _DEFAULT_CLOCK,
-        warnings: Sequence[str] = (),
-    ) -> None:
-        super().__init__()
-        self._artifacts = artifacts
-        self.model = model
-        self.clock = clock
-        self.warnings = tuple(warnings)
-        self.computed = 0
-
-    def analyze(self, episode: Episode, transcript: Transcript, prompt: str | None) -> Analysis:
-        self._enter(AnalyzeCall(episode, transcript, prompt))
-        h = prompt_hash(prompt, self.model)
-        cached = self._artifacts.read_analysis(episode.key, h)
-        if cached is not None:
-            return cached
-        t0 = transcript.segments[0].start if transcript.segments else None
-        ts = (t0,) if t0 is not None else ()
-        context = "Mentioned as an example."
-
-        def entity(name: str) -> tuple[Entity, ...]:
-            return (Entity(name=name, context=context, timestamps_s=ts),)
-
-        analysis = Analysis(
-            episode_key=episode.key,
-            prompt=prompt,
-            prompt_hash=h,
-            model=self.model,
-            schema_version=ANALYSIS_SCHEMA_VERSION,
-            created_at=self.clock(),
-            summary=f"Fake summary of {episode.title}.",
-            key_claims=(Claim(text="The fake episode makes a claim.", timestamp_s=t0),),
-            people=entity("Ada Lovelace"),
-            papers=entity("On Computable Numbers"),
-            companies=entity("Acme Corp"),
-            tools=entity("Fake Tool"),
-            topics=entity("Testing"),
-            open_questions=("What did the fake episode leave out?",),
-            research_leads=(
-                ResearchLead(
-                    text="Follow up on the fake claim.", rationale="It is a test.", timestamp_s=t0
-                ),
-            ),
-            prompt_response=f"Fake response to: {prompt}" if prompt is not None else None,
-            warnings=self.warnings,
-        )
-        self._artifacts.write_analysis(analysis)
-        self.computed += 1
-        return analysis
-
-
-class FakeStore(FakeStage[StoreCall]):
-    def __init__(self, vault_dir: Path | None = None, subdir: str = "Earmark") -> None:
-        super().__init__()
-        pure = PurePosixPath(subdir)
-        if not subdir or pure.is_absolute() or "\\" in subdir or ".." in pure.parts:
-            raise ValueError("subdir must be a relative POSIX path without '..'")
-        self.vault_dir = vault_dir
-        self.subdir = subdir
-        self.digest_calls: list[DigestNote] = []
-
-    def write_digest(self, note: DigestNote, /) -> DigestWriteResult:
-        """Records the call and, with ``vault_dir``, writes the digest note whole."""
-        self.digest_calls.append(note)
-        path = f"{self.subdir}/Digests/{note.file_stem}.md"
-        status: Literal["created", "updated", "unchanged"] = "unchanged"
-        if self.vault_dir is not None:
-            paths = {
-                key: NotePaths(found.note_path, None)
-                for key, found in self.locate_notes(note.episode_keys).items()
-                if found.note_path is not None and (self.vault_dir / found.note_path).is_file()
-            }
-            target = self.vault_dir / path
-            text = new_note(note.owned, note.seeds, note.render(paths))
-            try:
-                before: str | None = target.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                before = None
-            if before != text:
-                atomic_write_text(target, text)
-                status = "created" if before is None else "updated"
-        return DigestWriteResult(note_path=path, status=status)
-
-    def store(
-        self,
-        episode: Episode,
-        transcript: Transcript,
-        analyses: Sequence[Analysis],
-        shared_at: datetime,
-    ) -> StoreResult:
-        self._enter(StoreCall(episode, transcript, tuple(analyses), shared_at))
-        result = StoreResult(
-            note_path=f"{self.subdir}/Podcasts/{episode.key}.md", transcript_note_path=None
-        )
-        if self.vault_dir is not None:
-            newest_first = sorted(
-                analyses, key=lambda a: (a.created_at, a.prompt_hash), reverse=True
-            )
-            parts = [f"# {episode.title}\n"]
-            parts.extend(
-                f"\n## {a.prompt or 'Default analysis'}\n\n{a.summary}\n" for a in newest_first
-            )
-            atomic_write_text(self.vault_dir / result.note_path, "".join(parts))
-        return result
-
-    def locate_notes(self, keys: Sequence[str], /) -> dict[str, NotePaths]:
-        """The paths ``store`` returns, for every key."""
-        return {k: NotePaths(f"{self.subdir}/Podcasts/{k}.md", None) for k in keys}
-
-
-class FakeThemer(FakeStage[ThemeRequest]):
-    """Satisfies ``Themer``: one theme per show, in order of the show's first lead."""
-
-    model = "fake-themes"
-
-    def themes(self, request: ThemeRequest, /) -> ThemeRecord:
-        self._enter(request)
-        by_show: dict[str, list[str]] = {}
-        for lead in request.leads:
-            by_show.setdefault(request.episodes[lead.episode_key].show_title, []).append(
-                lead.lead_id
-            )
-        themes = tuple(
-            ThemeEntry(title=show, summary=f"Research leads from {show}.", leads=tuple(ids))
-            for show, ids in by_show.items()
-        )
-        return ThemeRecord(
-            version=DIGEST_SCHEMA_VERSION,
-            input_hash=request.input_hash,
-            model=self.model,
-            themes=themes,
-            requests=0,
-        )
-
-    def close(self) -> None:
-        return None
-
-
-class FakeIndexer(FakeStage[IndexCall]):
-    def __init__(self) -> None:
-        super().__init__()
-        self.rows: dict[str, int] = {}
-
-    def index(
-        self,
-        episode: Episode,
-        transcript: Transcript,
-        analyses: Sequence[Analysis],
-        stored: StoreResult,
-    ) -> None:
-        self._enter(IndexCall(episode, transcript, tuple(analyses), stored))
-        self.rows[episode.key] = 1 + len(analyses)
-
-
-class FakeEmbedder:
-    """Deterministic embeddings that rank by shared words. Satisfies ``Embedder``.
-
-    Each token (``\\w+``, casefolded) adds +-1 at an index derived from its sha256; the
-    vector is L2-normalised, and a text with no tokens is the unit vector on index 0.
-    """
-
-    def __init__(
-        self, *, model: str = "fake-embed-v1", dim: int = 64, max_chars: int = 1000
-    ) -> None:
-        if dim < 1:
-            raise ValueError("dim must be >= 1")
-        self._model = model
-        self._dim = dim
-        self._max_chars = max_chars
-        self.documents: list[str] = []  # every text embed_documents received
-        self.queries: list[str] = []
-        self._failures: list[Exception] = []
-
-    @property
-    def model(self) -> str:
-        return self._model
-
-    @property
-    def dim(self) -> int:
-        return self._dim
-
-    def fail_next(self, exc: Exception, times: int = 1) -> None:
-        if times < 1:
-            raise ValueError("times must be >= 1")
-        self._failures.extend([exc] * times)
-
-    def fits(self, text: str, /) -> bool:
-        return len(text) <= self._max_chars
-
-    def _vector(self, text: str) -> list[float]:
-        values = [0.0] * self._dim
-        for token in re.findall(r"\w+", text.casefold()):
-            digest = hashlib.sha256(token.encode()).digest()
-            values[int.from_bytes(digest[:4]) % self._dim] += 1.0 if digest[4] & 1 == 0 else -1.0
-        norm = math.sqrt(sum(v * v for v in values))
-        if norm == 0.0:
-            values[0] = 1.0
-            return values
-        return [v / norm for v in values]
-
-    def _maybe_fail(self) -> None:
-        if self._failures:
-            raise self._failures.pop(0)
-
-    def embed_documents(self, texts: Sequence[str], /) -> list[list[float]]:
-        self._maybe_fail()
-        self.documents.extend(texts)
-        return [self._vector(t) for t in texts]
-
-    def embed_query(self, text: str, /) -> list[float]:
-        self._maybe_fail()
-        self.queries.append(text)
-        return self._vector(text)
-
-
-class FakeSearcher(FakeStage[SearchQuery]):
-    def __init__(self, hits: Sequence[SearchHit] = (), *, index_exists: bool = True) -> None:
-        super().__init__()
-        self._hits = tuple(hits)
-        self._index_exists = index_exists
-
-    def search(self, query: SearchQuery, /) -> SearchResults:
-        self._enter(query)
-        return SearchResults(hits=self._hits[: query.limit], index_exists=self._index_exists)
-
-
 class FakeNotifier(FakeStage[NotifyCall]):
     def notify(self, job: Job, episode: Episode | None) -> None:
         self._enter(NotifyCall(job, episode))
@@ -458,9 +173,6 @@ class FakeBackends:
     resolver: FakeResolver
     fetcher: FakeAudioFetcher
     transcriber: FakeTranscriber
-    analyzer: FakeAnalyzer
-    store: FakeStore
-    indexer: FakeIndexer
     notifier: FakeNotifier
 
     def backends(self) -> Backends:
@@ -468,28 +180,16 @@ class FakeBackends:
             resolver=self.resolver,
             fetcher=self.fetcher,
             transcriber=self.transcriber,
-            analyzer=self.analyzer,
-            store=self.store,
-            indexer=self.indexer,
             notifier=self.notifier,
         )
 
 
-def make_fake_backends(
-    data_dir: Path,
-    *,
-    vault_dir: Path | None = None,
-    subdir: str = "Earmark",
-    clock: Clock = _DEFAULT_CLOCK,
-) -> FakeBackends:
+def make_fake_backends(data_dir: Path) -> FakeBackends:
     artifacts = ArtifactStore(data_dir)
     return FakeBackends(
         artifacts=artifacts,
         resolver=FakeResolver(),
         fetcher=FakeAudioFetcher(artifacts),
         transcriber=FakeTranscriber(artifacts),
-        analyzer=FakeAnalyzer(artifacts, clock=clock),
-        store=FakeStore(vault_dir, subdir),
-        indexer=FakeIndexer(),
         notifier=FakeNotifier(),
     )

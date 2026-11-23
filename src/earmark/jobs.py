@@ -152,43 +152,23 @@ class JobStore:
     ) -> Enqueued:
         if not url.strip():
             raise ValueError("url must not be empty")
-        return self._enqueue("ingest", url, None, url, prompt, shared_at)
+        return self._enqueue(url, prompt, shared_at)
 
-    def enqueue_reanalyze(
-        self,
-        episode_key: str,
-        *,
-        prompt: str | None = None,
-        shared_at: datetime | None = None,
-    ) -> Enqueued:
-        if not is_episode_key(episode_key):
-            raise ValueError("episode_key must be 20 lowercase hex characters")
-        return self._enqueue("reanalyze", episode_key, episode_key, None, prompt, shared_at)
-
-    def _enqueue(
-        self,
-        kind: JobKind,
-        subject: str,
-        episode_key: str | None,
-        url: str | None,
-        prompt: str | None,
-        shared_at: datetime | None,
-    ) -> Enqueued:
+    def _enqueue(self, url: str, prompt: str | None, shared_at: datetime | None) -> Enqueued:
         now = self._now()
         shared = now if shared_at is None else _check_aware(shared_at)
         job = Job(
             id=uuid.uuid4().hex,
-            kind=kind,
+            kind="ingest",
             status="queued",
             url=url,
             prompt=prompt,
-            episode_key=episode_key,
             run_after=now,
             shared_at=shared,
             created_at=now,
             updated_at=now,
         )
-        key = _dedupe_key(kind, subject, prompt)
+        key = _dedupe_key("ingest", url, prompt)
         with self._db.transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE dedupe_key = ? AND status IN ('queued', 'running')",
@@ -198,17 +178,15 @@ class JobStore:
                 return Enqueued(_row_to_job(row), False)
             conn.execute(
                 """
-                INSERT INTO jobs (id, kind, status, url, prompt, episode_key, dedupe_key,
+                INSERT INTO jobs (id, kind, status, url, prompt, dedupe_key,
                                   attempts, run_after, warnings, shared_at, created_at,
                                   updated_at)
-                VALUES (?, ?, 'queued', ?, ?, ?, ?, 0, ?, '[]', ?, ?, ?)
+                VALUES (?, 'ingest', 'queued', ?, ?, ?, 0, ?, '[]', ?, ?, ?)
                 """,
                 (
                     job.id,
-                    kind,
                     url,
                     prompt,
-                    episode_key,
                     key,
                     _to_db(now),
                     _to_db(shared),

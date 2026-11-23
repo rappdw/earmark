@@ -21,8 +21,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# Replace the second path with your vault folder (EARMARK_VAULT_DIR).
-ReadWritePaths=/srv/earmark/data /home/you/Obsidian/Vault
+ReadWritePaths=/srv/earmark/data
 
 [Install]
 WantedBy=multi-user.target

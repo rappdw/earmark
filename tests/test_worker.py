@@ -117,7 +117,6 @@ def test_without_heartbeat_long_stage_is_requeued(tmp_path: Path) -> None:
     assert job.error.startswith("worker stopped responding")
     assert job.result is None
     assert env.fakes.notifier.call_count == 0
-    assert env.fakes.analyzer.call_count == 0
 
 
 def test_heartbeat_thread_survives_store_errors(
@@ -217,7 +216,7 @@ class _SignalingNotifier:
 
 
 def test_sigterm_during_notify_finishes(tmp_path: Path) -> None:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     notifier = _SignalingNotifier(fakes.notifier)
     env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), notifier=notifier))
     first = env.jobs.enqueue(CANON, prompt="one").job

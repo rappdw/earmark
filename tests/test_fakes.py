@@ -6,36 +6,26 @@ import pytest
 
 from earmark.errors import PermanentError, TransientError
 from earmark.fakes import (
-    FAKE_NOW,
-    AnalyzeCall,
-    FakeAnalyzer,
     FakeAudioFetcher,
     FakeBackends,
-    FakeIndexer,
     FakeNotifier,
     FakeResolver,
-    FakeStore,
     FakeTranscriber,
     FetchCall,
     ResolveCall,
     TranscribeCall,
-    fixed_clock,
     make_fake_backends,
 )
-from earmark.models import Analysis, Episode, StoreResult, Transcript, prompt_hash
-from tests.factories import T0, make_analysis, make_episode, make_job, make_transcript
+from earmark.models import Episode, Transcript
+from tests.factories import make_episode, make_job
 
 URL = "https://podcasts.apple.com/us/podcast/x/id1?i=2"
 
 
-def _run(
-    fb: FakeBackends, prompt: str | None = "Q?"
-) -> tuple[Episode, Transcript, Analysis, StoreResult]:
+def _run(fb: FakeBackends) -> tuple[Episode, Transcript]:
     ep = fb.resolver.resolve(URL)
     audio = fb.fetcher.fetch(ep)
-    tr = fb.transcriber.transcribe(ep, audio)
-    an = fb.analyzer.analyze(ep, tr, prompt)
-    return ep, tr, an, fb.store.store(ep, tr, [an], FAKE_NOW)
+    return ep, fb.transcriber.transcribe(ep, audio)
 
 
 def _tree(root: Path) -> dict[str, bytes]:
@@ -43,12 +33,12 @@ def _tree(root: Path) -> dict[str, bytes]:
 
 
 def test_fakes_deterministic(tmp_path: Path) -> None:
-    a = make_fake_backends(tmp_path / "a" / "data", vault_dir=tmp_path / "a" / "vault")
-    b = make_fake_backends(tmp_path / "b" / "data", vault_dir=tmp_path / "b" / "vault")
+    a = make_fake_backends(tmp_path / "a" / "data")
+    b = make_fake_backends(tmp_path / "b" / "data")
     assert _run(a) == _run(b)
     tree_a, tree_b = _tree(tmp_path / "a"), _tree(tmp_path / "b")
     assert tree_a == tree_b
-    assert len(tree_a) == 5  # audio, transcript x2, analysis, note
+    assert len(tree_a) == 3  # audio, transcript x2
 
 
 def test_resolver_same_url_same_episode() -> None:
@@ -71,19 +61,13 @@ def test_resolver_mapping_wins() -> None:
 
 def test_call_counts(tmp_path: Path) -> None:
     fb = make_fake_backends(tmp_path)
-    ep, tr, an, res = _run(fb)
+    ep, _ = _run(fb)
     audio = fb.artifacts.audio_path(ep.key, "mp3")
     job = make_job()
-    fb.indexer.index(ep, tr, [an], res)
     fb.notifier.notify(job, None)
     assert fb.resolver.calls == [ResolveCall(URL)]
     assert fb.fetcher.calls == [FetchCall(ep)]
     assert fb.transcriber.calls == [TranscribeCall(ep, audio)]
-    assert fb.analyzer.calls == [AnalyzeCall(ep, tr, "Q?")]
-    assert fb.store.call_count == 1
-    assert fb.store.calls[0].analyses == (an,)
-    assert fb.store.calls[0].shared_at == FAKE_NOW
-    assert fb.indexer.calls[0].stored == res
     assert fb.notifier.calls[0].job == job
     assert fb.notifier.calls[0].episode is None
     assert fb.notifier.call_count == 1
@@ -107,21 +91,6 @@ def test_transcriber_cache_hit_not_computed(tmp_path: Path) -> None:
     assert fb.transcriber.transcribe(ep, audio) == first
     assert (fb.transcriber.call_count, fb.transcriber.computed) == (2, 1)
     assert first.duration_s == 900.0
-
-
-def test_analyzer_cache_hit_not_computed(tmp_path: Path) -> None:
-    fb = make_fake_backends(tmp_path)
-    ep, tr, an, _ = _run(fb)
-    assert fb.analyzer.analyze(ep, tr, "Q?") == an
-    assert (fb.analyzer.call_count, fb.analyzer.computed) == (2, 1)
-
-
-def test_analyzer_new_prompt_computes(tmp_path: Path) -> None:
-    fb = make_fake_backends(tmp_path)
-    ep, tr, _, _ = _run(fb)
-    fb.analyzer.analyze(ep, tr, "Other?")
-    assert fb.analyzer.computed == 2
-    assert len(list(fb.artifacts.analyses_dir(ep.key).glob("*.json"))) == 2
 
 
 def test_fail_next_once_then_succeeds(tmp_path: Path) -> None:
@@ -158,7 +127,7 @@ def _stages(
     tmp_path: Path,
 ) -> list[tuple[Callable[[], int], Callable[[Exception], None], Callable[[], object]]]:
     fb = make_fake_backends(tmp_path)
-    ep, tr, an, res = _run(fb)
+    ep, _ = _run(fb)
     audio = fb.artifacts.audio_path(ep.key, "mp3")
     return [
         (
@@ -173,21 +142,6 @@ def _stages(
             lambda: fb.transcriber.transcribe(ep, audio),
         ),
         (
-            lambda: fb.analyzer.call_count,
-            fb.analyzer.fail_next,
-            lambda: fb.analyzer.analyze(ep, tr, None),
-        ),
-        (
-            lambda: fb.store.call_count,
-            fb.store.fail_next,
-            lambda: fb.store.store(ep, tr, [an], FAKE_NOW),
-        ),
-        (
-            lambda: fb.indexer.call_count,
-            fb.indexer.fail_next,
-            lambda: fb.indexer.index(ep, tr, [an], res),
-        ),
-        (
             lambda: fb.notifier.call_count,
             fb.notifier.fail_next,
             lambda: fb.notifier.notify(make_job(), ep),
@@ -195,9 +149,9 @@ def _stages(
     ]
 
 
-@pytest.mark.parametrize("index", range(7))
-def test_every_fake_supports_fail_next(tmp_path: Path, index: int) -> None:
-    count, fail_next, invoke = _stages(tmp_path)[index]
+@pytest.mark.parametrize("stage_number", range(4))
+def test_every_fake_supports_fail_next(tmp_path: Path, stage_number: int) -> None:
+    count, fail_next, invoke = _stages(tmp_path)[stage_number]
     before = count()
     fail_next(PermanentError("boom"))
     with pytest.raises(PermanentError, match="boom"):
@@ -208,56 +162,18 @@ def test_every_fake_supports_fail_next(tmp_path: Path, index: int) -> None:
 
 
 def test_fake_pipeline_writes_artifacts(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    fb = make_fake_backends(tmp_path / "data", vault_dir=vault)
-    ep, _, an, res = _run(fb)
+    fb = make_fake_backends(tmp_path / "data")
+    ep, _ = _run(fb)
     a = fb.artifacts
     assert not a.episode_path(ep.key).exists()
     assert a.find_audio(ep.key) == a.audio_path(ep.key, "mp3")
     assert a.transcript_json_path(ep.key).is_file()
     assert a.transcript_text_path(ep.key).is_file()
-    assert a.analysis_path(ep.key, an.prompt_hash).is_file()
-    assert (vault / res.note_path).is_file()
-    assert res.note_path == f"Earmark/Podcasts/{ep.key}.md"
-    note = (vault / res.note_path).read_text()
-    assert note.startswith(f"# {ep.title}\n")
-    assert "## Q?" in note
-
-
-def test_store_twice_same_bytes(tmp_path: Path) -> None:
-    fb = make_fake_backends(tmp_path / "d", vault_dir=tmp_path / "v")
-    ep, tr, an, res = _run(fb, prompt=None)
-    path = tmp_path / "v" / res.note_path
-    first = path.read_bytes()
-    second_an = make_analysis(guid=ep.guid, prompt="newer", created_at=T0)
-    for analyses in ([an], [an, second_an], [second_an, an]):
-        fb.store.store(ep, tr, analyses, FAKE_NOW)
-        fb.store.store(ep, tr, analyses, FAKE_NOW)
-    assert path.read_bytes() == _two_analysis_note(ep.title, an, second_an)
-    assert first.startswith(b"# ")
-    assert b"## Default analysis" in first
-
-
-def _two_analysis_note(title: str, a: Analysis, b: Analysis) -> bytes:
-    newest, oldest = sorted((a, b), key=lambda x: (x.created_at, x.prompt_hash), reverse=True)
-    return (
-        f"# {title}\n\n## {newest.prompt or 'Default analysis'}\n\n{newest.summary}\n"
-        f"\n## {oldest.prompt or 'Default analysis'}\n\n{oldest.summary}\n"
-    ).encode()
-
-
-def test_store_without_vault_writes_nothing(tmp_path: Path) -> None:
-    store = FakeStore()
-    ep = make_episode()
-    res = store.store(ep, make_transcript(), [], FAKE_NOW)
-    assert res.transcript_note_path is None
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_store_rejects_bad_subdir() -> None:
-    for bad in ("/abs", "../x", ""):
-        with pytest.raises(ValueError, match="subdir"):
-            FakeStore(subdir=bad)
+    assert sorted(p.name for p in a.episode_dir(ep.key).iterdir()) == [
+        "audio.mp3",
+        "transcript.json",
+        "transcript.txt",
+    ]
 
 
 def test_transcriber_missing_audio_is_permanent(tmp_path: Path) -> None:
@@ -268,40 +184,14 @@ def test_transcriber_missing_audio_is_permanent(tmp_path: Path) -> None:
     assert fb.transcriber.computed == 0
 
 
-def test_analyzer_prompt_response(tmp_path: Path) -> None:
-    fb = make_fake_backends(tmp_path)
-    ep, tr, _, _ = _run(fb, prompt=None)
-    assert fb.analyzer.analyze(ep, tr, None).prompt_response is None
-    answer = fb.analyzer.analyze(ep, tr, "Why?").prompt_response
-    assert answer is not None
-    assert "Why?" in answer
-    assert fb.analyzer.analyze(ep, tr, "Why?").prompt_hash == prompt_hash("Why?", "fake-llm")
-
-
 def test_fake_warnings_flow(tmp_path: Path) -> None:
     artifacts = make_fake_backends(tmp_path).artifacts
     transcriber = FakeTranscriber(artifacts, warnings=["tw"])
-    analyzer = FakeAnalyzer(artifacts, warnings=["aw"], clock=fixed_clock(T0))
     ep = FakeResolver().resolve(URL)
     audio = FakeAudioFetcher(artifacts).fetch(ep)
     tr = transcriber.transcribe(ep, audio)
-    an = analyzer.analyze(ep, tr, None)
     assert tr.warnings == ("tw",)
-    assert an.warnings == ("aw",)
-    assert an.created_at == T0
     assert transcriber.transcribe(ep, audio).warnings == ("tw",)
-    assert analyzer.analyze(ep, tr, None).warnings == ("aw",)
-
-
-def test_indexer_rows_replace(tmp_path: Path) -> None:
-    fb = make_fake_backends(tmp_path)
-    ep, tr, an, res = _run(fb)
-    idx = FakeIndexer()
-    idx.index(ep, tr, [an], res)
-    idx.index(ep, tr, [an], res)
-    assert idx.rows == {ep.key: 2}
-    idx.index(ep, tr, [], res)
-    assert idx.rows == {ep.key: 1}
 
 
 def test_notifier_records() -> None:
@@ -316,60 +206,4 @@ def test_fake_backends_as_backends(tmp_path: Path) -> None:
     assert b.resolver is fb.resolver
     assert b.fetcher is fb.fetcher
     assert b.transcriber is fb.transcriber
-    assert b.analyzer is fb.analyzer
-    assert b.store is fb.store
-    assert b.indexer is fb.indexer
     assert b.notifier is fb.notifier
-
-
-# -- digest fakes ------------------------------------------------------------------------------
-
-
-def test_fake_themer_one_theme_per_show() -> None:
-    from earmark.digest.model import DigestLead, ThemeRequest
-    from earmark.fakes import FakeThemer
-    from tests.factories import make_episode
-
-    a = make_episode(guid="a").model_copy(update={"show_title": "Show A"})
-    b = make_episode(guid="b").model_copy(update={"show_title": "Show B"})
-    leads = (
-        DigestLead("L1", b.key, "x", "", None),
-        DigestLead("L2", a.key, "y", "", None),
-        DigestLead("L3", b.key, "z", "", None),
-    )
-    themer = FakeThemer()
-    record = themer.themes(ThemeRequest("0" * 16, leads, {a.key: a, b.key: b}))
-    assert themer.model == "fake-themes"
-    assert [(t.title, t.leads) for t in record.themes] == [
-        ("Show B", ("L1", "L3")),
-        ("Show A", ("L2",)),
-    ]
-    assert record.themes[0].summary == "Research leads from Show B."
-    assert (record.requests, record.warnings) == (0, ())
-    assert themer.call_count == 1
-    themer.fail_next(RuntimeError("boom"))
-    with pytest.raises(RuntimeError):
-        themer.themes(ThemeRequest("0" * 16, leads, {a.key: a, b.key: b}))
-
-
-def test_fake_store_write_digest_statuses(tmp_path: Path) -> None:
-    from earmark.digest.model import DigestNote
-    from earmark.fakes import FakeStore
-
-    text = ["one"]
-    note = DigestNote(
-        "2026-W47",
-        "2026-W47",
-        (("earmark", "digest"),),
-        (),
-        ("a" * 20,),
-        lambda paths: f"{text[0]} {sorted(paths)}\n",
-    )
-    store = FakeStore(tmp_path, "Earmark")
-    first = store.write_digest(note)
-    assert (first.status, first.note_path) == ("created", "Earmark/Digests/2026-W47.md")
-    assert store.write_digest(note).status == "unchanged"
-    text[0] = "two"
-    assert store.write_digest(note).status == "updated"
-    assert len(store.digest_calls) == 3
-    assert FakeStore().write_digest(note).status == "unchanged"

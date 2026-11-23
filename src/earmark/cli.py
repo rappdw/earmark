@@ -4,9 +4,8 @@ import json
 import logging
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import Annotated
 
 import typer
 
@@ -17,21 +16,14 @@ from earmark.jobs import LIST_LIMIT_MAX
 from earmark.log import configure_logging
 from earmark.models import Job, JobStatus
 
-if TYPE_CHECKING:
-    from earmark.episodes import EpisodeInfo
-
 logger = logging.getLogger(__name__)
 
 app = typer.Typer(
     name="earmark",
     no_args_is_help=True,
     add_completion=False,
-    help="Share a podcast episode, get a research note.",
+    help="Share a podcast episode, get its transcript.",
 )
-
-
-entities_app = typer.Typer(no_args_is_help=True, help="The entity registry.")
-app.add_typer(entities_app, name="entities")
 
 
 def _version_callback(value: bool) -> None:
@@ -52,7 +44,7 @@ def main(
         ),
     ] = False,
 ) -> None:
-    """Share a podcast episode, get a research note."""
+    """Share a podcast episode, get its transcript."""
 
 
 def _load_or_exit() -> Settings:
@@ -107,29 +99,15 @@ def serve_command() -> None:
     configure_logging(settings.log_level, settings.secret_values())
     from earmark.api.app import create_app
     from earmark.api.auth import ApiTokenError
-    from earmark.index.search import Searcher, UnavailableSearcher
-    from earmark.pipeline.factory import build_searcher
 
-    # Building the searcher creates nothing; its warning is logged only once the token and the
-    # job store are known to be fine, so those errors keep their place and exit codes.
-    searcher: Searcher
-    unavailable: str | None = None
     try:
-        built = build_searcher(settings)
-        searcher = built or UnavailableSearcher("search is turned off (EARMARK_INDEX_BACKEND=none)")
-    except ConfigError as exc:
-        unavailable = exc.errors[0] if exc.errors else "search is unavailable"
-        searcher = UnavailableSearcher(unavailable)
-    try:
-        api = create_app(settings, searcher=searcher)
+        api = create_app(settings)
     except ApiTokenError as exc:
         typer.echo(f"earmark serve: {exc}", err=True)
         raise typer.Exit(code=2) from None
     except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
         typer.echo(f"earmark serve: cannot open the job store: {exc}", err=True)
         raise typer.Exit(code=1) from None
-    if unavailable is not None:
-        logger.warning("search is unavailable: %s", unavailable)
     import uvicorn
 
     uvicorn.run(api, host=settings.host, port=settings.port, log_config=None, server_header=False)
@@ -169,7 +147,9 @@ def worker_command(
 @app.command("submit")
 def submit_command(
     url: Annotated[str, typer.Argument(help="Apple Podcasts episode URL.")],
-    prompt: Annotated[str | None, typer.Option("--prompt", help="Analysis prompt.")] = None,
+    prompt: Annotated[
+        str | None, typer.Option("--prompt", help="A prompt to keep with the job.")
+    ] = None,
 ) -> None:
     """Enqueue an episode, the same way POST /ingest does."""
     settings = _load_or_exit()
@@ -198,124 +178,6 @@ def submit_command(
         raise typer.Exit(code=1) from None
     suffix = "" if enqueued.created else " (existing job)"
     typer.echo(f"{enqueued.job.id} {enqueued.job.status}{suffix}")
-
-
-@app.command("reanalyze")
-def reanalyze_command(
-    episode_key: Annotated[str, typer.Argument(help="Episode key; see `earmark episodes`.")],
-    prompt: Annotated[str | None, typer.Option("--prompt", help="Analysis prompt.")] = None,
-) -> None:
-    """Run a prompt on a stored episode: enqueue a job that starts at analysis."""
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from pydantic import ValidationError
-
-    from earmark.artifacts import ArtifactStore
-    from earmark.episodes import (
-        EpisodeNotFoundError,
-        TranscriptMissingError,
-        enqueue_reanalyze,
-    )
-    from earmark.jobs import open_job_store
-    from earmark.models import ReanalyzeRequest, is_episode_key
-
-    if not is_episode_key(episode_key):
-        typer.echo(f"earmark reanalyze: not an episode key: {_clean(episode_key)}", err=True)
-        raise typer.Exit(code=2)
-    try:
-        request = ReanalyzeRequest(prompt=prompt)
-    except ValidationError as exc:
-        errors = exc.errors(include_input=False, include_url=False)
-        typer.echo("earmark reanalyze: " + "; ".join(str(e["msg"]) for e in errors), err=True)
-        raise typer.Exit(code=2) from None
-    try:
-        store = open_job_store(settings)
-        enqueued = enqueue_reanalyze(store, ArtifactStore(settings.data_dir), episode_key, request)
-    except EpisodeNotFoundError:
-        typer.echo(
-            f"earmark reanalyze: no episode {episode_key} under EARMARK_DATA_DIR; "
-            "see `earmark episodes`",
-            err=True,
-        )
-        raise typer.Exit(code=1) from None
-    except TranscriptMissingError as exc:
-        typer.echo(f"earmark reanalyze: episode {episode_key}: {exc.message}", err=True)
-        raise typer.Exit(code=1) from None
-    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
-        typer.echo(f"earmark reanalyze: cannot open the job store: {exc}", err=True)
-        raise typer.Exit(code=1) from None
-    suffix = "" if enqueued.created else " (existing job)"
-    typer.echo(f"{enqueued.job.id} {enqueued.job.status}{suffix}")
-
-
-PROMPT_SHOWN_CHARS = 200
-
-
-def _episode_lines(info: "EpisodeInfo", settings: Settings) -> list[str]:
-    from zoneinfo import ZoneInfo
-
-    if info.published_at is None:
-        date = "-"
-    else:
-        tz = ZoneInfo(settings.tz) if settings.tz else None
-        date = info.published_at.astimezone(tz).strftime("%Y-%m-%d")
-    lines = [_clean(f"{info.key}  {date}  {info.show} \u2014 {info.title}")]
-    for a in info.analyses:
-        if a.prompt is None:
-            shown = "(default analysis)"
-        else:
-            shown = " ".join(a.prompt.split())
-            if len(shown) > PROMPT_SHOWN_CHARS:
-                shown = shown[: PROMPT_SHOWN_CHARS - 1] + "\u2026"
-        lines.append(_clean(f"  {a.prompt_hash}  {a.model}  {shown}"))
-    if not info.has_transcript:
-        lines.append("  no transcript yet")
-    return lines
-
-
-@app.command("episodes")
-def episodes_command(
-    limit: Annotated[
-        int,
-        typer.Option("--limit", min=1, max=200, help="How many episodes to show."),
-    ] = 50,
-    offset: Annotated[int, typer.Option("--offset", min=0, help="Skip this many.")] = 0,
-    as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
-) -> None:
-    """List stored episodes, newest share first, with the prompts already run."""
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from earmark.artifacts import ArtifactStore
-    from earmark.episodes import EPISODES_OFFSET_MAX, list_episodes
-    from earmark.errors import TransientError
-
-    if offset > EPISODES_OFFSET_MAX:
-        typer.echo(f"earmark episodes: --offset must be at most {EPISODES_OFFSET_MAX}", err=True)
-        raise typer.Exit(code=2)
-    try:
-        page = list_episodes(ArtifactStore(settings.data_dir), limit=limit, offset=offset)
-    except TransientError as exc:
-        typer.echo(
-            f"earmark episodes: {_clean(exc.message)} (temporary; try again later)", err=True
-        )
-        raise typer.Exit(code=1) from None
-    if as_json:
-        typer.echo(page.model_dump_json())
-        return
-    if page.total == 0:
-        typer.echo("no episodes")
-        return
-    if not page.episodes:
-        typer.echo(f"no episodes at offset {offset} (total {page.total})")
-        return
-    for info in page.episodes:
-        for line in _episode_lines(info, settings):
-            typer.echo(line)
-    if offset > 0 or page.next_offset is not None:
-        footer = f"showing {offset + 1}-{offset + len(page.episodes)} of {page.total}"
-        if page.next_offset is not None:
-            footer += f"; next: --offset {page.next_offset}"
-        typer.echo(footer)
 
 
 def _clean(value: object) -> str:
@@ -488,368 +350,3 @@ def transcribe_command(
         return
     for line in transcript.to_text().splitlines():
         typer.echo(_clean(line))
-
-
-@app.command("analyze")
-def analyze_command(
-    episode_key: Annotated[str, typer.Argument(help="Episode key (see data/episodes/).")],
-    prompt: Annotated[str | None, typer.Option("--prompt", help="Analysis prompt.")] = None,
-    as_json: Annotated[bool, typer.Option("--json", help="Print the Analysis as JSON.")] = False,
-) -> None:
-    """Analyze an episode's stored transcript and print the analysis.
-
-    Writes `analyses/<hash>.json` (or reuses it); does not update the vault note.
-    """
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from earmark.analyze.analyzer import LlmAnalyzer
-    from earmark.analyze.render import render_analysis
-    from earmark.artifacts import ArtifactStore
-    from earmark.errors import PermanentError, TransientError
-    from earmark.models import is_episode_key, normalize_prompt
-    from earmark.pipeline.factory import build_analyzer
-
-    if not is_episode_key(episode_key):
-        typer.echo(f"earmark analyze: not an episode key: {_clean(episode_key)}", err=True)
-        raise typer.Exit(code=2)
-    try:
-        normalised = normalize_prompt(prompt)
-    except ValueError as exc:
-        typer.echo(f"earmark analyze: {exc}", err=True)
-        raise typer.Exit(code=2) from None
-    try:
-        analyzer = build_analyzer(settings)
-    except ConfigError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2) from None
-    try:
-        artifacts = ArtifactStore(settings.data_dir)
-        episode = artifacts.read_episode(episode_key)
-        transcript = artifacts.read_transcript(episode_key)
-        if episode is None or transcript is None:
-            what = "episode" if episode is None else "transcript"
-            typer.echo(
-                f"earmark analyze: no {what} for {episode_key} under EARMARK_DATA_DIR; "
-                "share the episode first",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        analysis = analyzer.analyze(episode, transcript, normalised)
-    except TransientError as exc:
-        typer.echo(f"earmark analyze: {_clean(exc.message)} (temporary; try again later)", err=True)
-        raise typer.Exit(code=1) from None
-    except PermanentError as exc:
-        typer.echo(f"earmark analyze: {_clean(exc.message)}", err=True)
-        raise typer.Exit(code=1) from None
-    finally:
-        if isinstance(analyzer, LlmAnalyzer):
-            analyzer.close()
-    for warning in analysis.warnings:
-        typer.echo(f"earmark analyze: warning: {_clean(warning)}", err=True)
-    if as_json:
-        typer.echo(analysis.model_dump_json(indent=2))
-        return
-    for line in render_analysis(analysis).splitlines():
-        typer.echo(_clean(line))
-
-
-def _digest_now() -> datetime:
-    """The clock of ``earmark digest``; a seam so tests can fix the date."""
-    from earmark.models import utc_now
-
-    return utc_now()
-
-
-@app.command("digest")
-def digest_command(
-    week: Annotated[
-        str | None, typer.Option("--week", help="ISO week to cover, such as 2026-W47.")
-    ] = None,
-    since: Annotated[
-        str | None, typer.Option("--since", help="The last N local days, today included: 7d.")
-    ] = None,
-    refresh: Annotated[
-        bool, typer.Option("--refresh", help="Ask the model again, ignoring cached themes.")
-    ] = False,
-    no_notify: Annotated[
-        bool, typer.Option("--no-notify", help="Do not send a notification.")
-    ] = False,
-) -> None:
-    """Write the digest note: research leads grouped into themes, for the episodes first
-    shared in a week (default: the last complete ISO week in EARMARK_TZ)."""
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from zoneinfo import ZoneInfo
-
-    from earmark.artifacts import ArtifactStore
-    from earmark.digest.cache import DigestCache
-    from earmark.digest.run import run_digest
-    from earmark.digest.window import WindowError, select_window
-    from earmark.errors import EarmarkError, TransientError
-    from earmark.notify.ntfy import compose_digest
-    from earmark.pipeline.factory import (
-        build_digest_notifier,
-        build_digest_writer,
-        build_themer,
-    )
-
-    tz = ZoneInfo(settings.tz) if settings.tz else None
-    tz_label = settings.tz or "system time zone"
-    now = _digest_now()
-    try:
-        window = select_window(week=week, since=since, now=now, tz=tz)
-    except WindowError as exc:
-        typer.echo(f"earmark digest: {_clean(exc)}", err=True)
-        raise typer.Exit(code=2) from None
-    cache = DigestCache(settings.data_dir)
-    try:
-        writer = build_digest_writer(settings)
-        themer = build_themer(settings, cache)
-        notifier = None if no_notify else build_digest_notifier(settings)
-    except ConfigError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2) from None
-    try:
-        try:
-            report = run_digest(
-                window,
-                artifacts=ArtifactStore(settings.data_dir),
-                cache=cache,
-                themer=themer,
-                writer=writer,
-                tz=tz,
-                tz_label=tz_label,
-                refresh=refresh,
-            )
-        except TransientError as exc:
-            typer.echo(
-                f"earmark digest: {_clean(exc.message)} (temporary; try again later)", err=True
-            )
-            raise typer.Exit(code=1) from None
-        except EarmarkError as exc:
-            typer.echo(f"earmark digest: {_clean(exc.message)}", err=True)
-            raise typer.Exit(code=1) from None
-        except OSError as exc:
-            typer.echo(f"earmark digest: {_clean(exc)}", err=True)
-            raise typer.Exit(code=1) from None
-        finally:
-            themer.close()
-        for warning in report.warnings:
-            typer.echo(f"earmark digest: warning: {_clean(warning)}", err=True)
-
-        def count(n: int, noun: str) -> str:
-            return f"{n} {noun}{'' if n == 1 else 's'}"
-
-        tail = "; the window is not over yet" if window.weekly and window.end > now else ""
-        if report.status == "empty":
-            typer.echo(
-                _clean(
-                    f"no episodes were first shared in {window.label} ({window.first_day} to "
-                    f"{window.last_day}, {tz_label}); nothing written{tail}"
-                )
-            )
-            return
-        if report.cached:
-            detail = "themes from cache"
-        elif report.leads == 0:
-            detail = "no research leads"
-        else:
-            detail = count(report.requests, "model request")
-        summary = (
-            f"{count(report.episodes, 'episode')}, {count(report.leads, 'research lead')}, "
-            f"{count(report.themes, 'theme')} ({detail})"
-        )
-        line = (
-            f"{report.note_path} is up to date: {summary}"
-            if report.status == "unchanged"
-            else f"wrote {report.note_path}: {summary}"
-        )
-        typer.echo(_clean(line + tail))
-        if notifier is not None and report.status in ("created", "updated") and report.note_path:
-            try:
-                notifier.publish(
-                    compose_digest(
-                        label=window.label,
-                        note_path=report.note_path,
-                        episodes=report.episodes,
-                        leads=report.leads,
-                        themes=report.themes,
-                        vault_name=notifier.options.vault_name,
-                        secrets=tuple(settings.secret_values()),
-                    )
-                )
-            except EarmarkError as exc:
-                typer.echo(
-                    f"earmark digest: warning: notify failed: {_clean(exc.message)}", err=True
-                )
-    finally:
-        if notifier is not None:
-            notifier.close()
-
-
-@entities_app.command("rebuild")
-def entities_rebuild_command(
-    prune: Annotated[
-        bool,
-        typer.Option(
-            "--prune",
-            help="Proceed even when episode notes have no files under EARMARK_DATA_DIR.",
-        ),
-    ] = False,
-) -> None:
-    """Rebuild the entity registry from the stored analyses and regenerate every note."""
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from earmark.errors import PermanentError, TransientError
-    from earmark.vault.aliases import AliasFileError
-    from earmark.vault.notes import build_vault_store
-
-    try:
-        store = build_vault_store(settings)
-    except ConfigError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2) from None
-    try:
-        report = store.rebuild(prune=prune)
-    except AliasFileError as exc:
-        typer.echo(f"earmark entities rebuild: {_clean(exc.message)}", err=True)
-        raise typer.Exit(code=1) from None
-    except TransientError as exc:
-        typer.echo(
-            f"earmark entities rebuild: {_clean(exc.message)} (temporary; try again later)",
-            err=True,
-        )
-        raise typer.Exit(code=1) from None
-    except PermanentError as exc:
-        typer.echo(f"earmark entities rebuild: {_clean(exc.message)}", err=True)
-        raise typer.Exit(code=1) from None
-    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
-        typer.echo(f"cannot open the entity registry: {_clean(exc)}", err=True)
-        raise typer.Exit(code=1) from None
-    for warning in report.warnings:
-        typer.echo(f"earmark entities rebuild: warning: {_clean(warning)}", err=True)
-    line = (
-        f"rebuilt the entity registry: {report.episodes} episodes, {report.entities} entities; "
-        f"{report.written} notes written"
-    )
-    if report.skipped:
-        line += f"; skipped {report.skipped} incomplete episodes"
-    typer.echo(_clean(line))
-
-
-@app.command("search")
-def search_command(
-    query: Annotated[str, typer.Argument(help="What to look for, in your own words.")],
-    limit: Annotated[int, typer.Option("--limit", help="How many hits (1-50).")] = 10,
-    kind: Annotated[
-        list[str] | None,
-        typer.Option("--kind", help="Only this kind of row (repeatable)."),
-    ] = None,
-    episode: Annotated[str | None, typer.Option("--episode", help="Only this episode key.")] = None,
-    as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
-) -> None:
-    """Search the transcripts and analyses of processed episodes."""
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from earmark.errors import EarmarkError, TransientError
-    from earmark.index.search import InvalidQuery, parse_query
-    from earmark.pipeline.factory import build_searcher
-
-    try:
-        parsed = parse_query(query, limit=limit, kinds=kind or (), episode_key=episode)
-    except InvalidQuery as exc:
-        typer.echo(f"earmark search: {exc}", err=True)
-        raise typer.Exit(code=2) from None
-    try:
-        searcher = build_searcher(settings)
-    except ConfigError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2) from None
-    if searcher is None:
-        typer.echo("earmark search: search is turned off (EARMARK_INDEX_BACKEND=none)", err=True)
-        raise typer.Exit(code=2)
-    try:
-        results = searcher.search(parsed)
-    except TransientError as exc:
-        typer.echo(f"earmark search: {_clean(exc.message)} (temporary; try again later)", err=True)
-        raise typer.Exit(code=1) from None
-    except EarmarkError as exc:
-        typer.echo(f"earmark search: {_clean(exc.message)}", err=True)
-        raise typer.Exit(code=1) from None
-    if as_json:
-        typer.echo(results.model_dump_json())
-        return
-    if not results.hits:
-        if results.index_exists:
-            typer.echo("no results")
-        else:
-            typer.echo(
-                "the search index is empty; it fills as the worker processes episodes, "
-                "or run `earmark reindex`"
-            )
-        return
-    for hit in results.hits:
-        when = "" if hit.timestamp is None else f"  [{hit.timestamp}]"
-        head = (
-            f"{hit.rank}. {hit.score:.4f}  {hit.show_title} \u2014 {hit.episode_title}"
-            f"{when}  {hit.kind}"
-        )
-        typer.echo(_clean(head))
-        typer.echo(_clean(f"   {hit.snippet}"))
-        if hit.note_path is not None:
-            typer.echo(_clean(f"   {hit.note_path}"))
-
-
-@app.command("reindex")
-def reindex_command(
-    episode: Annotated[
-        str | None, typer.Option("--episode", help="Re-index only this episode key.")
-    ] = None,
-) -> None:
-    """Rebuild the search index from the episode files and the vault's notes."""
-    settings = _load_or_exit()
-    configure_logging(settings.log_level, settings.secret_values())
-    from earmark.artifacts import ArtifactStore
-    from earmark.errors import EarmarkError, TransientError
-    from earmark.index.lancedb_index import build_lancedb_index
-    from earmark.index.rebuild import reindex
-    from earmark.index.search import IndexMismatchError
-    from earmark.pipeline.factory import build_note_locator
-
-    if settings.index_backend != "lancedb":
-        typer.echo(
-            "earmark reindex rebuilds the lancedb index; "
-            f"EARMARK_INDEX_BACKEND is '{settings.index_backend}'",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-    try:
-        index = build_lancedb_index(settings, allow_download=True)
-        locate = build_note_locator(settings)
-        report = reindex(ArtifactStore(settings.data_dir), index, locate, only=episode)
-    except ConfigError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2) from None
-    except IndexMismatchError as exc:
-        message = exc.message
-        if episode is not None:
-            message = message.replace(
-                "`earmark reindex` to", "`earmark reindex` (without --episode) to"
-            )
-        typer.echo(f"earmark reindex: {_clean(message)}", err=True)
-        raise typer.Exit(code=1) from None
-    except TransientError as exc:
-        typer.echo(f"earmark reindex: {_clean(exc.message)} (temporary; try again later)", err=True)
-        raise typer.Exit(code=1) from None
-    except EarmarkError as exc:
-        typer.echo(f"earmark reindex: {_clean(exc.message)}", err=True)
-        raise typer.Exit(code=1) from None
-    except (sqlite3.Error, OSError) as exc:
-        typer.echo(f"earmark reindex: {_clean(exc)}", err=True)
-        raise typer.Exit(code=1) from None
-    for warning in report.warnings:
-        typer.echo(f"earmark reindex: warning: {_clean(warning)}", err=True)
-    line = f"reindexed {report.episodes} episodes ({report.rows} rows)"
-    if report.skipped:
-        line += f"; skipped {report.skipped} incomplete episodes"
-    typer.echo(_clean(line))

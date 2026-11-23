@@ -6,7 +6,6 @@ import traceback
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Final
 
@@ -15,11 +14,9 @@ from earmark.errors import EarmarkError, PermanentError, SkipEpisode, TransientE
 from earmark.jobs import Claim, JobStore, LeaseLostError
 from earmark.log import redact, scrub_urls
 from earmark.models import (
-    Analysis,
     Episode,
     Job,
     JobResult,
-    StoreResult,
     Transcript,
     scrub_surrogates,
 )
@@ -84,15 +81,8 @@ class Pipeline:
         state = _RunState()
         try:
             with interruptible():
-                analysis, stored = self._stage_work(claim, state)
-            done = self._jobs.complete(
-                claim,
-                JobResult(
-                    note_path=stored.note_path,
-                    transcript_note_path=stored.transcript_note_path,
-                    analysis_hash=analysis.prompt_hash,
-                ),
-            )
+                transcript = self._stage_work(claim, state)
+            done = self._jobs.complete(claim, JobResult(duration_s=transcript.duration_s))
         except LeaseLostError:
             logger.warning("lost the lease on job %s; abandoning it", job.id)
             return None
@@ -170,16 +160,7 @@ class Pipeline:
         for warning in warnings:
             self._jobs.add_warning(job_id, warning)
 
-    def _stage_work(self, claim: Claim, state: _RunState) -> tuple[Analysis, StoreResult]:
-        if claim.job.kind == "reanalyze":
-            episode, transcript, shared_at = self._stored_inputs(claim, state)
-        else:
-            episode, transcript, shared_at = self._ingest_inputs(claim, state)
-        return self._analyze_store_index(claim, episode, transcript, shared_at)
-
-    def _ingest_inputs(
-        self, claim: Claim, state: _RunState
-    ) -> tuple[Episode, Transcript, datetime]:
+    def _stage_work(self, claim: Claim, state: _RunState) -> Transcript:
         job = claim.job
         jobs = self._jobs
         b = self._b
@@ -191,7 +172,7 @@ class Pipeline:
         state.episode = episode
         self._artifacts.write_episode(episode)
         jobs.set_episode_key(claim, episode.key)
-        shared_at = self._artifacts.record_share(episode.key, job.shared_at)
+        self._artifacts.record_share(episode.key, job.shared_at)
 
         transcript = self._artifacts.read_transcript(episode.key)
         if transcript is None:
@@ -203,56 +184,5 @@ class Pipeline:
             logger.info("job %s: transcript for %s is cached", job.id, episode.key)
         if transcript.episode_key != episode.key:
             raise PermanentError("transcriber returned a transcript for another episode")
-        jobs.set_stage(claim, "analyze")
-        return episode, transcript, shared_at
-
-    def _stored_inputs(
-        self, claim: Claim, state: _RunState
-    ) -> tuple[Episode, Transcript, datetime]:
-        job = claim.job
-        key = job.episode_key
-        if key is None:
-            raise PermanentError("reanalyze job without an episode key")
-        self._jobs.set_stage(claim, "analyze")
-        episode = self._artifacts.read_episode(key)
-        if episode is None:
-            raise PermanentError(f"episode {key} is not stored; share it again")
-        state.episode = episode
-        transcript = self._artifacts.read_transcript(key)
-        if transcript is None:
-            raise PermanentError(
-                f"episode {key} has no transcript; share it again to transcribe it"
-            )
-        shared_at = self._artifacts.record_share(key, job.shared_at)
-        return episode, transcript, shared_at
-
-    def _analyze_store_index(
-        self, claim: Claim, episode: Episode, transcript: Transcript, shared_at: datetime
-    ) -> tuple[Analysis, StoreResult]:
-        job = claim.job
-        jobs = self._jobs
-        b = self._b
         self._warn(job.id, transcript.warnings)
-
-        analysis = b.analyzer.analyze(episode, transcript, job.prompt)
-        if analysis.episode_key != episode.key:
-            raise PermanentError("analyzer returned an analysis for another episode")
-        self._warn(job.id, analysis.warnings)
-
-        analyses = self._artifacts.list_analyses(episode.key)
-        if not any(a.prompt_hash == analysis.prompt_hash for a in analyses):
-            analyses.append(analysis)
-            analyses.sort(key=lambda a: (a.created_at, a.prompt_hash))
-
-        jobs.set_stage(claim, "store")
-        stored = b.store.store(episode, transcript, tuple(analyses), shared_at)
-        self._warn(job.id, stored.warnings)
-
-        if b.indexer is not None:
-            jobs.set_stage(claim, "index")
-            try:
-                b.indexer.index(episode, transcript, tuple(analyses), stored)
-            except Exception as exc:
-                logger.warning("indexing failed for job %s", job.id, exc_info=exc)
-                jobs.add_warning(job.id, f"index failed: {describe_error(exc, self._secrets)}")
-        return analysis, stored
+        return transcript

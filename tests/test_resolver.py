@@ -561,7 +561,7 @@ def test_resolve_modules_make_no_direct_requests() -> None:
 
 
 def _pipeline_env(tmp_path: Path, server: FixtureServer) -> PipelineEnv:
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     backends = replace(fakes.backends(), resolver=resolver_for(server))
     return make_env(tmp_path, backends=backends, fakes=fakes)
 

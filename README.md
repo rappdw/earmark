@@ -21,8 +21,6 @@ Every stage is a protocol with a real backend and a fake, chosen by configuratio
   check, private-address block, size cap).
 - **transcribe**: `faster_whisper` in the worker, or `remote`, an OpenAI-compatible speech
   server such as vLLM serving Whisper ([docs/asr.md](docs/asr.md)).
-- **analyze**: `anthropic` (Claude) or `openai_compat`, a local server
-  ([docs/llm.md](docs/llm.md)). Long transcripts are chunked, never truncated.
 - **store**: the `vault` store writes the episode note, a transcript note, and entity
   notes for the people, papers, companies, tools and topics it finds.
 - **index**: `lancedb` with local embeddings, for `earmark search` and `GET /search`.
@@ -131,7 +129,6 @@ reaches the API.
 - [docs/runbook-spark.md](docs/runbook-spark.md): a step-by-step first setup on a DGX
   Spark, with a check after each phase.
 - [docs/asr.md](docs/asr.md): remote transcription servers.
-- [docs/llm.md](docs/llm.md): running the analysis on a local model.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the design, contracts, and security rules.
 - [docs/PLAN.md](docs/PLAN.md): the build plan and what is built so far.
 
@@ -147,23 +144,12 @@ Run them as `uv run earmark <command>`.
 | `jobs [--status] [--limit] [--json]` | List recent jobs, newest first. |
 | `resolve <url>` | Resolve an episode URL to its feed, GUID, and audio URL. |
 | `transcribe <file> [--json]` | Transcribe a local audio file and print the result. |
-| `analyze <key> [--prompt] [--json]` | Analyze an episode's stored transcript and print the analysis. |
-| `episodes [--limit] [--offset] [--json]` | List stored episodes, newest share first, with the prompts already run. |
-| `reanalyze <key> [--prompt]` | Run a prompt on a stored episode: enqueue a job that starts at analysis. |
-| `digest [--week] [--since] [--refresh] [--no-notify]` | Write the digest note for a week (default: the last complete ISO week). |
-| `entities rebuild [--prune]` | Rebuild the entity notes from the stored analyses. |
-| `search QUERY [--limit] [--kind] [--episode] [--json]` | Search transcripts and analyses of processed episodes. |
-| `reindex [--episode KEY]` | Rebuild the search index from the episode files and the vault's notes. |
 | `doctor [--online]` | Check the configuration, directories, database, backends, and credentials. |
 | `config` | Show the effective configuration with secrets redacted. |
 | `--version` | Print the version. |
 
-`analyze` prints an analysis and writes no note. `reanalyze` is a job: it updates the
-note, the entities, and the index, and notifies.
-
-The HTTP API is `POST /ingest`, `GET /jobs/{id}`, `GET /jobs`, `GET /search`,
-`GET /episodes`, `POST /episodes/{key}/analyze`, and `GET|HEAD /healthz`. Everything
-except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The HTTP API is `POST /ingest`, `GET /jobs/{id}`, `GET /jobs`, and `GET|HEAD /healthz`.
+Everything except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
@@ -185,9 +171,6 @@ Copy `.env.example` to start.
 | Variable | Default | Meaning |
 |---|---|---|
 | `EARMARK_DATA_DIR` | `./data` | Jobs database, episode artifacts, index. A local filesystem. |
-| `EARMARK_VAULT_DIR` | unset | Root of the Obsidian vault. Must exist. Required for the vault store. |
-| `EARMARK_VAULT_SUBDIR` | `Earmark` | Folder inside the vault that earmark owns. |
-| `EARMARK_OBSIDIAN_VAULT_NAME` | unset | The vault's name in Obsidian, for `obsidian://` links in notifications. |
 
 ### Backends
 
@@ -198,9 +181,6 @@ Copy `.env.example` to start.
 | `EARMARK_RESOLVER_BACKEND` | `apple` | `apple` or `fake`. |
 | `EARMARK_FETCH_BACKEND` | `http` | `http` or `fake`. |
 | `EARMARK_ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, or `fake`. |
-| `EARMARK_LLM_PROVIDER` | `anthropic` | `anthropic`, `openai_compat`, or `fake`. |
-| `EARMARK_STORE_BACKEND` | `vault` | `vault` or `fake`. |
-| `EARMARK_INDEX_BACKEND` | `lancedb` | `lancedb`, `fake`, or `none`. |
 | `EARMARK_NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, or `none`. |
 
 ### Transcription
@@ -224,28 +204,6 @@ See [docs/asr.md](docs/asr.md). Used when `EARMARK_ASR_BACKEND=remote`.
 | `EARMARK_ASR_API_KEY` | unset | Bearer key for the server (secret). |
 | `EARMARK_ASR_MAX_UPLOAD_MB` | unset | Refuse uploads larger than this, before sending. Unset means no limit. |
 | `EARMARK_ASR_TIMEOUT_SECONDS` | `10800` | How long to wait for the server's answer. |
-
-### Analysis
-
-See [docs/llm.md](docs/llm.md) for local servers.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `EARMARK_LLM_MODEL` | `claude-opus-5-5` | Model id. Part of the analysis cache key. |
-| `EARMARK_LLM_EFFORT` | `medium` | Claude effort: `low`, `medium`, `high`, `xhigh`, `max`. Claude only. |
-| `EARMARK_LLM_FALLBACKS` | `true` | Retry a refused Claude request on the recommended fallback model. Claude only. |
-| `EARMARK_LLM_BASE_URL` | unset | A local server's base URL, ending in `/v1`. Required for `openai_compat`. |
-| `EARMARK_LLM_API_KEY` | unset | Anthropic API key, or the local server's key (secret). |
-| `EARMARK_LLM_CONTEXT_TOKENS` | unset | Context window in tokens. Required for `openai_compat`; Anthropic defaults to 1,000,000. |
-| `EARMARK_LLM_TIMEOUT_SECONDS` | `3600` | How long to wait for a local server's answer. |
-| `EARMARK_LLM_RESPONSE_FORMAT` | `json_schema` | `json_schema` or `json_object`, for `openai_compat`. |
-
-### Index
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `EARMARK_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model. Changing it needs `earmark reindex`. |
-| `EARMARK_EMBED_MODEL_DIR` | unset | Where embedding models are downloaded (default: `<DATA_DIR>/models/embed`). |
 
 ### Notifications
 
@@ -276,7 +234,6 @@ See "Notifications" in [docs/deploy.md](docs/deploy.md).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EARMARK_TZ` | unset | IANA time zone for note dates, such as `Europe/Berlin`. Unset uses the machine's zone (UTC in a container). |
 | `EARMARK_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 <!-- settings:end -->
 

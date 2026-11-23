@@ -148,16 +148,11 @@ def _settings(tmp_path: Path, **overrides: typing.Any) -> Settings:
     values: dict[str, typing.Any] = {
         "resolver_backend": "fake",
         "asr_backend": "fake",
-        "llm_provider": "fake",
-        "store_backend": "fake",
-        "index_backend": "fake",
         "notify_backend": "fake",
         "fetch_backend": "http",
     }
     values.update(overrides)
-    return Settings(
-        _env_file=None, data_dir=tmp_path / "data", vault_dir=tmp_path / "vault", **values
-    )
+    return Settings(_env_file=None, data_dir=tmp_path / "data", **values)
 
 
 def test_factory_builds_http_fetcher(tmp_path: Path) -> None:
@@ -185,7 +180,7 @@ def _pipeline(tmp_path: Path, status: int = 200, retry_after: str | None = None)
             return httpx2.Response(status, headers=headers)
         return _serve(request)
 
-    fakes = make_fake_backends(tmp_path / "data", vault_dir=tmp_path / "vault")
+    fakes = make_fake_backends(tmp_path / "data")
     http = HttpAudioFetcher(fakes.artifacts, mock_fetcher(handler), max_bytes=MIB)
     env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), fetcher=http))
     return PipelineRig(env, calls)
