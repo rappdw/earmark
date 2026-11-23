@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from typer.testing import CliRunner
 
 import earmark
+from earmark.api.schemas import JobView
 from earmark.cli import app
 from earmark.config import Settings, env_var
 from earmark.db import APPLICATION_ID
@@ -22,13 +23,13 @@ from earmark.errors import PermanentError, SkipEpisode, TransientError
 from earmark.fakes import FakeResolver
 from earmark.jobs import open_job_store
 from earmark.log import configure_logging
-from earmark.models import MAX_PROMPT_CHARS, Episode, Transcript
+from earmark.models import MAX_INSTRUCTIONS_CHARS, Episode, Transcript
 from earmark.pipeline import factory
 from earmark.pipeline.worker import Worker
 from earmark.resolve.apple import MESSAGES, UrlProblem
 from earmark.transcribe import faster_whisper as fw
 from earmark.transcribe.faster_whisper import AudioDecodeError
-from tests.factories import make_episode
+from tests.factories import TO, make_episode, new_podcast_job
 from tests.legacy_db import V010_SCHEMA_VERSION, make_v010_database
 from tests.uds_http import asgi_on_uds
 from tests.whisper_fakes import FakeInfo, FakeRuntime, FakeSegment, FakeWhisperModel
@@ -267,17 +268,18 @@ BACKEND_VARS = (
 def fake_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_root_logging: None) -> Path:
     for name in BACKEND_VARS:
         monkeypatch.setenv(f"EARMARK_{name}", "fake")
+    monkeypatch.setenv("EARMARK_ALLOWED_RECIPIENTS", TO)
     return tmp_path
 
 
-def _submit(*args: str) -> str:
-    result = runner.invoke(app, ["submit", *args])
+def _submit(*args: str, to: str = TO) -> str:
+    result = runner.invoke(app, ["submit", *args, "--to", to])
     assert result.exit_code == 0, result.stderr
     return result.stdout
 
 
 def test_submit_then_worker_once(fake_env: Path) -> None:
-    out = _submit(SHARE, "--prompt", "q")
+    out = _submit(SHARE, "--instructions", "q")
     match = re.fullmatch(r"([0-9a-f]{32}) queued\n", out)
     assert match
     job_id = match.group(1)
@@ -344,22 +346,167 @@ def test_submit_dedupe(fake_env: Path) -> None:
 
 @pytest.mark.parametrize(("url", "problem"), [(SHOW_LINK, "show_link"), ("not a url", "malformed")])
 def test_submit_rejects_url(fake_env: Path, url: str, problem: UrlProblem) -> None:
-    result = runner.invoke(app, ["submit", url])
+    result = runner.invoke(app, ["submit", url, "--to", TO])
     assert result.exit_code == 2
     assert MESSAGES[problem] in result.stderr
     assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
 
 
-def test_submit_rejects_long_prompt(fake_env: Path) -> None:
-    result = runner.invoke(app, ["submit", SHARE, "--prompt", "x" * (MAX_PROMPT_CHARS + 1)])
+def test_submit_rejects_long_instructions(fake_env: Path) -> None:
+    args = ["submit", SHARE, "--to", TO, "--instructions", "x" * (MAX_INSTRUCTIONS_CHARS + 1)]
+    result = runner.invoke(app, args)
     assert result.exit_code == 2
-    assert f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)" in result.stderr
+    assert (
+        f"instructions is too long (at most {MAX_INSTRUCTIONS_CHARS} characters)" in result.stderr
+    )
     assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
 
 
+def test_submit_prompt_option_is_gone(fake_env: Path) -> None:
+    result = runner.invoke(app, ["submit", SHARE, "--to", TO, "--prompt", "q"])
+    assert result.exit_code == 2
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_submit_requires_to(fake_env: Path) -> None:
+    result = runner.invoke(app, ["submit", SHARE])
+    assert result.exit_code == 2
+    assert "--to" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # CI forces colour
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+@pytest.mark.parametrize("bad", ["not-an-address", "a@b.org, c@d.org"])
+def test_submit_invalid_to_exit_2(fake_env: Path, bad: str) -> None:
+    result = runner.invoke(app, ["submit", SHARE, "--to", bad])
+    assert result.exit_code == 2
+    assert "to must be one email address" in result.stderr
+    assert bad not in result.stdout + result.stderr
+
+
+def test_submit_recipient_refused_exit_2(fake_env: Path) -> None:
+    result = runner.invoke(app, ["submit", SHARE, "--to", "stranger@example.com"])
+    assert result.exit_code == 2
+    assert "to is not an allowed recipient (EARMARK_ALLOWED_RECIPIENTS)" in result.stderr
+    assert "stranger" not in result.stdout + result.stderr
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_submit_with_no_allowlist_is_refused(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EARMARK_ALLOWED_RECIPIENTS")
+    result = runner.invoke(app, ["submit", SHARE, "--to", TO])
+    assert result.exit_code == 2
+    assert "no recipients are allowed yet" in result.stderr
+
+
+def test_submit_url(fake_env: Path) -> None:
+    out = _submit("https://audio.example.net/p/clip.mp3?sig=Q#f", "--title", "Clip")
+    assert re.fullmatch(r"[0-9a-f]{32} queued\n", out)
+    [job] = json.loads(runner.invoke(app, ["jobs", "--json"]).stdout)["jobs"]
+    assert (job["source"], job["to"], job["title"]) == ("url", TO, "Clip")
+    assert job["url"] == "https://audio.example.net/p/clip.mp3"
+    assert _submit("https://audio.example.net/p/clip.mp3?sig=Q").endswith("(existing job)\n")
+
+
+def test_submit_file_copies_to_staging(fake_env: Path) -> None:
+    clip = fake_env / "My Clip.m4a"
+    clip.write_bytes(b"ID3" + bytes(5000))
+    out = _submit(str(clip), "--instructions", "Summarise")
+    job_id = out.split()[0]
+    [staged] = list((fake_env / "data" / "uploads").iterdir())
+    assert staged.read_bytes() == clip.read_bytes()
+    assert staged.suffix == ".m4a"
+    assert clip.exists()  # the original is left alone
+    [job] = json.loads(runner.invoke(app, ["jobs", "--json"]).stdout)["jobs"]
+    assert (job["id"], job["source"], job["url"], job["instructions"]) == (
+        job_id,
+        "upload",
+        None,
+        "Summarise",
+    )
+    assert "upload_file" not in job
+    worked = runner.invoke(app, ["worker", "--once"])
+    assert worked.stdout == f"job {job_id} done\n"
+    assert list((fake_env / "data" / "uploads").iterdir()) == []
+    again = fake_env / "again.m4a"
+    again.write_bytes(clip.read_bytes())
+    second = _submit(str(again), "--instructions", "Summarise")
+    assert second.endswith("done (existing job)\n")
+    assert list((fake_env / "data" / "uploads").iterdir()) == []
+
+
+def test_submit_file_not_audio_exit_2(fake_env: Path) -> None:
+    notes = fake_env / "notes.txt"
+    notes.write_text("hello")
+    result = runner.invoke(app, ["submit", str(notes), "--to", TO])
+    assert result.exit_code == 2
+    assert result.stderr.startswith("earmark submit: notes.txt does not look like audio")
+    assert not (fake_env / "data" / "uploads").exists()
+    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+
+
+def test_submit_file_over_cap_exit_2_nothing_staged(
+    fake_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EARMARK_MAX_UPLOAD_MB", "1")
+    big = fake_env / "big.mp3"
+    big.write_bytes(bytes(1024 * 1024 + 1))
+    result = runner.invoke(app, ["submit", str(big), "--to", TO])
+    assert result.exit_code == 2
+    assert result.stderr == (
+        "earmark submit: the file is larger than the 1 MiB limit (EARMARK_MAX_UPLOAD_MB)\n"
+    )
+    assert list((fake_env / "data" / "uploads").iterdir()) == []
+    exact = fake_env / "exact.mp3"
+    exact.write_bytes(bytes(1024 * 1024))
+    assert runner.invoke(app, ["submit", str(exact), "--to", TO]).exit_code == 0
+
+
+def test_submit_empty_file_exit_2(fake_env: Path) -> None:
+    empty = fake_env / "empty.mp3"
+    empty.write_bytes(b"")
+    result = runner.invoke(app, ["submit", str(empty), "--to", TO])
+    assert result.exit_code == 2
+    assert "is empty" in result.stderr
+    assert list((fake_env / "data" / "uploads").iterdir()) == []
+
+
+def test_submit_file_recipient_refused_stages_nothing(fake_env: Path) -> None:
+    clip = fake_env / "clip.mp3"
+    clip.write_bytes(b"ID3")
+    result = runner.invoke(app, ["submit", str(clip), "--to", "stranger@example.com"])
+    assert result.exit_code == 2
+    assert not (fake_env / "data" / "uploads").exists()
+
+
+def test_jobs_json_prints_views(fake_env: Path) -> None:
+    _submit(
+        "https://audio.example.net/private/PATH-TOKEN.mp3?sig=QUERY-TOKEN",
+        "--instructions",
+        "i" * 300,
+    )
+    payload = json.loads(runner.invoke(app, ["jobs", "--json"]).stdout)
+    [job] = payload["jobs"]
+    assert set(job) == set(JobView.model_fields)
+    assert job["url"] == "https://audio.example.net/private/PATH-TOKEN.mp3"
+    assert job["instructions"] == "i" * 199 + "…"
+    assert job["to"] == TO
+    assert "QUERY-TOKEN" not in json.dumps(payload)
+
+
+def test_jobs_text_shows_upload_subject(fake_env: Path) -> None:
+    clip = fake_env / "clip.mp3"
+    clip.write_bytes(b"ID3")
+    job_id = _submit(str(clip)).split()[0]
+    [line] = runner.invoke(app, ["jobs"]).stdout.splitlines()
+    assert line.split("  ")[0] == job_id
+    assert line.endswith("  upload")
+
+
 def test_jobs_text_output(fake_env: Path) -> None:
-    first = _submit(SHARE, "--prompt", "one").split()[0]
-    second = _submit(SHARE, "--prompt", "two").split()[0]
+    first = _submit(SHARE, "--instructions", "one").split()[0]
+    second = _submit(SHARE, "--instructions", "two").split()[0]
     runner.invoke(app, ["worker", "--once"])  # runs the first job
     lines = runner.invoke(app, ["jobs"]).stdout.splitlines()
     assert [ln.split("  ")[0] for ln in lines] == [second, first]
@@ -375,7 +522,7 @@ def test_jobs_text_output(fake_env: Path) -> None:
 
 def test_jobs_sanitizes_control_chars(fake_env: Path) -> None:
     store = open_job_store(Settings(_env_file=None))
-    store.enqueue("https://podcasts.apple.com/us/podcast/id1?i=2")
+    store.enqueue(new_podcast_job("https://podcasts.apple.com/us/podcast/id1?i=2"))
     claim = store.claim_next()
     assert claim is not None
     store.fail(claim, "bad \x1b[31mred\x1b[0m\nsecond line", transient=False)
@@ -842,7 +989,9 @@ def _row_count(path: Path) -> int:
 
 @pytest.mark.usefixtures("restore_root_logging")
 @pytest.mark.parametrize(
-    "args", [["serve"], ["worker", "--once"], ["jobs"], ["submit", SHARE]], ids=lambda a: a[0]
+    "args",
+    [["serve"], ["worker", "--once"], ["jobs"], ["submit", SHARE, "--to", TO]],
+    ids=lambda a: a[0],
 )
 def test_v010_database_refused_by_commands(
     fake_env: Path,

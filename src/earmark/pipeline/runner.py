@@ -21,6 +21,8 @@ from earmark.models import (
     scrub_surrogates,
 )
 from earmark.pipeline.stages import Backends
+from earmark.sources import audio_episode, audio_title, sha256_file
+from earmark.staging import Staging
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +63,13 @@ class Pipeline:
         artifacts: ArtifactStore,
         jobs: JobStore,
         *,
+        staging: Staging,
         secrets: Sequence[str] = (),
     ) -> None:
         self._b = backends
         self._artifacts = artifacts
         self._jobs = jobs
+        self._staging = staging
         self._secrets = tuple(secrets)
 
     # -- public -----------------------------------------------------------------------
@@ -100,8 +104,13 @@ class Pipeline:
         except Exception as exc:
             logger.error("job %s raised an unexpected error", job.id, exc_info=exc)
             return self._finish(claim, state.episode, exc, transient=True)
-        self.notify(done, state.episode)
+        self.finish(done, state.episode)
         return done
+
+    def finish(self, job: Job, episode: Episode | None) -> None:
+        """A job reached a terminal state: delete its staged audio, then notify."""
+        self._staging.release(job)
+        self.notify(job, episode)
 
     def notify(self, job: Job, episode: Episode | None) -> None:
         notifier = self._b.notifier
@@ -121,12 +130,19 @@ class Pipeline:
                 )
 
     def load_episode(self, job: Job) -> Episode | None:
+        if job.source == "upload":
+            if job.content_sha256 is None:
+                return None
+            return audio_episode(job, job.content_sha256)
         if job.episode_key is None:
             return None
         try:
-            return self._artifacts.read_episode(job.episode_key)
+            episode = self._artifacts.read_episode(job.episode_key)
         except (PermanentError, OSError):
             return None
+        if episode is not None and job.source == "url":
+            return episode.model_copy(update={"title": audio_title(job)})
+        return episode
 
     # -- outcomes ---------------------------------------------------------------------
 
@@ -151,7 +167,7 @@ class Pipeline:
             logger.warning("lost the lease on job %s; abandoning it", claim.job.id)
             return None
         if job.status != "queued":
-            self.notify(job, episode)
+            self.finish(job, episode)
         return job
 
     # -- stages -----------------------------------------------------------------------
@@ -164,20 +180,40 @@ class Pipeline:
         job = claim.job
         jobs = self._jobs
         b = self._b
-        if job.url is None:
-            raise PermanentError("ingest job without a url")
+        staging = self._staging
 
         jobs.set_stage(claim, "resolve")
-        episode = b.resolver.resolve(job.url)
+        audio: Path | None = None
+        if job.source == "apple_podcasts":
+            if job.url is None:
+                raise PermanentError("ingest job without a url")
+            episode = b.resolver.resolve(job.url)
+        elif job.source == "upload":
+            if job.upload_file is None or job.content_sha256 is None:
+                raise PermanentError("upload job without its file")
+            audio = staging.upload_path(job.upload_file)
+            if not audio.is_file():
+                raise PermanentError("the uploaded audio is missing; upload it again")
+            if sha256_file(audio) != job.content_sha256:
+                raise PermanentError("the uploaded audio changed after it was received")
+            episode = audio_episode(job, job.content_sha256)
+        else:
+            if job.url is None:
+                raise PermanentError("ingest job without a url")
+            jobs.set_stage(claim, "fetch")
+            staging.clear_download(job.id)
+            audio = b.fetcher.download(job.url, staging.download_destination(job.id))
+            episode = audio_episode(job, sha256_file(audio))
         state.episode = episode
         self._artifacts.write_episode(episode)
         jobs.set_episode_key(claim, episode.key)
         self._artifacts.record_share(episode.key, job.shared_at)
 
-        transcript = self._artifacts.read_transcript(episode.key)
+        transcript = b.transcriber.cached(episode)
         if transcript is None:
-            jobs.set_stage(claim, "fetch")
-            audio = b.fetcher.fetch(episode)
+            if audio is None:
+                jobs.set_stage(claim, "fetch")
+                audio = b.fetcher.fetch(episode)
             jobs.set_stage(claim, "transcribe")
             transcript = b.transcriber.transcribe(episode, audio)
         else:

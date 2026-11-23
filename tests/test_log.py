@@ -189,7 +189,7 @@ def test_own_messages_unchanged() -> None:
     stream = io.StringIO()
     configure_logging("DEBUG", stream=stream)
     apple = "https://podcasts.apple.com/us/podcast/id1?i=2"
-    logging.getLogger("earmark.ingest").info("accepted %s", apple)
+    logging.getLogger("earmark.submission").info("accepted %s", apple)
     logging.getLogger("earmark.fetch").debug("GET feeds.example (hop 0)")
     out = stream.getvalue()
     assert f"accepted {apple}" in out

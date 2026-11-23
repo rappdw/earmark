@@ -6,6 +6,7 @@ import pytest
 
 from earmark.errors import PermanentError, TransientError
 from earmark.fakes import (
+    DownloadCall,
     FakeAudioFetcher,
     FakeBackends,
     FakeNotifier,
@@ -207,3 +208,32 @@ def test_fake_backends_as_backends(tmp_path: Path) -> None:
     assert b.fetcher is fb.fetcher
     assert b.transcriber is fb.transcriber
     assert b.notifier is fb.notifier
+
+
+def test_fake_download_records_writes_and_fails(tmp_path: Path) -> None:
+    fetcher = FakeAudioFetcher(
+        make_fake_backends(tmp_path).artifacts, payload=b"default", payloads={"u2": b"special"}
+    )
+    first = fetcher.download("u1", lambda ext: tmp_path / f"one.{ext}")
+    second = fetcher.download("u2", lambda ext: tmp_path / f"two.{ext}")
+    assert (first.read_bytes(), second.read_bytes()) == (b"default", b"special")
+    assert (fetcher.downloads, fetcher.computed) == (2, 0)
+    assert fetcher.calls == [DownloadCall("u1"), DownloadCall("u2")]
+    fetcher.fail_next(PermanentError("gone"))
+    with pytest.raises(PermanentError, match="gone"):
+        fetcher.download("u3", lambda ext: tmp_path / f"three.{ext}")
+    assert fetcher.downloads == 2
+    assert not (tmp_path / "three.mp3").exists()
+
+
+def test_fake_transcriber_cache_follows_profile(tmp_path: Path) -> None:
+    fb = make_fake_backends(tmp_path)
+    ep, transcript = _run(fb)
+    assert transcript.asr_profile == fb.transcriber.profile
+    assert fb.transcriber.cached(ep) == transcript
+    other = FakeTranscriber(fb.artifacts, model="other-model")
+    assert other.cached(ep) is None
+    assert other.profile != fb.transcriber.profile
+    legacy = transcript.model_copy(update={"asr_profile": None})
+    fb.artifacts.write_transcript(legacy)
+    assert fb.transcriber.cached(ep) is None

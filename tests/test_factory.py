@@ -10,9 +10,8 @@ from earmark import config
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings, env_var
 from earmark.fakes import FakeAudioFetcher, FakeNotifier, FakeResolver, FakeTranscriber
-from earmark.ingest import enqueue_ingest
-from earmark.models import IngestRequest
 from earmark.pipeline import factory
+from tests.factories import new_podcast_job
 
 SHARE = "https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981&uo=4"
 
@@ -93,7 +92,7 @@ def test_build_worker_runs_a_job(tmp_path: Path) -> None:
     worker = factory.build_worker(settings)
     from earmark.jobs import open_job_store
 
-    enqueue_ingest(open_job_store(settings), IngestRequest(url=SHARE))
+    open_job_store(settings).enqueue(new_podcast_job(SHARE))
     job = worker.run_once()
     assert job is not None
     assert job.status == "done"
@@ -191,3 +190,25 @@ def test_build_resolver_unbuilt_name(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 # -- digest builders ---------------------------------------------------------------------------
+
+
+def test_build_worker_sweeps_downloads(tmp_path: Path) -> None:
+    from earmark.db import open_database
+    from earmark.jobs import JobStore, NewJob
+
+    settings = _fake_settings(tmp_path)
+    store = JobStore(open_database(tmp_path / "data" / "earmark.db"))
+    store.enqueue(NewJob(source="url", to="you@example.org", url="https://audio.example.net/a.mp3"))
+    claim = store.claim_next()  # a worker that crashed mid-download
+    assert claim is not None
+    running = claim.job.id
+    downloads = tmp_path / "data" / "downloads"
+    downloads.mkdir(parents=True)
+    (downloads / f"{running}.mp3").write_bytes(b"partial of a running job")
+    (downloads / f".{running}.mp3.abc.part").write_bytes(b"part")
+    (downloads / f"{'2' * 32}.mp3").write_bytes(b"orphan")
+    (downloads / "stray.txt").write_bytes(b"stray")
+    factory.build_worker(settings)
+    assert sorted(p.name for p in downloads.iterdir()) == sorted(
+        [f"{running}.mp3", f".{running}.mp3.abc.part"]
+    )

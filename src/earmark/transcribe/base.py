@@ -4,8 +4,10 @@ Light imports only. An engine turns an audio file into a ``Transcript``; this sh
 everything around it, so a second engine (the remote backend) reuses it unchanged.
 """
 
+import json
 import logging
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -16,10 +18,21 @@ from earmark.models import Episode, Segment, Transcript
 logger = logging.getLogger(__name__)
 
 
+def asr_profile(backend: str, options: Mapping[str, str | int | bool | None]) -> str:
+    """The cache profile of a backend: its name and a canonical JSON of its options."""
+    return backend + " " + json.dumps(options, sort_keys=True, separators=(",", ":"))
+
+
 class TranscriptionEngine(Protocol):
     @property
     def name(self) -> str:
         """For logs and ``Transcript.model``, e.g. ``faster-whisper:large-v3``."""
+        ...
+
+    @property
+    def profile(self) -> str:
+        """Backend, model and options (see ``asr_profile``); a transcript made with another
+        profile is not reused."""
         ...
 
     def transcribe_file(self, audio: Path, episode_key: str, /) -> Transcript:
@@ -77,9 +90,20 @@ class CachedTranscriber:
     def keep_audio(self) -> bool:
         return self._keep_audio
 
+    @property
+    def profile(self) -> str:
+        return self._engine.profile
+
+    def cached(self, episode: Episode, /) -> Transcript | None:
+        """The stored transcript if it was made with this engine's profile; loads no model."""
+        stored = self._artifacts.read_transcript(episode.key)
+        if stored is None or stored.asr_profile != self.profile:
+            return None
+        return stored
+
     def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
         key = episode.key
-        cached = self._artifacts.read_transcript(key)
+        cached = self.cached(episode)
         if cached is not None:
             self._cleanup(key)
             return cached
@@ -92,6 +116,7 @@ class CachedTranscriber:
             raise
         if transcript.episode_key != key:
             raise PermanentError(f"{self._engine.name} returned a transcript for another episode")
+        transcript = transcript.model_copy(update={"asr_profile": self.profile})
         self._artifacts.write_transcript(transcript)
         self._cleanup(key)
         logger.info("transcript for %s written (%d segments)", key, len(transcript.segments))

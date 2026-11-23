@@ -48,6 +48,7 @@ from tests.asr_stub import (
     StubReply,
     parse_multipart,
 )
+from tests.factories import new_podcast_job
 from tests.pipeline_env import CANON, CountingJobStore, make_env
 
 MIB = 1024 * 1024
@@ -354,7 +355,7 @@ def test_text_only_warning_reaches_job(tmp_path: Path) -> None:
         fakes=fakes,
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "done"
@@ -362,7 +363,7 @@ def test_text_only_warning_reaches_job(tmp_path: Path) -> None:
     key = job.episode_key
     assert key is not None
     assert NO_TIMESTAMPS_WARNING in fakes.artifacts.transcript_json_path(key).read_text()
-    env.jobs.enqueue(CANON, prompt="a new prompt")
+    env.jobs.enqueue(new_podcast_job(CANON, instructions="a new prompt"))
     again = env.worker.run_once()
     assert again is not None
     assert again.status == "done"
@@ -686,7 +687,7 @@ def test_cached_transcript_makes_no_request(tmp_path: Path, keep_audio: bool) ->
             model_name="remote:old",
             language=None,
             audio_name="a",
-        )
+        ).model_copy(update={"asr_profile": transcriber.profile})
         artifacts.write_transcript(stored)
         assert transcriber.transcribe(CANON_EPISODE, path) == stored
         assert server.calls == 0
@@ -736,9 +737,9 @@ def test_pipeline_with_remote(tmp_path: Path) -> None:
         fakes=fakes,
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     first = env.worker.run_once()
-    env.jobs.enqueue(CANON, prompt="another prompt")
+    env.jobs.enqueue(new_podcast_job(CANON, instructions="another prompt"))
     second = env.worker.run_once()
     assert first is not None
     assert second is not None
@@ -772,7 +773,7 @@ def test_heartbeat_fresh_during_remote_wait(tmp_path: Path) -> None:
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
     holder.append(env)
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "done"
@@ -985,3 +986,12 @@ def test_lone_surrogate_in_segment_text(tmp_path: Path) -> None:
     stored = artifacts.read_transcript(CANON_EPISODE.key)
     assert stored == transcript
     artifacts.transcript_text_path(CANON_EPISODE.key).read_bytes().decode("utf-8")
+
+
+def test_profile_includes_model_and_language() -> None:
+    base = _engine().profile
+    assert base.startswith("remote ")
+    assert _engine(model="whisper-y").profile != base
+    assert _engine(language="fr").profile != base
+    assert _engine(timeout_s=5.0).profile == base
+    assert _engine().profile == base

@@ -13,7 +13,7 @@ import pytest
 
 import earmark
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import make_fake_backends
+from earmark.fakes import FetchCall, make_fake_backends
 from earmark.fetch import MIB, GuardedFetcher
 from earmark.models import Episode
 from earmark.pipeline.stages import Resolver
@@ -57,6 +57,7 @@ from tests.apple_fixtures import (
     strip_enclosure,
     with_episode_fields,
 )
+from tests.factories import new_podcast_job
 from tests.http_helpers import dns_intercepted
 from tests.pipeline_env import CANON, PipelineEnv, make_env
 
@@ -569,7 +570,7 @@ def _pipeline_env(tmp_path: Path, server: FixtureServer) -> PipelineEnv:
 def test_pipeline_with_apple_resolver(tmp_path: Path) -> None:
     env = _pipeline_env(tmp_path, default_server())
     assert CANON == DAILY
-    job = env.jobs.enqueue(CANON).job
+    job = env.jobs.enqueue(new_podcast_job(CANON)).job
     env.worker.run_once()
     done = env.jobs.get(job.id)
     assert done is not None
@@ -577,12 +578,14 @@ def test_pipeline_with_apple_resolver(tmp_path: Path) -> None:
     assert done.episode_key == "f2faca69c9811409f6a6"
     stored = env.fakes.artifacts.read_episode("f2faca69c9811409f6a6")
     assert stored == resolver_for(default_server()).resolve(DAILY)
-    assert [c.episode.key for c in env.fakes.fetcher.calls] == ["f2faca69c9811409f6a6"]
+    assert [c.episode.key for c in env.fakes.fetcher.calls if isinstance(c, FetchCall)] == [
+        "f2faca69c9811409f6a6"
+    ]
 
 
 def test_pipeline_skip_no_feed(tmp_path: Path) -> None:
     env = _pipeline_env(tmp_path, default_server())
-    job = env.jobs.enqueue(NO_FEED).job
+    job = env.jobs.enqueue(new_podcast_job(NO_FEED)).job
     env.worker.run_once()
     done = env.jobs.get(job.id)
     assert done is not None
@@ -591,7 +594,7 @@ def test_pipeline_skip_no_feed(tmp_path: Path) -> None:
 
 def test_pipeline_unknown_show_fails(tmp_path: Path) -> None:
     env = _pipeline_env(tmp_path, default_server())
-    job = env.jobs.enqueue(UNKNOWN).job
+    job = env.jobs.enqueue(new_podcast_job(UNKNOWN)).job
     env.worker.run_once()
     done = env.jobs.get(job.id)
     assert done is not None
@@ -602,7 +605,7 @@ def test_pipeline_transient_requeues(tmp_path: Path) -> None:
     server = default_server()
     server.lookups["1200361736"] = Reply(503, b"busy", headers={"Retry-After": "600"})
     env = _pipeline_env(tmp_path, server)
-    job = env.jobs.enqueue(CANON).job
+    job = env.jobs.enqueue(new_podcast_job(CANON)).job
     env.worker.run_once()
     done = env.jobs.get(job.id)
     assert done is not None

@@ -15,8 +15,9 @@ builder and from doctor: it loads httpx2.
 import json
 import logging
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Final, Self
 from urllib.parse import urlsplit
 
@@ -27,9 +28,10 @@ from earmark.config import NTFY_TOPIC_PATTERN, Settings
 from earmark.endpoint import error_detail, host_label
 from earmark.errors import PermanentError, TransientError
 from earmark.fetch import USER_AGENT, parse_retry_after
-from earmark.log import redact
+from earmark.log import redact, scrub_urls
 from earmark.models import Episode, Job, JobStatus, format_hms, utc_now
 from earmark.sanitize import clean_unicode, fit_bytes
+from earmark.sources import url_host
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,8 @@ TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
     "skipped": "Skipped",
 }
 UNKNOWN_EPISODE: Final = "podcast episode"
+UNKNOWN_UPLOAD: Final = "uploaded audio"
+UPLOAD_LINE: Final = "Uploaded audio"
 UNKNOWN_SHOW: Final = "Apple Podcasts episode"
 _JOINERS: Final = frozenset({"‌", "‍"})
 _DROPPED_CATEGORIES: Final = frozenset({"Cc", "Cf", "Co", "Cn", "Zl", "Zp"})
@@ -106,12 +110,30 @@ class Notification:
         return body
 
 
+def _label(job: Job, episode: Episode | None, field: Callable[[str, int], str]) -> tuple[str, str]:
+    """(first message line, the name that stands for the episode in the title)."""
+    if job.source == "upload":
+        stem = PurePosixPath(job.upload_name).stem if job.upload_name else ""
+        for candidate in (job.title or "", episode.title if episode else "", stem):
+            name = field(candidate, NAME_MAX_BYTES)
+            if name:
+                return UPLOAD_LINE, name
+        return UPLOAD_LINE, UNKNOWN_UPLOAD
+    if job.source == "url":
+        host = field(url_host(job.url or ""), LINE_MAX_BYTES)
+        name = field(job.title or "", NAME_MAX_BYTES)
+        return f"Audio from {host}", name or f"audio from {host}"
+    name = field(episode.title, NAME_MAX_BYTES) if episode is not None else ""
+    show = field(episode.show_title, LINE_MAX_BYTES) if episode is not None else ""
+    return show or UNKNOWN_SHOW, name or UNKNOWN_EPISODE
+
+
 def compose(
     job: Job, episode: Episode | None, *, secrets: Sequence[str] = ()
 ) -> Notification | None:
     """The notification for a terminal job; None for queued or running.
 
-    It never carries a URL, a prompt or a path.
+    It never carries a URL path or query, instructions, a destination address or a file path.
     """
     status = job.status
     if status not in TAGS:
@@ -120,22 +142,21 @@ def compose(
     def field(text: str, limit: int) -> str:
         return clean_field(redact(text, secrets), limit)
 
-    name = field(episode.title, NAME_MAX_BYTES) if episode is not None else ""
-    title = fit_bytes(f"{TITLE_PREFIX[status]}: {name or UNKNOWN_EPISODE}", TITLE_MAX_BYTES)
-    show = field(episode.show_title, LINE_MAX_BYTES) if episode is not None else ""
+    first_line, name = _label(job, episode, field)
+    title = fit_bytes(f"{TITLE_PREFIX[status]}: {name}", TITLE_MAX_BYTES)
 
-    lines: list[str] = [show or UNKNOWN_SHOW]
+    lines: list[str] = [first_line]
     if status == "done":
         if job.result is not None:
             lines.append(f"Duration: {format_hms(job.result.duration_s)}")
         if job.warnings:
-            first = field(job.warnings[0], LINE_MAX_BYTES)
+            first = field(scrub_urls(job.warnings[0]), LINE_MAX_BYTES)
             count = len(job.warnings)
             lines.append(f"{count} warning{'' if count == 1 else 's'}: {first}")
     else:
         if status == "failed" and job.stage:
             lines.append(f"Stage: {field(job.stage, LINE_MAX_BYTES)}")
-        reason = field(job.error or "", LINE_MAX_BYTES)
+        reason = field(scrub_urls(job.error or ""), LINE_MAX_BYTES)
         lines.append(f"Reason: {reason or 'no reason recorded'}")
         if status == "failed" and job.attempts > 1:
             lines.append(f"Gave up after {job.attempts} attempts.")

@@ -33,6 +33,7 @@ from earmark.transcribe.base import (
     CachedTranscriber,
     NoSpeechError,
     UnusableAudioError,
+    asr_profile,
     segment_from,
 )
 
@@ -221,6 +222,12 @@ class RemoteAsrEngine:
     @property
     def name(self) -> str:
         return f"remote:{self._options.model}"
+
+    @property
+    def profile(self) -> str:
+        return asr_profile(
+            "remote", {"model": self._options.model, "language": self._options.language}
+        )
 
     @property
     def options(self) -> RemoteOptions:

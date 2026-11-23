@@ -1,5 +1,6 @@
 import hmac
 import json
+import logging
 import socket
 import sqlite3
 from collections.abc import Iterator
@@ -22,13 +23,18 @@ from earmark.api.auth import (
     token_digest,
     token_matches,
 )
-from earmark.api.routes import MAX_BODY_BYTES, build_router
+from earmark.api.routes import MAX_JSON_BODY_BYTES, build_router
+from earmark.api.schemas import VIEW_INSTRUCTIONS_CHARS, JobView, job_view
 from earmark.config import Settings
 from earmark.db import LegacyDatabaseError, open_database
 from earmark.jobs import JobStore
-from earmark.models import MAX_PROMPT_CHARS, Job
+from earmark.models import MAX_INSTRUCTIONS_CHARS, Job
+from earmark.recipients import RecipientPolicy
 from earmark.resolve.apple import MESSAGES, UrlProblem
-from tests.factories import T0, MutableClock
+from earmark.staging import Staging
+from earmark.submission import Intake
+from tests.asgi_helpers import call_asgi
+from tests.factories import T0, TO, MutableClock
 from tests.legacy_db import V010_JOB_COUNT, V010_SCHEMA_VERSION, make_v010_database
 
 TOKEN = "test-token-6b1f0e"
@@ -37,11 +43,17 @@ EP = "1000802907981"
 SHARE = f"https://podcasts.apple.com/us/podcast/did-a-i-break-the-internet/id{SHOW}?i={EP}&uo=4"
 CANON = f"https://podcasts.apple.com/us/podcast/id{SHOW}?i={EP}"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+SECRET_TO = "zelda.secret@example.org"
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(_env_file=None, api_token=SecretStr(TOKEN), data_dir=tmp_path / "data")
+    return Settings(
+        _env_file=None,
+        api_token=SecretStr(TOKEN),
+        data_dir=tmp_path / "data",
+        allowed_recipients=(TO, SECRET_TO),
+    )
 
 
 @pytest.fixture
@@ -67,7 +79,7 @@ def anon(settings: Settings, store: JobStore) -> Iterator[TestClient]:
 
 
 def _ingest(c: TestClient, **body: Any) -> Any:
-    return c.post("/ingest", json={"url": SHARE, **body})
+    return c.post("/transcriptions", json={"url": SHARE, "to": TO, **body})
 
 
 # -- A1: auth ----------------------------------------------------------------------------
@@ -76,7 +88,7 @@ def _ingest(c: TestClient, **body: Any) -> Any:
 @pytest.mark.parametrize(
     ("method", "path"),
     [
-        ("POST", "/ingest"),
+        ("POST", "/transcriptions"),
         ("GET", "/jobs"),
         ("GET", f"/jobs/{'a' * 32}"),
         ("GET", "/nope"),
@@ -111,7 +123,11 @@ def test_wrong_token_401(anon: TestClient, header: str) -> None:
 
 
 def test_bearer_scheme_case_insensitive(anon: TestClient, store: JobStore) -> None:
-    r = anon.post("/ingest", json={"url": SHARE}, headers={"Authorization": f"bearer {TOKEN}"})
+    r = anon.post(
+        "/transcriptions",
+        json={"url": SHARE, "to": TO},
+        headers={"Authorization": f"bearer {TOKEN}"},
+    )
     assert r.status_code == 202
 
 
@@ -140,10 +156,22 @@ def test_token_compared_with_compare_digest(
 
 def test_auth_runs_before_body_parsing(anon: TestClient, store: JobStore) -> None:
     h = {"Content-Type": "application/json"}
-    assert anon.post("/ingest", content=b"{not json", headers=h).status_code == 401
-    assert anon.post("/ingest", content=b"x" * 100_000, headers=h).status_code == 401
-    assert anon.post("/ingest", content=b'{"promt": 1}', headers=h).status_code == 401
+    assert anon.post("/transcriptions", content=b"{not json", headers=h).status_code == 401
+    assert anon.post("/transcriptions", content=b"x" * 100_000, headers=h).status_code == 401
+    assert anon.post("/transcriptions", content=b'{"promt": 1}', headers=h).status_code == 401
     assert store.list_recent() == []
+
+
+def test_auth_before_body_json(settings: Settings, store: JobStore) -> None:
+    app = create_app(settings, store=store)
+    result = call_asgi(
+        app,
+        headers={"content-type": "application/json", "content-length": "20"},
+        chunks=[b'{"url": "x", "to": ', b'"y"}'],
+    )
+    assert result.status == 401
+    assert result.receive_calls == 0
+    assert not (settings.data_dir / "uploads").exists()
 
 
 def test_websocket_without_token_refused(anon: TestClient) -> None:
@@ -180,15 +208,16 @@ def test_token_matches() -> None:
 # -- A2: ingest --------------------------------------------------------------------------
 
 
-def test_ingest_returns_202_and_queues(client: TestClient, store: JobStore) -> None:
-    r = _ingest(client, prompt="why?", timestamp="2026-03-04T05:06:07-08:00")
+def test_transcription_returns_202_and_queues(client: TestClient, store: JobStore) -> None:
+    r = _ingest(client, instructions="why?", timestamp="2026-03-04T05:06:07-08:00")
     assert r.status_code == 202
     body = r.json()
     assert body == {"job_id": body["job_id"], "status": "queued", "created": True}
     assert r.headers["Location"] == f"/jobs/{body['job_id']}"
     job = store.get(body["job_id"])
     assert job is not None
-    assert (job.status, job.kind, job.url, job.prompt) == ("queued", "ingest", CANON, "why?")
+    assert (job.status, job.kind, job.url, job.instructions) == ("queued", "ingest", CANON, "why?")
+    assert (job.source, job.to) == ("apple_podcasts", TO)
     assert job.shared_at.isoformat() == "2026-03-04T13:06:07+00:00"
 
 
@@ -202,10 +231,12 @@ def test_ingest_shared_at_defaults_to_now(
 
 
 def test_get_job_after_ingest(client: TestClient, store: JobStore) -> None:
-    job_id = _ingest(client, prompt="p").json()["job_id"]
+    job_id = _ingest(client, instructions="p").json()["job_id"]
     r = client.get(f"/jobs/{job_id}")
     assert r.status_code == 200
-    assert Job.model_validate(r.json()) == store.get(job_id)
+    job = store.get(job_id)
+    assert job is not None
+    assert JobView.model_validate(r.json()) == job_view(job)
 
 
 # -- A3: no outbound I/O -----------------------------------------------------------------
@@ -225,16 +256,17 @@ def test_ingest_makes_no_outbound_io(client: TestClient) -> None:
 @pytest.mark.parametrize(
     ("url", "problem"),
     [
-        ("https://open.spotify.com/episode/abc", "unsupported_host"),
         (f"https://podcasts.apple.com/us/podcast/the-daily/id{SHOW}", "show_link"),
         ("not a url", "malformed"),
+        ("ftp://audio.example.net/a.mp3", "malformed"),
+        ("open.spotify.com/episode/abc", "malformed"),
         ("https://podcasts.apple.com/us/channel/x/id1?i=2", "not_episode"),
+        ("https://music.apple.com/us/album/x/1", "not_episode"),
+        ("https://user:pw@cdn.example/a.mp3", "credentials"),
     ],
 )
-def test_ingest_rejects_url(
-    client: TestClient, store: JobStore, url: str, problem: UrlProblem
-) -> None:
-    r = client.post("/ingest", json={"url": url})
+def test_bad_urls_422(client: TestClient, store: JobStore, url: str, problem: UrlProblem) -> None:
+    r = client.post("/transcriptions", json={"url": url, "to": TO})
     assert r.status_code == 422
     detail = r.json()["detail"]
     assert detail == MESSAGES[problem]
@@ -245,8 +277,8 @@ def test_ingest_rejects_url(
 def test_ingest_dedupe_hit_returns_existing_job(client: TestClient, store: JobStore) -> None:
     first = _ingest(client).json()
     second = client.post(
-        "/ingest",
-        json={"url": f"https://itunes.apple.com/US/podcast/x/id{SHOW}?i={EP}&mt=2"},
+        "/transcriptions",
+        json={"url": f"https://itunes.apple.com/US/podcast/x/id{SHOW}?i={EP}&mt=2", "to": TO},
     )
     assert second.status_code == 202
     assert second.json() == {**first, "created": False}
@@ -256,47 +288,200 @@ def test_ingest_dedupe_hit_returns_existing_job(client: TestClient, store: JobSt
     assert third.json() == {"job_id": first["job_id"], "status": "running", "created": False}
 
 
-# -- A6: prompt and body limits ----------------------------------------------------------
+# -- A6: instructions and body limits ---------------------------------------------------
 
 
-def test_ingest_blank_prompt_stored_as_null(client: TestClient, store: JobStore) -> None:
-    first = _ingest(client, prompt="   ").json()
+def test_blank_instructions_stored_as_empty(client: TestClient, store: JobStore) -> None:
+    first = _ingest(client, instructions="   ").json()
     job = store.get(first["job_id"])
     assert job is not None
-    assert job.prompt is None
+    assert job.instructions == ""
     second = _ingest(client).json()
     assert second["job_id"] == first["job_id"]
     assert second["created"] is False
 
 
-def test_ingest_overlong_prompt_422(client: TestClient, store: JobStore) -> None:
-    r = _ingest(client, prompt="x" * (MAX_PROMPT_CHARS + 1))
+def test_null_instructions_accepted(client: TestClient, store: JobStore) -> None:
+    assert _ingest(client, instructions=None).status_code == 202
+
+
+def test_overlong_instructions_422(client: TestClient, store: JobStore) -> None:
+    r = _ingest(client, instructions="x" * (MAX_INSTRUCTIONS_CHARS + 1))
     assert r.status_code == 422
-    assert r.json()["detail"] == "prompt is too long (at most 4000 characters)"
+    assert r.json()["detail"] == "instructions is too long (at most 4000 characters)"
     assert store.list_recent() == []
 
 
-def test_ingest_body_too_large_413(client: TestClient, store: JobStore) -> None:
-    big = {"url": SHARE, "prompt": "x" * (MAX_BODY_BYTES + 1)}
-    assert client.post("/ingest", json=big).status_code == 413
-
-    def chunks() -> Iterator[bytes]:
-        yield b'{"url": "'
-        for _ in range(MAX_BODY_BYTES // 1024 + 2):
-            yield b"a" * 1024
-        yield b'"}'
-
-    r = client.post("/ingest", content=chunks(), headers={"Content-Type": "application/json"})
+def test_json_over_64k_413_declared_and_streamed(
+    client: TestClient, store: JobStore, settings: Settings
+) -> None:
+    big = {"url": SHARE, "to": TO, "instructions": "x" * (MAX_JSON_BODY_BYTES + 1)}
+    r = client.post("/transcriptions", json=big)
     assert r.status_code == 413
+    assert r.json() == {"detail": "request body is larger than 64 KiB"}
+
+    chunks = [b'{"url": "', *[b"a" * 1024] * (MAX_JSON_BODY_BYTES // 1024 + 2), b'"}']
+    streamed = call_asgi(
+        create_app(settings, store=store),
+        headers={"authorization": f"Bearer {TOKEN}", "content-type": "application/json"},
+        chunks=chunks,
+    )
+    assert streamed.status == 413
+    assert streamed.json() == {"detail": "request body is larger than 64 KiB"}
+    declared = call_asgi(
+        create_app(settings, store=store),
+        headers={
+            "authorization": f"Bearer {TOKEN}",
+            "content-type": "application/json",
+            "content-length": str(MAX_JSON_BODY_BYTES + 1),
+        },
+        chunks=[b"{}"],
+    )
+    assert declared.status == 413
+    assert declared.receive_calls == 0
     assert store.list_recent() == []
 
 
-def test_ingest_max_valid_body_accepted(client: TestClient, store: JobStore) -> None:
-    body = json.dumps({"url": SHARE, "prompt": "\U0001f600" * MAX_PROMPT_CHARS})
+def test_json_max_valid_body_accepted(client: TestClient, store: JobStore) -> None:
+    body = json.dumps(
+        {
+            "url": SHARE,
+            "to": TO,
+            "instructions": "\U0001f600" * MAX_INSTRUCTIONS_CHARS,
+            "title": "\U0001f600" * 200,
+        }
+    )
     assert len(body) > 40_000
-    r = client.post("/ingest", content=body.encode(), headers={"Content-Type": "application/json"})
+    r = client.post(
+        "/transcriptions", content=body.encode(), headers={"Content-Type": "application/json"}
+    )
     assert r.status_code == 202
     assert len(store.list_recent()) == 1
+
+
+def test_unsupported_content_type_415(client: TestClient, store: JobStore) -> None:
+    for headers in (
+        {"Content-Type": "text/plain"},
+        {"Content-Type": "application/x-www-form-urlencoded"},
+        {},
+    ):
+        r = client.post("/transcriptions", content=b"url=x", headers=headers)
+        assert r.status_code == 415
+        assert "application/json" in r.json()["detail"]
+        assert "multipart/form-data" in r.json()["detail"]
+    assert store.list_recent() == []
+
+
+def test_empty_json_body_422(client: TestClient) -> None:
+    r = client.post("/transcriptions", content=b"", headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "request body is missing; send a JSON object with url and to"
+
+
+def test_ingest_route_gone_404(client: TestClient) -> None:
+    r = client.post("/ingest", json={"url": SHARE, "to": TO})
+    assert r.status_code == 404
+
+
+# -- recipients --------------------------------------------------------------------------
+
+
+def test_to_missing_422(client: TestClient, store: JobStore) -> None:
+    r = client.post("/transcriptions", json={"url": SHARE})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "to is required"
+    assert store.list_recent() == []
+
+
+@pytest.mark.parametrize(
+    "bad", ["not-an-address", "a@b", "a@b.org, c@d.org", "a b@c.org", "a@b.org\r\nBcc: x@y.org"]
+)
+def test_to_invalid_422_does_not_echo(client: TestClient, store: JobStore, bad: str) -> None:
+    r = client.post("/transcriptions", json={"url": SHARE, "to": bad})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "to must be one email address"
+    assert bad not in r.text
+    assert store.list_recent() == []
+
+
+def test_to_not_allowlisted_422(client: TestClient, store: JobStore) -> None:
+    r = client.post("/transcriptions", json={"url": SHARE, "to": "stranger@example.com"})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "to is not an allowed recipient (EARMARK_ALLOWED_RECIPIENTS)"
+    assert "stranger" not in r.text
+    assert store.list_recent() == []
+
+
+def test_to_is_matched_after_normalisation(client: TestClient, store: JobStore) -> None:
+    r = _ingest(client, to="you@EXAMPLE.org")
+    assert r.status_code == 202
+    job = store.get(r.json()["job_id"])
+    assert job is not None
+    assert job.to == TO
+    assert _ingest(client, to="You@example.org").status_code == 422  # the local part is exact
+
+
+def test_allowlist_unset_refuses_everything(
+    tmp_path: Path, store: JobStore, settings: Settings
+) -> None:
+    unset = Settings(_env_file=None, api_token=SecretStr(TOKEN), data_dir=settings.data_dir)
+    with TestClient(create_app(unset, store=store), headers=AUTH) as c:
+        r = _ingest(c)
+    assert r.status_code == 422
+    assert r.json()["detail"] == (
+        "no recipients are allowed yet: set EARMARK_ALLOWED_RECIPIENTS on the server"
+    )
+    assert store.list_recent() == []
+
+
+def test_allow_all_accepts_any_address(settings: Settings, store: JobStore) -> None:
+    everyone = settings.model_copy(update={"allowed_recipients": ("all",)})
+    with TestClient(create_app(everyone, store=store), headers=AUTH) as c:
+        assert _ingest(c, to="anyone@example.net").status_code == 202
+        assert _ingest(c, to="not an address").status_code == 422
+
+
+def test_allow_all_logs_warning_at_startup(
+    settings: Settings, store: JobStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    everyone = settings.model_copy(update={"allowed_recipients": ("all",)})
+    with caplog.at_level(logging.WARNING, logger="earmark.api.app"):
+        create_app(everyone, store=store)
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "EARMARK_ALLOWED_RECIPIENTS=all" in record.getMessage()
+    assert "\n" not in record.getMessage()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="earmark.api.app"):
+        create_app(settings, store=store)
+    assert caplog.records == []
+
+
+def test_direct_url_request(client: TestClient, store: JobStore) -> None:
+    r = client.post(
+        "/transcriptions",
+        json={"url": "https://audio.example.net/p/clip.mp3?sig=Q#frag", "to": TO, "title": "Clip"},
+    )
+    assert r.status_code == 202
+    job = store.get(r.json()["job_id"])
+    assert job is not None
+    assert (job.source, job.url, job.title) == (
+        "url",
+        "https://audio.example.net/p/clip.mp3?sig=Q",
+        "Clip",
+    )
+
+
+def test_double_tap_returns_same_job(client: TestClient, store: JobStore) -> None:
+    first = _ingest(client, instructions="x").json()
+    second = _ingest(client, instructions="x").json()
+    assert second == {**first, "created": False}
+    claim = store.claim_next()
+    assert claim is not None
+    store.complete(claim)
+    third = _ingest(client, instructions="x").json()
+    assert third == {"job_id": first["job_id"], "status": "done", "created": False}
+    assert _ingest(client, instructions="y").json()["created"] is True
+    assert _ingest(client, instructions="x", to=SECRET_TO).json()["created"] is True
 
 
 # -- A7: healthz and docs ----------------------------------------------------------------
@@ -367,27 +552,28 @@ CT_MSG = "request body must be a JSON object sent with Content-Type: application
     ("kwargs", "expected"),
     [
         ({"content": b"{not json", "headers": JSON_H}, "request body is not valid JSON"),
-        (
-            {"content": b"", "headers": JSON_H},
-            "request body is missing; send a JSON object with a url",
-        ),
         ({"content": b"null", "headers": JSON_H}, CT_MSG),
         ({"content": b"[1]", "headers": JSON_H}, CT_MSG),
-        ({"content": b'{"url": "sentinel-4a7d"}'}, CT_MSG),
-        ({"json": {}}, "url is required"),
-        ({"json": {"url": ["sentinel-4a7d"]}}, None),
+        ({"json": {}}, "to is required; url is required"),
+        ({"json": {"url": SHARE}}, "to is required"),
+        ({"json": {"url": ["sentinel-4a7d"], "to": TO}}, None),
         (
-            {"json": {"url": SHARE, "promt": "sentinel-4a7d"}},
-            "unknown field 'promt' (allowed: url, prompt, timestamp)",
+            {"json": {"url": SHARE, "to": TO, "promt": "sentinel-4a7d"}},
+            "unknown field 'promt' (allowed: url, to, instructions, title, timestamp)",
         ),
-        ({"json": {"url": SHARE, "timestamp": "2026-01-01T00:00:00"}}, None),
-        ({"json": {"url": SHARE, "prompt": 5}}, None),
+        ({"json": {"url": SHARE, "to": TO, "prompt": "sentinel-4a7d"}}, None),
+        ({"json": {"url": SHARE, "to": TO, "timestamp": "2026-01-01T00:00:00"}}, None),
+        ({"json": {"url": SHARE, "to": TO, "instructions": 5}}, None),
+        (
+            {"json": {"url": SHARE, "to": TO, "title": "t" * 201}},
+            "title is too long (at most 200 characters)",
+        ),
     ],
 )
 def test_validation_messages(
     client: TestClient, store: JobStore, kwargs: dict[str, Any], expected: str | None
 ) -> None:
-    r = client.post("/ingest", **kwargs)
+    r = client.post("/transcriptions", **kwargs)
     assert r.status_code == 422
     detail = r.json()["detail"]
     assert isinstance(detail, str)
@@ -399,21 +585,24 @@ def test_validation_messages(
 
 
 def test_validation_message_specifics(client: TestClient) -> None:
-    d = client.post("/ingest", json={"url": ["sentinel-4a7d"]}).json()["detail"]
-    assert d.startswith("url:")
-    d = client.post("/ingest", json={"url": SHARE, "timestamp": "2026-01-01T00:00:00"}).json()[
-        "detail"
-    ]
+    def post(**body: Any) -> str:
+        r = client.post("/transcriptions", json={"url": SHARE, "to": TO, **body})
+        return str(r.json()["detail"])
+
+    assert (
+        client.post("/transcriptions", json={"url": ["s"], "to": TO})
+        .json()["detail"]
+        .startswith("url:")
+    )
+    d = post(timestamp="2026-01-01T00:00:00")
     assert "timestamp:" in d
     assert "UTC offset" in d
-    d = client.post("/ingest", json={"url": SHARE, "prompt": 5}).json()["detail"]
-    assert d.startswith("prompt:")
-    d = client.post("/ingest", json={"url": "   "}).json()["detail"]
-    assert d == "url must not be empty"
+    assert post(instructions=5).startswith("instructions:")
+    assert post(url="   ") == "url must not be empty"
 
 
 def test_unknown_field_name_truncated(client: TestClient) -> None:
-    r = client.post("/ingest", json={"url": SHARE, "k" * 100: 1})
+    r = client.post("/transcriptions", json={"url": SHARE, "to": TO, "k" * 100: 1})
     assert f"unknown field '{'k' * 40}' (" in r.json()["detail"]
 
 
@@ -445,7 +634,7 @@ def test_list_jobs(client: TestClient, store: JobStore, clock: MutableClock) -> 
     ids = []
     for i in range(3):
         clock.advance(10)
-        ids.append(_ingest(client, prompt=f"p{i}").json()["job_id"])
+        ids.append(_ingest(client, instructions=f"p{i}").json()["job_id"])
     r = client.get("/jobs")
     assert [j["id"] for j in r.json()["jobs"]] == ids[::-1]
     assert [j["id"] for j in client.get("/jobs?limit=2").json()["jobs"]] == ids[:0:-1]
@@ -475,25 +664,27 @@ def test_store_error_503(settings: Settings, tmp_path: Path) -> None:
 
     locked = LockedStore(open_database(tmp_path / "x.db"))
     with TestClient(create_app(settings, store=locked), headers=AUTH) as c:
-        r = c.post("/ingest", json={"url": SHARE})
+        r = c.post("/transcriptions", json={"url": SHARE, "to": TO})
     assert r.status_code == 503
     assert r.headers["Retry-After"] == "5"
     assert r.json() == {"detail": "the job store is unavailable; try again shortly"}
 
 
-def test_routes_are_exactly_the_kept_ones(store: JobStore) -> None:
+def test_routes_are_exactly_the_kept_ones(store: JobStore, tmp_path: Path) -> None:
+    intake = Intake(store, RecipientPolicy.from_setting((TO,)), Staging(tmp_path))
+    router = build_router(intake, max_upload_bytes=1024)
     routes = {
         (route.path, frozenset(route.methods or ()))
-        for route in build_router(store).routes
+        for route in router.routes
         if isinstance(route, APIRoute)
     }
     assert routes == {
-        ("/ingest", frozenset({"POST"})),
+        ("/transcriptions", frozenset({"POST"})),
         ("/jobs/{job_id}", frozenset({"GET"})),
         ("/jobs", frozenset({"GET"})),
         ("/healthz", frozenset({"GET", "HEAD"})),
     }
-    assert len(build_router(store).routes) == 4
+    assert len(router.routes) == 4
 
 
 def test_create_app_refuses_v010_database(settings: Settings, tmp_path: Path) -> None:
@@ -509,3 +700,98 @@ def test_create_app_refuses_v010_database(settings: Settings, tmp_path: Path) ->
         assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == V010_JOB_COUNT
     finally:
         conn.close()
+
+
+# -- job views ---------------------------------------------------------------------------
+
+
+def _view(client: TestClient, job_id: str) -> dict[str, Any]:
+    r = client.get(f"/jobs/{job_id}")
+    assert r.status_code == 200
+    body: dict[str, Any] = r.json()
+    return body
+
+
+def test_job_view_fields(client: TestClient) -> None:
+    view = _view(client, _ingest(client).json()["job_id"])
+    assert set(view) == set(JobView.model_fields)
+    for hidden in ("heartbeat_at", "upload_file", "upload_name", "content_sha256", "lease_token"):
+        assert hidden not in view
+    assert set(view) == {
+        "id", "status", "stage", "source", "url", "to", "instructions", "title", "episode_key",
+        "attempts", "run_after", "error", "warnings", "result", "shared_at", "created_at",
+        "updated_at",
+    }  # fmt: skip
+    assert view["to"] == TO
+
+
+def test_view_instructions_truncated_to_200(client: TestClient) -> None:
+    exact = "é" * VIEW_INSTRUCTIONS_CHARS
+    assert (
+        _view(client, _ingest(client, instructions=exact).json()["job_id"])["instructions"] == exact
+    )
+    long = "é" * (VIEW_INSTRUCTIONS_CHARS + 50)
+    shown = _view(client, _ingest(client, instructions=long).json()["job_id"])["instructions"]
+    assert shown == "é" * 199 + "…"
+    assert len(shown) == VIEW_INSTRUCTIONS_CHARS
+
+
+def test_view_direct_url_scheme_host_path_only(client: TestClient) -> None:
+    url = "https://user@Audio.Example.NET:8443/private/PATH-TOKEN.mp3?sig=QUERY-TOKEN#frag"
+    r = client.post("/transcriptions", json={"url": url, "to": TO})
+    assert r.status_code == 422  # credentials are refused before anything is stored
+    url = "https://Audio.Example.NET:8443/private/PATH-TOKEN.mp3?sig=QUERY-TOKEN#frag"
+    job_id = client.post("/transcriptions", json={"url": url, "to": TO}).json()["job_id"]
+    view = _view(client, job_id)
+    assert view["url"] == "https://audio.example.net:8443/private/PATH-TOKEN.mp3"
+    assert view["source"] == "url"
+    assert "QUERY-TOKEN" not in json.dumps(view)
+
+
+def test_view_podcast_url_whole(client: TestClient) -> None:
+    view = _view(client, _ingest(client).json()["job_id"])
+    assert view["url"] == CANON
+
+
+def test_view_errors_scrubbed(client: TestClient, store: JobStore) -> None:
+    job_id = _ingest(client).json()["job_id"]
+    claim = store.claim_next()
+    assert claim is not None
+    store.add_warning(job_id, "slow server https://cdn.example/a/b.mp3?token=WARN-TOKEN")
+    store.fail(claim, "got 404 from https://cdn.example/a/b.mp3?token=ERR-TOKEN", transient=False)
+    view = _view(client, job_id)
+    assert view["error"] == "got 404 from https://cdn.example/…"
+    assert view["warnings"] == ["slow server https://cdn.example/…"]
+    assert "TOKEN" not in json.dumps(view)
+
+
+def test_list_jobs_returns_views(client: TestClient) -> None:
+    _ingest(client)
+    [view] = client.get("/jobs").json()["jobs"]
+    assert set(view) == set(JobView.model_fields)
+
+
+def test_upload_job_view_has_no_url_or_file_name(client: TestClient, store: JobStore) -> None:
+    from tests.factories import new_upload_job
+
+    job = store.enqueue(new_upload_job("e" * 64, upload_name="PRIVATE-NAME.mp3")).job
+    view = _view(client, job.id)
+    assert (view["source"], view["url"]) == ("upload", None)
+    assert "PRIVATE-NAME" not in json.dumps(view)
+
+
+# -- startup sweep -----------------------------------------------------------------------
+
+
+def test_create_app_sweeps_stale_uploads(settings: Settings, store: JobStore) -> None:
+    from tests.factories import new_upload_job
+
+    uploads = settings.data_dir / "uploads"
+    uploads.mkdir(parents=True)
+    kept = f"{'a' * 32}.mp3"
+    (uploads / kept).write_bytes(b"queued job's audio")
+    (uploads / f".{'b' * 32}.mp3.part").write_bytes(b"crashed mid-upload")
+    (uploads / f"{'c' * 32}.mp3").write_bytes(b"orphan")
+    store.enqueue(new_upload_job("d" * 64, upload_file=kept))
+    create_app(settings, store=store)
+    assert [p.name for p in uploads.iterdir()] == [kept]

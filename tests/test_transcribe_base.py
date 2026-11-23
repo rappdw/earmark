@@ -13,6 +13,7 @@ from earmark.transcribe.base import (
     NoSpeechError,
     TranscriptionEngine,
     UnusableAudioError,
+    asr_profile,
 )
 from tests.factories import make_episode
 
@@ -20,9 +21,16 @@ from tests.factories import make_episode
 class RecordingEngine:
     name = "recording-engine"
 
-    def __init__(self, *, error: BaseException | None = None, key: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        key: str | None = None,
+        profile: str = "recording {}",
+    ) -> None:
         self.error = error
         self.key = key
+        self.profile = profile
         self.calls: list[tuple[Path, str]] = []
 
     def transcribe_file(self, audio: Path, episode_key: str, /) -> Transcript:
@@ -67,6 +75,7 @@ def test_cached_transcript_returned_without_engine(tmp_path: Path) -> None:
         duration_s=3.0,
         model="old",
         segments=(Segment(start=0.0, end=1.0, text="stored"),),
+        asr_profile=RecordingEngine().profile,
     )
     artifacts.write_transcript(stored)
     engine = RecordingEngine()
@@ -102,7 +111,11 @@ def test_keep_audio_keeps_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize("keep", [False, True])
 def test_cached_hit_cleans_up_audio(tmp_path: Path, keep: bool) -> None:
     artifacts, episode, audio = _setup(tmp_path)
-    artifacts.write_transcript(RecordingEngine().transcribe_file(audio, episode.key))
+    engine = RecordingEngine()
+    stamped = engine.transcribe_file(audio, episode.key).model_copy(
+        update={"asr_profile": engine.profile}
+    )
+    artifacts.write_transcript(stamped)
     _make(artifacts, RecordingEngine(), keep_audio=keep).transcribe(episode, audio)
     assert audio.exists() is keep
 
@@ -216,6 +229,66 @@ def test_transcript_files_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert text_path.stat().st_mode & 0o777 == 0o644
     assert json_path.stat().st_mode & 0o777 == 0o644
     assert not [p for p in text_path.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_asr_profile_is_canonical() -> None:
+    assert asr_profile("b", {"z": 1, "a": None, "m": True}) == 'b {"a":null,"m":true,"z":1}'
+    assert asr_profile("b", {"a": "x"}) != asr_profile("c", {"a": "x"})
+
+
+def test_profile_mismatch_is_a_miss(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    tiny = RecordingEngine(profile="p tiny")
+    _make(artifacts, tiny, keep_audio=True).transcribe(episode, audio)
+    large = RecordingEngine(profile="p large")
+    transcriber = _make(artifacts, large, keep_audio=True)
+    assert transcriber.cached(episode) is None
+    result = transcriber.transcribe(episode, audio)
+    assert large.calls == [(audio, episode.key)]
+    assert result.asr_profile == "p large"
+    stored = artifacts.read_transcript(episode.key)
+    assert stored is not None
+    assert stored.asr_profile == "p large"
+    # Switching back is a miss again: one transcript per episode on disk.
+    assert _make(artifacts, tiny, keep_audio=True).cached(episode) is None
+
+
+def test_profile_match_is_a_hit(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    first = RecordingEngine(profile="p tiny")
+    written = _make(artifacts, first, keep_audio=True).transcribe(episode, audio)
+    second = RecordingEngine(profile="p tiny")
+    transcriber = _make(artifacts, second, keep_audio=True)
+    assert transcriber.cached(episode) == written
+    assert transcriber.transcribe(episode, audio) == written
+    assert second.calls == []
+
+
+def test_legacy_transcript_without_profile_is_a_miss(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    artifacts.write_transcript(RecordingEngine().transcribe_file(audio, episode.key))
+    engine = RecordingEngine()
+    transcriber = _make(artifacts, engine, keep_audio=True)
+    assert transcriber.cached(episode) is None
+    transcriber.transcribe(episode, audio)
+    assert len(engine.calls) == 1
+
+
+def test_written_transcript_carries_profile(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    engine = RecordingEngine(profile="p tiny")
+    _make(artifacts, engine).transcribe(episode, audio)
+    stored = artifacts.read_transcript(episode.key)
+    assert stored is not None
+    assert stored.asr_profile == "p tiny"
+    assert '"asr_profile": "p tiny"' in artifacts.transcript_json_path(episode.key).read_text()
+
+
+def test_cached_reads_without_the_engine(tmp_path: Path) -> None:
+    artifacts, episode, _ = _setup(tmp_path)
+    engine = RecordingEngine()
+    assert _make(artifacts, engine).cached(episode) is None
+    assert engine.calls == []
 
 
 def test_segment_from_lives_in_base() -> None:

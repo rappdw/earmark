@@ -17,12 +17,21 @@ from earmark.jobs import (
     JobNotFoundError,
     JobStore,
     LeaseLostError,
+    NewJob,
     open_job_store,
     retry_delay,
 )
 from earmark.models import JobResult, episode_key
 from tests import db_helpers
-from tests.factories import PST, T0, MutableClock
+from tests.factories import (
+    PST,
+    T0,
+    TO,
+    MutableClock,
+    new_podcast_job,
+    new_upload_job,
+    new_url_job,
+)
 
 URL = "https://podcasts.apple.com/us/podcast/x/id1?i=2"
 KEY = episode_key("apple_podcasts", "1", "g")
@@ -65,7 +74,7 @@ def test_claim_returns_none_when_empty(store: JobStore) -> None:
 
 
 def test_claim_exactly_once_threads(store: JobStore) -> None:
-    ids = [store.enqueue(f"{URL}{i}").job.id for i in range(200)]
+    ids = [store.enqueue(new_podcast_job(f"{URL}{i}")).job.id for i in range(200)]
     n = 8
     barrier = threading.Barrier(n)
     claimed: list[str] = []
@@ -89,7 +98,7 @@ def test_claim_exactly_once_threads(store: JobStore) -> None:
 
 
 def test_claim_exactly_once_processes(store: JobStore, tmp_path: Path, clock: MutableClock) -> None:
-    ids = [store.enqueue(f"{URL}{i}").job.id for i in range(300)]
+    ids = [store.enqueue(new_podcast_job(f"{URL}{i}")).job.id for i in range(300)]
     ctx = multiprocessing.get_context("spawn")
     n = 4
     barrier = ctx.Barrier(n)
@@ -120,7 +129,7 @@ def test_claim_exactly_once_processes(store: JobStore, tmp_path: Path, clock: Mu
 
 
 def test_transient_failure_backs_off_then_fails(store: JobStore, clock: MutableClock) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     delays = []
     for _ in range(3):
         claim = claim_one(store)
@@ -141,13 +150,13 @@ def test_transient_failure_backs_off_then_fails(store: JobStore, clock: MutableC
 
 
 def test_permanent_failure_fails_immediately(store: JobStore) -> None:
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     job = store.fail(claim_one(store), "bad url", transient=False)
     assert (job.status, job.attempts) == ("failed", 1)
 
 
 def test_retry_after_raises_delay(store: JobStore, clock: MutableClock) -> None:
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     job = store.fail(claim_one(store), "x", transient=True, retry_after_s=600)
     assert job.run_after - clock() == timedelta(seconds=600)
     clock.now = job.run_after
@@ -170,7 +179,7 @@ def test_retry_delay_values() -> None:
 
 def test_max_attempts_one(tmp_path: Path, clock: MutableClock) -> None:
     store = make_store(tmp_path, clock, max_attempts=1)
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     assert store.fail(claim_one(store), "x", transient=True).status == "failed"
 
 
@@ -186,7 +195,7 @@ def test_invalid_store_arguments(tmp_path: Path, clock: MutableClock) -> None:
 
 
 def test_requeue_stale_boundary(store: JobStore, clock: MutableClock) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim_one(store)
     clock.advance(900)
     assert store.requeue_stale() == []
@@ -205,7 +214,7 @@ def test_requeue_stale_boundary(store: JobStore, clock: MutableClock) -> None:
 
 
 def test_fresh_heartbeat_not_requeued(store: JobStore, clock: MutableClock) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim = claim_one(store)
     clock.advance(800)
     store.heartbeat(claim)
@@ -219,7 +228,7 @@ def test_fresh_heartbeat_not_requeued(store: JobStore, clock: MutableClock) -> N
 
 
 def test_set_stage_refreshes_heartbeat(store: JobStore, clock: MutableClock) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim = claim_one(store)
     clock.advance(800)
     store.set_stage(claim, "fetch")
@@ -232,7 +241,7 @@ def test_set_stage_refreshes_heartbeat(store: JobStore, clock: MutableClock) -> 
 
 def test_requeue_stale_fails_at_max_attempts(tmp_path: Path, clock: MutableClock) -> None:
     store = make_store(tmp_path, clock, max_attempts=1)
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     claim_one(store)
     clock.advance(1000)
     (job,) = store.requeue_stale()
@@ -259,7 +268,7 @@ FENCED_IDS = [name for name, _ in FENCED]
 def test_old_claim_cannot_act_after_requeue(
     store: JobStore, clock: MutableClock, call: FencedCall
 ) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     old = claim_one(store)
     clock.advance(1000)
     store.requeue_stale()
@@ -271,7 +280,7 @@ def test_old_claim_cannot_act_after_requeue(
 
 @pytest.mark.parametrize("call", [c for _, c in FENCED], ids=FENCED_IDS)
 def test_fenced_after_terminal(store: JobStore, call: FencedCall) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim = claim_one(store)
     done = store.complete(claim)
     with pytest.raises(LeaseLostError):
@@ -283,56 +292,171 @@ def test_fenced_after_terminal(store: JobStore, call: FencedCall) -> None:
 
 
 def test_dedupe_while_queued(store: JobStore) -> None:
-    a = store.enqueue(URL, prompt="p")
-    b = store.enqueue(URL, prompt="p")
+    a = store.enqueue(new_podcast_job(URL, instructions="p"))
+    b = store.enqueue(new_podcast_job(URL, instructions="p"))
     assert (a.created, b.created) == (True, False)
     assert a.job.id == b.job.id
     assert len(store.list_recent()) == 1
 
 
 def test_dedupe_while_running(store: JobStore) -> None:
-    a = store.enqueue(URL)
+    a = store.enqueue(new_podcast_job(URL))
     claim_one(store)
-    b = store.enqueue(URL)
+    b = store.enqueue(new_podcast_job(URL))
     assert not b.created
     assert b.job.id == a.job.id
     assert b.job.status == "running"
 
 
 def test_dedupe_while_waiting_for_retry(store: JobStore) -> None:
-    a = store.enqueue(URL)
+    a = store.enqueue(new_podcast_job(URL))
     store.fail(claim_one(store), "x", transient=True)
-    b = store.enqueue(URL)
+    b = store.enqueue(new_podcast_job(URL))
     assert not b.created
     assert b.job.id == a.job.id
 
 
 def test_dedupe_keeps_first_shared_at(store: JobStore, clock: MutableClock) -> None:
-    a = store.enqueue(URL)
+    a = store.enqueue(new_podcast_job(URL))
     clock.advance(5)
-    b = store.enqueue(URL, shared_at=clock())
+    b = store.enqueue(new_podcast_job(URL, shared_at=clock()))
     assert b.job.shared_at == a.job.shared_at == T0
 
 
-@pytest.mark.parametrize("how", ["complete", "skip", "fail"])
-def test_new_job_after_terminal(store: JobStore, how: str) -> None:
-    a = store.enqueue(URL)
+@pytest.mark.parametrize("how", ["skip", "fail"])
+def test_new_job_after_failed_or_skipped(store: JobStore, how: str) -> None:
+    a = store.enqueue(new_podcast_job(URL))
     claim = claim_one(store)
-    if how == "complete":
-        store.complete(claim)
-    elif how == "skip":
+    if how == "skip":
         store.skip(claim, "nothing to do")
     else:
         store.fail(claim, "bad", transient=False)
-    b = store.enqueue(URL)
+    b = store.enqueue(new_podcast_job(URL))
     assert b.created
     assert b.job.id != a.job.id
 
 
-def test_dedupe_distinguishes_prompt(store: JobStore) -> None:
-    ids = {store.enqueue(URL, prompt=p).job.id for p in (None, "", "a", "b")}
-    ids.add(store.enqueue(URL + "3").job.id)
-    assert len(ids) == 5
+def finish_done(store: JobStore) -> None:
+    store.complete(claim_one(store))
+
+
+def test_dedupe_active_returns_same(store: JobStore) -> None:
+    a = store.enqueue(new_podcast_job(URL, instructions="x"))
+    b = store.enqueue(new_podcast_job(URL, instructions="x"))
+    assert (a.created, b.created) == (True, False)
+    assert a.job.id == b.job.id
+
+
+def test_dedupe_done_within_window_returns_same(store: JobStore, clock: MutableClock) -> None:
+    a = store.enqueue(new_podcast_job(URL))
+    finish_done(store)
+    clock.advance(599)
+    b = store.enqueue(new_podcast_job(URL))
+    assert not b.created
+    assert b.job.id == a.job.id
+    assert b.job.status == "done"
+
+
+def test_dedupe_done_after_window_creates_new(store: JobStore, clock: MutableClock) -> None:
+    a = store.enqueue(new_podcast_job(URL))
+    finish_done(store)
+    clock.advance(601)
+    b = store.enqueue(new_podcast_job(URL))
+    assert b.created
+    assert b.job.id != a.job.id
+
+
+def test_dedupe_window_zero_active_only(tmp_path: Path, clock: MutableClock) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    store = JobStore(db, clock=clock, dedupe_window=timedelta(0))
+    a = store.enqueue(new_podcast_job(URL))
+    assert not store.enqueue(new_podcast_job(URL)).created
+    finish_done(store)
+    b = store.enqueue(new_podcast_job(URL))
+    assert b.created
+    assert b.job.id != a.job.id
+
+
+def test_dedupe_prefers_active_over_done(store: JobStore, clock: MutableClock) -> None:
+    store.enqueue(new_podcast_job(URL))
+    finish_done(store)
+    clock.advance(700)
+    active = store.enqueue(new_podcast_job(URL))
+    assert active.created
+    again = store.enqueue(new_podcast_job(URL))
+    assert (again.created, again.job.id) == (False, active.job.id)
+
+
+def test_negative_dedupe_window_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="dedupe_window"):
+        JobStore(open_database(tmp_path / "e.db"), dedupe_window=timedelta(seconds=-1))
+
+
+def test_new_to_new_job(store: JobStore) -> None:
+    a = store.enqueue(new_podcast_job(URL, to="a@example.org"))
+    b = store.enqueue(new_podcast_job(URL, to="b@example.org"))
+    assert b.created
+    assert a.job.id != b.job.id
+    assert (a.job.to, b.job.to) == ("a@example.org", "b@example.org")
+
+
+def test_new_instructions_new_job(store: JobStore) -> None:
+    ids = {store.enqueue(new_podcast_job(URL, instructions=p)).job.id for p in ("", "a", "b")}
+    ids.add(store.enqueue(new_podcast_job(URL + "3")).job.id)
+    assert len(ids) == 4
+
+
+def test_title_change_same_job(store: JobStore) -> None:
+    a = store.enqueue(new_podcast_job(URL, title="one"))
+    b = store.enqueue(new_podcast_job(URL, title="two"))
+    assert not b.created
+    assert b.job.id == a.job.id
+    assert b.job.title == "one"
+
+
+def test_dedupe_distinguishes_source_and_subject(store: JobStore) -> None:
+    ids = {
+        store.enqueue(new_podcast_job(URL)).job.id,
+        store.enqueue(new_url_job(URL)).job.id,
+        store.enqueue(new_upload_job("a" * 64)).job.id,
+        store.enqueue(new_upload_job("b" * 64)).job.id,
+    }
+    assert len(ids) == 4
+    again = store.enqueue(new_upload_job("a" * 64, upload_file="f" * 32 + ".mp3"))
+    assert not again.created
+
+
+def test_enqueue_rejects_inconsistent_jobs(store: JobStore) -> None:
+    bad = [
+        NewJob(source="upload", to=TO, url=URL),
+        NewJob(source="upload", to=TO, upload_file="a" * 32 + ".mp3"),
+        NewJob(source="url", to=TO),
+        NewJob(source="url", to=TO, url=URL, upload_file="a" * 32 + ".mp3"),
+        NewJob(source="apple_podcasts", to=" ", url=URL),
+    ]
+    for new in bad:
+        with pytest.raises(ValueError, match=r"upload|url|to must"):
+            store.enqueue(new)
+    assert store.list_recent() == []
+
+
+def test_request_fields_round_trip(store: JobStore) -> None:
+    new = new_upload_job("c" * 64, instructions="Why?\nHow?", title="T", upload_name="x y.mp3")
+    job = store.enqueue(new).job
+    assert store.get(job.id) == job
+    assert (job.source, job.url, job.to, job.instructions) == ("upload", None, TO, "Why?\nHow?")
+    assert (job.upload_name, job.content_sha256) == ("x y.mp3", "c" * 64)
+
+
+def test_active_upload_files_and_running_ids(store: JobStore) -> None:
+    up = store.enqueue(new_upload_job("a" * 64)).job
+    store.enqueue(new_url_job(URL))
+    assert store.active_upload_files() == {up.upload_file}
+    assert store.running_job_ids() == set()
+    claim = claim_one(store)
+    assert store.running_job_ids() == {claim.job.id}
+    store.complete(claim)
+    assert store.active_upload_files() == set()
 
 
 def test_dedupe_concurrent_threads(store: JobStore) -> None:
@@ -343,7 +467,7 @@ def test_dedupe_concurrent_threads(store: JobStore) -> None:
 
     def work() -> None:
         barrier.wait(timeout=30)
-        r = store.enqueue(URL, prompt="p")
+        r = store.enqueue(new_podcast_job(URL, instructions="p"))
         with lock:
             results.append(r)
 
@@ -364,21 +488,21 @@ def test_dedupe_concurrent_threads(store: JobStore) -> None:
 def test_claim_oldest_first(store: JobStore, clock: MutableClock) -> None:
     ids = []
     for i in range(3):
-        ids.append(store.enqueue(f"{URL}{i}").job.id)
+        ids.append(store.enqueue(new_podcast_job(f"{URL}{i}")).job.id)
         clock.advance(1)
     assert [claim_one(store).job.id for _ in range(3)] == ids
 
 
 def test_claim_ties_by_insertion_order(store: JobStore) -> None:
-    ids = [store.enqueue(f"{URL}{i}").job.id for i in range(5)]
+    ids = [store.enqueue(new_podcast_job(f"{URL}{i}")).job.id for i in range(5)]
     assert [claim_one(store).job.id for _ in range(5)] == ids
 
 
 def test_future_run_after_not_claimed(store: JobStore, clock: MutableClock) -> None:
-    first = store.enqueue(URL)
+    first = store.enqueue(new_podcast_job(URL))
     retry = store.fail(claim_one(store), "x", transient=True)
     clock.advance(1)
-    newer = store.enqueue(URL + "2")
+    newer = store.enqueue(new_podcast_job(URL + "2"))
     assert claim_one(store).job.id == newer.job.id
     assert store.claim_next() is None
     clock.now = retry.run_after - timedelta(microseconds=1)
@@ -388,9 +512,9 @@ def test_future_run_after_not_claimed(store: JobStore, clock: MutableClock) -> N
 
 
 def test_retried_job_keeps_age_order(store: JobStore, clock: MutableClock) -> None:
-    first = store.enqueue(URL)
+    first = store.enqueue(new_podcast_job(URL))
     clock.advance(1)
-    second = store.enqueue(URL + "2")
+    second = store.enqueue(new_podcast_job(URL + "2"))
     store.fail(claim_one(store), "x", transient=True)  # first goes back with a delay
     assert claim_one(store).job.id == second.job.id
     clock.advance(3600)
@@ -401,7 +525,7 @@ def test_retried_job_keeps_age_order(store: JobStore, clock: MutableClock) -> No
 
 
 def test_release_undoes_attempt(store: JobStore) -> None:
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     claim = claim_one(store)
     store.set_stage(claim, "fetch")
     store.add_warning(claim.job.id, "w")
@@ -412,14 +536,14 @@ def test_release_undoes_attempt(store: JobStore) -> None:
 
 
 def test_release_keeps_error(store: JobStore, clock: MutableClock) -> None:
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     retry = store.fail(claim_one(store), "why", transient=True)
     clock.now = retry.run_after
     assert store.release(claim_one(store)).error == "why"
 
 
 def test_old_claim_after_release_and_reclaim(store: JobStore) -> None:
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     old = claim_one(store)
     store.release(old)
     new = claim_one(store)
@@ -433,7 +557,7 @@ def test_old_claim_after_release_and_reclaim(store: JobStore) -> None:
 
 
 def test_complete_stores_result(store: JobStore, clock: MutableClock) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim = claim_one(store)
     retry = store.fail(claim, "transient", transient=True)
     assert retry.error == "transient"
@@ -447,7 +571,7 @@ def test_complete_stores_result(store: JobStore, clock: MutableClock) -> None:
 
 
 def test_add_warning_appends_and_dedupes(store: JobStore) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     for msg in ["é ☕", 'say "hi"', "é ☕", "it's"]:
         store.add_warning(job_id, msg)
     job = store.get(job_id)
@@ -456,7 +580,7 @@ def test_add_warning_appends_and_dedupes(store: JobStore) -> None:
 
 
 def test_add_warning_on_terminal_job(store: JobStore) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     store.complete(claim_one(store))
     store.add_warning(job_id, "notifier failed")
     job = store.get(job_id)
@@ -470,7 +594,7 @@ def test_add_warning_unknown_job(store: JobStore) -> None:
 
 
 def test_set_stage_and_episode_key(store: JobStore) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim = claim_one(store)
     store.set_stage(claim, "transcribe")
     store.set_episode_key(claim, KEY)
@@ -482,7 +606,7 @@ def test_set_stage_and_episode_key(store: JobStore) -> None:
 
 
 def test_skip_records_reason(store: JobStore) -> None:
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     job = store.skip(claim_one(store), "not a podcast")
     assert (job.status, job.error) == ("skipped", "not a podcast")
 
@@ -492,7 +616,7 @@ def test_skip_records_reason(store: JobStore) -> None:
 
 def test_shared_at_offset_round_trips(store: JobStore) -> None:
     shared = datetime(2026, 1, 1, 4, 0, tzinfo=PST)
-    job = store.enqueue(URL, shared_at=shared).job
+    job = store.enqueue(new_podcast_job(URL, shared_at=shared)).job
     got = store.get(job.id)
     assert got is not None
     assert got.shared_at == shared
@@ -501,20 +625,20 @@ def test_shared_at_offset_round_trips(store: JobStore) -> None:
 
 
 def test_shared_at_defaults_to_now(store: JobStore) -> None:
-    assert store.enqueue(URL).job.shared_at == T0
+    assert store.enqueue(new_podcast_job(URL)).job.shared_at == T0
 
 
 def test_naive_datetimes_refused(store: JobStore, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="timezone"):
-        store.enqueue(URL, shared_at=NAIVE)
+        store.enqueue(new_podcast_job(URL, shared_at=NAIVE))
     naive = JobStore(Database(tmp_path / "earmark.db"), clock=lambda: NAIVE)
     with pytest.raises(ValueError, match="timezone"):
-        naive.enqueue(URL)
+        naive.enqueue(new_podcast_job(URL))
     assert raw(tmp_path, "SELECT count(*) FROM jobs")[0][0] == 0
 
 
 def test_stored_timestamps_sort_as_text(store: JobStore, tmp_path: Path) -> None:
-    store.enqueue(URL, shared_at=datetime(2026, 1, 1, 4, 0, tzinfo=PST))
+    store.enqueue(new_podcast_job(URL, shared_at=datetime(2026, 1, 1, 4, 0, tzinfo=PST)))
     (row,) = raw(tmp_path, "SELECT run_after, shared_at, created_at, updated_at FROM jobs")
     assert row["shared_at"] == "2026-01-01T12:00:00.000000+00:00"
     assert tuple(row) == ("2026-01-01T12:00:00.000000+00:00",) * 4
@@ -532,7 +656,7 @@ def test_get_unknown_and_malformed(store: JobStore) -> None:
 def test_list_recent_order_limit_status(store: JobStore, clock: MutableClock) -> None:
     ids = []
     for i in range(4):
-        ids.append(store.enqueue(f"{URL}{i}").job.id)
+        ids.append(store.enqueue(new_podcast_job(f"{URL}{i}")).job.id)
         clock.advance(1)
     store.complete(claim_one(store))  # the oldest
     assert [j.id for j in store.list_recent()] == ids[::-1]
@@ -551,7 +675,7 @@ def test_list_recent_limit_bounds(store: JobStore) -> None:
 
 def test_enqueue_blank_url_refused(store: JobStore) -> None:
     with pytest.raises(ValueError, match="url"):
-        store.enqueue("  ")
+        store.enqueue(new_podcast_job("  "))
 
 
 # --- B9: settings --------------------------------------------------------------------
@@ -563,11 +687,11 @@ def test_open_job_store_from_settings(tmp_path: Path, clock: MutableClock) -> No
     )
     store = open_job_store(settings, clock=clock)
     assert (tmp_path / "d" / "earmark.db").exists()
-    store.enqueue(URL)
+    store.enqueue(new_podcast_job(URL))
     retry = store.fail(claim_one(store), "x", transient=True)
     clock.now = retry.run_after
     assert store.fail(claim_one(store), "y", transient=True).status == "failed"
-    store.enqueue(URL + "2")
+    store.enqueue(new_podcast_job(URL + "2"))
     claim_one(store)
     clock.advance(60)
     assert store.requeue_stale() == []
@@ -580,7 +704,7 @@ def test_open_job_store_from_settings(tmp_path: Path, clock: MutableClock) -> No
 
 @pytest.mark.parametrize("text", ["", "  "])
 def test_blank_messages_refused(store: JobStore, text: str) -> None:
-    job_id = store.enqueue(URL).job.id
+    job_id = store.enqueue(new_podcast_job(URL)).job.id
     claim = claim_one(store)
     with pytest.raises(ValueError, match="error"):
         store.fail(claim, text, transient=False)

@@ -52,12 +52,11 @@ configuration to make it pass.
 ## Shape of the code
 
 ```
-POST /ingest ─► jobs table (SQLite) ─► worker ─► Pipeline
+POST /transcriptions ─► jobs table (SQLite) ─► worker ─► Pipeline
   resolve ─► fetch ─► transcribe ─► notify
 ```
 
-Planned: `POST /transcriptions` replaces `POST /ingest` and also takes uploads and direct
-audio URLs (step 24), and email delivery runs between transcribe and notify (step 25).
+Planned: email delivery runs between transcribe and notify (step 25).
 
 - Every stage is a `Protocol` in `earmark/pipeline/stages.py` with a real backend and a
   fake in `earmark/fakes.py`. Backends are chosen by config in

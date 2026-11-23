@@ -5,7 +5,7 @@ the stage Protocols is structural and is checked in ``tests/test_stages.py``.
 """
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +15,7 @@ from earmark.artifacts import ArtifactStore, atomic_write_bytes
 from earmark.errors import PermanentError
 from earmark.models import Clock, Episode, Job, Segment, Transcript, episode_key
 from earmark.pipeline.stages import Backends
+from earmark.transcribe.base import asr_profile
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -59,6 +60,11 @@ class FetchCall:
 
 
 @dataclass(frozen=True)
+class DownloadCall:
+    url: str
+
+
+@dataclass(frozen=True)
 class TranscribeCall:
     episode: Episode
     audio: Path
@@ -98,12 +104,26 @@ class FakeResolver(FakeStage[ResolveCall]):
         )
 
 
-class FakeAudioFetcher(FakeStage[FetchCall]):
-    def __init__(self, artifacts: ArtifactStore, payload: bytes = b"fake audio\n") -> None:
+class FakeAudioFetcher(FakeStage[FetchCall | DownloadCall]):
+    def __init__(
+        self,
+        artifacts: ArtifactStore,
+        payload: bytes = b"fake audio\n",
+        payloads: Mapping[str, bytes] | None = None,
+    ) -> None:
         super().__init__()
         self._artifacts = artifacts
         self._payload = payload
+        self._payloads = dict(payloads or {})
         self.computed = 0
+        self.downloads = 0
+
+    def download(self, url: str, destination: Callable[[str], Path]) -> Path:
+        self._enter(DownloadCall(url))
+        path = destination("mp3")
+        atomic_write_bytes(path, self._payloads.get(url, self._payload))
+        self.downloads += 1
+        return path
 
     def fetch(self, episode: Episode) -> Path:
         self._enter(FetchCall(episode))
@@ -134,9 +154,19 @@ class FakeTranscriber(FakeStage[TranscribeCall]):
         self.warnings = tuple(warnings)
         self.computed = 0
 
+    @property
+    def profile(self) -> str:
+        return asr_profile("fake", {"model": self.model, "language": self.language})
+
+    def cached(self, episode: Episode) -> Transcript | None:
+        stored = self._artifacts.read_transcript(episode.key)
+        if stored is None or stored.asr_profile != self.profile:
+            return None
+        return stored
+
     def transcribe(self, episode: Episode, audio: Path) -> Transcript:
         self._enter(TranscribeCall(episode, audio))
-        cached = self._artifacts.read_transcript(episode.key)
+        cached = self.cached(episode)
         if cached is not None:
             return cached
         if not audio.is_file():
@@ -156,6 +186,7 @@ class FakeTranscriber(FakeStage[TranscribeCall]):
             model=self.model,
             segments=segments,
             warnings=self.warnings,
+            asr_profile=self.profile,
         )
         self._artifacts.write_transcript(transcript)
         self.computed += 1

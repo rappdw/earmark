@@ -2,11 +2,13 @@
 
 import re
 from pathlib import Path
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, ValidationError, ValidationInfo, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from earmark.recipients import ALL, RecipientPolicy, normalize_address
 
 ResolverBackend = Literal["apple", "fake"]
 FetchBackend = Literal["http", "fake"]
@@ -82,6 +84,11 @@ class Settings(BaseSettings):
         10800.0, gt=0, description="How long to wait for the remote ASR server's answer."
     )
     keep_audio: bool = Field(False, description="Keep audio after transcription.")
+    allowed_recipients: Annotated[tuple[str, ...], NoDecode] = Field(
+        (), description="Who may receive transcripts: comma-separated addresses, or all."
+    )
+    max_upload_mb: int = Field(1024, gt=0, description="Upload size cap (MiB).")
+    dedupe_window_s: int = Field(600, ge=0, description="Seconds a finished job answers repeats.")
     ntfy_url: SecretStr | None = Field(None, description="ntfy topic URL (secret).")
     ntfy_token: SecretStr | None = Field(None, description="ntfy access token.")
     max_audio_mb: int = Field(1024, gt=0, description="Audio download size cap.")
@@ -96,6 +103,31 @@ class Settings(BaseSettings):
     @classmethod
     def _upper_log_level(cls, v: object) -> object:
         return v.upper() if isinstance(v, str) else v
+
+    @field_validator("allowed_recipients", mode="before")
+    @classmethod
+    def _split_recipients(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.split(",")
+        if not isinstance(v, list | tuple):
+            return v
+        entries = [e.strip() if isinstance(e, str) else e for e in v]
+        entries = [e for e in entries if e != ""]
+        if any(isinstance(e, str) and e.lower() == ALL for e in entries):
+            if len(entries) != 1:
+                raise ValueError("all cannot be combined with addresses")
+            return (ALL,)
+        out: list[str] = []
+        for number, entry in enumerate(entries, start=1):
+            try:
+                address = normalize_address(entry) if isinstance(entry, str) else None
+            except ValueError:
+                address = None
+            if address is None:
+                raise ValueError(f"entry {number} is not an email address")
+            if address not in out:
+                out.append(address)
+        return tuple(out)
 
     @field_validator("asr_model")
     @classmethod
@@ -186,6 +218,9 @@ class Settings(BaseSettings):
             raise ValueError("must be printable ASCII without spaces")
         return SecretStr(stripped)
 
+    def recipient_policy(self) -> RecipientPolicy:
+        return RecipientPolicy.from_setting(self.allowed_recipients)
+
     def secret_values(self) -> list[str]:
         """Every set secret, plus the bare ntfy topic when it is at least 12 characters."""
         values: list[str] = []
@@ -205,6 +240,8 @@ class Settings(BaseSettings):
             value = getattr(self, name)
             if value is None:
                 display = ""
+            elif name == "allowed_recipients":
+                display = self.recipient_policy().describe()
             elif isinstance(value, SecretStr):
                 display = REDACTED if value.get_secret_value() else ""
             elif name.endswith("_url"):

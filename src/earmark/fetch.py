@@ -365,7 +365,7 @@ def pick_extension(final_path: str, content_type: str | None, original_path: str
     )
 
 
-def _limit_text(max_bytes: int) -> str:
+def limit_text(max_bytes: int) -> str:
     if max_bytes % MIB == 0:
         return f"{max_bytes // MIB} MiB"
     return f"{max_bytes} bytes"
@@ -570,7 +570,7 @@ class GuardedFetcher:
     def _too_large(purpose: str, max_bytes: int, limit_name: str | None) -> PermanentFetchError:
         hint = f" ({limit_name})" if limit_name else ""
         return PermanentFetchError(
-            f"{purpose} is larger than the {_limit_text(max_bytes)} limit{hint}"
+            f"{purpose} is larger than the {limit_text(max_bytes)} limit{hint}"
         )
 
     # -- public API --------------------------------------------------------------------------

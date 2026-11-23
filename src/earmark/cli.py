@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -14,7 +14,13 @@ from earmark.config import ConfigError, Settings, load_settings
 from earmark.db import DatabaseSetupError
 from earmark.jobs import LIST_LIMIT_MAX
 from earmark.log import configure_logging
-from earmark.models import Job, JobStatus
+from earmark.models import JobStatus
+
+if TYPE_CHECKING:
+    from earmark.api.schemas import JobView
+    from earmark.jobs import Enqueued
+    from earmark.models import UploadFields
+    from earmark.submission import Intake
 
 logger = logging.getLogger(__name__)
 
@@ -146,32 +152,58 @@ def worker_command(
 
 @app.command("submit")
 def submit_command(
-    url: Annotated[str, typer.Argument(help="Apple Podcasts episode URL.")],
-    prompt: Annotated[
-        str | None, typer.Option("--prompt", help="A prompt to keep with the job.")
+    source: Annotated[
+        str, typer.Argument(help="An Apple Podcasts episode URL, a direct audio URL, or a file.")
+    ],
+    to: Annotated[str, typer.Option("--to", help="Destination address (must be allowed).")],
+    instructions: Annotated[
+        str | None, typer.Option("--instructions", help="Instructions for the analysis.")
     ] = None,
+    title: Annotated[str | None, typer.Option("--title", help="A title for the audio.")] = None,
 ) -> None:
-    """Enqueue an episode, the same way POST /ingest does."""
+    """Enqueue a transcription, the same way POST /transcriptions does."""
     settings = _load_or_exit()
     configure_logging(settings.log_level, settings.secret_values())
     from pydantic import ValidationError
 
-    from earmark.ingest import enqueue_ingest
     from earmark.jobs import open_job_store
-    from earmark.models import IngestRequest
+    from earmark.models import TranscriptionRequest, UploadFields
+    from earmark.recipients import RecipientRefused
     from earmark.resolve.apple import UnsupportedUrlError
+    from earmark.staging import Staging
+    from earmark.submission import Intake
 
+    path = Path(source)
+    fields: UploadFields | None = None
+    request: TranscriptionRequest | None = None
     try:
-        request = IngestRequest(url=url, prompt=prompt)
+        if path.is_file():
+            fields = UploadFields(to=to, instructions=instructions or "", title=title)
+        else:
+            request = TranscriptionRequest(
+                url=source, to=to, instructions=instructions or "", title=title
+            )
     except ValidationError as exc:
         errors = exc.errors(include_input=False, include_url=False)
         typer.echo("earmark submit: " + "; ".join(str(e["msg"]) for e in errors), err=True)
         raise typer.Exit(code=2) from None
+    enqueued: Enqueued
     try:
-        store = open_job_store(settings)
-        enqueued = enqueue_ingest(store, request)
-    except UnsupportedUrlError as exc:
+        intake = Intake(
+            open_job_store(settings), settings.recipient_policy(), Staging(settings.data_dir)
+        )
+        if fields is not None:
+            intake.check_recipient(fields.to)
+            enqueued = _submit_file(intake, settings, path, fields)
+        elif request is not None:
+            enqueued = intake.submit_url(request)
+        else:  # pragma: no cover - one of the two was built above
+            raise typer.Exit(code=2)
+    except (UnsupportedUrlError, RecipientRefused) as exc:
         typer.echo(f"earmark submit: {exc.message}", err=True)
+        raise typer.Exit(code=2) from None
+    except _SubmitRefused as exc:
+        typer.echo(f"earmark submit: {exc}", err=True)
         raise typer.Exit(code=2) from None
     except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
         typer.echo(f"earmark submit: cannot open the job store: {exc}", err=True)
@@ -180,21 +212,52 @@ def submit_command(
     typer.echo(f"{enqueued.job.id} {enqueued.job.status}{suffix}")
 
 
+class _SubmitRefused(Exception):  # noqa: N818  # a usage problem with its own message
+    """The input cannot be submitted; str(exc) is the message to show."""
+
+
+def _submit_file(
+    intake: "Intake", settings: Settings, path: Path, fields: "UploadFields"
+) -> "Enqueued":
+    from earmark.fetch import MIB
+    from earmark.sources import clean_upload_name, upload_extension
+
+    ext = upload_extension(path.name, None)
+    if ext is None:
+        raise _SubmitRefused(
+            f"{_clean(path.name)} does not look like audio "
+            "(use an audio file extension such as .mp3 or .m4a)"
+        )
+    limit = settings.max_upload_mb * MIB
+    with intake.staging.begin_upload(ext) as writer, path.open("rb") as source:
+        while chunk := source.read(MIB):
+            writer.write(chunk)
+            if writer.size > limit:
+                raise _SubmitRefused(
+                    f"the file is larger than the {settings.max_upload_mb} MiB limit "
+                    "(EARMARK_MAX_UPLOAD_MB)"
+                )
+        if writer.size == 0:
+            raise _SubmitRefused(f"{_clean(path.name)} is empty")
+        staged = writer.commit()
+    return intake.submit_upload(fields, staged, upload_name=clean_upload_name(path.name))
+
+
 def _clean(value: object) -> str:
     """Replace non-printable characters so stored text cannot drive the terminal."""
     return "".join(c if c.isprintable() else "?" for c in str(value))
 
 
-def _job_lines(job: Job) -> list[str]:
+def _job_lines(view: "JobView") -> list[str]:
     from datetime import UTC
 
-    created = job.created_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    subject = job.url or job.episode_key or "-"
-    fields = (job.id, job.status, job.stage or "-", job.attempts, created, subject)
+    created = view.created_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    subject = view.url or ("upload" if view.source == "upload" else "-")
+    fields = (view.id, view.status, view.stage or "-", view.attempts, created, subject)
     lines = ["  ".join(_clean(f) for f in fields)]
-    if job.error:
-        lines.append(f"  error: {_clean(job.error)}")
-    lines.extend(f"  warning: {_clean(w)}" for w in job.warnings)
+    if view.error:
+        lines.append(f"  error: {_clean(view.error)}")
+    lines.extend(f"  warning: {_clean(w)}" for w in view.warnings)
     return lines
 
 
@@ -209,15 +272,16 @@ def jobs_command(
     """List recent jobs, newest first."""
     settings = _load_or_exit()
     configure_logging(settings.log_level, settings.secret_values())
+    from earmark.api.schemas import job_view
     from earmark.jobs import open_job_store
 
     try:
-        jobs = open_job_store(settings).list_recent(limit, status=status)
+        jobs = [job_view(j) for j in open_job_store(settings).list_recent(limit, status=status)]
     except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
         typer.echo(f"earmark jobs: cannot open the job store: {exc}", err=True)
         raise typer.Exit(code=1) from None
     if as_json:
-        payload = {"jobs": [j.model_dump(mode="json") for j in jobs]}
+        payload = {"jobs": [view.model_dump(mode="json") for view in jobs]}
         typer.echo(json.dumps(payload, ensure_ascii=False))
         return
     if not jobs:

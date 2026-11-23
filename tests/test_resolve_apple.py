@@ -166,7 +166,7 @@ def test_messages_short_and_never_echo_input() -> None:
 
 def test_apple_module_imports_light() -> None:
     code = (
-        "import sys, earmark.resolve.apple, earmark.ingest\n"
+        "import sys, earmark.resolve.apple, earmark.sources, earmark.staging, earmark.recipients\n"
         "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
     )

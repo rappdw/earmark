@@ -12,7 +12,7 @@ from pydantic import SecretStr
 from earmark.config import REDACTED, Settings
 from earmark.errors import PermanentError, TransientError
 from earmark.fakes import make_fake_backends
-from earmark.models import Job, JobResult
+from earmark.models import Episode, Job, JobResult
 from earmark.notify import ntfy
 from earmark.notify.ntfy import (
     Notification,
@@ -24,7 +24,7 @@ from earmark.notify.ntfy import (
     compose,
     split_topic_url,
 )
-from tests.factories import make_episode, make_job
+from tests.factories import make_episode, make_job, new_podcast_job
 from tests.ntfy_stub import (
     ACCOUNT_ANON,
     HEALTH_OK,
@@ -74,7 +74,7 @@ def _job(status: str = "done", **overrides: Any) -> Job:
         "stage": "transcribe",
         "attempts": 4,
         "error": "asr server said no",
-        "prompt": None,
+        "instructions": "",
         "warnings": (),
         "result": JobResult(duration_s=125.5),
     }
@@ -126,7 +126,7 @@ def test_compose_done_has_no_reason_and_counts_warnings() -> None:
     assert "Reason" not in plain.message
     assert "warning" not in plain.message
     assert "Duration: 00:02:05" in plain.message
-    job = _job("done", prompt="Who is cited?", warnings=("first problem", "second"))
+    job = _job("done", instructions="Who is cited?", warnings=("first problem", "second"))
     message = _compose(job).message
     assert "Prompt:" not in message
     assert "Who is cited?" not in message
@@ -326,7 +326,7 @@ def test_pipeline_ntfy_failure_is_warning(
     env, seen = _notifier_env(tmp_path, lambda r: json_reply(500, b'{"error":"boom"}'))
     if fail:
         env.fakes.transcriber.fail_next(PermanentError("bad audio"))
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     with caplog.at_level(logging.WARNING):
         job = env.worker.run_once()
     assert job is not None
@@ -347,7 +347,7 @@ def test_pipeline_unexpected_notifier_error_is_warning(tmp_path: Path) -> None:
         raise RuntimeError("unexpected")
 
     env, _ = _notifier_env(tmp_path, handler)
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     stored = env.jobs.get(job.id)
@@ -358,7 +358,7 @@ def test_pipeline_unexpected_notifier_error_is_warning(tmp_path: Path) -> None:
 
 def test_pipeline_ntfy_success_no_warning(tmp_path: Path) -> None:
     env, seen = _notifier_env(tmp_path, lambda r: json_reply(200, PUBLISHED))
-    env.jobs.enqueue(CANON, prompt="secret-prompt-7q")
+    env.jobs.enqueue(new_podcast_job(CANON, instructions="secret-prompt-7q"))
     job = env.worker.run_once()
     assert job is not None
     stored = env.jobs.get(job.id)
@@ -397,7 +397,7 @@ def test_clean_field_defuses_encoded_words() -> None:
 def test_compose_title_and_message_caps() -> None:
     long = "é" * 10_000
     episode = make_episode(title=long)
-    job = _job("failed", error=long, prompt=long, stage="x")
+    job = _job("failed", error=long, instructions=long, stage="x")
     result = compose(job, episode)
     assert result is not None
     assert len(result.title.encode()) <= ntfy.TITLE_MAX_BYTES
@@ -506,9 +506,9 @@ def test_payload_never_has_click(status: str) -> None:
 
 @pytest.mark.parametrize("status", ["done", "failed", "skipped"])
 @pytest.mark.parametrize("with_episode", [True, False])
-def test_compose_never_includes_url_prompt_or_path(status: str, with_episode: bool) -> None:
+def test_compose_never_includes_url_instructions_or_path(status: str, with_episode: bool) -> None:
     episode = make_episode()
-    job = _job(status, url=CANON, prompt="private-question-3k", stage="resolve")
+    job = _job(status, url=CANON, instructions="private-question-3k", stage="resolve")
     result = _compose(job, episode=with_episode)
     text = result.title + "\n" + result.message
     assert "://" not in text
@@ -519,3 +519,98 @@ def test_compose_never_includes_url_prompt_or_path(status: str, with_episode: bo
 def test_compose_done_without_result_has_no_duration_line() -> None:
     result = _compose(_job("done", result=None))
     assert "Duration" not in result.message
+
+
+# -- upload and direct-URL labels ---------------------------------------------------------
+
+DIRECT = "https://audio.example.net/private/PATH-TOKEN-91d2.mp3?sig=QUERY-TOKEN-a77b"
+
+
+def _audio_job(source: str, status: str = "done", **overrides: Any) -> Job:
+    values: dict[str, Any] = {"source": source, "to": "zelda.secret@example.org", **overrides}
+    if source == "upload":
+        values |= {"url": None, "upload_file": "a" * 32 + ".mp3", "content_sha256": "b" * 64}
+    else:
+        values |= {"url": DIRECT}
+    return _job(status, **values)
+
+
+def _audio_episode(job: Job, title: str = "From the episode") -> Episode:
+    return make_episode().model_copy(
+        update={"title": title, "show_title": "", "source": job.source}
+    )
+
+
+def test_compose_upload_labels() -> None:
+    job = _audio_job("upload", upload_name="memo.final.m4a")
+    result = compose(job, _audio_episode(job, "Episode title"))
+    assert result is not None
+    assert result.title == "Transcribed: Episode title"
+    assert result.message.splitlines()[0] == "Uploaded audio"
+    titled = compose(_audio_job("upload", title="My title"), _audio_episode(job))
+    assert titled is not None
+    assert titled.title == "Transcribed: My title"
+    no_episode = compose(_audio_job("upload", upload_name="memo.final.m4a"), None)
+    assert no_episode is not None
+    assert no_episode.title == "Transcribed: memo.final"
+    bare = compose(_audio_job("upload", upload_name=None), None)
+    assert bare is not None
+    assert bare.title == "Transcribed: uploaded audio"
+    failed = compose(_audio_job("upload", "failed"), None)
+    assert failed is not None
+    assert failed.title.startswith("Failed: ")
+    assert failed.message.splitlines()[0] == "Uploaded audio"
+
+
+def test_compose_url_label_uses_host_not_path() -> None:
+    job = _audio_job("url")
+    episode = _audio_episode(job, "PATH-TOKEN-91d2.mp3")  # a title built from the URL path
+    result = compose(job, episode)
+    assert result is not None
+    assert result.title == "Transcribed: audio from audio.example.net"
+    assert result.message.splitlines()[0] == "Audio from audio.example.net"
+    text = result.title + result.message
+    for token in ("PATH-TOKEN", "QUERY-TOKEN", "/private/", "://"):
+        assert token not in text
+
+
+def test_compose_url_with_title() -> None:
+    job = _audio_job("url", title="Board meeting")
+    result = compose(job, _audio_episode(job, "ignored"))
+    assert result is not None
+    assert result.title == "Transcribed: Board meeting"
+    assert result.message.splitlines()[0] == "Audio from audio.example.net"
+
+
+@pytest.mark.parametrize("source", ["upload", "url"])
+def test_compose_failed_before_episode_for_audio_sources(source: str) -> None:
+    job = _audio_job(source, "failed", error="audio URL on audio.example.net returned 404")
+    result = compose(job, None)
+    assert result is not None
+    assert result.title.startswith("Failed: ")
+    assert "Reason: audio URL on audio.example.net returned 404" in result.message
+    assert "Stage: transcribe" in result.message
+    assert result.priority == 4
+
+
+def test_compose_reason_scrubbed() -> None:
+    error = "could not read https://cdn.example/a/PATH-TOKEN.mp3?sig=QUERY-TOKEN: reset"
+    failed = compose(_job("failed", error=error), make_episode())
+    done = compose(_job("done", warnings=(error,)), make_episode())
+    for result in (failed, done):
+        assert result is not None
+        assert "https://cdn.example/…" in result.message
+        assert "PATH-TOKEN" not in result.message
+        assert "QUERY-TOKEN" not in result.message
+
+
+def test_compose_carries_no_address() -> None:
+    for source in ("upload", "url"):
+        for status in ("done", "failed", "skipped"):
+            job = _audio_job(source, status, instructions="INSTR-TOKEN")
+            result = compose(job, None)
+            assert result is not None
+            text = result.title + "\n" + result.message
+            assert "@" not in text
+            assert "zelda" not in text
+            assert "INSTR-TOKEN" not in text

@@ -25,6 +25,9 @@ def test_defaults() -> None:
     assert s.asr_api_key is None
     assert s.asr_max_upload_mb is None
     assert s.keep_audio is False
+    assert s.allowed_recipients == ()
+    assert s.max_upload_mb == 1024
+    assert s.dedupe_window_s == 600
     assert s.ntfy_url is None
     assert s.ntfy_token is None
     assert s.max_audio_mb == 1024
@@ -335,6 +338,9 @@ def test_settings_fields_are_exactly() -> None:
         "asr_max_upload_mb",
         "asr_timeout_seconds",
         "keep_audio",
+        "allowed_recipients",
+        "max_upload_mb",
+        "dedupe_window_s",
         "ntfy_url",
         "ntfy_token",
         "max_audio_mb",
@@ -345,3 +351,90 @@ def test_settings_fields_are_exactly() -> None:
         "worker_poll_seconds",
         "log_level",
     )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("you@example.org", ("you@example.org",)),
+        ("a@example.org,b@example.org", ("a@example.org", "b@example.org")),
+        (" a@example.org , b@Example.ORG ,", ("a@example.org", "b@example.org")),
+        ("a@example.org,a@EXAMPLE.org,b@example.org", ("a@example.org", "b@example.org")),
+        ("Alice@example.org,alice@example.org", ("Alice@example.org", "alice@example.org")),
+        ("all", ("all",)),
+        (" ALL ", ("all",)),
+        ("All,", ("all",)),
+    ],
+)
+def test_allowed_recipients_parsing(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: tuple[str, ...]
+) -> None:
+    monkeypatch.setenv("EARMARK_ALLOWED_RECIPIENTS", raw)
+    assert load_settings(env_file=None).allowed_recipients == expected
+
+
+def test_allowed_recipients_empty_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ALLOWED_RECIPIENTS", "")
+    settings = load_settings(env_file=None)
+    assert settings.allowed_recipients == ()
+    assert settings.recipient_policy().refuses_all
+    assert Settings(_env_file=None, allowed_recipients=(" ", "")).allowed_recipients == ()
+
+
+def test_allowed_recipients_from_dotenv(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("EARMARK_ALLOWED_RECIPIENTS=a@example.org, b@example.org\n")
+    assert load_settings(env_file=env).allowed_recipients == ("a@example.org", "b@example.org")
+
+
+def test_allowed_recipients_all_cannot_be_combined(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ALLOWED_RECIPIENTS", "all,a@example.org")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    [line] = info.value.errors
+    assert line.startswith("EARMARK_ALLOWED_RECIPIENTS: ")
+    assert "all cannot be combined with addresses" in line
+
+
+def test_allowed_recipients_bad_entry_named_by_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_ALLOWED_RECIPIENTS", "a@example.org,SECRET-NOT-AN-ADDRESS,b@x.org")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    [line] = info.value.errors
+    assert "entry 2 is not an email address" in line
+    assert "SECRET" not in str(info.value)
+    assert "a@example.org" not in str(info.value)
+
+
+def test_recipient_policy_from_settings() -> None:
+    assert Settings(_env_file=None).recipient_policy().refuses_all
+    assert Settings(_env_file=None, allowed_recipients=("all",)).recipient_policy().allow_all
+    policy = Settings(_env_file=None, allowed_recipients=("a@example.org",)).recipient_policy()
+    assert policy.allows("a@example.org")
+    assert not policy.allows("b@example.org")
+
+
+def test_allowed_recipients_redacted_display_masked(monkeypatch: pytest.MonkeyPatch) -> None:
+    def shown(*recipients: str) -> str:
+        items = dict(Settings(_env_file=None, allowed_recipients=recipients).redacted_items())
+        return items["EARMARK_ALLOWED_RECIPIENTS"]
+
+    assert shown() == ""
+    assert shown("all") == "all"
+    out = shown("zelda.secret@example.org", "bob@example.org")
+    assert out == "b…@example.org, z…@example.org"
+    assert "zelda" not in out
+
+
+@pytest.mark.parametrize("name", ["EARMARK_MAX_UPLOAD_MB", "EARMARK_DEDUPE_WINDOW_S"])
+def test_request_limits_validated(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.setenv(name, "-1")
+    with pytest.raises(ConfigError):
+        load_settings(env_file=None)
+    monkeypatch.setenv("EARMARK_MAX_UPLOAD_MB", "0")
+    monkeypatch.setenv("EARMARK_DEDUPE_WINDOW_S", "0")
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    assert [e.split(":")[0] for e in info.value.errors] == ["EARMARK_MAX_UPLOAD_MB"]
+    monkeypatch.setenv("EARMARK_MAX_UPLOAD_MB", "5")
+    assert load_settings(env_file=None).dedupe_window_s == 0

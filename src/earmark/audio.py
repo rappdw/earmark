@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 from urllib.parse import urlsplit
@@ -57,6 +58,22 @@ class HttpAudioFetcher:
         logger.info(
             "downloaded audio for %s: %d bytes from %s after %d redirects",
             key,
+            downloaded.size,
+            urlsplit(downloaded.url).hostname,
+            downloaded.redirects,
+        )
+        return downloaded.path
+
+    def download(self, url: str, destination: Callable[[str], Path], /) -> Path:
+        downloaded = self._fetcher.download(
+            url,
+            destination,
+            max_bytes=self._max_bytes,
+            purpose="audio",
+            limit_name="EARMARK_MAX_AUDIO_MB",
+        )
+        logger.info(
+            "downloaded direct audio: %d bytes from %s after %d redirects",
             downloaded.size,
             urlsplit(downloaded.url).hostname,
             downloaded.redirects,

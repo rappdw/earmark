@@ -28,6 +28,7 @@ from earmark.models import (
     JobKind,
     JobResult,
     JobStatus,
+    Source,
     Stage,
     is_episode_key,
     utc_now,
@@ -52,6 +53,21 @@ class JobNotFoundError(LookupError): ...
 class Claim:
     job: Job  # the job as claimed: status "running", attempts already incremented
     token: str  # uuid4().hex, private to this claim; never shown in the API
+
+
+@dataclass(frozen=True, slots=True)
+class NewJob:
+    """What ``JobStore.enqueue`` needs to create one job."""
+
+    source: Source
+    to: str  # normalised, non-empty
+    instructions: str = ""
+    title: str | None = None
+    url: str | None = None  # apple_podcasts: canonical; url: direct
+    upload_file: str | None = None
+    upload_name: str | None = None
+    content_sha256: str | None = None
+    shared_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,8 +113,10 @@ def _require_text(value: str, name: str) -> None:
         raise ValueError(f"{name} must not be empty")
 
 
-def _dedupe_key(kind: JobKind, subject: str, prompt: str | None) -> str:
-    payload = json.dumps([kind, subject, prompt], ensure_ascii=False, separators=(",", ":"))
+def _dedupe_key(kind: JobKind, source: Source, subject: str, to: str, instructions: str) -> str:
+    payload = json.dumps(
+        [kind, source, subject, to, instructions], ensure_ascii=False, separators=(",", ":")
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -109,8 +127,14 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         kind=row["kind"],
         status=row["status"],
         stage=row["stage"],
+        source=row["source"],
         url=row["url"],
-        prompt=row["prompt"],
+        to=row["recipient"],
+        instructions=row["instructions"],
+        title=row["title"],
+        upload_file=row["upload_file"],
+        upload_name=row["upload_name"],
+        content_sha256=row["content_sha256"],
         episode_key=row["episode_key"],
         attempts=row["attempts"],
         run_after=_from_db(row["run_after"]),
@@ -132,69 +156,104 @@ class JobStore:
         clock: Clock = utc_now,
         max_attempts: int = 4,
         lease: timedelta = timedelta(seconds=900),
+        dedupe_window: timedelta = timedelta(seconds=600),
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if lease <= timedelta(0):
             raise ValueError("lease must be > 0")
+        if dedupe_window < timedelta(0):
+            raise ValueError("dedupe_window must be >= 0")
         self._db = db
         self._clock = clock
         self._max_attempts = max_attempts
         self._lease = lease
+        self._dedupe_window = dedupe_window
 
     def _now(self) -> datetime:
         return _check_aware(self._clock())
 
     # -- enqueue ----------------------------------------------------------------------
 
-    def enqueue(
-        self, url: str, *, prompt: str | None = None, shared_at: datetime | None = None
-    ) -> Enqueued:
-        if not url.strip():
-            raise ValueError("url must not be empty")
-        return self._enqueue(url, prompt, shared_at)
-
-    def _enqueue(self, url: str, prompt: str | None, shared_at: datetime | None) -> Enqueued:
+    def enqueue(self, new: NewJob, /) -> Enqueued:
+        """Create a job, or return the active (or recently done) one for the same request."""
+        subject = self._validate(new)
         now = self._now()
-        shared = now if shared_at is None else _check_aware(shared_at)
+        shared = now if new.shared_at is None else _check_aware(new.shared_at)
         job = Job(
             id=uuid.uuid4().hex,
             kind="ingest",
             status="queued",
-            url=url,
-            prompt=prompt,
+            source=new.source,
+            url=new.url,
+            to=new.to,
+            instructions=new.instructions,
+            title=new.title,
+            upload_file=new.upload_file,
+            upload_name=new.upload_name,
+            content_sha256=new.content_sha256,
             run_after=now,
             shared_at=shared,
             created_at=now,
             updated_at=now,
         )
-        key = _dedupe_key("ingest", url, prompt)
+        key = _dedupe_key("ingest", new.source, subject, new.to, new.instructions)
+        cutoff = _to_db(now - self._dedupe_window)
         with self._db.transaction() as conn:
             row = conn.execute(
-                "SELECT * FROM jobs WHERE dedupe_key = ? AND status IN ('queued', 'running')",
-                (key,),
+                """
+                SELECT * FROM jobs
+                WHERE dedupe_key = :key
+                  AND (status IN ('queued', 'running')
+                       OR (status = 'done' AND updated_at > :cutoff))
+                ORDER BY CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END,
+                         updated_at DESC, seq DESC
+                LIMIT 1
+                """,
+                {"key": key, "cutoff": cutoff},
             ).fetchone()
             if row is not None:
                 return Enqueued(_row_to_job(row), False)
             conn.execute(
                 """
-                INSERT INTO jobs (id, kind, status, url, prompt, dedupe_key,
+                INSERT INTO jobs (id, kind, status, source, url, recipient, instructions,
+                                  title, upload_file, upload_name, content_sha256, dedupe_key,
                                   attempts, run_after, warnings, shared_at, created_at,
                                   updated_at)
-                VALUES (?, 'ingest', 'queued', ?, ?, ?, 0, ?, '[]', ?, ?, ?)
+                VALUES (:id, 'ingest', 'queued', :source, :url, :to, :instructions, :title,
+                        :upload_file, :upload_name, :content_sha256, :key, 0, :now, '[]',
+                        :shared, :now, :now)
                 """,
-                (
-                    job.id,
-                    url,
-                    prompt,
-                    key,
-                    _to_db(now),
-                    _to_db(shared),
-                    _to_db(now),
-                    _to_db(now),
-                ),
+                {
+                    "id": job.id,
+                    "source": new.source,
+                    "url": new.url,
+                    "to": new.to,
+                    "instructions": new.instructions,
+                    "title": new.title,
+                    "upload_file": new.upload_file,
+                    "upload_name": new.upload_name,
+                    "content_sha256": new.content_sha256,
+                    "key": key,
+                    "now": _to_db(now),
+                    "shared": _to_db(shared),
+                },
             )
         return Enqueued(job, True)
+
+    @staticmethod
+    def _validate(new: NewJob) -> str:
+        """The dedupe subject of ``new``; ValueError if it breaks the source rules."""
+        _require_text(new.to, "to")
+        if new.source == "upload":
+            if new.url is not None or not new.upload_file or not new.content_sha256:
+                raise ValueError("an upload job needs upload_file and content_sha256, not a url")
+            return "sha256:" + new.content_sha256
+        if new.url is None or not new.url.strip():
+            raise ValueError("url must not be empty")
+        if new.upload_file is not None:
+            raise ValueError("only an upload job has upload_file")
+        return new.url
 
     # -- claim and lease --------------------------------------------------------------
 
@@ -421,6 +480,22 @@ class JobStore:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return None if row is None else _row_to_job(row)
 
+    def active_upload_files(self) -> set[str]:
+        """The staged file names of queued and running upload jobs."""
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT upload_file FROM jobs
+                WHERE upload_file IS NOT NULL AND status IN ('queued', 'running')
+                """
+            ).fetchall()
+        return {str(r["upload_file"]) for r in rows}
+
+    def running_job_ids(self) -> set[str]:
+        with self._db.connect() as conn:
+            rows = conn.execute("SELECT id FROM jobs WHERE status = 'running'").fetchall()
+        return {str(r["id"]) for r in rows}
+
     def list_recent(self, limit: int = 20, *, status: JobStatus | None = None) -> list[Job]:
         if not 1 <= limit <= LIST_LIMIT_MAX:
             raise ValueError(f"limit must be between 1 and {LIST_LIMIT_MAX}")
@@ -444,4 +519,5 @@ def open_job_store(settings: Settings, *, clock: Clock = utc_now) -> JobStore:
         clock=clock,
         max_attempts=settings.job_max_attempts,
         lease=timedelta(seconds=settings.job_lease_seconds),
+        dedupe_window=timedelta(seconds=settings.dedupe_window_s),
     )

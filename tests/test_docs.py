@@ -13,8 +13,11 @@ from earmark.api.app import create_app
 from earmark.config import Settings, env_var
 from earmark.db import open_database
 from earmark.jobs import JobStore
-from earmark.models import IngestRequest
+from earmark.models import TranscriptionRequest
+from earmark.recipients import RecipientPolicy
 from earmark.resolve.apple import UnsupportedUrlError, parse_apple_url
+from earmark.staging import Staging
+from earmark.submission import Intake
 from tests.doc_helpers import (
     ROOT,
     after_marker,
@@ -46,11 +49,16 @@ def _quickstart() -> str:
 
 
 def _post(body: str, tmp_path: Path) -> tuple[int, dict[str, Any], JobStore]:
-    settings = Settings(_env_file=None, api_token=SecretStr(TOKEN), data_dir=tmp_path / "data")
+    settings = Settings(
+        _env_file=None,
+        api_token=SecretStr(TOKEN),
+        data_dir=tmp_path / "data",
+        allowed_recipients=("you@example.org",),
+    )
     store = JobStore(open_database(tmp_path / "earmark.db"))
     with TestClient(create_app(settings, store=store), headers=AUTH) as client:
         response = client.post(
-            "/ingest", content=body.encode(), headers={"Content-Type": "application/json"}
+            "/transcriptions", content=body.encode(), headers={"Content-Type": "application/json"}
         )
     return response.status_code, response.json(), store
 
@@ -72,12 +80,24 @@ def test_quickstart_uses_fake_backends() -> None:
         assert re.search(rf"\b{env_var(name)}=fake\b", script), name
 
 
-def test_quickstart_ingest_body_valid() -> None:
+def test_quickstart_request_body_valid() -> None:
     match = re.search(r"-d '(?P<body>\{.*\})'", _quickstart())
     assert match
-    request = IngestRequest.model_validate_json(match["body"])
-    assert request.prompt
+    request = TranscriptionRequest.model_validate_json(match["body"])
+    assert request.instructions
     assert parse_apple_url(request.url).url.startswith("https://podcasts.apple.com/")
+    assert "/transcriptions" in _quickstart()
+    assert "/ingest" not in _quickstart()
+
+
+def test_quickstart_exports_allowed_recipients() -> None:
+    script = _quickstart()
+    export = re.search(r"^export EARMARK_ALLOWED_RECIPIENTS=(?P<value>\S+)$", script, re.MULTILINE)
+    body = re.search(r"-d '(?P<body>\{.*\})'", script)
+    assert export
+    assert body
+    settings = Settings(_env_file=None, allowed_recipients=(export["value"],))
+    assert settings.recipient_policy().allows(json.loads(body["body"])["to"])
 
 
 def test_quickstart_runs_no_network_command() -> None:
@@ -127,9 +147,9 @@ def _response_example() -> str:
 
 def test_shortcut_request_example_validates() -> None:
     body = _request_example()
-    request = IngestRequest.model_validate_json(body)
-    assert set(json.loads(body)) == {"url", "prompt"}
-    assert request.prompt is not None
+    request = TranscriptionRequest.model_validate_json(body)
+    assert set(json.loads(body)) == {"url", "to", "instructions"}
+    assert request.instructions
     parse_apple_url(request.url)
 
 
@@ -166,7 +186,7 @@ def test_shortcut_actions_in_order() -> None:
 def test_shortcut_post_action_details() -> None:
     items = dict(zip(ACTIONS, _action_items(), strict=True))
     post = items["Get Contents of URL"]
-    for word in ("POST", "Authorization", "Bearer", "JSON", "`url`", "`prompt`"):
+    for word in ("POST", "Authorization", "Bearer", "JSON", "`url`", "`to`", "`instructions`"):
         assert word in post, word
     assert "optional" in items["Ask for Input"].lower()
 
@@ -269,7 +289,7 @@ def test_share_sheet_fixture_shape() -> None:
 def test_recorded_share_sheet_captures(tmp_path: Path) -> None:
     for index, entry in enumerate(_fixture()["shares"]):
         assert check_share_capture(entry) == [], f"share {index}"
-        body = json.dumps({"url": entry["url"]})
+        body = json.dumps({"url": entry["url"], "to": "you@example.org"})
         status, _, store = _post(body, tmp_path / str(index))
         assert status == 202, f"share {index}"
         assert [j.url for j in store.list_recent()] == [entry["canonical"]]
@@ -278,7 +298,7 @@ def test_recorded_share_sheet_captures(tmp_path: Path) -> None:
 def test_share_capture_checker_accepts_known_shape(tmp_path: Path) -> None:
     entry = _synthetic_entry()
     assert check_share_capture(entry) == []
-    status, _, store = _post(json.dumps({"url": entry["url"]}), tmp_path)
+    status, _, store = _post(json.dumps({"url": entry["url"], "to": "you@example.org"}), tmp_path)
     assert status == 202
     assert [j.url for j in store.list_recent()] == [entry["canonical"]]
 
@@ -353,7 +373,8 @@ def test_readme_http_api_lists_every_route(tmp_path: Path) -> None:
     from earmark.api.routes import build_router
 
     store = JobStore(open_database(tmp_path / "earmark.db"))
-    router = build_router(store)
+    intake = Intake(store, RecipientPolicy.from_setting(()), Staging(tmp_path / "data"))
+    router = build_router(intake, max_upload_bytes=1024)
     actual = {
         (method, re.sub(r"\{[^}]*\}", "{}", route.path))
         for route in router.routes

@@ -34,13 +34,14 @@ Create a new Shortcut and name it "Earmark". In its details (the ⓘ button), tu
 2. **Get URLs from Input**: the input is Shortcut Input.
 3. **Get Item from List**: First Item, from URLs. A share can contain more than one URL,
    and the API takes exactly one.
-4. **Ask for Input**: type Text, with the prompt "Question for this episode (optional)".
-   Leaving the answer blank gives the default analysis, so this prompt is optional.
+4. **Ask for Input**: type Text, with the prompt "Instructions for this transcript
+   (optional)". Leaving the answer blank sends no instructions, so this prompt is optional.
    Whether Shortcuts accepts an empty answer is unverified.
-5. **Get Contents of URL**: URL `https://earmark.example.com/ingest` (or
-   `https://spark.tailnet-name.ts.net/ingest` with Tailscale Serve). Under Show More:
-   Method **POST**; Headers: `Authorization` = `Bearer <your token>`; Request Body
-   **JSON**, with Text fields `url` = Item from List and `prompt` = Provided Input. This
+5. **Get Contents of URL**: URL `https://earmark.example.com/transcriptions` (or
+   `https://spark.tailnet-name.ts.net/transcriptions` with Tailscale Serve). Under Show
+   More: Method **POST**; Headers: `Authorization` = `Bearer <your token>`; Request Body
+   **JSON**, with Text fields `url` = Item from List, `to` = your address (Text) and
+   `instructions` = Provided Input. This
    posts the JSON with the bearer header. `Authorization` is the only header to add:
    Shortcuts sends `Content-Type: application/json` for a JSON body. No header row may be
    left empty.
@@ -62,7 +63,8 @@ The Shortcut sends this JSON:
 ```json
 {
   "url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736?i=1000802907981",
-  "prompt": "Which studies are cited, and who ran them?"
+  "to": "you@example.org",
+  "instructions": "Which studies are cited, and who ran them?"
 }
 ```
 
@@ -79,7 +81,7 @@ you get the same job back instead of a second one.
 To test from a laptop, put the request in `body.json` and run:
 
 ```bash
-curl -s https://earmark.example.com/ingest \
+curl -s https://earmark.example.com/transcriptions \
   -H "Authorization: Bearer $EARMARK_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d @body.json
@@ -93,10 +95,10 @@ The API's message is shown as is, in `detail`.
 |---|---|---|
 | 401 | `missing or invalid API token` | The `Authorization` header is missing or the token is wrong. |
 | 422 | `That is not a valid link. Share an episode from Apple Podcasts.` | The shared text is not a URL. |
-| 422 | `Only Apple Podcasts episode links are supported.` | A link from another site. |
+| 422 | `to is not an allowed recipient (EARMARK_ALLOWED_RECIPIENTS)` | The address is not on the server's allowlist. |
 | 422 | `This links to a whole show. Share a single episode instead.` | The link has no episode (`?i=`). |
 | 422 | `This Apple link is not a podcast episode.` | An Apple link of another kind. |
-| 422 | `unknown field 'x' (allowed: url, prompt, timestamp)` | The JSON body has a field the API does not know. |
+| 422 | `unknown field 'x' (allowed: url, to, instructions, title, timestamp)` | The JSON body has a field the API does not know. |
 | 422 | `request body is not valid JSON` | The request body is not JSON. |
 | 413 | `Content Too Large` | The body is larger than 64 KiB. |
 | 503 | `the job store is unavailable; try again shortly` | The database is busy. Try again. |

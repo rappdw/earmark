@@ -72,6 +72,7 @@ uv run earmark --version
 demo=$(mktemp -d)
 mkdir "$demo/vault"
 export EARMARK_API_TOKEN=demo-token
+export EARMARK_ALLOWED_RECIPIENTS=you@example.org
 export EARMARK_DATA_DIR="$demo/data" EARMARK_VAULT_DIR="$demo/vault"
 export EARMARK_RESOLVER_BACKEND=fake EARMARK_FETCH_BACKEND=fake EARMARK_ASR_BACKEND=fake \
   EARMARK_LLM_PROVIDER=fake EARMARK_STORE_BACKEND=fake EARMARK_INDEX_BACKEND=fake \
@@ -80,10 +81,10 @@ uv run earmark doctor
 
 uv run earmark serve &
 curl -s --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/healthz
-curl -s http://127.0.0.1:8787/ingest \
+curl -s http://127.0.0.1:8787/transcriptions \
   -H "Authorization: Bearer $EARMARK_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981", "prompt": "Which papers are mentioned?"}'
+  -d '{"url": "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981", "to": "you@example.org", "instructions": "Which papers are mentioned?"}'
 uv run earmark worker --once
 uv run earmark jobs
 uv run earmark episodes
@@ -140,7 +141,7 @@ Run them as `uv run earmark <command>`.
 |---|---|
 | `serve` | Run the ingest API on `EARMARK_HOST:EARMARK_PORT`. |
 | `worker [--once]` | Run the job worker; `--once` processes at most one job and exits. |
-| `submit <url> [--prompt]` | Enqueue an episode, the same way `POST /ingest` does. |
+| `submit <url-or-file> --to <address> [--instructions] [--title]` | Enqueue a transcription, the same way `POST /transcriptions` does. |
 | `jobs [--status] [--limit] [--json]` | List recent jobs, newest first. |
 | `resolve <url>` | Resolve an episode URL to its feed, GUID, and audio URL. |
 | `transcribe <file> [--json]` | Transcribe a local audio file and print the result. |
@@ -148,7 +149,7 @@ Run them as `uv run earmark <command>`.
 | `config` | Show the effective configuration with secrets redacted. |
 | `--version` | Print the version. |
 
-The HTTP API is `POST /ingest`, `GET /jobs/{id}`, `GET /jobs`, and `GET|HEAD /healthz`.
+The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs`, and `GET|HEAD /healthz`.
 Everything except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
@@ -213,6 +214,14 @@ See "Notifications" in [docs/deploy.md](docs/deploy.md).
 |---|---|---|
 | `EARMARK_NTFY_URL` | unset | The ntfy topic URL (secret: on public ntfy.sh the topic name is the password). |
 | `EARMARK_NTFY_TOKEN` | unset | ntfy access token, sent as a bearer token (secret). |
+
+### Requests
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EARMARK_ALLOWED_RECIPIENTS` | unset | Who may receive transcripts: comma-separated addresses, or `all`. Unset refuses every request. |
+| `EARMARK_MAX_UPLOAD_MB` | `1024` | Largest audio upload accepted. |
+| `EARMARK_DEDUPE_WINDOW_S` | `600` | Seconds a finished job answers a repeat of the same request. |
 
 ### Fetching
 

@@ -14,7 +14,7 @@ from earmark.fakes import FakeNotifier, make_fake_backends
 from earmark.models import Episode, Job
 from earmark.pipeline.runner import Pipeline
 from earmark.pipeline.worker import Heartbeat, Worker, heartbeat_interval
-from tests.factories import make_episode
+from tests.factories import make_episode, new_podcast_job, new_upload_job, new_url_job
 from tests.pipeline_env import (
     CANON,
     CountingJobStore,
@@ -42,7 +42,7 @@ def test_heartbeat_interval() -> None:
 
 def test_stale_failed_job_is_notified(tmp_path: Path) -> None:
     env = make_env(tmp_path, max_attempts=1, lease_s=10)
-    enqueued = env.jobs.enqueue(CANON)
+    enqueued = env.jobs.enqueue(new_podcast_job(CANON))
     claim = env.jobs.claim_next()  # a worker that then crashed
     assert claim is not None
     episode = make_episode()
@@ -59,9 +59,41 @@ def test_stale_failed_job_is_notified(tmp_path: Path) -> None:
     assert call.episode == episode
 
 
+def test_stale_failed_upload_audio_deleted(tmp_path: Path) -> None:
+    env = make_env(tmp_path, max_attempts=1, lease_s=10)
+    with env.staging.begin_upload("mp3") as writer:
+        writer.write(b"ID3" + bytes(32))
+        staged = writer.commit()
+    enqueued = env.jobs.enqueue(new_upload_job(staged.sha256, upload_file=staged.name))
+    assert env.jobs.claim_next() is not None  # a worker that then crashed
+    assert staged.path.exists()
+    env.clock.advance(11)
+    assert env.worker.run_once() is None
+    job = _stored(env, enqueued.job)
+    assert job.status == "failed"
+    assert not staged.path.exists()
+    [call] = env.fakes.notifier.calls
+    assert call.job == job
+    assert call.episode is not None
+    assert call.episode.source == "upload"
+
+
+def test_stale_failed_url_job_clears_partial_download(tmp_path: Path) -> None:
+    env = make_env(tmp_path, max_attempts=1, lease_s=10)
+    enqueued = env.jobs.enqueue(new_url_job("https://audio.example.net/a.mp3"))
+    claim = env.jobs.claim_next()
+    assert claim is not None
+    partial = env.staging.download_destination(claim.job.id)("mp3")
+    partial.write_bytes(b"half")
+    env.clock.advance(11)
+    assert env.worker.run_once() is None
+    assert _stored(env, enqueued.job).status == "failed"
+    assert not partial.exists()
+
+
 def test_stale_requeued_job_is_run_not_notified(tmp_path: Path) -> None:
     env = make_env(tmp_path, lease_s=10)
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     assert env.jobs.claim_next() is not None
     env.clock.advance(11)
     job = env.worker.run_once()
@@ -89,7 +121,7 @@ def test_heartbeat_keeps_long_stage_alive(tmp_path: Path) -> None:
     env = make_blocking_env(
         tmp_path, make, store_type=CountingJobStore, lease_s=30, heartbeat_s=0.01
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "done"
@@ -108,7 +140,7 @@ def test_without_heartbeat_long_stage_is_requeued(tmp_path: Path) -> None:
         return callback
 
     env = make_blocking_env(tmp_path, make, lease_s=30, heartbeat_s=100)
-    enqueued = env.jobs.enqueue(CANON)
+    enqueued = env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert [j.id for j in stale[0]] == [enqueued.job.id]
@@ -130,7 +162,7 @@ def test_heartbeat_thread_survives_store_errors(
 
     env = make_blocking_env(tmp_path, make, store_type=CountingJobStore, heartbeat_s=0.01)
     counting_store(env).heartbeat_error = sqlite3.OperationalError("disk I/O error")
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     with caplog.at_level(logging.WARNING):
         job = env.worker.run_once()
     assert job is not None
@@ -148,7 +180,7 @@ def _heartbeat_threads() -> list[str]:
 def test_heartbeat_unit(tmp_path: Path) -> None:
     env = make_env(tmp_path, store_type=CountingJobStore)
     store = counting_store(env)
-    store.enqueue(CANON)
+    store.enqueue(new_podcast_job(CANON))
     claim = store.claim_next()
     assert claim is not None
     with pytest.raises(ValueError, match="interval_s"):
@@ -173,14 +205,14 @@ def test_heartbeat_unit(tmp_path: Path) -> None:
 
 
 def _fresh_worker(env: PipelineEnv) -> tuple[Worker, Pipeline]:
-    pipeline = Pipeline(env.fakes.backends(), env.fakes.artifacts, env.jobs)
+    pipeline = Pipeline(env.fakes.backends(), env.fakes.artifacts, env.jobs, staging=env.staging)
     return Worker(env.jobs, pipeline, poll_seconds=0.01, heartbeat_seconds=60), pipeline
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 def test_signal_during_stage_releases(tmp_path: Path, signum: signal.Signals) -> None:
     env = make_blocking_env(tmp_path, lambda _env: signal_and_sleep(signum))
-    enqueued = env.jobs.enqueue(CANON)
+    enqueued = env.jobs.enqueue(new_podcast_job(CANON))
     before = signal.getsignal(signum)
     started = time.monotonic()
     with env.worker.handle_signals():
@@ -219,8 +251,8 @@ def test_sigterm_during_notify_finishes(tmp_path: Path) -> None:
     fakes = make_fake_backends(tmp_path / "data")
     notifier = _SignalingNotifier(fakes.notifier)
     env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), notifier=notifier))
-    first = env.jobs.enqueue(CANON, prompt="one").job
-    second = env.jobs.enqueue(CANON, prompt="two").job
+    first = env.jobs.enqueue(new_podcast_job(CANON, instructions="one")).job
+    second = env.jobs.enqueue(new_podcast_job(CANON, instructions="two")).job
     before = signal.getsignal(signal.SIGTERM)
     env.worker.run_forever()
     assert signal.getsignal(signal.SIGTERM) is before
@@ -251,7 +283,7 @@ def test_sigterm_while_idle_exits(tmp_path: Path) -> None:
 
 def test_stop_requested_before_claim(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    enqueued = env.jobs.enqueue(CANON)
+    enqueued = env.jobs.enqueue(new_podcast_job(CANON))
     env.worker.request_stop()
     assert env.worker.run_once() is None
     job = _stored(env, enqueued.job)
@@ -280,7 +312,7 @@ def test_handle_signals_off_main_thread(tmp_path: Path) -> None:
 
 def test_run_forever_processes_then_stops(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    enqueued = env.jobs.enqueue(CANON)
+    enqueued = env.jobs.enqueue(new_podcast_job(CANON))
     timer = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM))
     try:
         timer.start()

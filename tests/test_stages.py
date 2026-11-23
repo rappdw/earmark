@@ -19,12 +19,17 @@ def test_fakes_satisfy_protocols(tmp_path: Path) -> None:
 
     episode = resolver.resolve("https://example.com/e")
     audio = fetcher.fetch(episode)
+    assert transcriber.cached(episode) is None
     transcript = transcriber.transcribe(episode, audio)
+    assert transcriber.cached(episode) == transcript
+    downloaded = fetcher.download("https://example.com/a.mp3", lambda ext: tmp_path / f"d.{ext}")
+    assert downloaded.read_bytes() == b"fake audio\n"
     notifier.notify(make_job(), episode)
     assert transcript.episode_key == episode.key
 
 
 SNIPPET = """\
+from collections.abc import Callable
 from pathlib import Path
 
 from earmark.models import Episode, Transcript
@@ -43,6 +48,9 @@ class BadTranscriber:
 
 class GoodFetcher:
     def fetch(self, ep: Episode) -> Path:
+        return Path()
+
+    def download(self, u: str, d: Callable[[str], Path]) -> Path:
         return Path()
 
 

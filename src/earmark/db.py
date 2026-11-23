@@ -94,6 +94,24 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             "CREATE INDEX jobs_by_status ON jobs (status, created_at, seq)",
         ),
     ),
+    Migration(
+        "0002_requests",
+        (
+            """
+            ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'apple_podcasts'
+                CHECK (source IN ('apple_podcasts', 'upload', 'url'))
+            """,
+            "ALTER TABLE jobs ADD COLUMN recipient TEXT",
+            "ALTER TABLE jobs ADD COLUMN instructions TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE jobs ADD COLUMN title TEXT",
+            "ALTER TABLE jobs ADD COLUMN upload_file TEXT",
+            "ALTER TABLE jobs ADD COLUMN upload_name TEXT",
+            "ALTER TABLE jobs ADD COLUMN content_sha256 TEXT",
+            "UPDATE jobs SET instructions = COALESCE(prompt, '')",
+            "ALTER TABLE jobs DROP COLUMN prompt",
+            "CREATE INDEX jobs_by_dedupe ON jobs (dedupe_key, status, updated_at)",
+        ),
+    ),
 )
 SCHEMA_VERSION: Final = len(MIGRATIONS)
 

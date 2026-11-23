@@ -86,6 +86,7 @@ class OfflineChecks:
         s = self.settings
         results = [
             guarded("api token", self.api_token),
+            guarded("recipients", self.recipients),
             guarded("data dir", self.data_dir),
             guarded("database", self.database),
         ]
@@ -115,6 +116,26 @@ class OfflineChecks:
                 f"shorter than {MIN_TOKEN_CHARS} characters; generate one with {GENERATE_HINT}",
             )
         return CheckResult("api token", "ok", "set")
+
+    def recipients(self) -> CheckResult:
+        policy = self.settings.recipient_policy()
+        if policy.refuses_all:
+            return CheckResult(
+                "recipients",
+                "fail",
+                "EARMARK_ALLOWED_RECIPIENTS is not set: every request is refused. Set it to "
+                "the destination addresses, comma-separated, or to all.",
+            )
+        if policy.allow_all:
+            return CheckResult(
+                "recipients",
+                "warn",
+                "all: any address is accepted. Anyone with the API token can have earmark "
+                "send to any address.",
+            )
+        return CheckResult(
+            "recipients", "ok", f"{len(policy.addresses)} allowed: {policy.describe()}"
+        )
 
     def data_dir(self) -> CheckResult:
         path = self.settings.data_dir

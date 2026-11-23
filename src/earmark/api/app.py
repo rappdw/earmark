@@ -13,8 +13,11 @@ from earmark import __version__
 from earmark.api.auth import BearerAuthMiddleware, require_api_token
 from earmark.api.routes import build_router
 from earmark.config import Settings
+from earmark.fetch import MIB
 from earmark.jobs import JobStore, open_job_store
-from earmark.models import INGEST_ERROR_TYPES, IngestRequest
+from earmark.models import JSON_FIELDS, REQUEST_ERROR_TYPES
+from earmark.staging import Staging
+from earmark.submission import Intake
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ def _describe(error: Mapping[str, Any], body_fields: Sequence[str], missing_body
         return f"unknown field '{field[:40]}' (allowed: {allowed})"
     if kind == "missing":
         return f"{field} is required"
-    if kind in INGEST_ERROR_TYPES:
+    if kind in REQUEST_ERROR_TYPES:
         return msg
     if field == "timestamp":
         return f"timestamp: {msg} (send ISO 8601 with a UTC offset, e.g. 2026-11-19T19:03:03-08:00)"
@@ -49,8 +52,8 @@ def _describe(error: Mapping[str, Any], body_fields: Sequence[str], missing_body
 def describe_validation_errors(
     errors: Sequence[Mapping[str, Any]],
     *,
-    body_fields: Sequence[str] = tuple(IngestRequest.model_fields),
-    missing_body: str = "request body is missing; send a JSON object with a url",
+    body_fields: Sequence[str] = JSON_FIELDS,
+    missing_body: str = "request body is missing; send a JSON object with url and to",
 ) -> str:
     """One short string for a 422. Never uses the error's input or ctx."""
     messages = list(dict.fromkeys(_describe(e, body_fields, missing_body) for e in errors))
@@ -75,9 +78,24 @@ async def _on_store_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-def create_app(settings: Settings, *, store: JobStore | None = None) -> FastAPI:
+ALL_RECIPIENTS_WARNING: Final = (
+    "EARMARK_ALLOWED_RECIPIENTS=all: any address is accepted; anyone with the API token can "
+    "have earmark send transcripts to any address"
+)
+
+
+def create_app(
+    settings: Settings, *, store: JobStore | None = None, max_upload_bytes: int | None = None
+) -> FastAPI:
     token = require_api_token(settings)
     store = store if store is not None else open_job_store(settings)
+    policy = settings.recipient_policy()
+    staging = Staging(settings.data_dir)
+    # Partial uploads from a crash, and complete files no active job references.
+    staging.sweep_uploads(store.active_upload_files())
+    if policy.allow_all:
+        logger.warning(ALL_RECIPIENTS_WARNING)
+    limit = settings.max_upload_mb * MIB if max_upload_bytes is None else max_upload_bytes
     app = FastAPI(
         title="earmark",
         version=__version__,
@@ -93,7 +111,7 @@ def create_app(settings: Settings, *, store: JobStore | None = None) -> FastAPI:
             "auto_configure": False,
         },
     )
-    app.include_router(build_router(store))
+    app.include_router(build_router(Intake(store, policy, staging), max_upload_bytes=limit))
     app.add_exception_handler(RequestValidationError, _on_validation_error)
     app.add_exception_handler(sqlite3.Error, _on_store_error)
     app.add_middleware(BearerAuthMiddleware, token=token)

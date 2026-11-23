@@ -17,10 +17,11 @@ from earmark.models import Episode, Stage, Transcript
 from earmark.pipeline.runner import Pipeline
 from earmark.pipeline.stages import Backends, Transcriber
 from earmark.pipeline.worker import Worker
+from earmark.staging import Staging
+from tests.factories import CANON as CANON
 from tests.factories import MutableClock
 
 SECRET = "sentinel-secret-3f9a"
-CANON = "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981"
 
 
 @dataclass
@@ -30,6 +31,7 @@ class PipelineEnv:
     fakes: FakeBackends
     pipeline: Pipeline
     worker: Worker
+    staging: Staging
 
 
 def make_env(
@@ -46,9 +48,12 @@ def make_env(
     db = open_database(tmp_path / "data" / "earmark.db")
     jobs = store_type(db, clock=clock, max_attempts=max_attempts, lease=timedelta(seconds=lease_s))
     fakes = fakes or make_fake_backends(tmp_path / "data")
-    pipeline = Pipeline(backends or fakes.backends(), fakes.artifacts, jobs, secrets=(SECRET,))
+    staging = Staging(tmp_path / "data")
+    pipeline = Pipeline(
+        backends or fakes.backends(), fakes.artifacts, jobs, staging=staging, secrets=(SECRET,)
+    )
     worker = Worker(jobs, pipeline, poll_seconds=0.01, heartbeat_seconds=heartbeat_s)
-    return PipelineEnv(clock, jobs, fakes, pipeline, worker)
+    return PipelineEnv(clock, jobs, fakes, pipeline, worker, staging)
 
 
 class BlockingTranscriber:
@@ -57,6 +62,9 @@ class BlockingTranscriber:
     def __init__(self, inner: Transcriber, callback: Callable[[], None]) -> None:
         self.inner = inner
         self.callback = callback
+
+    def cached(self, episode: Episode, /) -> Transcript | None:
+        return self.inner.cached(episode)
 
     def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
         self.callback()

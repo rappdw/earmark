@@ -17,7 +17,7 @@ from earmark.fetch import MIB, PermanentFetchError
 from earmark.models import Episode, Job
 from earmark.pipeline import factory
 from earmark.pipeline.stages import AudioFetcher
-from tests.factories import T0, make_episode
+from tests.factories import T0, make_episode, new_podcast_job
 from tests.http_helpers import ScriptedNetwork, StaticResolver, guarded_fetcher_for, mock_fetcher
 from tests.pipeline_env import CANON, PipelineEnv, make_env
 
@@ -186,8 +186,8 @@ def _pipeline(tmp_path: Path, status: int = 200, retry_after: str | None = None)
     return PipelineRig(env, calls)
 
 
-def _run(rig: PipelineRig, prompt: str | None = None) -> Job:
-    rig.env.jobs.enqueue(CANON, prompt=prompt)
+def _run(rig: PipelineRig, prompt: str = "") -> Job:
+    rig.env.jobs.enqueue(new_podcast_job(CANON, instructions=prompt))
     job = rig.env.worker.run_once()
     assert job is not None
     return job
@@ -222,3 +222,63 @@ def test_pipeline_http_503_requeues(tmp_path: Path) -> None:
     assert job.status == "queued"
     assert job.attempts == 1
     assert job.run_after >= T0 + timedelta(seconds=600)
+
+
+# -- direct audio URLs ----------------------------------------------------------------------
+
+DIRECT = "https://audio.example.net/private/PATH-TOKEN-91d2.mp3?sig=QUERY-TOKEN-a77b"
+
+
+def test_download_writes_destination_and_logs_host_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from earmark.staging import Staging
+
+    caplog.set_level(logging.DEBUG)
+    staging = Staging(tmp_path / "data")
+    fetcher = HttpAudioFetcher(
+        ArtifactStore(tmp_path / "data"), mock_fetcher(_serve), max_bytes=MIB
+    )
+    destination = staging.download_destination("a" * 32)
+    path = fetcher.download(DIRECT, destination)
+    fetcher.close()
+    assert path == staging.downloads_dir / ("a" * 32 + ".mp3")
+    assert path.read_bytes() == AUDIO
+    texts = [r.getMessage() for r in caplog.records if r.name.startswith("earmark.")]
+    assert any("downloaded direct audio" in t and "audio.example.net" in t for t in texts)
+    for text in texts:
+        assert "PATH-TOKEN" not in text
+        assert "QUERY-TOKEN" not in text
+        assert "/private/" not in text
+    assert not [p for p in staging.downloads_dir.iterdir() if p.name.endswith(".part")]
+
+
+def test_download_refuses_textual_type(tmp_path: Path) -> None:
+    from earmark.staging import Staging
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"Content-Type": "text/html"}, content=b"<html>")
+
+    staging = Staging(tmp_path / "data")
+    fetcher = HttpAudioFetcher(
+        ArtifactStore(tmp_path / "data"), mock_fetcher(handler), max_bytes=MIB
+    )
+    with pytest.raises(PermanentFetchError, match="not audio") as info:
+        fetcher.download(DIRECT, staging.download_destination("b" * 32))
+    fetcher.close()
+    assert "PATH-TOKEN" not in str(info.value)
+    assert not list(staging.downloads_dir.glob("*"))
+
+
+def test_download_names_the_limit(tmp_path: Path) -> None:
+    from earmark.staging import Staging
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"Content-Type": "audio/mpeg"}, content=bytes(MIB + 1))
+
+    fetcher = HttpAudioFetcher(
+        ArtifactStore(tmp_path / "data"), mock_fetcher(handler), max_bytes=MIB
+    )
+    with pytest.raises(PermanentFetchError, match="EARMARK_MAX_AUDIO_MB"):
+        fetcher.download(DIRECT, Staging(tmp_path / "data").download_destination("c" * 32))
+    fetcher.close()

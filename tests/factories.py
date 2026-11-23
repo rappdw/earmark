@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta, timezone
 
+from earmark.jobs import NewJob
 from earmark.models import (
     Episode,
     Job,
@@ -11,6 +12,10 @@ from earmark.models import (
     episode_key,
 )
 
+CANON = "https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981"
+TO = "you@example.org"
+DIRECT_URL = "https://audio.example.net/private/clip.mp3"
+SHA = "ab" * 32
 PST = timezone(timedelta(hours=-8))
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
@@ -65,14 +70,60 @@ def make_transcript(*, guid: str = "urn:example:guid-1") -> Transcript:
     )
 
 
+def new_podcast_job(
+    url: str = CANON,
+    to: str = TO,
+    *,
+    instructions: str = "",
+    title: str | None = None,
+    shared_at: datetime | None = None,
+) -> NewJob:
+    return NewJob(
+        source="apple_podcasts",
+        url=url,
+        to=to,
+        instructions=instructions,
+        title=title,
+        shared_at=shared_at,
+    )
+
+
+def new_url_job(
+    url: str = DIRECT_URL, to: str = TO, *, instructions: str = "", title: str | None = None
+) -> NewJob:
+    return NewJob(source="url", url=url, to=to, instructions=instructions, title=title)
+
+
+def new_upload_job(
+    sha256: str = SHA,
+    to: str = TO,
+    *,
+    upload_file: str | None = None,
+    upload_name: str | None = "clip.mp3",
+    instructions: str = "",
+    title: str | None = None,
+) -> NewJob:
+    return NewJob(
+        source="upload",
+        to=to,
+        instructions=instructions,
+        title=title,
+        upload_file=upload_file or f"{sha256[:32]}.mp3",
+        upload_name=upload_name,
+        content_sha256=sha256,
+    )
+
+
 def make_job() -> Job:
     return Job(
         id="a" * 32,
         kind="ingest",
         status="running",
         stage="fetch",
+        source="apple_podcasts",
         url="https://podcasts.apple.com/us/podcast/x/id1?i=2",
-        prompt="Quoi ?",
+        to=TO,
+        instructions="Quoi ?",
         episode_key=make_episode().key,
         attempts=1,
         run_after=T0,

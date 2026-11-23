@@ -21,6 +21,7 @@ from earmark.doctor.report import CheckResult, exit_code, render, summary
 from earmark.fetch import GuardedFetcher
 from earmark.jobs import open_job_store
 from earmark.transcribe.compat import Installed
+from tests.factories import new_podcast_job
 from tests.http_helpers import ScriptedNetwork, StaticResolver
 from tests.legacy_db import V010_SCHEMA_VERSION, make_v010_database
 from tests.ntfy_stub import (
@@ -51,6 +52,7 @@ def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
         **FAKES,
         "api_token": SecretStr(TOKEN_OK),
         "data_dir": tmp_path / "data",
+        "allowed_recipients": ("you@example.org",),
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -170,8 +172,12 @@ def test_doctor_database_missing_not_created(tmp_path: Path) -> None:
 def test_doctor_database_ok_counts_jobs(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     store = open_job_store(settings)
-    store.enqueue("https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981")
-    store.enqueue("https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907982")
+    store.enqueue(
+        new_podcast_job("https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981")
+    )
+    store.enqueue(
+        new_podcast_job("https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907982")
+    )
     result = status(settings, "database")
     assert result.status == "ok"
     assert result.detail == (f"schema {SCHEMA_VERSION}, 2 jobs (queued 2, running 0, failed 0)")
@@ -198,7 +204,7 @@ def test_doctor_database_older_warns_and_is_not_migrated(tmp_path: Path) -> None
 
 def test_doctor_database_not_wal_warns(tmp_path: Path) -> None:
     db_path(tmp_path).parent.mkdir()
-    with closing(sqlite3.connect(db_path(tmp_path))) as conn:
+    with closing(sqlite3.connect(db_path(tmp_path), autocommit=True)) as conn:
         for migration in MIGRATIONS:
             for statement in migration.statements:
                 conn.execute(statement)
@@ -880,6 +886,7 @@ def test_doctor_check_names_in_order(tmp_path: Path) -> None:
     results = run_doctor(make_settings(tmp_path))
     assert [r.name for r in results] == [
         "api token",
+        "recipients",
         "data dir",
         "database",
         "resolver",
@@ -899,3 +906,39 @@ def test_doctor_database_v010_fails(tmp_path: Path) -> None:
     with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == V010_SCHEMA_VERSION
         assert conn.execute("PRAGMA application_id").fetchone()[0] == 0
+
+
+# -- recipients ---------------------------------------------------------------------------------
+
+
+def test_doctor_recipients_unset_fails(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, allowed_recipients=())
+    result = status(settings, "recipients")
+    assert result.status == "fail"
+    assert result.detail == (
+        "EARMARK_ALLOWED_RECIPIENTS is not set: every request is refused. Set it to the "
+        "destination addresses, comma-separated, or to all."
+    )
+    assert exit_code(run_doctor(settings)) == 1
+
+
+def test_doctor_recipients_list_ok_masked(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path, allowed_recipients=("zelda.secret@example.org", "bob@example.org")
+    )
+    result = status(settings, "recipients")
+    assert result.status == "ok"
+    assert result.detail == "2 allowed: b…@example.org, z…@example.org"
+    assert "zelda" not in result.detail
+
+
+def test_doctor_recipients_all_warns(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path, allowed_recipients=("all",)), "recipients")
+    assert result.status == "warn"
+    assert result.detail.startswith("all: any address is accepted.")
+    assert "Anyone with the API token" in result.detail
+
+
+def test_doctor_recipients_listed_right_after_api_token(tmp_path: Path) -> None:
+    names = [r.name for r in run_doctor(make_settings(tmp_path))]
+    assert names[:2] == ["api token", "recipients"]

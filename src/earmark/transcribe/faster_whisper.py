@@ -5,7 +5,6 @@ through ``importlib`` inside ``load_runtime`` only, and everything else here is 
 against the small Protocols below. Nothing heavy is imported at module top.
 """
 
-import hashlib
 import importlib
 import logging
 import math
@@ -21,11 +20,13 @@ from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
 from earmark.errors import PermanentError, TransientError
 from earmark.log import adopt_library_loggers
-from earmark.models import Segment, Transcript, episode_key, format_hms
+from earmark.models import Segment, Transcript, content_key, format_hms
+from earmark.sources import sha256_file
 from earmark.transcribe.base import (
     CachedTranscriber,
     NoSpeechError,
     UnusableAudioError,
+    asr_profile,
 )
 from earmark.transcribe.base import (
     SegmentLike as SegmentLike,
@@ -44,7 +45,6 @@ VAD_FILTER: Final = True
 PROGRESS_INTERVAL_S: Final = 60.0
 MAX_DETAIL_CHARS: Final = 200
 MAX_MODEL_CHARS: Final = 100
-HASH_CHUNK: Final = 1024 * 1024
 NOT_FOUND_ERRORS: Final = frozenset(
     {"RepositoryNotFoundError", "RevisionNotFoundError", "GatedRepoError", "DisabledRepoError"}
 )
@@ -265,6 +265,21 @@ class FasterWhisperEngine:
         return f"faster-whisper:{self._options.model}"
 
     @property
+    def profile(self) -> str:
+        o = self._options
+        return asr_profile(
+            "faster_whisper",
+            {
+                "model": o.model,
+                "device": o.device,
+                "compute_type": o.compute_type,
+                "language": o.language,
+                "beam_size": BEAM_SIZE,
+                "vad_filter": VAD_FILTER,
+            },
+        )
+
+    @property
     def options(self) -> WhisperOptions:
         return self._options
 
@@ -420,8 +435,4 @@ def build_faster_whisper_transcriber(
 
 def file_key(path: Path) -> str:
     """Episode key for a local file: derived from its content, for ``earmark transcribe``."""
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        while chunk := f.read(HASH_CHUNK):
-            digest.update(chunk)
-    return episode_key("local", "file", digest.hexdigest())
+    return content_key(sha256_file(path))

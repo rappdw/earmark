@@ -22,7 +22,13 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-Source = Literal["apple_podcasts"]
+from earmark.recipients import MAX_ADDRESS_CHARS as MAX_ADDRESS_CHARS
+from earmark.recipients import normalize_address
+
+Source = Literal["apple_podcasts", "upload", "url"]
+AUDIO_SOURCES: Final[frozenset[Source]] = frozenset({"upload", "url"})
+AUDIO_SHOW_ID: Final = "audio"  # the synthetic show id of upload and url episodes
+GUID_SHA256_PREFIX: Final = "sha256:"
 JobKind = Literal["ingest"]
 JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
 Stage = Literal["resolve", "fetch", "transcribe", "notify"]  # "notify" is never set
@@ -32,13 +38,26 @@ TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset({"done", "failed", "s
 EPISODE_KEY_LENGTH: Final = 20
 
 MAX_URL_CHARS: Final = 2048
-MAX_PROMPT_CHARS: Final = 4000
-INGEST_ERROR_TYPES: Final = frozenset(
-    {"url_empty", "url_too_long", "prompt_too_long", "timestamp_out_of_range"}
+MAX_INSTRUCTIONS_CHARS: Final = 4000
+MAX_TITLE_CHARS: Final = 200
+REQUEST_ERROR_TYPES: Final = frozenset(
+    {
+        "url_empty",
+        "url_too_long",
+        "to_invalid",
+        "instructions_too_long",
+        "title_too_long",
+        "timestamp_out_of_range",
+    }
 )
+# The field names a request accepts, in the order error messages list them.
+JSON_FIELDS: Final = ("url", "to", "instructions", "title", "timestamp")
+FORM_FIELDS: Final = ("to", "instructions", "title", "timestamp")
 
 EpisodeKey = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{20}$")]
 JobId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+UploadFileName = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}\.[a-z0-9]{1,5}$")]
 Seconds = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
 
@@ -57,6 +76,23 @@ def episode_key(source: str, show_id: str, guid: str) -> str:
     return digest[:EPISODE_KEY_LENGTH]
 
 
+def content_key(sha256_hex: str) -> str:
+    """Key of content-identified audio: ``episode_key("local", "file", sha256_hex)``."""
+    return episode_key("local", "file", sha256_hex)
+
+
+_SHA256_GUID: Final = re.compile("sha256:[0-9a-f]{64}")
+
+
+def source_key(source: Source, show_id: str, guid: str) -> str:
+    """``content_key`` for upload and url (guid ``sha256:`` + 64 hex), else ``episode_key``."""
+    if source in AUDIO_SOURCES:
+        if show_id != AUDIO_SHOW_ID or _SHA256_GUID.fullmatch(guid) is None:
+            raise ValueError("an upload or url episode needs show_id 'audio' and a sha256 guid")
+        return content_key(guid[len(GUID_SHA256_PREFIX) :])
+    return episode_key(source, show_id, guid)
+
+
 def is_episode_key(value: str) -> bool:
     return re.fullmatch("[0-9a-f]{20}", value) is not None
 
@@ -67,18 +103,6 @@ def format_hms(seconds: float) -> str:
         raise ValueError("seconds must be finite and non-negative")
     s = int(seconds)
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
-
-
-def normalize_prompt(value: str | None) -> str | None:
-    """Strip; blank -> None; raise ValueError if longer than MAX_PROMPT_CHARS."""
-    if value is None:
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    if len(value) > MAX_PROMPT_CHARS:
-        raise ValueError(f"prompt is too long (at most {MAX_PROMPT_CHARS} characters)")
-    return value
 
 
 _LONE_SURROGATE: Final = re.compile("[\ud800-\udfff]")
@@ -111,10 +135,67 @@ class Model(BaseModel):
         return _scrub_value(value)
 
 
-class IngestRequest(Model):
-    url: str
-    prompt: str | None = None
+class RequestFields(Model):
+    to: str
+    instructions: str = ""
+    title: str | None = None
     timestamp: AwareDatetime | None = None
+
+    @field_validator("to", mode="after")
+    @classmethod
+    def _normalise_to(cls, v: str) -> str:
+        try:
+            return normalize_address(v)
+        except ValueError:
+            raise PydanticCustomError("to_invalid", "to must be one email address") from None
+
+    @field_validator("instructions", mode="before")
+    @classmethod
+    def _none_instructions(cls, v: object) -> object:
+        return "" if v is None else v
+
+    @field_validator("instructions", mode="after")
+    @classmethod
+    def _normalise_instructions(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) > MAX_INSTRUCTIONS_CHARS:
+            raise PydanticCustomError(
+                "instructions_too_long",
+                f"instructions is too long (at most {MAX_INSTRUCTIONS_CHARS} characters)",
+            )
+        return v
+
+    @field_validator("title", mode="after")
+    @classmethod
+    def _normalise_title(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > MAX_TITLE_CHARS:
+            raise PydanticCustomError(
+                "title_too_long", f"title is too long (at most {MAX_TITLE_CHARS} characters)"
+            )
+        return v
+
+    @field_validator("timestamp", mode="after")
+    @classmethod
+    def _check_timestamp(cls, v: datetime | None) -> datetime | None:
+        if v is not None:
+            try:
+                v.astimezone(UTC)
+            except OverflowError:
+                raise PydanticCustomError(
+                    "timestamp_out_of_range", "timestamp is out of range"
+                ) from None
+        return v
+
+
+class TranscriptionRequest(RequestFields):
+    """The JSON body of ``POST /transcriptions``."""
+
+    url: str
 
     @field_validator("url", mode="after")
     @classmethod
@@ -128,25 +209,9 @@ class IngestRequest(Model):
             )
         return v
 
-    @field_validator("prompt", mode="after")
-    @classmethod
-    def _normalise_prompt(cls, v: str | None) -> str | None:
-        try:
-            return normalize_prompt(v)
-        except ValueError as exc:
-            raise PydanticCustomError("prompt_too_long", str(exc)) from None
 
-    @field_validator("timestamp", mode="after")
-    @classmethod
-    def _check_timestamp(cls, v: datetime | None) -> datetime | None:
-        if v is not None:
-            try:
-                v.astimezone(UTC)
-            except OverflowError:
-                raise PydanticCustomError(
-                    "timestamp_out_of_range", "timestamp is out of range"
-                ) from None
-        return v
+class UploadFields(RequestFields):
+    """The text fields of a multipart upload."""
 
 
 class EpisodeRef(Model):
@@ -181,7 +246,7 @@ class Episode(Model):
 
     @model_validator(mode="after")
     def _key_matches(self) -> Self:
-        if self.key != episode_key(self.source, self.show_id, self.guid):
+        if self.key != source_key(self.source, self.show_id, self.guid):
             raise ValueError("key does not match source, show_id and guid")
         return self
 
@@ -206,6 +271,7 @@ class Transcript(Model):
     model: str
     segments: tuple[Segment, ...] = ()
     warnings: tuple[str, ...] = ()
+    asr_profile: str | None = None  # backend, model and options; None before step 24
 
     def to_text(self) -> str:
         """One ``[HH:MM:SS] text`` line per segment; the content of ``transcript.txt``."""
@@ -233,8 +299,14 @@ class Job(Model):
     kind: JobKind
     status: JobStatus
     stage: Stage | None = None
-    url: str | None
-    prompt: str | None
+    source: Source = "apple_podcasts"
+    url: str | None  # apple_podcasts: canonical URL; url: the direct URL; upload: None
+    to: str | None = None  # normalised; None only on jobs enqueued before step 24
+    instructions: str = ""
+    title: str | None = None
+    upload_file: UploadFileName | None = None  # upload: the staged file's name under data/uploads
+    upload_name: str | None = None  # upload: the client's file name, cleaned
+    content_sha256: Sha256Hex | None = None  # upload: sha256 of the staged bytes
     episode_key: EpisodeKey | None = None
     attempts: int = Field(0, ge=0)
     run_after: AwareDatetime
@@ -248,6 +320,14 @@ class Job(Model):
 
     @model_validator(mode="after")
     def _kind_requirements(self) -> Self:
-        if self.url is None:
-            raise ValueError("an ingest job requires url")
+        if self.source == "upload":
+            if self.url is not None:
+                raise ValueError("an upload job must not have a url")
+            if self.upload_file is None or self.content_sha256 is None:
+                raise ValueError("an upload job requires upload_file and content_sha256")
+        else:
+            if self.url is None:
+                raise ValueError("a job requires url")
+            if self.upload_file is not None:
+                raise ValueError("only an upload job has upload_file")
         return self

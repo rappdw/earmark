@@ -9,6 +9,7 @@ import pytest
 
 from earmark.db import (
     APPLICATION_ID,
+    MIGRATIONS,
     SCHEMA_VERSION,
     Database,
     DatabaseSetupError,
@@ -20,8 +21,9 @@ from earmark.db import (
     retry_on_busy,
 )
 from earmark.jobs import JobStore
+from earmark.models import Job
 from tests import db_helpers
-from tests.factories import MutableClock
+from tests.factories import MutableClock, new_podcast_job
 from tests.legacy_db import V010_JOB_COUNT, V010_SCHEMA_VERSION, make_v010_database
 
 URL = "https://podcasts.apple.com/us/podcast/x/id1?i=2"
@@ -103,7 +105,7 @@ def test_transaction_rolls_back_on_error(tmp_path: Path) -> None:
 def test_reopen_runs_no_migration_and_keeps_rows(tmp_path: Path) -> None:
     path = tmp_path / "earmark.db"
     store = JobStore(open_database(path))
-    jobs = [store.enqueue(f"{URL}{i}").job for i in range(3)]
+    jobs = [store.enqueue(new_podcast_job(f"{URL}{i}")).job for i in range(3)]
     db = Database(path)
     assert db.migrate() == 0
     assert db.schema_version() == SCHEMA_VERSION
@@ -348,7 +350,7 @@ def test_fresh_database_identity(tmp_path: Path) -> None:
     path = tmp_path / "earmark.db"
     db = open_database(path)
     assert db.identity() == (APPLICATION_ID, SCHEMA_VERSION)
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     with db.connect() as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert names == {"jobs"}
@@ -383,3 +385,67 @@ def test_identity_error_table(
     else:
         assert type(error) is expected
         assert isinstance(error, DatabaseSetupError)
+
+
+def test_migration_0002_from_v1(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    open_database(path, migrations=MIGRATIONS[:1])
+    stamp = "2026-01-01T12:00:00.000000+00:00"
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        conn.execute(
+            """
+            INSERT INTO jobs (id, kind, status, url, prompt, dedupe_key, attempts, run_after,
+                              warnings, shared_at, created_at, updated_at)
+            VALUES (?, 'ingest', 'queued', ?, 'p', 'k', 0, ?, '[]', ?, ?, ?)
+            """,
+            ("a" * 32, URL, stamp, stamp, stamp, stamp),
+        )
+    finally:
+        conn.close()
+    db = open_database(path)
+    assert db.schema_version() == 2
+    with db.connect() as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        row = conn.execute("SELECT * FROM jobs").fetchone()
+    assert "prompt" not in columns
+    assert {"source", "recipient", "instructions", "title", "upload_file"} <= columns
+    assert (row["instructions"], row["source"], row["recipient"]) == ("p", "apple_podcasts", None)
+    job = JobStore(db).get("a" * 32)
+    assert isinstance(job, Job)
+    assert (job.to, job.instructions, job.source, job.url) == (None, "p", "apple_podcasts", URL)
+
+
+def test_migration_0002_carries_null_prompt_as_empty(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    open_database(path, migrations=MIGRATIONS[:1])
+    stamp = "2026-01-01T12:00:00.000000+00:00"
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        conn.execute(
+            """
+            INSERT INTO jobs (id, kind, status, url, dedupe_key, attempts, run_after, warnings,
+                              shared_at, created_at, updated_at)
+            VALUES (?, 'ingest', 'done', ?, 'k', 1, ?, '[]', ?, ?, ?)
+            """,
+            ("b" * 32, URL, stamp, stamp, stamp, stamp),
+        )
+    finally:
+        conn.close()
+    job = JobStore(open_database(path)).get("b" * 32)
+    assert job is not None
+    assert job.instructions == ""
+
+
+def test_source_check_constraint(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    stamp = "2026-01-01T12:00:00.000000+00:00"
+    with pytest.raises(sqlite3.IntegrityError), db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (id, kind, status, source, dedupe_key, attempts, run_after,
+                              warnings, shared_at, created_at, updated_at)
+            VALUES (?, 'ingest', 'queued', 'ftp', 'k', 0, ?, '[]', ?, ?, ?)
+            """,
+            ("c" * 32, stamp, stamp, stamp, stamp),
+        )

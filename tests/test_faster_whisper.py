@@ -42,7 +42,7 @@ from earmark.transcribe.faster_whisper import (
     load_runtime,
     segment_from,
 )
-from tests.factories import make_episode
+from tests.factories import make_episode, new_podcast_job
 from tests.http_helpers import FakeMonotonic
 from tests.pipeline_env import CANON, CountingJobStore, make_env
 from tests.whisper_fakes import (
@@ -245,8 +245,8 @@ def test_worker_loads_model_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     )
     worker = factory.build_worker(settings)
     store = open_job_store(settings)
-    store.enqueue(CANON)
-    store.enqueue(CANON.replace("1000802907981", "1000802907982"))
+    store.enqueue(new_podcast_job(CANON))
+    store.enqueue(new_podcast_job(CANON.replace("1000802907981", "1000802907982")))
     for _ in range(2):
         job = worker.run_once()
         assert job is not None
@@ -514,7 +514,7 @@ def test_heartbeat_fresh_during_transcription(tmp_path: Path) -> None:
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
     holder.append(env)
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "done"
@@ -543,7 +543,7 @@ def test_pipeline_with_faster_whisper(tmp_path: Path) -> None:
         fakes=fakes,
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "done"
@@ -552,7 +552,7 @@ def test_pipeline_with_faster_whisper(tmp_path: Path) -> None:
     assert fakes.artifacts.transcript_json_path(key).is_file()
     assert fakes.artifacts.find_audio(key) is None
     loads, decodes = len(fake.loads), len(fake.decodes)
-    env.jobs.enqueue(CANON, prompt="a new prompt")
+    env.jobs.enqueue(new_podcast_job(CANON, instructions="a new prompt"))
     again = env.worker.run_once()
     assert again is not None
     assert again.status == "done"
@@ -568,6 +568,21 @@ def test_transcriber_satisfies_protocol(tmp_path: Path) -> None:
     e: TranscriptionEngine = FasterWhisperEngine(_options(), fake.runtime())
     t: Transcriber = CachedTranscriber(ArtifactStore(tmp_path), e, keep_audio=False)
     assert (m, e, t) is not None
+
+
+def test_profile_includes_model_and_options() -> None:
+    def profile(**overrides: Any) -> str:
+        return FasterWhisperEngine(_options(**overrides), _fake().runtime()).profile
+
+    base = profile()
+    assert base.startswith("faster_whisper ")
+    assert '"model":"tiny"' in base
+    assert profile(model="large-v3") != base
+    assert profile(language="fr") != base
+    assert profile(compute_type="float16") != base
+    assert profile(device="cuda") != base
+    assert profile(model_dir=Path("/elsewhere")) == base  # where models live is not an option
+    assert profile() == base
 
 
 def test_factory_builds_faster_whisper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -700,7 +715,7 @@ def test_no_speech_fails_job_and_keeps_audio(tmp_path: Path) -> None:
         fakes=fakes,
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "failed"
@@ -856,7 +871,7 @@ def test_pyav19_type_error_requeues_and_keeps_audio(
         fakes=fakes,
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     with caplog.at_level(logging.ERROR):
         job = env.worker.run_once()
     assert job is not None
@@ -902,7 +917,7 @@ def test_pyav19_type_error_exhausted_keeps_audio(
         fakes=fakes,
         backends=dataclasses.replace(fakes.backends(), transcriber=transcriber),
     )
-    env.jobs.enqueue(CANON)
+    env.jobs.enqueue(new_podcast_job(CANON))
     job = env.worker.run_once()
     assert job is not None
     assert job.status == "failed"

@@ -18,6 +18,7 @@ from earmark.models import Clock, utc_now
 from earmark.pipeline.runner import Pipeline
 from earmark.pipeline.stages import AudioFetcher, Backends, Notifier, Resolver, Transcriber
 from earmark.pipeline.worker import Worker, heartbeat_interval
+from earmark.staging import Staging
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,12 @@ def build_worker(
     artifacts = ArtifactStore(settings.data_dir)
     backends = build_backends(settings, artifacts, clock=clock)
     jobs = jobs or open_job_store(settings, clock=clock)
-    pipeline = Pipeline(backends, artifacts, jobs, secrets=settings.secret_values())
+    staging = Staging(settings.data_dir)
+    # A crashed job is still "running" here, so its partial download is kept for the retry.
+    staging.sweep_downloads(jobs.running_job_ids())
+    pipeline = Pipeline(
+        backends, artifacts, jobs, staging=staging, secrets=settings.secret_values()
+    )
     logger.info(
         "backends: resolver=%s fetch=%s asr=%s notify=%s",
         settings.resolver_backend,

@@ -1,15 +1,16 @@
 # Architecture
 
-earmark is a self-hosted transcription service. Today a request is an Apple Podcasts
-episode link; the worker resolves the audio, transcribes it, caches the transcript and
-sends an ntfy push.
+earmark is a self-hosted transcription service. A request (step 24) carries an Apple
+Podcasts episode link, a direct audio URL, or an uploaded audio file, plus a destination
+address checked against an allowlist, free-form instructions, and optionally a title. The
+worker resolves or downloads the audio, transcribes it, caches the transcript and sends an
+ntfy push.
 
-Steps 24–26 add uploads and direct audio URLs with a destination address and instructions,
-email delivery to the operator's PKA instances, which do the analysis and filing, and GPU
-transcription in the image. Their contracts are in "Planned (steps 24–26)".
+Steps 25–26 add email delivery to the operator's PKA instances, which do the analysis and
+filing, and GPU transcription in the image. Their contracts are in "Planned (steps 25–26)".
 
-How to read this document: the sections before "Planned (steps 24–26)" describe the code as
-it is. "Planned (steps 24–26)" is what steps 24–26 build against. "History: removed in step
+How to read this document: the sections before "Planned (steps 25–26)" describe the code as
+it is. "Planned (steps 25–26)" is what steps 25–26 build against. "History: removed in step
 22" lists what step 22 removed. When a step changes a contract described here, it changes
 this file in the same commit. Steps 01–21 built a larger pipeline, tagged
 `v0.1.0-full-pipeline`.
@@ -22,37 +23,43 @@ backend, not the pipeline.
 
 | Question | Decision | How to change it |
 |---|---|---|
-| Scope | earmark transcribes, and from step 25 delivers the transcript by email; analysis and filing are done by the operator's PKA instances. | See "Planned (steps 24–26)". |
-| State | The job table (SQLite, WAL) and the per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, audio while it is needed). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
-| Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, `Transcribed: <title>` with the duration, and no link (steps 15, 22). Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
+| Scope | earmark transcribes, and from step 25 delivers the transcript by email; analysis and filing are done by the operator's PKA instances. | See "Planned (steps 25–26)". |
+| State | The job table (SQLite, WAL), the per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed), and per-job staging files for uploads and direct URLs (`uploads/`, `downloads/`, deleted when the job ends; step 24). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
+| Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, `Transcribed: <label>` with the duration, and no link (steps 15, 22, 24). Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
+| Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2, which step 26 plans inside the image. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge; the Cloudflare token lives only with the proxy. Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
 | Deployment | One container image (CPU, extras by build argument, `transcribe` by default) running either `earmark serve` or `earmark worker`; `compose.yaml` with a shared data volume; GPU transcription through a vLLM Whisper service in the compose `gpu` profile and the `remote` ASR backend; systemd units for the API and the worker (steps 16, 22). | See "Deployment" below and `docs/deploy.md`. |
-| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), python-multipart's streaming `MultipartParser` for uploads (step 24; Starlette's own form parser spools files to the system temp dir, so it is not used). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
 ```
-iPhone Shortcut
-   │  POST /ingest {url, prompt?, timestamp?}   Authorization: Bearer <token>
+iPhone Shortcut, curl, `earmark submit`
+   │  POST /transcriptions   Authorization: Bearer <token>
+   │    JSON {url, to, instructions?, title?, timestamp?}
+   │    or multipart: file + to, instructions?, title?, timestamp?  (streamed to data/uploads/)
    ▼
-API (FastAPI) ── validates, enqueues, returns 202 {job_id} ──► jobs table (SQLite, WAL)
-                                                                   │ claim
-                                                                   ▼
+API (FastAPI) ── validates, checks `to`, enqueues, returns 202 {job_id} ──► jobs table (SQLite, WAL)
+                                                                              │ claim
+                                                                              ▼
 Worker ── Pipeline.run(job)
-   resolve     Apple URL → iTunes Lookup (or the episode page) → RSS feed → Episode
-   fetch       enclosure → data/episodes/<key>/audio.<ext>
-   transcribe  audio → transcript.json + transcript.txt
+   resolve     apple_podcasts: Apple URL → iTunes Lookup (or the episode page) → RSS → Episode
+               upload: the staged file's sha256 → Episode (key = file_key of the bytes)
+               url: download (guarded fetch) → data/downloads/<job_id>.<ext> → sha256 → Episode
+   fetch       podcasts only: enclosure → data/episodes/<key>/audio.<ext>
+   transcribe  audio → transcript.json + transcript.txt (skipped when cached with this ASR profile)
    complete    JobResult(duration_s)
-   notify      ntfy (never fails the job)
+   finish      delete upload/download staging files; notify via ntfy (never fails the job)
 ```
 
-The API handler does no network I/O and no heavy work. It validates and enqueues, so the
-Shortcut always gets its 202 in milliseconds.
+The API handler makes no outbound network request. It validates, streams an upload to disk,
+and enqueues, so the Shortcut gets its 202 as soon as the body has arrived.
 
-`prompt` is stored with the job and is part of its dedupe key; nothing reads it after
-enqueue (step 22 kept it so the Shortcut keeps working).
+`to`, `instructions` and `title` are stored with the job (step 24). `to` and `instructions`
+are part of the dedupe key. Nothing reads `to` or `instructions` after enqueue until step 25
+delivers the mail. `title` names uploads and direct URLs, and is ignored for podcasts.
 
 ## Module layout
 
@@ -72,7 +79,13 @@ src/earmark/
   fetch.py             GuardedFetcher: guarded GET and streaming download, address policy,
                        pinned-address network backend (step 06)
   audio.py             HttpAudioFetcher, the `http` AudioFetcher backend (step 06)
-  ingest.py            enqueue_ingest: IngestRequest → canonical URL → JobStore (API and CLI)
+  submission.py        Intake: recipient check, URL classification, enqueue (API and CLI; step 24)
+  recipients.py        normalize_address, mask_address, RecipientPolicy, RecipientRefused;
+                       standard library only (step 24)
+  sources.py           parse_source_url (Apple link or direct URL), display_url, upload_extension,
+                       clean_upload_name, audio_title, sha256_file, audio_episode (step 24)
+  staging.py           Staging: data/uploads/ (UploadWriter) and data/downloads/, release at a
+                       terminal state, startup sweeps (step 24)
   sanitize.py          untrusted text to file names and YAML, and the frontmatter emitter;
                        standard library only (step 22)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
@@ -80,6 +93,8 @@ src/earmark/
   fakes.py             a fake backend for each of the four stages (tests and smoke runs)
   cli.py               `earmark` entry point
   api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
+                       (responses and JobView), upload.py (receive_upload: the streaming
+                       multipart reader; step 24)
   pipeline/
     stages.py          stage Protocols, Backends (the four stage implementations)
     runner.py          Pipeline: runs one claimed job, maps exceptions to job outcomes
@@ -121,13 +136,19 @@ and then the artifact JSON and SQLite writes would fail with a `ValueError` that
 runner retries. `models.scrub_surrogates` is the helper; `runner.describe_error` applies it
 to job text.
 
-- `IngestRequest`: `url`, `prompt: str | None`, `timestamp: datetime | None`. The
-  `POST /ingest` body; unknown keys are rejected (a typo such as `promt` must not
-  silently drop the user's question). Validators normalise: `url` stripped, at most
-  `MAX_URL_CHARS` (2048); `prompt` stripped, blank or whitespace-only becomes `None`,
-  at most `MAX_PROMPT_CHARS` (4000) after stripping; `timestamp` must convert to UTC
-  (its offset is kept). `prompt` is stored on the job and is part of its dedupe key, and
-  nothing reads it after enqueue (step 22). Step 24 replaces this request. Step 04.
+- `RequestFields` (step 24), the fields every request carries. Unknown keys are rejected,
+  and messages never echo input.
+  - `to`: one email address, normalised by `recipients.normalize_address`: ASCII, a
+    dot-atom local part kept exactly, a lower-cased domain of two or more labels, at most
+    254 characters.
+  - `instructions`: stripped; `null` or missing becomes `""`; at most
+    `MAX_INSTRUCTIONS_CHARS` (4000); otherwise verbatim.
+  - `title`: stripped; blank becomes `None`; at most `MAX_TITLE_CHARS` (200).
+  - `timestamp`: optional, and must convert to UTC (its offset is kept). It sets
+    `shared_at`.
+- `TranscriptionRequest(RequestFields)` adds `url` (stripped, at most `MAX_URL_CHARS`, 2048).
+  It is the JSON body of `POST /transcriptions`. `UploadFields(RequestFields)` holds the
+  multipart text fields. Both replaced step 04's `IngestRequest` and its `prompt` in step 24.
 - `EpisodeRef`: `source` (`"apple_podcasts"`), `show_id`, `episode_id`, `country`, `url`.
   Returned by `resolve.apple.parse_apple_url`; `url` is the canonical
   `https://podcasts.apple.com/{country}/podcast/id{show_id}?i={episode_id}` (country
@@ -135,8 +156,18 @@ to job text.
   parameters dropped; legacy `itunes.apple.com` and `http` mapped to it).
 - `Episode`: `key`, `source`, `show_id`, `episode_id`, `guid`, `title`, `show_title`,
   `published_at | None`, `duration_s | None`, `audio_url`, `feed_url | None`, `url`,
-  `description`. A validator requires `key == episode_key(source, show_id, guid)`.
-  `source` is `apple_podcasts`, the only `Source` today.
+  `description`. A validator requires `key == source_key(source, show_id, guid)`.
+  `Source` is `apple_podcasts`, `upload` or `url` (step 24).
+  - **Upload and URL episodes** come from `sources.audio_episode(job, sha256_hex)`. They
+    have `show_id = "audio"` (synthetic), `guid = "sha256:<hex of the audio bytes>"`, and
+    `key = content_key(hex)`, which is `episode_key("local", "file", hex)`. That is exactly
+    `transcribe.faster_whisper.file_key` of the same bytes, so an upload, a direct URL and
+    `earmark transcribe` of identical bytes share one cache directory.
+  - Their `title` is `sources.audio_title(job)`: the request's `title`, else the upload's
+    file-name stem, else the URL's last path segment, else `Uploaded audio` or the URL's
+    host.
+  - Their `episode_id`, `show_title`, `audio_url` and `url` are `""`, and `published_at`,
+    `duration_s` and `feed_url` are `None`.
   From the `apple` resolver (step 07): `guid` is Apple's episode GUID when Apple gives
   one, else the matched feed item's, else `apple-podcasts:<episode_id>`; `title` and
   `show_title` are Apple's, cleaned of control characters and capped (500 characters);
@@ -144,23 +175,38 @@ to job text.
   lookup's `feedUrl`; `description` is plain text, capped at 20 000 characters.
 - `Segment`: `start`, `end`, `text`, `speaker: str | None`.
 - `Transcript`: `episode_key`, `language | None`, `duration_s`, `model`, `segments`,
-  `warnings`. `to_text()` renders one `[HH:MM:SS] text` line per segment (whitespace
-  collapsed, hours unbounded, trailing newline); it is the content of `transcript.txt`.
+  `warnings`, `asr_profile | None` (step 24: the profile it was made with, see
+  "Transcribing"; `None` on transcripts written earlier). `to_text()` renders one
+  `[HH:MM:SS] text` line per segment (whitespace collapsed, hours unbounded, trailing
+  newline); it is the content of `transcript.txt`.
 - `JobResult`: `duration_s` (required), the transcript's duration (step 22).
 - `ShareRecord`: the content of `shared.json`, the earliest share time of the episode,
   recorded by the runner on every job (earliest wins). Nothing reads it yet; it is kept for
   the note's `shared_at` (step 25).
 - `Job`: `id` (`uuid4().hex`), `kind` (`ingest`, the only `JobKind`), `status`, `stage`
-  (`Stage` is `resolve`, `fetch`, `transcribe` or `notify`; `notify` is never set), `url`
-  (required: the canonical episode URL, so `Episode.url` is canonical too), `prompt`,
-  `episode_key | None` (set after resolve), `attempts`, `run_after`, `error` (failure
-  message or skip reason), `warnings`, `result: JobResult | None`, `shared_at`,
-  `created_at`, `updated_at`, `heartbeat_at`.
+  (`Stage` is `resolve`, `fetch`, `transcribe` or `notify`; `notify` is never set),
+  `source`, `url`, `to | None`, `instructions` (`""` when none), `title | None`,
+  `upload_file | None`, `upload_name | None`, `content_sha256 | None`, `episode_key | None`
+  (set after resolve), `attempts`, `run_after`, `error` (failure message or skip reason),
+  `warnings`, `result: JobResult | None`, `shared_at`, `created_at`, `updated_at`,
+  `heartbeat_at`. Step 24 added `source` through `content_sha256` and removed `prompt`
+  (carried over into `instructions` by migration `0002`).
+  - **Per source:**
+    - `apple_podcasts`: `url` is the canonical episode URL, so `Episode.url` is canonical
+      too.
+    - `url`: `url` is the client's direct URL without its fragment.
+    - `upload`: `url` is `None`. `upload_file` is the staged file's name under
+      `data/uploads/` (`<32 hex>.<ext>`), `upload_name` the client's cleaned file name, and
+      `content_sha256` the hex sha256 of the staged bytes.
+  - **`to`** is `None` only on jobs enqueued before step 24.
+  - **The view.** The API never returns a `Job`. It returns a `JobView` (see "HTTP API").
 
 **Episode key.** `sha256("{source}:{show_id}:{guid}")` over UTF-8, first 20 hex
 characters, from `models.episode_key`. The Apple show id is used instead of the feed URL
-because feeds move and show ids do not. The key names the cache directory, so the same
-episode shared twice is transcribed once. Parts are not normalised (the resolver strips
+because feeds move and show ids do not. Upload and URL episodes use
+`content_key(hex) = episode_key("local", "file", hex)` instead (step 24), through
+`models.source_key`. The key names the cache directory, so the same episode shared twice,
+or the same bytes sent twice, is transcribed once. Parts are not normalised (the resolver strips
 the GUID); `source` and `show_id` may not contain `:`. Keys are checked with
 `re.fullmatch("[0-9a-f]{20}")` wherever they reach the filesystem.
 
@@ -182,9 +228,11 @@ class Resolver(Protocol):
 
 class AudioFetcher(Protocol):
     def fetch(self, episode: Episode, /) -> Path: ...
+    def download(self, url: str, destination: Callable[[str], Path], /) -> Path: ...  # step 24
 
 
 class Transcriber(Protocol):
+    def cached(self, episode: Episode, /) -> Transcript | None: ...  # step 24
     def transcribe(self, episode: Episode, audio: Path, /) -> Transcript: ...
 
 
@@ -194,9 +242,18 @@ class Notifier(Protocol):
 
 `Notifier` receives the job in its terminal state.
 
+- `AudioFetcher.download` fetches a client-supplied direct audio URL to `destination(ext)`
+  and returns the path. It always downloads, with no cache. Only the runner calls it, for
+  `url` jobs.
+- `Transcriber.cached` returns the cached transcript only when it was made with this
+  transcriber's ASR profile, and never loads a model.
+- `Resolver.resolve` is called only for `apple_podcasts` jobs, so nothing else reaches it.
+
 Every stage has a fake in `fakes.py` that records each call (`calls`), can be told to
 raise (`fail_next(exc, times)`), and, for the cache-aware stages (fetch, transcribe),
-counts the calls that did real work (`computed`). The cache-aware fakes write real
+counts the calls that did real work (`computed`). `FakeAudioFetcher` also counts direct
+downloads (`downloads`), and serves `payloads.get(url, payload)`, so two URLs can serve
+the same bytes. The cache-aware fakes write real
 artifacts through `ArtifactStore`. `make_fake_backends(data_dir)` builds the set, and
 `FakeBackends.backends()` turns it into the `Backends` the runner takes.
 
@@ -205,10 +262,11 @@ Rules every backend follows:
 1. **Idempotent and cache-aware.** If the output artifact exists, return it without
    doing the work. The runner does not track per-stage checkpoints in the database; it
    calls every stage and relies on this. `job.stage` exists for observability only.
-   One exception: audio is deleted after transcription, so when `transcript.json`
-   exists the runner skips `fetch` and `transcribe` and reads the transcript from
-   `ArtifactStore`. The resolver is not cached; the runner writes `episode.json` after
-   it returns.
+   One exception: audio is deleted after transcription, so when
+   `transcriber.cached(episode)` finds a transcript (with this ASR profile), the runner
+   skips `fetch` and `transcribe`. The resolver is not cached; the runner writes
+   `episode.json` after it returns. A direct URL is downloaded on every attempt, and is
+   hashed before the cache is consulted (step 24).
 2. **Atomic writes.** Write to a temp file in the same directory, then rename. Use
    `artifacts.atomic_writer` / `atomic_write_bytes` / `atomic_write_text` (temp files
    are `.<name>.<random>.tmp`, or another suffix such as `.part`; final files are mode
@@ -233,13 +291,37 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   builder, and a name with no builder is a `ConfigError` naming the variable, raised
   before the database is opened. Real backends import their heavy modules inside the
   builder.
-- **Order.** `Pipeline.run(claim)`: resolve → write `episode.json`, record the episode
-  key on the job, record the share time in `shared.json` → if `transcript.json` exists,
-  read it and skip fetch and transcribe, else fetch → transcribe → refuse a transcript for
-  another episode (permanent) → copy the transcript's warnings to the job → `complete`
-  with `JobResult(duration_s)` → notify. Each stage sets `job.stage` before it runs, so a
-  fresh job ends at `transcribe` and a job with a cached transcript at `resolve`; a failed
-  job keeps the stage it failed in, and `notify` is never set as a stage.
+- **Order.** `Pipeline.run(claim)` runs the stages below. Each stage sets `job.stage` before
+  it runs. A fresh job ends at `transcribe`. A job with a cached transcript ends at
+  `resolve`, or at `fetch` for a direct URL. A failed job keeps the stage it failed in, and
+  `notify` is never set as a stage.
+  1. **The episode** (`resolve`), by source (step 24):
+     - `apple_podcasts`: `resolver.resolve(job.url)`.
+     - `upload`: the staged file `data/uploads/<upload_file>`. It must exist, else a
+       permanent failure: "the uploaded audio is missing; upload it again". Its sha256 must
+       equal `content_sha256`, else permanent. The episode is
+       `audio_episode(job, content_sha256)`.
+     - `url`: set stage `fetch`, clear this job's old downloads, then
+       `fetcher.download(job.url, staging.download_destination(job.id))`, then
+       `audio_episode(job, sha256_file(path))`.
+  2. **Record** it: write `episode.json`, record the episode key on the job, and record the
+     share time in `shared.json`.
+  3. **Cache.** If `transcriber.cached(episode)` returns a transcript, skip fetch and
+     transcribe.
+  4. **Transcribe.** Otherwise, for a podcast only, `fetch`. Then `transcribe` the
+     podcast's audio, or the staged upload or download in place: it is never moved into
+     `episodes/<key>/`.
+  5. **Check.** Refuse a transcript for another episode (permanent). Copy the transcript's
+     warnings to the job.
+  6. **Complete** with `JobResult(duration_s)`.
+  7. **Finish:** `staging.release(job)`, then notify.
+- **Retention** (step 24). `Pipeline.finish(job, episode)` releases the staging files of an
+  upload (`uploads/<upload_file>`) or a direct URL (`downloads/<job_id>.*`), then notifies.
+  - **When it runs:** for every job that reaches `done`, `failed` or `skipped`, including
+    jobs that `requeue_stale` fails.
+  - **What it ignores:** `EARMARK_KEEP_AUDIO` does not keep uploaded or downloaded audio. A
+    requeued retry keeps the staging file. Release errors are logged, never raised.
+  - **Podcasts:** their audio follows `CachedTranscriber`'s rules (see "Transcribing").
 - **Outcomes.** `SkipEpisode` → `skipped`; `PermanentError` → `failed`;
   `TransientError` → requeued with backoff (honouring `retry_after_s`) until attempts
   run out; any other `Exception` → transient, with the traceback logged at ERROR and a
@@ -259,9 +341,16 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   notifying, the worker finishes it, then exits.
 - **Lost lease.** A fenced call raising `LeaseLostError` makes the runner abandon the
   job without writing to it or notifying.
-- **Each poll** the worker first runs `requeue_stale` and notifies the jobs it failed.
-  `earmark worker --once` processes at most one job; `earmark submit` enqueues through
-  `ingest.enqueue_ingest`, like `POST /ingest`; `earmark jobs` lists recent jobs.
+- **Each poll** the worker first runs `requeue_stale` and passes the jobs it failed to
+  `Pipeline.finish`.
+- **Commands.**
+  - `earmark worker --once` processes at most one job.
+  - `earmark submit SOURCE --to … [--instructions …] [--title …]` enqueues through
+    `submission.Intake`, like `POST /transcriptions`. SOURCE is an existing file, which is
+    copied into `data/uploads/` under `EARMARK_MAX_UPLOAD_MB`, or a URL.
+  - `earmark jobs` lists recent jobs as `JobView`s.
+- **Startup.** `build_worker` sweeps `data/downloads/` of every file not belonging to a
+  `running` job, before the first poll.
 
 ### Fetching
 
@@ -289,6 +378,10 @@ Step 06; exact signatures in `docs/steps/06-fetch.md`.
   `episode.audio_url` with `MAX_AUDIO_MB`, and names the file `audio.<ext>`: the
   extension of the final URL's path, else the `Content-Type`'s, else the original URL
   path's, else `bin`.
+- **Direct URLs** (step 24). `HttpAudioFetcher.download(url, destination)` downloads a
+  client-supplied URL through the same `GuardedFetcher.download`, with the same rules and
+  `MAX_AUDIO_MB`. That includes the address guard on every hop, the refusal of a textual
+  content type, and host-only messages. It logs the host only.
 
 ### Resolving
 
@@ -343,6 +436,22 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   because on a podcast it more likely means a broken engine than a silent file (step
   19). `base.segment_from` is the shared monotonic mapping (starts never decrease,
   `end >= start`, all within the duration; blank segments dropped).
+- **ASR profile, the transcript cache key** (step 24).
+  - **The engine.** Every `TranscriptionEngine` has a `profile`:
+    `asr_profile(backend, options)`, that is `<backend> <JSON of the options, keys sorted>`.
+    - `faster_whisper`: model, device, compute type, language (`null` for auto), beam size
+      and VAD filter.
+    - `remote`: model and language.
+    - The fake: model and language.
+
+    Step 26's batch size joins the `faster_whisper` options.
+  - **The stamp.** `CachedTranscriber` stamps it on every transcript it writes
+    (`Transcript.asr_profile`). `cached(episode)` returns `transcript.json` only when the
+    stamp equals the engine's profile.
+  - **A miss** (another model or options, or a transcript from before step 24)
+    re-transcribes. That overwrites the episode's one `transcript.json` and
+    `transcript.txt`, so a `tiny` dry-run transcript is never reused for `large-v3`.
+  - **`earmark transcribe`** writes nothing and is unaffected.
 - **`faster_whisper` engine.** `transcribe.faster_whisper.FasterWhisperEngine` imports
   `faster_whisper` and `ctranslate2` only through `load_runtime()`
   (`importlib.import_module`), which the factory's builder calls; without the extra the
@@ -409,14 +518,24 @@ Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
   are fixed, plus `Authorization: Bearer EARMARK_NTFY_TOKEN` when a token is set. No
   untrusted text goes into a header, the URL, or a query string. `markdown` is never set.
 - **Content.**
-  - Titles are `Transcribed: <episode>`, `Failed: <episode>`, and `Skipped: <episode>`
-    (`podcast episode` when unknown). Tags are `white_check_mark`, `x`, and
-    `fast_forward`; priority is 4 for failed and 3 otherwise.
-  - The message starts with the show, or `Apple Podcasts episode` when the episode is
-    unknown. Done adds `Duration: HH:MM:SS` and the warning count with the first warning.
-    Failed adds the stage, `Reason: <job.error>`, and `Gave up after N attempts.` when there
-    was more than one. Skipped adds the reason.
-  - No push carries a URL, the prompt, or a path, and none has a `click` link.
+  - Titles are `Transcribed: <label>`, `Failed: <label>`, and `Skipped: <label>`. Tags are
+    `white_check_mark`, `x`, and `fast_forward`; priority is 4 for failed and 3 otherwise.
+  - **Labels and the first message line, by source** (step 24):
+    - podcast: the episode title (`podcast episode` when unknown), then the show
+      (`Apple Podcasts episode` when unknown);
+    - upload: the request's title, else the episode title, else the file-name stem, else
+      `uploaded audio`, then `Uploaded audio`;
+    - direct URL: the request's title, else `audio from <host>`, then `Audio from <host>`.
+      A URL job's episode title is never used, because it can come from the URL path.
+  - The rest of the message:
+    - Done adds `Duration: HH:MM:SS` and the warning count with the first warning.
+    - Failed adds the stage, `Reason: <job.error>`, and `Gave up after N attempts.` when
+      there was more than one.
+    - Skipped adds the reason.
+
+    Reasons and warnings pass through `log.scrub_urls` as well.
+  - No push carries a URL path or query, the instructions, the recipient address, or a
+    path, and none has a `click` link. Step 25 adds the masked recipient.
   - Every value is cleaned: NFC; control, format (except ZWJ/ZWNJ), private-use,
     unassigned, and line or paragraph separator characters removed; whitespace collapsed;
     `=?` defused, because ntfy RFC-2047-decodes titles even in JSON mode; secrets
@@ -440,6 +559,9 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
   when settings do not load.
 - **Offline checks**, in order.
   - The API token.
+  - `recipients` (step 24): `FAIL` when `EARMARK_ALLOWED_RECIPIENTS` is unset (every request
+    would be refused), `warn` for `all`, otherwise `ok` with the count and the masked
+    addresses.
   - `DATA_DIR` writability, by creating and removing one random temp file.
   - The database: schema version, application id, journal mode, `quick_check`, and job
     counts, read without migrating. A missing file is never created. A database from before
@@ -502,11 +624,28 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
   is older than `JOB_LEASE_SECONDS` is requeued by `requeue_stale` (or failed, if it has
   used its attempts), which covers a crashed worker. `requeue_stale` returns the jobs it
   changed; the worker calls it on every poll and notifies the ones it failed.
-- **Dedupe.** Enqueueing the same `(url, prompt)` while an identical job is `queued` or
-  `running` returns the existing job (`Enqueued.created` is `False`). A partial unique
-  index on a `dedupe_key` column enforces one active job per request, so a double-tapped
-  share creates one job. Prompts are normalised before the key is computed (stripped,
-  blank is `None`).
+- **Enqueue** (step 24). `enqueue(NewJob)` takes the source, `to`, `instructions`,
+  `title`, the URL or the staged upload's name, file name and sha256, and `shared_at`.
+- **Dedupe** (step 24).
+  - **The key** is `sha256(json [kind, source, subject, to, instructions])`, where the
+    subject is the canonical Apple URL, the direct URL, or `sha256:<hex>` for an upload.
+    `title` and `shared_at` are not part of it.
+  - **A repeat** returns the existing job (`Enqueued.created` is `False`) while it is
+    `queued` or `running`, or while it is `done` and its `updated_at` is less than
+    `EARMARK_DEDUPE_WINDOW_S` (default 600) old. So a double tap sends one email.
+  - **Not deduped.** A `failed` or `skipped` job is never returned, so sharing again
+    retries. A new `to` or new `instructions` makes a new job, which reuses the cached
+    transcript.
+  - **The index.** A partial unique index on `dedupe_key` still enforces one active job per
+    request.
+  - **Normalisation.** `to` is normalised and `instructions` stripped before the key is
+    computed.
+  - **Content.** The same bytes as an upload and as a URL are different requests, because a
+    URL's bytes are unknown until the worker downloads them. They still share one
+    transcript through the content key.
+- **Staging queries** (step 24). `active_upload_files()` returns the `upload_file` of the
+  queued and running jobs, which the API's startup sweep keeps. `running_job_ids()` is
+  used by the worker's.
 - **Warnings.** `add_warning(job_id, message)` appends unless the same text is already
   there, and works on terminal jobs (notifier failures are recorded after `done`).
 - **Time.** Clocks are injected so tests control time. Timestamps are stored as
@@ -517,9 +656,18 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
 
 Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 
-- The migration list restarted in step 22 with one migration, `0001_jobs` (the `jobs`
-  table with `CHECK (kind IN ('ingest'))`, `jobs_active_dedupe`, `jobs_by_status`), so
-  `SCHEMA_VERSION` is 1. Migrations stay append-only from here.
+- The migration list restarted in step 22 with `0001_jobs` (the `jobs` table with
+  `CHECK (kind IN ('ingest'))`, `jobs_active_dedupe`, `jobs_by_status`). Migrations stay
+  append-only.
+- Step 24 appended `0002_requests`, so `SCHEMA_VERSION` is 2. It adds these columns:
+  - `source` (`NOT NULL DEFAULT 'apple_podcasts'`, `CHECK` in the three sources);
+  - `recipient`, which is the `Job.to` field (`TO` is an SQL keyword);
+  - `instructions` (`NOT NULL DEFAULT ''`);
+  - `title`, `upload_file`, `upload_name` and `content_sha256`.
+
+  It copies `prompt` into `instructions`, drops `prompt`, and adds
+  `jobs_by_dedupe (dedupe_key, status, updated_at)`. Rows from before it keep `recipient`
+  NULL and their status.
 - The lineage is marked by `PRAGMA application_id = 0x45524D4B` (`b"ERMK"`), stamped in
   the same transaction that creates `jobs`.
 - `identity_error(path, application_id, user_version)` decides:
@@ -548,7 +696,15 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
-  earmark.db                    jobs (application id ERMK, schema 1); WAL mode
+  earmark.db                    jobs (application id ERMK, schema 2); WAL mode
+  uploads/                      staging.Staging, owned by the API (mode 0o700; step 24)
+    .<upload_id>.<ext>.part     an upload still streaming (0o600); swept at API startup
+    <upload_id>.<ext>           a received upload (0o600); deleted when its job ends, or by the
+                                API's startup sweep when no queued or running job names it
+  downloads/                    staging.Staging, owned by the worker (step 24)
+    <job_id>.<ext>              a direct URL's audio for one job; deleted when the job ends
+    .<job_id>.<ext>.<random>.part  download in progress; swept at worker startup unless the
+                                job is running
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
     shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
@@ -561,8 +717,11 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
                                 faster-whisper's model cache when ASR_MODEL_DIR is unset (step 16)
 ```
 
-An episode key is checked against `[0-9a-f]{20}` before it becomes a path, and nothing
-outside `DATA_DIR` is written.
+An episode key is checked against `[0-9a-f]{20}`, an upload name against
+`[0-9a-f]{32}\.[a-z0-9]{1,5}`, and a job id against `[0-9a-f]{32}`, before any of them
+becomes a path. Nothing outside `DATA_DIR` is written, and uploads never touch the system
+temp dir. For an upload or URL episode (a content key), `episode.json` is rewritten by each
+job, so it holds the last job's title. Its audio is never stored under `episodes/`.
 
 ## HTTP API
 
@@ -577,13 +736,63 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 
 | Route | Purpose |
 |---|---|
-| `POST /ingest` | Body `{url, prompt?, timestamp?}` (`IngestRequest`, JSON, at most 64 KiB, else 413). Enqueues the canonical episode URL. 202 `{job_id, status, created}` with `Location: /jobs/{id}`; `created` is `false` when an identical active job was returned (dedupe). 401 bad token. 422 unsupported or malformed URL, show link, or invalid body, with a message the Shortcut can display. |
-| `GET /jobs/{id}` | The `Job` as JSON: status, stage, error, warnings, `url`, `prompt`, and `result` (`{duration_s}`). 404 if unknown. |
-| `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [Job, …]}`, newest first. |
+| `POST /transcriptions` | JSON `{url, to, instructions?, title?, timestamp?}` (`TranscriptionRequest`, at most 64 KiB), or `multipart/form-data` with one `file` part plus the text fields `to`, `instructions`, `title` and `timestamp` (the file at most `EARMARK_MAX_UPLOAD_MB`). The answer is 202 `{job_id, status, created}` with `Location: /jobs/{id}`; `created` is `false` when dedupe returned an existing job. 401 bad token. 413 too large. 415 a content type that is neither, or an upload that does not look like audio. 422 an invalid body, a missing, invalid or not-allowed `to`, or a bad URL or show link, with a message the Shortcut can display. Step 24; it replaced `POST /ingest`. |
+| `GET /jobs/{id}` | The job's `JobView`. 404 if unknown. |
+| `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [JobView, …]}`, newest first. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
 
-Step 24 replaces `POST /ingest` with `POST /transcriptions` and the raw `Job` with a view
-model (see "Planned (steps 24–26)").
+**`POST /transcriptions`** (step 24; exact rules in `docs/steps/24-transcription-requests.md`
+section 5).
+
+- **No automatic body handling.** The route is `async` and has no body parameters, so
+  FastAPI reads nothing. It sets no route `max_body_size` and enforces both caps itself.
+- **Dispatch.** It branches on the media type:
+  - `application/json`: at most 64 KiB, checked against `Content-Length` and against the
+    bytes read.
+  - `multipart/form-data`:
+    - **Streaming.** `api.upload.receive_upload` feeds `request.stream()` to
+      python-multipart's streaming `MultipartParser`, and writes the `file` part's bytes to
+      `data/uploads/.<id>.<ext>.part` through the threadpool, hashing as it goes.
+    - **Never spooled.** Starlette's form parser is not used, because it spools files to
+      memory and the system temp dir.
+    - **Size.** The declared `Content-Length` is checked against the cap plus 128 KiB
+      before reading. The file bytes are checked against the exact cap while reading.
+    - **Fields.** Text fields may come before or after the file. Each is at most 16 KiB.
+      There are at most 8 parts, and unknown or repeated fields are refused.
+    - **The audio check** is the part's declared content type or its file name's extension
+      only (`fetch.AUDIO_EXTENSIONS`, `CONTENT_TYPE_EXTENSIONS`, any `audio/*`).
+    - **Cleanup.** Any rejection, a malformed or truncated body, or a client disconnect
+      deletes the partial file. A validation failure after the file deletes it too, and so
+      does a dedupe hit or a store error at enqueue. A partial or rejected upload therefore
+      leaves nothing in `uploads/`.
+- **URLs.** An Apple Podcasts link (`podcasts.apple.com`, `itunes.apple.com`) is
+  canonicalised as before, with the same messages for malformed links, show links and
+  non-episodes.
+  - Any other `http://` or `https://` URL is a direct audio URL, stored without its
+    fragment.
+  - Other `*.apple.com` hosts are refused as not an episode, and URLs with credentials are
+    refused.
+  - A direct URL needs its scheme spelled out. It is not audio-checked at the API, which
+    makes no request.
+- **Recipients.** `to` is normalised and checked against `EARMARK_ALLOWED_RECIPIENTS`
+  after the body validates. Refusals name the setting, never the address.
+- **Startup.** `create_app` sweeps `data/uploads/` of everything not named by a queued or
+  running job, and logs a WARNING when the allowlist is `all`. `create_app(…,
+  max_upload_bytes=…)` overrides the cap for tests.
+
+**`JobView`** (step 24) is the only job shape the API and `earmark jobs` return. It has:
+
+- `id`, `status`, `stage`, `source`;
+- `url`: the canonical Apple URL whole; for a direct URL, scheme, host, port and path only;
+  for an upload, `null`;
+- `to`, in full;
+- `instructions`, cut to 200 characters (199 and `…`);
+- `title`, `episode_key`, `attempts`, `run_after`;
+- `error` and `warnings`, passed through `log.scrub_urls`;
+- `result`, `shared_at`, `created_at`, `updated_at`.
+
+It never carries `heartbeat_at`, the lease token, the staged file name, the upload's file
+name or the content hash.
 
 ## Configuration
 
@@ -608,7 +817,10 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `ASR_TIMEOUT_SECONDS` | `10800` | How long the remote backend waits for the server's answer (read and write timeout) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional access token (both secret; step 15). URL: http(s), a host, optional path prefix, ending in the topic (`[-_A-Za-z0-9]{1,64}`), such as `https://ntfy.sh/my-earmark-topic` or `http://ntfy.tailnet-name.ts.net/earmark`; no credentials, query, or fragment. On public ntfy.sh the topic name is the only protection unless the topic is reserved, so pick a long random one. Token: printable ASCII without spaces (`tk_…`), sent as a bearer token |
-| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
+| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_AUDIO_MB` also caps direct-URL downloads; `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
+| `ALLOWED_RECIPIENTS` | unset (every request refused) | Comma-separated exact addresses, or `all` (any address; a written acceptance of risk, warned about at `serve` startup and by doctor). Matching is exact on the local part and case-insensitive on the domain. Cannot mix `all` with addresses. Shown masked by `earmark config` (step 24) |
+| `MAX_UPLOAD_MB` | `1024` | Upload size cap in MiB, for `POST /transcriptions` and `earmark submit FILE` (step 24) |
+| `DEDUPE_WINDOW_S` | `600` | Seconds a `done` job is returned for an identical request (same source, `to` and `instructions`); `0` dedupes active jobs only (step 24) |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive) |
 
@@ -694,13 +906,53 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
 The service runs on a private network, but it fetches URLs that third parties control
 and handles text they wrote.
 
-- **Ingest.** Only hosts with a registered source are accepted (`podcasts.apple.com`,
-  legacy `itunes.apple.com`, exact match). A show link without `?i=` is rejected with a
-  clear message. The API stores the canonical URL it built from the parsed ids, never
-  the client's string, so re-shares dedupe and no client-controlled URL reaches the
-  resolver. The handler does no outbound I/O. The resolver accepts only Apple Podcasts
-  episode links. The rules for client-supplied direct URLs, uploads, recipients and
-  instructions come with step 24 and are in "Planned (steps 24–26)".
+- **Requests: Apple links** (step 24). An Apple Podcasts link (`podcasts.apple.com`, legacy
+  `itunes.apple.com`, exact match) is parsed into its ids. A show link without `?i=` is
+  rejected with a clear message. The API stores the canonical URL it built from those ids,
+  never the client's string, so re-shares dedupe and no client-controlled URL reaches the
+  resolver. The resolver accepts only Apple Podcasts episode links, and the runner calls it
+  only for them.
+- **Requests: direct URLs.** Any other client URL is a direct audio URL. The guarded fetch
+  (`fetch.py`, below) is its only path, as `AudioFetcher.download` in the worker. So it
+  gets http(s) only, no credentials (also refused at the API), the private-address guard
+  on every connection and redirect, the `MAX_AUDIO_MB` cap, and the textual-type refusal.
+  The handler makes no outbound request.
+- **Requests: uploads.**
+  - Auth comes first. Uploads are authenticated before the body is read: the middleware
+    answers 401 without calling `receive`.
+  - They are streamed to `data/uploads/` under `EARMARK_MAX_UPLOAD_MB`, checked against
+    the declared length and the bytes read. They are never held whole in memory and never
+    written to the system temp dir.
+  - They are deleted when the request is rejected at any point, or when the job ends.
+    Leftovers are swept at startup.
+  - The upload's file name is untrusted. It is cleaned (base name only, control and format
+    characters removed, 255 characters) and used only as a title fallback. The staged file
+    is named by a random id, never by the client.
+- **Untrusted request text.** Client-supplied URLs, uploaded bytes, upload file names,
+  titles and instructions are all untrusted. Anything that becomes a file name or YAML goes
+  through `earmark.sanitize`. Validation errors never echo input.
+- **The recipient allowlist is the gate** (step 24).
+  - Every `to` is validated as one ASCII address, which leaves no room for CR, LF, comma,
+    space, quotes or angle brackets. It is then checked against
+    `EARMARK_ALLOWED_RECIPIENTS`, exact on the local part and case-insensitive on the
+    domain.
+  - Unset or empty refuses every request.
+  - `all` is the operator's written acceptance of a risk. Anyone holding the API token can
+    then have earmark mail anyone, from step 25, and can instruct both PKAs. `serve` logs a
+    WARNING at startup, and doctor reports it. earmark never defaults `to`.
+- **Leak rules** (step 24). Each has a test that captures the log, the push or the API
+  response (`tests/test_leaks.py`, `tests/test_api.py`):
+  - `instructions` never appears in logs or pushes;
+  - `to` appears in logs only masked: the first character of the local part, then `…@`,
+    then the domain (`recipients.mask_address`);
+  - a direct URL appears in logs and pushes host-only;
+  - pushes carry no instructions, no URL path or query, and no address except in masked
+    form;
+  - the API's `JobView` shows `to` in full, `instructions` cut to 200 characters, a direct
+    URL as scheme, host and path only, and scrubbed errors.
+
+  earmark's one enqueue log line names the source (the canonical Apple URL, `audio URL on
+  <host>`, or `upload of <n> bytes`), the masked `to`, and whether instructions were given.
 - **Outbound fetches.** Feed and enclosure URLs come from podcast publishers. Every such
   fetch goes through `fetch.py`:
   - http and https only, checked on the first URL and on every redirect target; URLs
@@ -740,8 +992,8 @@ and handles text they wrote.
     `huggingface_hub` retry warning keeps its host and reason, uvicorn's access line keeps
     the method, route, and status but not the query, and an unexpected library
     exception logged by the runner loses its URL path. earmark's own messages are left as
-    written: they name hosts only, except the canonical Apple URL that ingest logs, which
-    earmark builds from parsed ids.
+    written: they name hosts only, except the canonical Apple URL that the enqueue line
+    logs, which earmark builds from parsed ids.
   - *Libraries do not print around the handler.* `huggingface_hub` installs its own stderr
     `StreamHandler` on its logger at import and still propagates, so each of its warnings
     printed twice, once unformatted and unredacted. `log.adopt_library_loggers()` removes
@@ -784,8 +1036,9 @@ and handles text they wrote.
     removed, whitespace collapsed, RFC 2047 `=?` defused, byte-capped) and redacted.
   - Values travel only in the JSON body, never in a header, the URL, or a query string,
     so there is no header injection.
-  - Notifications carry no transcript text, and no secret, topic, URL, prompt, or path.
-    There is no `click` link.
+  - Notifications carry no transcript text, and no secret, topic, URL path or query,
+    instructions, recipient address, or file path. There is no `click` link. A direct URL
+    job is labelled by its host only (step 24).
 - **Untrusted text to names and YAML.** `earmark.sanitize` (`clean_unicode`, `fit_bytes`,
   `file_component`, `yaml_quote`, `emit_frontmatter`; standard library only, step 22).
   Today only the ntfy client uses it (`clean_unicode`, `fit_bytes`); step 25 renders the
@@ -872,6 +1125,18 @@ tested through `doctor.Probes`: injected transports, an injected `GuardedFetcher
 missing extras simulated with `sys.modules` stubs. `tests/legacy_db.py` builds the
 v0.1.0-shaped database for the refusal tests.
 
+Upload tests (step 24) use two helpers:
+
+- `tests/asgi_helpers.call_asgi` drives the ASGI app directly. It delivers scripted
+  `http.request` chunks, optionally disconnects, runs a hook before each `receive`, and
+  counts the calls.
+- `tests/multipart_helpers.multipart_body` builds exact multipart bytes in any part order.
+
+`TestClient` reads a request body whole and sends it as one message, so it cannot test
+streaming, a lying `Content-Length`, a mid-body disconnect, or that `receive` was never
+called. The leak tests configure earmark's real handler on a `StringIO` at DEBUG, and
+capture ntfy bodies with `httpx2.MockTransport`.
+
 Documents are tested against the code (step 16).
 
 - **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
@@ -881,8 +1146,9 @@ Documents are tested against the code (step 16).
   - The README's settings reference lists every `Settings` field exactly once, one
     variable per table row.
   - The README quickstart sets all four backends to `fake`.
-  - `docs/shortcut.md`'s example request body validates against `IngestRequest` and is
-    accepted by `POST /ingest`, and the example response matches the route.
+  - `docs/shortcut.md`'s example request body validates against `TranscriptionRequest`
+    and is accepted by `POST /transcriptions`, and the example response matches the route
+    (step 24).
   - The Shortcut's actions appear in a fixed order.
   - Relative links in the README, `docs/deploy.md` and `docs/shortcut.md` resolve.
   - The README's command table names every CLI command, and its HTTP API sentence names
@@ -897,10 +1163,18 @@ Documents are tested against the code (step 16).
 - **The gate.** `ruff format --check .` also formats Python code blocks in Markdown, so
   those must be ruff-clean.
 
-With every backend set to `fake`, the whole service runs in the sandbox: `earmark serve`,
-`curl` an ingest, `earmark worker --once`, and `GET /jobs/{id}` shows the job `done` with
-`result.duration_s`; the transcript is cached under `data/episodes/<key>/`. Verifiers use
-this as the live smoke test from step 05 onward.
+With every backend set to `fake` and `EARMARK_ALLOWED_RECIPIENTS` set, the whole service
+runs in the sandbox:
+
+1. `earmark serve`;
+2. `curl` a `POST /transcriptions`, with a podcast link, a direct URL (the fake fetcher
+   serves it), or a multipart upload;
+3. `earmark worker --once`;
+4. `GET /jobs/{id}` shows the job `done` with `result.duration_s`, the transcript is
+   cached under `data/episodes/<key>/`, and `data/uploads/` and `data/downloads/` are
+   empty.
+
+Verifiers use this as the live smoke test from step 05 onward.
 
 ### Continuous integration
 
@@ -1034,13 +1308,16 @@ Step planners should check these against current documentation instead of assumi
    The `transcribe` extra pins `av>=18.1,<19` until a faster-whisper release includes the
    fix already on its `master`. The weekly `slow` job would catch a regression.
 
-## Planned (steps 24–26)
+## Planned (steps 25–26)
 
-Nothing in this section is built yet. It is what steps 24–26 build against. It carries the
-operator's decisions and the mail contract from `docs/PLAN.md` "Re-scope" verbatim, and
-restates the briefs of steps 24–26 as contracts. A revision changes both files in the same
-commit. Each step's planner may settle what is listed under "Open questions", and records
-its choice here.
+Nothing in this section is built yet, except where a bullet says "Built in step NN". It is
+what steps 25–26 build against. It carries the operator's decisions and the mail contract
+from `docs/PLAN.md` "Re-scope" verbatim, and restates the briefs of steps 25–26 as
+contracts. A revision changes both files in the same commit. Each step's planner may settle
+what is listed under "Open questions", and records its choice here. Step 24's request
+model, source identity, allowlist, dedupe, retention and leak rules are built. They moved
+from here into the sections above, and `docs/steps/24-transcription-requests.md` has the
+exact rules.
 
 ### What changes
 
@@ -1071,6 +1348,7 @@ context. earmark's job is:
   then mail anyone from the operator's domain, and can instruct both PKAs. When the
   setting is unset, every request is refused. The caller chooses personal or work, since
   the Shortcut fills in `to`; earmark never defaults it.
+  Built in step 24: see "The recipient allowlist is the gate" under Security.
 - **Delivery is at-least-once.** A crash after the SMTP server accepts the message, but
   before earmark records it as sent, cannot be told apart from a failure. In that case
   earmark resends with the same `Message-ID` and the same `job_id`. The PKA treats the
@@ -1082,6 +1360,8 @@ context. earmark's job is:
 - **Direct URLs are identified by content.** A URL is downloaded again on every request
   and hashed. Transcription, the expensive part, is cached by that hash. Uploads work the
   same way. Podcasts keep their episode identity and their audio cache.
+  Built in step 24: see "Episode key" under Domain models and "Order" under Runner and
+  worker.
 - **Old databases are refused.** No v0.1.0 deployment exists (the operator is at
   runbook phase 0). A database created by `v0.1.0-full-pipeline` makes startup fail with
   a clear message saying to move it aside. It is not migrated.
@@ -1092,115 +1372,6 @@ context. earmark's job is:
 - **Removed code is deleted.** It stays recoverable from the `v0.1.0-full-pipeline` tag.
   Done in step 22: see "History: removed in step 22".
 
-### Request model (step 24)
-
-- `POST /transcriptions` replaces `POST /ingest`. It accepts either JSON `{url, to,
-  instructions?, title?}`, or a multipart form with an audio file plus the same `to`,
-  `instructions` and `title` fields. Multipart adds the `python-multipart` dependency.
-- `url`: an Apple Podcasts episode link goes through the resolver. A direct http(s) audio
-  URL goes through the guarded fetch. Nothing else reaches the resolver.
-- `to`: one email address, required, checked against `EARMARK_ALLOWED_RECIPIENTS` (see
-  "Recipients allowlist").
-- `instructions`: optional free text with a length cap.
-- `title`: optional, with a cap. It names uploads and direct URLs, and is ignored for
-  podcasts.
-- Uploads stream to a staging directory on the data volume, `data/uploads/`, never the
-  system temp dir, under `EARMARK_MAX_UPLOAD_MB`. The route overrides the 64 KiB JSON body
-  cap only for multipart. The byte limit is injectable, so tests stay small. Nothing is held
-  in memory. The fields may arrive after the file part. A request that fails validation
-  after staging deletes its staged file.
-- The audio check at the API is the declared content type or extension only. Decoding is
-  the real test: undecodable audio ends the job as a permanent failure, with a clear reason.
-- Auth is checked before the body is read.
-- Errors: a missing or invalid `to`, or a `to` not on the allowlist, gives 422 with a
-  message the Shortcut can show. A bad URL, or a show link with no episode, gives 422 with
-  the existing messages. An oversize upload gives 413, checked against the declared length
-  and against the bytes actually read. A partial or rejected upload leaves nothing in
-  staging.
-- The job stores the source, `to`, `instructions` and `title`.
-- `earmark submit` takes `--to`, `--instructions`, `--title`, and a URL or a file.
-- Each input form creates a job that transcribes on fakes.
-
-### Source identity and caching (step 24)
-
-- Podcasts keep their episode identity and their audio cache.
-- Uploads and direct URLs are keyed by the sha256 of their bytes, reusing `file_key` from
-  the transcriber (`transcribe.faster_whisper.file_key`, which `earmark transcribe` uses
-  today). A direct URL is downloaded again on each request and hashed; transcription, the
-  expensive part, is cached by that hash. Two different direct URLs serving the same bytes
-  share one cached transcript.
-- `Source` and `Episode` are generalised: new `Source` values `upload` and `url`, with a
-  synthetic show id and the `sha256:` guid. `Transcriber`, `AudioFetcher` and `Notifier`
-  keep working on an `Episode`.
-- The transcript cache key includes the ASR backend, model and options, so a `tiny` dry-run
-  transcript is never reused for `large-v3`. Step 26's `EARMARK_ASR_BATCH_SIZE` feeds it
-  too.
-
-### Recipients allowlist (step 24)
-
-- `EARMARK_ALLOWED_RECIPIENTS` is a comma-separated list of exact addresses, or the literal
-  `all`.
-- Matching is case-insensitive on the domain, and exact on the local part.
-- Unset or empty means every request is refused.
-- `all` accepts any address. Startup logs a warning and doctor reports it. Setting it is
-  the operator's written record of an accepted risk: anyone holding the API token can then
-  mail anyone from the operator's domain, and can instruct both PKAs.
-- The caller chooses the destination, personal or work, since the Shortcut fills in `to`.
-  earmark never defaults `to`. The sender, `EARMARK_SMTP_FROM` (step 25), has no default
-  either; the repo's placeholder is `earmark@example.org`.
-
-### De-duplication and retention (step 24)
-
-- The same source, `to` and `instructions` returns the existing job while it is active, and
-  for `EARMARK_DEDUPE_WINDOW_S` after it finishes (default 600), so a double tap sends one
-  email.
-- Any change to `to` or `instructions` makes a new job that reuses the cached transcript.
-  That new job downloads a podcast once and transcribes once, and a direct URL is downloaded
-  again and not transcribed again.
-- A re-share is a new job: a new `job_id`, the same `guid`, and the whole transcript sent
-  again.
-- Audio from uploads and direct URLs is deleted when its job reaches a terminal state,
-  `done` or `failed`. The transcript cache stays. Staging files left by a crash are swept at
-  startup. Podcast audio keeps today's behaviour (deleted after transcription unless
-  `EARMARK_KEEP_AUDIO`).
-
-### Leak rules and the API view model (step 24)
-
-Each leak rule has a test that captures the log, the push or the API response:
-
-- `instructions` never appears in logs or pushes;
-- `to` appears in logs only masked, as the first character of the local part, then `…@`,
-  then the domain;
-- a direct URL appears in logs and pushes host-only;
-- pushes carry no instructions, no URL path or query, and no address except in masked
-  form.
-
-Step 25 adds two more: no job error contains the recipient address or the SMTP server's
-reply text, and `EARMARK_SMTP_PASSWORD` never appears in logs, job errors, `earmark config`
-or doctor output. The mail contract keeps the guid out of the mail body.
-
-`GET /jobs` and `GET /jobs/{id}` return a dedicated view model, never the raw `Job`:
-
-- `to` is shown in full;
-- `instructions` is truncated to 200 characters;
-- a direct URL is shown as scheme, host and path only;
-- errors are scrubbed.
-
-### Security for client-supplied input (step 24)
-
-- The guarded fetch (`fetch.py`, see "Fetching" and "Security") is the only path to a
-  direct URL: http(s) only, the private-address guard on every connection and redirect, and
-  its size caps.
-- The resolver accepts only Apple Podcasts episode links. A direct URL never reaches it, and
-  nothing else does either.
-- Client-supplied URLs, uploaded bytes, upload file names, titles and instructions are
-  untrusted. Anything that becomes a file name or YAML goes through `earmark.sanitize`.
-- Recipients and instructions are data that must not leak: see "Leak rules and the API view
-  model".
-- Uploads are authenticated before the body is read, streamed to `data/uploads/` under
-  `EARMARK_MAX_UPLOAD_MB`, never held in memory, deleted when validation fails, and swept at
-  startup.
-
 ### Delivery (step 25)
 
 Step 25 builds to the mail contract below, which is `contract: 1` and still a draft. If
@@ -1209,6 +1380,15 @@ pka-skills sends a revision before step 25 is dispatched, the orchestrator updat
 
 - **Where it runs.** Delivery runs after transcription and before the job completes; the
   push then says the transcript was sent. The stage's name is step 25's.
+- **Leak rules.** Step 25 keeps step 24's leak rules (see Security) and adds two more: no
+  job error contains the recipient address or the SMTP server's reply text, and
+  `EARMARK_SMTP_PASSWORD` never appears in logs, job errors, `earmark config` or doctor
+  output. The mail contract keeps the guid out of the mail body.
+- **Jobs without `to`.** Jobs enqueued before step 24 have `to` set to `None`. Delivery
+  fails them permanently with a message saying to share again.
+- **The request offset.** The request's optional `timestamp` (kept by step 24) sets
+  `shared_at`. It is one candidate source for the requester's offset (see "Open
+  questions").
 - **Ordinary email.** earmark is not part of AMAP. It sends ordinary email from a sending
   mailbox on a domain the operator owns. Each PKA runtime reads an attachment only from an
   allowlisted sender that passes DMARC. earmark is send-only and reads no mail; it learns
@@ -1423,14 +1603,19 @@ Notes for step 25 (not part of the contract):
 
 ### Open questions, owned by later steps
 
-- **Step 24:** the length caps of `instructions` and `title`; the default of
-  `EARMARK_MAX_UPLOAD_MB`; the synthetic show id; how the job stores the source, `to`,
-  `instructions` and `title` (a migration on the new lineage); what becomes of today's
-  `prompt` field; what the resolve stage does for uploads and direct URLs.
+- **Settled by step 24** (see `docs/steps/24-transcription-requests.md` section 8):
+  - the caps: `instructions` 4000 characters, `title` 200;
+  - `EARMARK_MAX_UPLOAD_MB` defaults to 1024;
+  - the synthetic show id is `audio`;
+  - the job stores its request through migration `0002`, with the column `recipient`;
+  - `prompt` became `instructions`, carried over;
+  - for uploads and URLs, the resolve stage builds the episode from the job and the bytes;
+  - the dedupe window applies to `done` jobs only.
 - **Step 25:**
   - The time zone: where the requester's offset comes from, the request (the Shortcut can
     send it), a re-added setting, or UTC. Today the job stores `shared_at` as a UTC
-    instant, and step 22 removed `EARMARK_TZ` and `tzdata`.
+    instant, and step 22 removed `EARMARK_TZ` and `tzdata`. The request's `timestamp`
+    field still exists (step 24 kept it), but its offset is not stored.
   - The feed guid: the contract wants `feed:<feed guid verbatim>`, else `apple:<i= episode
     id>`. Today `Episode.guid` prefers Apple's `episodeGuid` over the matched feed item's
     GUID and falls back to `apple-podcasts:<episode_id>`; Apple's and the feed's GUIDs can

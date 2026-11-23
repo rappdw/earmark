@@ -4,6 +4,7 @@ Every parameter is positional-only, so implementations may name them freely and 
 runner must call stages positionally.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -28,10 +29,24 @@ class AudioFetcher(Protocol):
         """
         ...
 
+    def download(self, url: str, destination: Callable[[str], Path], /) -> Path:
+        """Download a client-supplied direct audio URL to ``destination(ext)``; return the path.
+
+        Always downloads (no cache). Errors follow ``fetch.py``.
+        """
+        ...
+
 
 class Transcriber(Protocol):
+    def cached(self, episode: Episode, /) -> Transcript | None:
+        """The cached transcript if one exists for this transcriber's profile.
+
+        Never loads a model.
+        """
+        ...
+
     def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
-        """Return the cached transcript if ``transcript.json`` exists (loading no model).
+        """Return the cached transcript if ``cached`` has one (loading no model).
 
         Otherwise transcribe ``audio`` and write both transcript files through
         ``ArtifactStore.write_transcript``.

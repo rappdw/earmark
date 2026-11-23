@@ -135,7 +135,7 @@ class Worker:
         for stale in self._jobs.requeue_stale():
             logger.warning("job %s: %s", stale.id, stale.error)
             if stale.status == "failed":
-                self._pipeline.notify(stale, self._pipeline.load_episode(stale))
+                self._pipeline.finish(stale, self._pipeline.load_episode(stale))
         claim = self._jobs.claim_next()
         if claim is None:
             return None
