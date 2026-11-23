@@ -40,7 +40,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 20 | Fix: dry-run findings (third-party URL logging, noisy output) | 19 | done |
 | 21 | Hugging Face telemetry off by default | 20 | done |
 | 22 | Re-scope I: remove analysis, vault, entities, search, re-run, digest | 21 | done |
-| 23 | Re-scope II: architecture and CLAUDE.md | 22 | todo |
+| 23 | Re-scope II: architecture and CLAUDE.md | 22 | done |
 | 24 | Transcription requests: audio upload or URL, destination, instructions | 23 | todo |
 | 25 | Delivery: the transcript note and the email | 24 | todo |
 | 26 | GPU transcription inside the image | 25 | todo |
@@ -616,8 +616,8 @@ and filing, each with its own context. earmark's job is:
    optionally a title.
 2. Transcribe the audio on the Spark's GPU.
 3. Email two Markdown attachments to that address. One is the transcript note, which is
-   data. The other holds the requester's instructions. The body and subject carry only
-   text earmark generates.
+   data. The other holds the requester's instructions. The body carries only text earmark
+   generates, and the subject carries only the sanitised, capped title.
 4. Send an ntfy push saying the transcript was sent, or why the job failed.
 
 **Decisions (the operator's, 2026-11-23).**
