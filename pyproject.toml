@@ -58,12 +58,13 @@ addopts = [
   "--allow-unix-socket",          # asyncio/TestClient need an AF_UNIX socketpair
   # NOTE: a command-line -m REPLACES this expression (last -m wins). `-m network` runs only
   # network tests, but `-m "not slow"` would also include network and gpu tests.
-  "-m", "not network and not slow and not gpu",
+  "-m", "not network and not slow and not gpu and not smtp",
 ]
 markers = [
   "network: hits real external endpoints (Apple, podcast feeds)",
   "slow: downloads a model, does CPU-heavy work, or needs the transcribe extra",
   "gpu: needs CUDA",
+  "smtp: sends one real message through a configured SMTP server",
 ]
 filterwarnings = [
   "error",

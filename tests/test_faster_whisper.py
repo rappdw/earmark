@@ -42,7 +42,7 @@ from earmark.transcribe.faster_whisper import (
     load_runtime,
     segment_from,
 )
-from tests.factories import make_episode, new_podcast_job
+from tests.factories import TO, make_episode, new_podcast_job
 from tests.http_helpers import FakeMonotonic
 from tests.pipeline_env import CANON, CountingJobStore, make_env
 from tests.whisper_fakes import (
@@ -185,6 +185,7 @@ def test_factory_missing_extra_is_config_error(
         fetch_backend="fake",
         asr_backend="faster_whisper",
         notify_backend="fake",
+        mail_backend="fake",
     )
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(settings.data_dir))
@@ -242,6 +243,8 @@ def test_worker_loads_model_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         fetch_backend="fake",
         asr_backend="faster_whisper",
         notify_backend="fake",
+        mail_backend="fake",
+        allowed_recipients=(TO,),
     )
     worker = factory.build_worker(settings)
     store = open_job_store(settings)
@@ -596,6 +599,7 @@ def test_factory_builds_faster_whisper(tmp_path: Path, monkeypatch: pytest.Monke
         asr_backend="faster_whisper",
         asr_model="small",
         notify_backend="fake",
+        mail_backend="fake",
     )
     b = factory.build_backends(settings, ArtifactStore(settings.data_dir))
     assert isinstance(b.transcriber, CachedTranscriber)

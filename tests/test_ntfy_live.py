@@ -53,7 +53,7 @@ def test_ntfy_publish_round_trip() -> None:
     assert response.status_code == 200
     messages = [json.loads(line) for line in response.text.splitlines() if line.strip()]
     [message] = [m for m in messages if m.get("event") == "message"]
-    assert message["title"] == "Transcribed: Live: Café X-Evil: 1 = ?UTF-8?B?4pyT?="
+    assert message["title"] == "Sent: Live: Café X-Evil: 1 = ?UTF-8?B?4pyT?="
     assert message["message"] == "Le Podcast ☕\nDuration: 00:02:05"
     assert message["tags"] == ["white_check_mark"]
     assert message["priority"] == 3

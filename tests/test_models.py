@@ -478,3 +478,49 @@ def test_scrub_keeps_valid_text_identical() -> None:
     text = "emoji \U0001f600 pair and caf\u00e9"
     assert scrub_surrogates(text) is text
     assert scrub_surrogates("x\ud800") == "x\ufffd"
+
+
+# -- delivery fields (step 25) -----------------------------------------------------------
+
+
+def _job_fields(**changes: Any) -> dict[str, Any]:
+    fields = make_job().model_dump()
+    fields.update(changes)
+    return fields
+
+
+def test_job_delivery_state_requirements() -> None:
+    sent_at = datetime(2026, 1, 1, tzinfo=UTC)
+    assert Job(**_job_fields()).delivery_state is None
+    with pytest.raises(ValidationError, match="requires message_id"):
+        Job(**_job_fields(delivery_state="sending"))
+    with pytest.raises(ValidationError, match="requires message_id"):
+        Job(**_job_fields(delivery_state="sent", sent_at=sent_at))
+    with pytest.raises(ValidationError, match="requires sent_at"):
+        Job(**_job_fields(delivery_state="sent", message_id="<m@example.org>"))
+    sending = Job(**_job_fields(delivery_state="sending", message_id="<m@example.org>"))
+    assert sending.sent_at is None
+    sent = Job(**_job_fields(delivery_state="sent", message_id="<m@example.org>", sent_at=sent_at))
+    assert (sent.delivery_state, sent.resent) == ("sent", False)
+    with pytest.raises(ValidationError):
+        Job(**_job_fields(delivery_state="delivered", message_id="<m@example.org>"))
+
+
+@pytest.mark.parametrize(("minutes", "ok"), [(-1439, True), (0, True), (1439, True), (1440, False)])
+def test_job_utc_offset_bounds(minutes: int, ok: bool) -> None:
+    if ok:
+        assert Job(**_job_fields(utc_offset_min=minutes)).utc_offset_min == minutes
+    else:
+        with pytest.raises(ValidationError):
+            Job(**_job_fields(utc_offset_min=minutes))
+    with pytest.raises(ValidationError):
+        Job(**_job_fields(utc_offset_min=-1440))
+
+
+def test_old_episode_json_loads_with_defaults() -> None:
+    data = make_episode().model_dump(mode="json")
+    del data["feed_guid"]
+    del data["published_date_only"]
+    old = Episode.model_validate(data)
+    assert (old.feed_guid, old.published_date_only) == (None, False)
+    assert old.key == make_episode().key

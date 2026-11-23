@@ -76,7 +76,7 @@ export EARMARK_ALLOWED_RECIPIENTS=you@example.org
 export EARMARK_DATA_DIR="$demo/data" EARMARK_VAULT_DIR="$demo/vault"
 export EARMARK_RESOLVER_BACKEND=fake EARMARK_FETCH_BACKEND=fake EARMARK_ASR_BACKEND=fake \
   EARMARK_LLM_PROVIDER=fake EARMARK_STORE_BACKEND=fake EARMARK_INDEX_BACKEND=fake \
-  EARMARK_NOTIFY_BACKEND=fake
+  EARMARK_MAIL_BACKEND=fake EARMARK_NOTIFY_BACKEND=fake
 uv run earmark doctor
 
 uv run earmark serve &
@@ -182,6 +182,7 @@ Copy `.env.example` to start.
 | `EARMARK_RESOLVER_BACKEND` | `apple` | `apple` or `fake`. |
 | `EARMARK_FETCH_BACKEND` | `http` | `http` or `fake`. |
 | `EARMARK_ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, or `fake`. |
+| `EARMARK_MAIL_BACKEND` | `smtp` | `smtp` or `fake`. The fake sends nothing and writes `data/outbox/<job id>.eml`. |
 | `EARMARK_NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, or `none`. |
 
 ### Transcription
@@ -205,6 +206,24 @@ See [docs/asr.md](docs/asr.md). Used when `EARMARK_ASR_BACKEND=remote`.
 | `EARMARK_ASR_API_KEY` | unset | Bearer key for the server (secret). |
 | `EARMARK_ASR_MAX_UPLOAD_MB` | unset | Refuse uploads larger than this, before sending. Unset means no limit. |
 | `EARMARK_ASR_TIMEOUT_SECONDS` | `10800` | How long to wait for the server's answer. |
+
+### Mail
+
+The transcript note and the instructions go to the request's destination as two Markdown
+attachments. Used when `EARMARK_MAIL_BACKEND=smtp`, which needs the host, the sender, the
+username and the password. TLS is always verified and the server must offer a login; there is
+no plaintext mode.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EARMARK_SMTP_HOST` | unset | The submission server's host name. Required for `smtp`. |
+| `EARMARK_SMTP_PORT` | unset | Unset means 587 for `starttls` and 465 for `tls`. |
+| `EARMARK_SMTP_SECURITY` | `starttls` | `starttls` (the server must offer it) or `tls` (implicit TLS). |
+| `EARMARK_SMTP_USERNAME` | unset | The login name. Required for `smtp`. |
+| `EARMARK_SMTP_PASSWORD` | unset | The login password, printable ASCII (secret). Required for `smtp`. |
+| `EARMARK_SMTP_FROM` | unset | The sender address. Its domain is also the EHLO name and the `Message-ID` domain. Required for `smtp`. |
+| `EARMARK_SMTP_TIMEOUT_S` | `60.0` | The whole SMTP session must finish within this many seconds (at most 90). |
+| `EARMARK_MAX_ATTACHMENT_MB` | `10` | The transcript and the instructions together may not exceed this (MiB). Nothing is truncated or split. |
 
 ### Notifications
 

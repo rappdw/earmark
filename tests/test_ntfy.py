@@ -93,7 +93,7 @@ def _compose(job: Job, *, episode: bool = True) -> Notification:
 
 def test_compose_titles_distinct_per_status() -> None:
     done, failed, skipped = (_compose(_job(s)) for s in ("done", "failed", "skipped"))
-    assert done.title.startswith("Transcribed: ")
+    assert done.title.startswith("Sent: ")
     assert failed.title.startswith("Failed: ")
     assert skipped.title.startswith("Skipped: ")
     assert len({done.title, failed.title, skipped.title}) == 3
@@ -366,7 +366,7 @@ def test_pipeline_ntfy_success_no_warning(tmp_path: Path) -> None:
     assert (stored.status, stored.warnings) == ("done", ())
     [request] = seen
     body = json.loads(request.content)
-    assert body["title"].startswith("Transcribed: Fake episode ")
+    assert body["title"].startswith("Sent: Fake episode ")
     assert "Duration: 00:15:00" in body["message"]
     for forbidden in (b"://", b"podcasts.apple.com", b"click", b"secret-prompt-7q"):
         assert forbidden not in request.content
@@ -422,7 +422,7 @@ def test_no_untrusted_text_in_headers() -> None:
     }
     assert "evil" not in " ".join(request.headers.values()).lower()
     title = json.loads(request.content)["title"]
-    assert title == "Transcribed: x X-Evil: 1"
+    assert title == "Sent: x X-Evil: 1"
     assert "\r" not in title
     assert request.url.query == b""
 
@@ -545,17 +545,17 @@ def test_compose_upload_labels() -> None:
     job = _audio_job("upload", upload_name="memo.final.m4a")
     result = compose(job, _audio_episode(job, "Episode title"))
     assert result is not None
-    assert result.title == "Transcribed: Episode title"
+    assert result.title == "Sent: Episode title"
     assert result.message.splitlines()[0] == "Uploaded audio"
     titled = compose(_audio_job("upload", title="My title"), _audio_episode(job))
     assert titled is not None
-    assert titled.title == "Transcribed: My title"
+    assert titled.title == "Sent: My title"
     no_episode = compose(_audio_job("upload", upload_name="memo.final.m4a"), None)
     assert no_episode is not None
-    assert no_episode.title == "Transcribed: memo.final"
+    assert no_episode.title == "Sent: memo.final"
     bare = compose(_audio_job("upload", upload_name=None), None)
     assert bare is not None
-    assert bare.title == "Transcribed: uploaded audio"
+    assert bare.title == "Sent: uploaded audio"
     failed = compose(_audio_job("upload", "failed"), None)
     assert failed is not None
     assert failed.title.startswith("Failed: ")
@@ -567,7 +567,7 @@ def test_compose_url_label_uses_host_not_path() -> None:
     episode = _audio_episode(job, "PATH-TOKEN-91d2.mp3")  # a title built from the URL path
     result = compose(job, episode)
     assert result is not None
-    assert result.title == "Transcribed: audio from audio.example.net"
+    assert result.title == "Sent: audio from audio.example.net"
     assert result.message.splitlines()[0] == "Audio from audio.example.net"
     text = result.title + result.message
     for token in ("PATH-TOKEN", "QUERY-TOKEN", "/private/", "://"):
@@ -578,7 +578,7 @@ def test_compose_url_with_title() -> None:
     job = _audio_job("url", title="Board meeting")
     result = compose(job, _audio_episode(job, "ignored"))
     assert result is not None
-    assert result.title == "Transcribed: Board meeting"
+    assert result.title == "Sent: Board meeting"
     assert result.message.splitlines()[0] == "Audio from audio.example.net"
 
 
@@ -611,6 +611,74 @@ def test_compose_carries_no_address() -> None:
             result = compose(job, None)
             assert result is not None
             text = result.title + "\n" + result.message
-            assert "@" not in text
+            assert text.count("@") == text.count("To: z…@example.org")
             assert "zelda" not in text
             assert "INSTR-TOKEN" not in text
+
+
+# -- step 25: delivery wording -----------------------------------------------------------
+
+
+def test_sent_push_has_masked_recipient_and_duration() -> None:
+    note = _compose(_job("done", to="you@example.org", warnings=()))
+    assert note.title == "Sent: Épisode 1: «Tests»"
+    assert note.message.splitlines() == [
+        "Le Podcast ☕",
+        "To: y…@example.org",
+        "Duration: 00:02:05",
+    ]
+    warned = _compose(_job("done", resent=True, warnings=("w",)))
+    assert warned.message.splitlines()[-2:] == ["Resent after an interruption.", "1 warning: w"]
+    assert "you@example.org" not in note.title + note.message
+    assert note.tags == ("white_check_mark",)
+    without = _compose(_job("done", to=None))
+    assert "To:" not in without.message
+
+
+def test_resent_push_says_so() -> None:
+    note = _compose(_job("done", resent=True, warnings=()))
+    assert note.message.splitlines() == [
+        "Le Podcast ☕",
+        "To: y…@example.org",
+        "Duration: 00:02:05",
+        "Resent after an interruption.",
+    ]
+    assert "Resent" not in _compose(_job("done", resent=False)).message
+
+
+def test_failed_push_may_have_been_delivered() -> None:
+    sending = _compose(
+        _job("failed", delivery_state="sending", message_id="<m@example.org>", error="no reply")
+    )
+    assert sending.message.splitlines() == [
+        "Le Podcast ☕",
+        "To: y…@example.org",
+        "Stage: transcribe",
+        "Reason: no reply",
+        "Gave up after 4 attempts.",
+        "The email may already have been delivered.",
+    ]
+    assert sending.title.startswith("Failed: ")
+    plain = _compose(_job("failed", delivery_state=None))
+    assert "may already have been delivered" not in plain.message
+    skipped = _compose(_job("skipped", delivery_state=None, to="you@example.org"))
+    assert "To:" not in skipped.message  # the skipped push is unchanged
+
+
+def test_push_never_has_full_address_guid_or_subject() -> None:
+    job = _job(
+        "done",
+        to="zelda.secret@example.org",
+        resent=True,
+        message_id="<earmark.MSGID-TOKEN@example.org>",
+        delivery_state="sent",
+        sent_at=make_job().updated_at,
+        instructions="INSTR-TOKEN",
+    )
+    episode = make_episode(feed_guid="GUID-TOKEN")
+    note = compose(job, episode, secrets=())
+    assert note is not None
+    text = note.title + "\n" + note.message
+    for token in ("zelda.secret", "GUID-TOKEN", "MSGID-TOKEN", "INSTR-TOKEN", "[earmark]", "apple"):
+        assert token not in text
+    assert "To: z…@example.org" in text

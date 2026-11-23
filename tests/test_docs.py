@@ -32,7 +32,7 @@ from tests.doc_helpers import (
 TOKEN = "docs-test-token-91c"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 DOCS = ["README.md", "docs/deploy.md", "docs/shortcut.md"]
-SECRET_FIELDS = ("api_token", "asr_api_key", "ntfy_url", "ntfy_token")
+SECRET_FIELDS = ("api_token", "asr_api_key", "ntfy_url", "ntfy_token", "smtp_password")
 ACTIONS = [
     "Receive input from Share Sheet",
     "Get URLs from Input",
@@ -75,7 +75,7 @@ def test_quickstart_block_present() -> None:
 def test_quickstart_uses_fake_backends() -> None:
     script = _quickstart()
     fields = [n for n in Settings.model_fields if n.endswith("_backend")]
-    assert len(fields) == 4
+    assert len(fields) == 5
     for name in fields:
         assert re.search(rf"\b{env_var(name)}=fake\b", script), name
 

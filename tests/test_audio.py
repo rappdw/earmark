@@ -149,6 +149,7 @@ def _settings(tmp_path: Path, **overrides: typing.Any) -> Settings:
         "resolver_backend": "fake",
         "asr_backend": "fake",
         "notify_backend": "fake",
+        "mail_backend": "fake",
         "fetch_backend": "http",
     }
     values.update(overrides)

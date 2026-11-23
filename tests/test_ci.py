@@ -392,6 +392,15 @@ def test_network_workflow_is_not_the_gate() -> None:
     assert "not network" in expression
     assert "not slow" in expression
     assert "not gpu" in expression
+    assert "not smtp" in expression
+
+
+def test_no_workflow_runs_smtp_marker() -> None:
+    # The smtp test sends a real message; no workflow may ask for it, directly or by marker.
+    for path in _workflow_files():
+        text = path.read_text()
+        assert not re.search(r"(?:-m|--markers?)[ =]+[\"']?[^\n\"']*\bsmtp\b", text), path.name
+        assert "SMTP_TEST_" not in text, path.name
 
 
 # --- slow job (step 08) --------------------------------------------------------------------

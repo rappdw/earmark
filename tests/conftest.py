@@ -7,7 +7,7 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-_SOCKET_MARKERS = ("network", "slow")
+_SOCKET_MARKERS = ("network", "slow", "smtp")
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

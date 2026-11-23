@@ -50,7 +50,7 @@ Create a new Shortcut and name it "Earmark". In its details (the ⓘ button), tu
 <!-- shortcut-actions:end -->
 
 Variations: use **Show Notification** instead of **Show Result** for a quieter result.
-There is no need to send a `timestamp`.
+Send `timestamp` (the current date as ISO 8601 with its UTC offset) so the note's dates are in your time zone; without it they are in UTC.
 
 The token is stored inside the Shortcut. Do not share the Shortcut with anyone; if you
 do, change `EARMARK_API_TOKEN` and the Shortcut.

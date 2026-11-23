@@ -31,11 +31,13 @@ AUDIO_SHOW_ID: Final = "audio"  # the synthetic show id of upload and url episod
 GUID_SHA256_PREFIX: Final = "sha256:"
 JobKind = Literal["ingest"]
 JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
-Stage = Literal["resolve", "fetch", "transcribe", "notify"]  # "notify" is never set
+Stage = Literal["resolve", "fetch", "transcribe", "deliver", "notify"]  # "notify" is never set
+DeliveryState = Literal["sending", "sent"]
 Clock = Callable[[], datetime]
 
 TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset({"done", "failed", "skipped"})
 EPISODE_KEY_LENGTH: Final = 20
+MAX_UTC_OFFSET_MIN: Final = 1439
 
 MAX_URL_CHARS: Final = 2048
 MAX_INSTRUCTIONS_CHARS: Final = 4000
@@ -236,6 +238,8 @@ class Episode(Model):
     feed_url: str | None
     url: str
     description: str = ""
+    feed_guid: str | None = None  # the matched feed item's <guid> (valid_guid), else None
+    published_date_only: bool = False  # published_at is a calendar date at 00:00 UTC
 
     @field_validator("show_id")
     @classmethod
@@ -317,6 +321,20 @@ class Job(Model):
     created_at: AwareDatetime
     updated_at: AwareDatetime
     heartbeat_at: AwareDatetime | None = None
+    # The requester's UTC offset in minutes, from the request's timestamp; None means UTC.
+    utc_offset_min: int | None = Field(None, ge=-MAX_UTC_OFFSET_MIN, le=MAX_UTC_OFFSET_MIN)
+    delivery_state: DeliveryState | None = None
+    message_id: str | None = None
+    sent_at: AwareDatetime | None = None
+    resent: bool = False
+
+    @model_validator(mode="after")
+    def _delivery_requirements(self) -> Self:
+        if self.delivery_state in ("sending", "sent") and self.message_id is None:
+            raise ValueError("a delivery in progress or done requires message_id")
+        if self.delivery_state == "sent" and self.sent_at is None:
+            raise ValueError("a sent delivery requires sent_at")
+        return self
 
     @model_validator(mode="after")
     def _kind_requirements(self) -> Self:

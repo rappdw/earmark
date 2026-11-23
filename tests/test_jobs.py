@@ -3,7 +3,7 @@ import multiprocessing
 import sqlite3
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -713,3 +713,134 @@ def test_blank_messages_refused(store: JobStore, text: str) -> None:
     with pytest.raises(ValueError, match="message"):
         store.add_warning(job_id, text)
     assert store.get(job_id) == claim.job.model_copy(update={"updated_at": T0})
+
+
+# -- delivery state and the requester's offset (step 25) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("shared_at", "minutes"),
+    [
+        (datetime.fromisoformat("2026-01-01T00:00:00-08:00"), -480),
+        (datetime.fromisoformat("2026-01-01T00:00:00+05:30"), 330),
+        (datetime.fromisoformat("2026-01-01T00:00:00+00:00"), 0),
+        (datetime(2026, 1, 1, tzinfo=UTC), 0),
+        (datetime.fromisoformat("2026-01-01T00:00:00+23:59"), 1439),
+        (None, None),
+    ],
+)
+def test_enqueue_stores_request_offset(
+    store: JobStore, shared_at: datetime | None, minutes: int | None
+) -> None:
+    enqueued = store.enqueue(new_podcast_job(shared_at=shared_at))
+    assert enqueued.job.utc_offset_min == minutes
+    again = store.get(enqueued.job.id)
+    assert again is not None
+    assert again.utc_offset_min == minutes
+    if shared_at is not None:
+        assert again.shared_at == shared_at  # the instant is unchanged; only the offset is kept
+
+
+def test_enqueue_refuses_an_offset_with_seconds(store: JobStore) -> None:
+    odd = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=1, seconds=15)))
+    with pytest.raises(ValueError, match="whole number of minutes"):
+        store.enqueue(new_podcast_job(shared_at=odd))
+    too_far = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=24) - timedelta(seconds=1)))
+    with pytest.raises(ValueError, match="whole number of minutes"):
+        store.enqueue(new_podcast_job(shared_at=too_far))
+
+
+def test_mark_sending_then_complete_sent(store: JobStore, clock: MutableClock) -> None:
+    store.enqueue(new_podcast_job())
+    claim = claim_one(store)
+    assert (claim.job.delivery_state, claim.job.resent) == (None, False)
+    clock.advance(5)
+    sending = store.mark_sending(claim, "<m@example.org>")
+    assert (sending.delivery_state, sending.message_id, sending.resent) == (
+        "sending",
+        "<m@example.org>",
+        False,
+    )
+    assert sending.heartbeat_at == clock.now
+    assert sending.sent_at is None
+    clock.advance(5)
+    done = store.complete_sent(claim, JobResult(duration_s=3.0))
+    assert (done.status, done.delivery_state, done.resent, done.error) == (
+        "done",
+        "sent",
+        False,
+        None,
+    )
+    assert done.sent_at == clock.now
+    assert done.result == JobResult(duration_s=3.0)
+    with pytest.raises(LeaseLostError):  # a done job holds no lease
+        store.complete_sent(claim, JobResult(duration_s=3.0))
+    with pytest.raises(LeaseLostError):
+        store.mark_sending(claim, "<m@example.org>")
+
+
+def test_second_mark_sending_sets_resent(store: JobStore, clock: MutableClock) -> None:
+    store.enqueue(new_podcast_job())
+    first = claim_one(store)
+    store.mark_sending(first, "<m@example.org>")
+    clock.advance(1000)
+    [stale] = store.requeue_stale()
+    assert (stale.status, stale.delivery_state, stale.resent) == ("queued", "sending", False)
+    second = claim_one(store)
+    assert second.job.delivery_state == "sending"  # the claim shows an interrupted delivery
+    resent = store.mark_sending(second, "<m@example.org>")
+    assert (resent.delivery_state, resent.resent) == ("sending", True)
+    with pytest.raises(LeaseLostError):  # the old claim was fenced out
+        store.complete_sent(first, JobResult(duration_s=1.0))
+    assert store.complete_sent(second, JobResult(duration_s=1.0)).resent is True
+
+
+def test_clear_sending_only_clears_sending(store: JobStore) -> None:
+    store.enqueue(new_podcast_job())
+    claim = claim_one(store)
+    assert store.clear_sending(claim).delivery_state is None  # nothing to clear: no change
+    store.mark_sending(claim, "<m@example.org>")
+    cleared = store.clear_sending(claim)
+    assert (cleared.delivery_state, cleared.resent) == (None, False)
+    assert cleared.message_id == "<m@example.org>"  # kept for the record
+    again = store.mark_sending(claim, "<m@example.org>")
+    assert (again.delivery_state, again.resent) == ("sending", False)  # not a resend
+
+
+def test_delivery_state_survives_fail_and_release(store: JobStore, clock: MutableClock) -> None:
+    store.enqueue(new_podcast_job())
+    claim = claim_one(store)
+    store.mark_sending(claim, "<m@example.org>")
+    queued = store.fail(claim, "disconnected", transient=True)
+    assert (queued.status, queued.delivery_state) == ("queued", "sending")
+    clock.advance(3600)
+    again = claim_one(store)
+    released = store.release(again)
+    assert (released.status, released.delivery_state) == ("queued", "sending")
+    last = claim_one(store)
+    failed = store.fail(last, "gave up", transient=False)
+    assert (failed.status, failed.delivery_state) == ("failed", "sending")
+
+
+def test_delivery_writes_are_fenced(store: JobStore) -> None:
+    store.enqueue(new_podcast_job())
+    claim = claim_one(store)
+    store.release(claim)
+    with pytest.raises(LeaseLostError):
+        store.mark_sending(claim, "<m@example.org>")
+    with pytest.raises(LeaseLostError):
+        store.clear_sending(claim)
+    with pytest.raises(LeaseLostError):
+        store.complete_sent(claim, JobResult(duration_s=1.0))
+
+
+def test_mark_sending_refuses_a_sent_job(tmp_path: Path, clock: MutableClock) -> None:
+    store = make_store(tmp_path, clock)
+    store.enqueue(new_podcast_job())
+    claim = claim_one(store)
+    with store._db.connect() as conn:  # a hand-edited row
+        conn.execute(
+            "UPDATE jobs SET delivery_state = 'sent', message_id = 'm', sent_at = run_after"
+        )
+    with pytest.raises(LeaseLostError):
+        store.mark_sending(claim, "<m@example.org>")

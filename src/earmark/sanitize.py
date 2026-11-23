@@ -22,7 +22,7 @@ _YAML_ESCAPED: Final = frozenset(
     [*range(0x20), *range(0x7F, 0xA0), 0x2028, 0x2029, 0xFEFF, 0xFFFE, 0xFFFF]
 )
 
-type YamlValue = str | date | datetime | tuple[str, ...] | None  # datetime is naive local
+type YamlValue = str | int | date | datetime | tuple[str, ...] | None
 
 _KEY_NAME: Final = re.compile(r"[a-z][a-z0-9_]*")
 
@@ -162,23 +162,53 @@ def yaml_quote(text: str) -> str:
     return '"' + "".join(out) + '"'
 
 
+def fit_chars(text: str, max_chars: int) -> str:
+    """At most ``max_chars`` characters, cut at a safe boundary and ending in ``…``.
+
+    Unchanged if it fits. ``ValueError`` if ``max_chars`` is below 2.
+    """
+    if max_chars < 2:
+        raise ValueError("max_chars must be at least 2")
+    if len(text) <= max_chars:
+        return text
+    return _repair_cut(text[: max_chars - 1]) + ELLIPSIS
+
+
 def emit_frontmatter(fields: Sequence[tuple[str, YamlValue]]) -> list[str]:
+    """One line per key, or a block list.
+
+    - None: the key is omitted.
+    - str: ``yaml_quote``.
+    - int (not bool): decimal.
+    - aware datetime: ``isoformat(timespec="seconds")``, so it keeps its offset.
+    - date: ``YYYY-MM-DD``.
+    - non-empty tuple of str: a block list of quoted items.
+
+    A naive datetime, a bool, ``""`` or ``()`` raises ``ValueError``. So does a key outside
+    ``[a-z][a-z0-9_]*``.
+    """
     lines: list[str] = []
     for key, value in fields:
         if not _KEY_NAME.fullmatch(key):
             raise ValueError(f"bad frontmatter key: {key!r}")
         if value is None:
-            lines.append(f"{key}: null\n")
-        elif isinstance(value, str):
+            continue
+        if isinstance(value, bool):
+            raise ValueError(f"frontmatter value for {key} must not be a bool")
+        if isinstance(value, str):
+            if not value:
+                raise ValueError(f"frontmatter value for {key} must not be empty")
             lines.append(f"{key}: {yaml_quote(value)}\n")
+        elif isinstance(value, int):
+            lines.append(f"{key}: {value}\n")
         elif isinstance(value, datetime):
-            if value.tzinfo is not None:
-                raise ValueError("frontmatter date-times must be naive local time")
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("frontmatter date-times must be timezone-aware")
             lines.append(f"{key}: {value.isoformat(timespec='seconds')}\n")
         elif isinstance(value, date):
             lines.append(f"{key}: {value.isoformat()}\n")
         elif not value:
-            lines.append(f"{key}: []\n")
+            raise ValueError(f"frontmatter list for {key} must not be empty")
         else:
             lines.append(f"{key}:\n")
             lines.extend(f"  - {yaml_quote(item)}\n" for item in value)

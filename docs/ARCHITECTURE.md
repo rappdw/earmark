@@ -1,19 +1,23 @@
 # Architecture
 
-earmark is a self-hosted transcription service. A request (step 24) carries an Apple
-Podcasts episode link, a direct audio URL, or an uploaded audio file, plus a destination
-address checked against an allowlist, free-form instructions, and optionally a title. The
-worker resolves or downloads the audio, transcribes it, caches the transcript and sends an
-ntfy push.
+earmark is a self-hosted transcription and delivery service. A request (step 24) carries an
+Apple Podcasts episode link, a direct audio URL, or an uploaded audio file, plus a
+destination address checked against an allowlist, free-form instructions, and optionally a
+title. The worker resolves or downloads the audio and transcribes it, then caches the
+transcript. It emails the transcript note and the instructions to the destination as two
+Markdown attachments, in the mail contract's format (step 25). Last, it sends an ntfy push.
+The operator's PKA instances do the analysis and filing.
 
-Steps 25–26 add email delivery to the operator's PKA instances, which do the analysis and
-filing, and GPU transcription in the image. Their contracts are in "Planned (steps 25–26)".
+Step 26 adds GPU transcription in the image. Its contract is in "Planned (step 26)".
 
-How to read this document: the sections before "Planned (steps 25–26)" describe the code as
-it is. "Planned (steps 25–26)" is what steps 25–26 build against. "History: removed in step
-22" lists what step 22 removed. When a step changes a contract described here, it changes
-this file in the same commit. Steps 01–21 built a larger pipeline, tagged
-`v0.1.0-full-pipeline`.
+How to read this document:
+
+- The sections before "Planned (step 26)" describe the code as it is.
+- "Planned (step 26)" is what step 26 builds against.
+- "History: removed in step 22" lists what step 22 removed.
+
+When a step changes a contract described here, it changes this file in the same commit.
+Steps 01–21 built a larger pipeline, tagged `v0.1.0-full-pipeline`.
 
 ## Decisions
 
@@ -23,15 +27,16 @@ backend, not the pipeline.
 
 | Question | Decision | How to change it |
 |---|---|---|
-| Scope | earmark transcribes, and from step 25 delivers the transcript by email; analysis and filing are done by the operator's PKA instances. | See "Planned (steps 25–26)". |
-| State | The job table (SQLite, WAL), the per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed), and per-job staging files for uploads and direct URLs (`uploads/`, `downloads/`, deleted when the job ends; step 24). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
-| Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, `Transcribed: <label>` with the duration, and no link (steps 15, 22, 24). Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
+| Scope | earmark transcribes, and delivers the transcript by email (step 25). The operator's PKA instances do the analysis and filing. | See "Re-scope decisions" and "Delivering". |
+| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). Per-job staging files for uploads and direct URLs (`uploads/`, `downloads/`, deleted when the job ends; step 24). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
+| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the pka-skills mail contract (`contract: 1`). Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
+| Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative (`remote`, step 09). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so on the DGX Spark GPU transcription means a remote server on the Spark (recommended: vLLM serving Whisper; see `docs/asr.md`) or a self-built CUDA CTranslate2, which step 26 plans inside the image. | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge; the Cloudflare token lives only with the proxy. Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
 | Deployment | One container image (CPU, extras by build argument, `transcribe` by default) running either `earmark serve` or `earmark worker`; `compose.yaml` with a shared data volume; GPU transcription through a vLLM Whisper service in the compose `gpu` profile and the `remote` ASR backend; systemd units for the API and the worker (steps 16, 22). | See "Deployment" below and `docs/deploy.md`. |
-| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), python-multipart's streaming `MultipartParser` for uploads (step 24; Starlette's own form parser spools files to the system temp dir, so it is not used). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
+| Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), python-multipart's streaming `MultipartParser` for uploads (step 24; Starlette's own form parser spools files to the system temp dir, so it is not used), the stdlib `email`, `smtplib` and `ssl` for delivery (step 25). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
 
@@ -50,16 +55,19 @@ Worker ── Pipeline.run(job)
                url: download (guarded fetch) → data/downloads/<job_id>.<ext> → sha256 → Episode
    fetch       podcasts only: enclosure → data/episodes/<key>/audio.<ext>
    transcribe  audio → transcript.json + transcript.txt (skipped when cached with this ASR profile)
-   complete    JobResult(duration_s)
+   deliver     render the note and instructions (mail contract) → MIME message (inside the
+               interruptible window); then, outside it: delivery_state=sending → SMTP →
+               delivery_state=sent + done with JobResult(duration_s), in one write
    finish      delete upload/download staging files; notify via ntfy (never fails the job)
 ```
 
 The API handler makes no outbound network request. It validates, streams an upload to disk,
 and enqueues, so the Shortcut gets its 202 as soon as the body has arrived.
 
-`to`, `instructions` and `title` are stored with the job (step 24). `to` and `instructions`
-are part of the dedupe key. Nothing reads `to` or `instructions` after enqueue until step 25
-delivers the mail. `title` names uploads and direct URLs, and is ignored for podcasts.
+`to`, `instructions` and `title` are stored with the job (step 24), and so is the offset of
+the request's `timestamp` (step 25). `to` and `instructions` are part of the dedupe key.
+After enqueue, only delivery reads `to` and `instructions` (step 25). `title` names uploads
+and direct URLs, and is ignored for podcasts.
 
 ## Module layout
 
@@ -71,7 +79,8 @@ src/earmark/
   log.py               configure_logging: stderr handler with a secret-redacting, URL-scrubbing
                        formatter and a wire-logger gate; scrub_urls; adopt_library_loggers
   models.py            domain models
-  errors.py            TransientError, PermanentError, SkipEpisode
+  errors.py            TransientError, PermanentError, SkipEpisode; MaybeDelivered (a
+                       TransientError: the SMTP outcome is unknown; step 25)
   artifacts.py         ArtifactStore: per-episode cache paths, atomic writes
   db.py                SQLite connection, migrations (PRAGMA user_version), and the lineage
                        check (PRAGMA application_id, step 22)
@@ -86,11 +95,15 @@ src/earmark/
                        clean_upload_name, audio_title, sha256_file, audio_episode (step 24)
   staging.py           Staging: data/uploads/ (UploadWriter) and data/downloads/, release at a
                        terminal state, startup sweeps (step 24)
-  sanitize.py          untrusted text to file names and YAML, and the frontmatter emitter;
-                       standard library only (step 22)
+  sanitize.py          untrusted text to file names and YAML, fit_chars, and the frontmatter
+                       emitter; standard library only (step 22)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
                        (remote ASR, ntfy)
-  fakes.py             a fake backend for each of the four stages (tests and smoke runs)
+  fakes.py             a fake backend for each of the five stages (tests and smoke runs)
+  mail/                note.py (the mail contract: note, instructions file, slug, guid, dates,
+                       paragraphs), message.py (compose_mail: the MIME message and the
+                       attachment cap), smtp.py (SmtpMailer, the `smtp` Mailer; check_login
+                       for doctor); step 25
   cli.py               `earmark` entry point
   api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
                        (responses and JobView), upload.py (receive_upload: the streaming
@@ -114,10 +127,12 @@ src/earmark/
   doctor/              report.py (CheckResult, render, exit code), checks.py (offline checks),
                        online.py (--online reachability checks), __init__.py (run_doctor,
                        Probes); `earmark doctor` (step 15)
-tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS, and
-                       share_sheet.json (real iOS share-sheet captures, added by hand);
-                       legacy_db.py builds a database shaped like v0.1.0's for the refusal
-                       tests (step 22)
+tests/                 mirrors src; fixtures/ holds recorded Apple JSON and RSS,
+                       share_sheet.json (real iOS share-sheet captures, added by hand) and
+                       tls/ (a test CA and an `smtp.test` certificate, with make-certs.sh;
+                       step 25); legacy_db.py builds a database shaped like v0.1.0's for the
+                       refusal tests (step 22); smtp_stub.py is the SMTP server for the
+                       delivery tests (step 25)
 Dockerfile, .dockerignore, compose.yaml    the container image and services (step 16)
 deploy/systemd/        earmark-api.service and earmark-worker.service (step 16)
 deploy/caddy/Caddyfile the example reverse proxy (step 16)
@@ -144,8 +159,9 @@ to job text.
   - `instructions`: stripped; `null` or missing becomes `""`; at most
     `MAX_INSTRUCTIONS_CHARS` (4000); otherwise verbatim.
   - `title`: stripped; blank becomes `None`; at most `MAX_TITLE_CHARS` (200).
-  - `timestamp`: optional, and must convert to UTC (its offset is kept). It sets
-    `shared_at`.
+  - `timestamp`: optional, and must convert to UTC. It sets `shared_at`, and its UTC offset
+    (whole minutes; pydantic refuses seconds offsets) is stored as the job's
+    `utc_offset_min`. That offset is the requester's for the note's dates (step 25).
 - `TranscriptionRequest(RequestFields)` adds `url` (stripped, at most `MAX_URL_CHARS`, 2048).
   It is the JSON body of `POST /transcriptions`. `UploadFields(RequestFields)` holds the
   multipart text fields. Both replaced step 04's `IngestRequest` and its `prompt` in step 24.
@@ -173,6 +189,13 @@ to job text.
   `show_title` are Apple's, cleaned of control characters and capped (500 characters);
   `audio_url` is the feed enclosure, else Apple's public audio URL; `feed_url` is the
   lookup's `feedUrl`; `description` is plain text, capped at 20 000 characters.
+  - **Step 25 added two fields with defaults**, so old `episode.json` files still load.
+    - `feed_guid: str | None` is the matched feed item's `<guid>`: stripped, at most 1000
+      characters, no control characters. It is `None` when the feed does not list the
+      episode or the item has no guid. It feeds the note's `feed:` guid only, and is not
+      part of the key.
+    - `published_date_only: bool` is true when `published_at` is Apple's calendar date
+      (midnight UTC from the episode page's JSON-LD).
 - `Segment`: `start`, `end`, `text`, `speaker: str | None`.
 - `Transcript`: `episode_key`, `language | None`, `duration_s`, `model`, `segments`,
   `warnings`, `asr_profile | None` (step 24: the profile it was made with, see
@@ -181,16 +204,22 @@ to job text.
   newline); it is the content of `transcript.txt`.
 - `JobResult`: `duration_s` (required), the transcript's duration (step 22).
 - `ShareRecord`: the content of `shared.json`, the earliest share time of the episode,
-  recorded by the runner on every job (earliest wins). Nothing reads it yet; it is kept for
-  the note's `shared_at` (step 25).
+  recorded by the runner on every job (earliest wins). `record_share` returns it, and the
+  note's `shared_at` is that time (step 25).
 - `Job`: `id` (`uuid4().hex`), `kind` (`ingest`, the only `JobKind`), `status`, `stage`
-  (`Stage` is `resolve`, `fetch`, `transcribe` or `notify`; `notify` is never set),
+  (`Stage` is `resolve`, `fetch`, `transcribe`, `deliver` or `notify`; `notify` is never set),
   `source`, `url`, `to | None`, `instructions` (`""` when none), `title | None`,
   `upload_file | None`, `upload_name | None`, `content_sha256 | None`, `episode_key | None`
   (set after resolve), `attempts`, `run_after`, `error` (failure message or skip reason),
   `warnings`, `result: JobResult | None`, `shared_at`, `created_at`, `updated_at`,
   `heartbeat_at`. Step 24 added `source` through `content_sha256` and removed `prompt`
   (carried over into `instructions` by migration `0002`).
+  - **Step 25 added these fields** (migration `0003`):
+    - `utc_offset_min: int | None`, in ±1439, the request's offset;
+    - `delivery_state: "sending" | "sent" | None`;
+    - `message_id`, required in both delivery states;
+    - `sent_at`, required when `sent`;
+    - `resent: bool`, set when a delivery starts while an earlier one was left `sending`.
   - **Per source:**
     - `apple_podcasts`: `url` is the canonical episode URL, so `Episode.url` is canonical
       too.
@@ -198,7 +227,8 @@ to job text.
     - `upload`: `url` is `None`. `upload_file` is the staged file's name under
       `data/uploads/` (`<32 hex>.<ext>`), `upload_name` the client's cleaned file name, and
       `content_sha256` the hex sha256 of the staged bytes.
-  - **`to`** is `None` only on jobs enqueued before step 24.
+  - **`to`** is `None` only on jobs enqueued before step 24. Delivery fails such a job
+    permanently: "this request has no destination address; share it again".
   - **The view.** The API never returns a `Job`. It returns a `JobView` (see "HTTP API").
 
 **Episode key.** `sha256("{source}:{show_id}:{guid}")` over UTF-8, first 20 hex
@@ -236,11 +266,20 @@ class Transcriber(Protocol):
     def transcribe(self, episode: Episode, audio: Path, /) -> Transcript: ...
 
 
+class Mailer(Protocol):  # step 25
+    @property
+    def sender(self) -> str: ...  # the From address
+    def send(self, mail: OutgoingMail, /) -> None: ...  # Transient/Permanent/MaybeDelivered
+
+
 class Notifier(Protocol):
     def notify(self, job: Job, episode: Episode | None, /) -> None: ...
 ```
 
-`Notifier` receives the job in its terminal state.
+`Notifier` receives the job in its terminal state. `OutgoingMail` (a frozen dataclass in
+`stages.py`) holds `job_id`, `message_id`, `sender`, `recipient` (the one envelope
+recipient, the job's validated `to`), `data` (the whole message: ASCII, CRLF), and the two
+attachment file names.
 
 - `AudioFetcher.download` fetches a client-supplied direct audio URL to `destination(ext)`
   and returns the path. It always downloads, with no cache. Only the runner calls it, for
@@ -253,7 +292,10 @@ Every stage has a fake in `fakes.py` that records each call (`calls`), can be to
 raise (`fail_next(exc, times)`), and, for the cache-aware stages (fetch, transcribe),
 counts the calls that did real work (`computed`). `FakeAudioFetcher` also counts direct
 downloads (`downloads`), and serves `payloads.get(url, payload)`, so two URLs can serve
-the same bytes. The cache-aware fakes write real
+the same bytes. `FakeMailer` records each `OutgoingMail`. When the factory builds it (with
+`EARMARK_MAIL_BACKEND=fake`), it also writes each message to `data/outbox/<job_id>.eml`
+(mode `0o600`). Its sender is `EARMARK_SMTP_FROM` or the placeholder
+`earmark@example.org`, because it sends nothing (step 25). The cache-aware fakes write real
 artifacts through `ArtifactStore`. `make_fake_backends(data_dir)` builds the set, and
 `FakeBackends.backends()` turns it into the `Backends` the runner takes.
 
@@ -285,16 +327,16 @@ Rules every backend follows:
 
 Step 05; exact signatures in `docs/steps/05-worker.md`.
 
-- **Backends.** `Backends` (in `stages.py`) holds the four stages; `notifier` is `None`
-  when its backend is `none`. `factory.build_backends` is the
+- **Backends.** `Backends` (in `stages.py`) holds the five stages (resolver, fetcher,
+  transcriber, mailer, notifier); `notifier` is `None` when its backend is `none`. `factory.build_backends` is the
   only code that constructs backends: one registry per setting maps a backend name to a
   builder, and a name with no builder is a `ConfigError` naming the variable, raised
   before the database is opened. Real backends import their heavy modules inside the
   builder.
 - **Order.** `Pipeline.run(claim)` runs the stages below. Each stage sets `job.stage` before
-  it runs. A fresh job ends at `transcribe`. A job with a cached transcript ends at
-  `resolve`, or at `fetch` for a direct URL. A failed job keeps the stage it failed in, and
-  `notify` is never set as a stage.
+  it runs. Every job that completes ends at `deliver` (step 25); one with a cached
+  transcript goes straight from `resolve` (or `fetch` for a direct URL) to `deliver`. A
+  failed job keeps the stage it failed in, and `notify` is never set as a stage.
   1. **The episode** (`resolve`), by source (step 24):
      - `apple_podcasts`: `resolver.resolve(job.url)`.
      - `upload`: the staged file `data/uploads/<upload_file>`. It must exist, else a
@@ -305,7 +347,7 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
        `fetcher.download(job.url, staging.download_destination(job.id))`, then
        `audio_episode(job, sha256_file(path))`.
   2. **Record** it: write `episode.json`, record the episode key on the job, and record the
-     share time in `shared.json`.
+     share time in `shared.json`. Keep the earliest share time it returns for the note.
   3. **Cache.** If `transcriber.cached(episode)` returns a transcript, skip fetch and
      transcribe.
   4. **Transcribe.** Otherwise, for a podcast only, `fetch`. Then `transcribe` the
@@ -313,8 +355,22 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
      `episodes/<key>/`.
   5. **Check.** Refuse a transcript for another episode (permanent). Copy the transcript's
      warnings to the job.
-  6. **Complete** with `JobResult(duration_s)`.
-  7. **Finish:** `staging.release(job)`, then notify.
+  6. **Compose** (stage `deliver`, still inside the interruptible window).
+     - A job without `to` fails permanently.
+     - So does a `to` the allowlist no longer allows: "the destination is no longer allowed
+       by EARMARK_ALLOWED_RECIPIENTS; nothing was sent". `build_worker` passes the policy;
+       `None` skips this check, for tests only.
+     - Otherwise `mail.message.compose_mail` renders the note and the instructions file and
+       builds the message (see "Delivering").
+  7. **Deliver**, outside the window.
+     1. `mark_sending(claim, message_id)`.
+     2. `mailer.send(mail)`. On a definite failure, `clear_sending(claim)` and re-raise. On
+        `MaybeDelivered`, re-raise and leave `sending`.
+     3. `complete_sent(claim, JobResult(duration_s))` writes `sent`, `sent_at` and `done`
+        in one fenced update.
+
+     A claimed job already `sent` (only possible by hand) completes without sending.
+  8. **Finish:** `staging.release(job)`, then notify.
 - **Retention** (step 24). `Pipeline.finish(job, episode)` releases the staging files of an
   upload (`uploads/<upload_file>`) or a direct URL (`downloads/<job_id>.*`), then notifies.
   - **When it runs:** for every job that reaches `done`, `failed` or `skipped`, including
@@ -335,10 +391,14 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   a requeued retry, a released job, or a lost lease.
 - **Heartbeat.** A thread heartbeats every `min(60 s, JOB_LEASE_SECONDS / 4)` while a
   job runs. It shows the process is alive, not that a stage progresses.
-- **Shutdown.** SIGTERM and SIGINT stop the worker from claiming. During stage work the
-  handler raises a `Shutdown` (`BaseException`) out of the stage, and the worker
-  `release`s the job (back to `queued`, attempt undone). Once the job is completing or
-  notifying, the worker finishes it, then exits.
+- **Shutdown.** SIGTERM and SIGINT stop the worker from claiming. During stage work and
+  composing, the handler raises a `Shutdown` (`BaseException`) out of the stage, and the
+  worker `release`s the job (back to `queued`, attempt undone). Once the job is delivering,
+  completing or notifying, the worker finishes it, then exits.
+  - Delivery is bounded by `EARMARK_SMTP_TIMEOUT_S` (at most 90 s).
+  - The worker's stop grace (compose `stop_grace_period` 2m, systemd `TimeoutStopSec` 120)
+    must be at least that plus `config.WORKER_STOP_MARGIN_S` (30 s, for the push and the
+    job store). `tests/test_deploy.py` pins this.
 - **Lost lease.** A fenced call raising `LeaseLostError` makes the runner abandon the
   job without writing to it or notifying.
 - **Each poll** the worker first runs `requeue_stale` and passes the jobs it failed to
@@ -506,9 +566,188 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   `EARMARK_ASR_*` settings; prints `[HH:MM:SS] text` lines or the `Transcript` JSON
   (warnings on stderr), and writes nothing outside the model cache.
 
+### Delivering
+
+Step 25; exact rules in `docs/steps/25-delivery.md` sections 4 and 5.
+
+- **The note and the instructions file** (`mail/note.py`) are rendered to the mail contract
+  below.
+  - **Strings.** Every feed- or caller-supplied frontmatter string goes through
+    `contract_text`: NFC, whitespace becomes a space, categories Cc, Cf, Co, Cn, Zl and Zp
+    are dropped (except ZWJ and ZWNJ), runs collapse, and the result is capped with
+    `sanitize.fit_chars` (`title` 200, others 300). `sanitize.emit_frontmatter` then quotes
+    every string; omits `None` keys; writes integers, `YYYY-MM-DD` dates, and RFC 3339
+    timestamps to the second with an offset; and refuses empty values.
+  - **The requester's offset** is the job's `utc_offset_min`, else UTC. `shared_at` (the
+    note's: the earliest share of the episode; the instructions': this request's) and the
+    filename date use it.
+  - **The publish date** is `published_at` in the requester's offset, or its calendar date
+    when `published_date_only`. The filename date is the publish date, else the
+    first-share date.
+  - **The slug.** NFKD, combining marks dropped, ASCII, lower-case, every run of characters
+    outside `[a-z0-9]` becomes `-`. A podcast joins the show and title slugs. The whole slug
+    is cut to 80 characters. When it is empty, the fallback is `podcast-<episode id>` or
+    `audio-<12 hex of the sha256>`.
+  - **The guid.**
+    - Audio: `sha256:<hex>`.
+    - Podcast: `feed:<Episode.feed_guid>` when that is verbatim (cleaning would not change
+      it) and at most 300 characters, else `apple:<episode id>`.
+    - Apple's `episodeGuid`, which still keys the cache, is not used for the note: it can
+      differ from the feed's.
+  - **`source_url`** (`origin: url` only) is `sources.display_url`. It is omitted when the
+    URL has a `?`, or when the value is over 300 characters or would be changed by cleaning.
+  - **`language`** is kept only when it looks like BCP 47 (`[a-z]{2,3}(-[A-Za-z0-9]{2,8})*`).
+  - **The body.** `# <show> — <title>` (podcast) or `# <title>`, then `## Transcript`, then
+    paragraphs. A new paragraph starts on a speaker change, once the current one spans
+    30 s, or when the next segment would take it past 60 s. A longer single segment stands
+    alone and is never split. Each paragraph starts with `[hh:mm:ss]` of its first segment.
+    Segment text has whitespace collapsed and Cc characters removed, and nothing else
+    changed. `transcript_sha256` is the sha256 of the bytes after the closing `---\n`.
+  - **The instructions body** is `job.instructions` with CRLF and CR turned into LF, and no
+    trailing newline added.
+- **The message** (`mail/message.py` `compose_mail`).
+  - **Headers:** `From`, `To`, `Subject`, `Date` (UTC, from the injected clock) and
+    `Message-ID: <earmark.<job_id>@<from domain>>`, in that order, plus the MIME headers.
+    There are no others.
+  - **The subject** is `[earmark] ` plus the note's title, cleaned with `=?` defused (an
+    encoded word in a header value is decoded when set), and capped at 120 characters. The
+    `email` policy (`email.policy.SMTP`) encodes non-ASCII as RFC 2047 words.
+  - **The text part** is a fixed ASCII template (`cte="7bit"`). Its only variable parts are
+    the job id and the two file names, which are `[0-9a-z.-]`.
+  - **Attachments.** Both are added as bytes: base64, `text/markdown; charset="utf-8"`,
+    `Content-Disposition: attachment; filename=…`. That keeps LF and the hash exact; the
+    `str` path would rewrite line endings.
+  - **The boundary** is `=_earmark_<job_id>`, injectable. It cannot occur in base64 or in
+    the template.
+  - **The size cap.** The two attachments' raw bytes together must not exceed
+    `EARMARK_MAX_ATTACHMENT_MB`, else the job fails permanently with a message naming the
+    setting. Nothing is truncated or split.
+  - **No job without `to`.** A job without `to` fails permanently.
+- **SMTP** (`mail/smtp.py` `SmtpMailer`, the `smtp` backend).
+  - **Settings.** `EARMARK_SMTP_HOST`, `EARMARK_SMTP_FROM`, `EARMARK_SMTP_USERNAME` and
+    `EARMARK_SMTP_PASSWORD` are required. Missing ones are a `ConfigError` at startup that
+    names each of them. The builder makes no connection.
+  - **Connection.**
+    - `smtplib.SMTP` (STARTTLS, port 587 by default) or `smtplib.SMTP_SSL` (`tls`, 465),
+      always constructed with the host, so `server_hostname` is set.
+    - `local_hostname` is the domain of `EARMARK_SMTP_FROM`, so `socket.getfqdn()` is never
+      called.
+    - The context comes from `ssl.create_default_context()`: `CERT_REQUIRED`,
+      `check_hostname`, strict X.509.
+    - No debug level.
+  - **STARTTLS** mode fails permanently when STARTTLS is not offered. EHLO is sent again
+    over TLS. AUTH happens only after TLS.
+  - **The transaction.** earmark drives it itself: `MAIL FROM`, one `RCPT TO` (the job's
+    `to`), `DATA`, the dot-stuffed payload, then the final reply. `sendmail` cannot tell a
+    loss before the end of data from a loss while waiting for the reply.
+  - **The deadline.** `EARMARK_SMTP_TIMEOUT_S` (default 60, at most 90) is both the
+    per-operation socket timeout and a whole-session deadline. A watchdog timer shuts the
+    socket down through a duplicate of its descriptor (`socket.fromfd`), so a dripping
+    server cannot hold a stopping worker.
+  - **The only private hook** is `_get_socket`, overridden to take an injected socket
+    factory (the tests' stub) and to arm the watchdog.
+- **Delivery state, at-least-once.**
+  - **`sending`.** `mark_sending` records `sending` and the `Message-ID` before the
+    conversation, and sets `resent` when the state was already `sending`.
+  - **`sent`.** After a 2xx to the end of data, `complete_sent` writes `sent`, `sent_at` and
+    `done` together. Nothing claims a `done` job, so a `sent` job is never sent again on
+    retry, restart or lease expiry.
+  - **Definite failures** clear `sending`. These are 4xx and 5xx replies, a connection lost
+    before the payload is fully written, auth, TLS, missing STARTTLS, and any exception
+    other than `MaybeDelivered`.
+  - **Ambiguous failures** leave it. These are a disconnect, timeout or unreadable reply
+    after the payload (`MaybeDelivered`), a crash, or a lost lease. The next attempt resends
+    with the same `Message-ID` and `job_id`, and its push says "Resent after an
+    interruption."
+- **Failure classes.**
+  - 4xx replies are transient, and 5xx replies are permanent.
+  - A connection error before the payload is complete is transient.
+  - A disconnect after the payload with no reply is `MaybeDelivered` (transient).
+  - AUTH failures: 5xx is permanent, naming `EARMARK_SMTP_USERNAME` and
+    `EARMARK_SMTP_PASSWORD`; 4xx is transient.
+  - A certificate that does not verify is permanent, naming `EARMARK_SMTP_HOST`.
+  - **Job errors** carry the host, the phase, the reply code and the enhanced status code.
+    They never carry the server's reply text, which echoes addresses: errors made from
+    smtplib exceptions are raised `from None`.
+
+#### The mail contract (pka-skills, `contract: 1`, 2026-11-23)
+
+Status: **DRAFT**. It becomes final once the operator approves the PKA's receiving
+procedure. A revision would come with a contract version bump, and would change
+`docs/PLAN.md` "Re-scope" and this copy together. Step 25 built to this text.
+
+- **Both files**
+  - **Encoding:** UTF-8 with no BOM and LF line endings. The extension is a lower-case
+    `.md`, and the media type is `text/markdown`.
+  - **Frontmatter:** YAML between `---` lines at the very top of the file.
+  - **Feed- or caller-supplied strings:** double-quoted and escaped, on one line, with
+    control characters stripped. They are capped at 300 characters, and `title` at 200.
+  - **Unknown values:** the key is omitted. A value is never an empty string or null.
+  - **Formats:** timestamps are RFC 3339 with an offset, and dates are `YYYY-MM-DD`.
+  - **Filenames:** `YYYY-MM-DD-<slug>.md`. The slug is lower-case ASCII `a-z0-9` joined
+    by single hyphens, at most 80 characters. A podcast slug is
+    `<show-slug>-<title-slug>`, truncated as a whole.
+  - **Filename date:** the publish date when known, otherwise the date of `shared_at` in
+    the requester's offset.
+- **Attachment 1, the note: `YYYY-MM-DD-<slug>.md`.** Podcasts and audio share one
+  schema.
+
+  | key | type | podcast | audio | notes |
+  |---|---|---|---|---|
+  | `type` | string | required | required | `podcast` or `audio` |
+  | `contract` | integer | required | required | `1` |
+  | `source` | string | required | required | `earmark` |
+  | `origin` | string | required | required | `apple_podcasts`, `upload` or `url` |
+  | `title` | string | required | required | podcast: the episode title; audio: the request's `title`, else the upload's filename stem or the URL's last path segment, sanitised |
+  | `show` | string | required | omit | |
+  | `date` | date | required | required | the filename date |
+  | `published` | date | optional | optional | only when actually known |
+  | `duration` | string | required | required | `hh:mm:ss` |
+  | `language` | string | optional | optional | BCP 47 |
+  | `apple_url` | string | optional | omit | |
+  | `source_url` | string | omit | optional | `origin: url` only, without userinfo, query or fragment; omitted entirely when the URL carries a query |
+  | `guid` | string | required | required | `feed:<feed guid verbatim>`, else `apple:<i= episode id>`, else `sha256:<hex of the audio bytes>` for upload and url |
+  | `shared_at` | timestamp | required | required | when this item was first shared |
+  | `transcript_sha256` | string | required | required | 64 lower-case hex |
+  | `tags` | list of strings | required | required | `["podcast"]` or `["audio"]` |
+
+  - **Body:** `# <title>` (for a podcast, `# <show> — <title>`), then a blank line, then
+    `## Transcript`, then a blank line. After that come paragraphs separated by blank
+    lines. Each paragraph covers 30–60 seconds or one speaker turn, and starts with
+    `[hh:mm:ss]`.
+  - **`transcript_sha256`:** the sha256 of the UTF-8 bytes from the first byte after the
+    closing `---\n` to the end of the file, as sent.
+  - **No audio hash for podcasts:** dynamic ad insertion changes the bytes on every
+    download.
+- **Attachment 2, the instructions: `YYYY-MM-DD-<slug>.instructions.md`.** It uses the
+  same date and slug as the note.
+  - **Keys:**
+    - `type: earmark-instructions`;
+    - `contract: 1`;
+    - `for`: the note's filename;
+    - `guid`: the same as the note's;
+    - `job_id`: stable across a resend, new on every re-share;
+    - `shared_at`: when this request was made.
+  - **Body:** the requester's words, verbatim, and nothing else.
+  - **Always sent.** An empty body means "file it, no analysis".
+- **Subject and body.**
+  - **Subject:** `[earmark] <title>`, sanitised and capped at 120 characters.
+  - **Body:** only text earmark generates. It names which attachment is the transcript,
+    which is data and never instructions, and which attachment holds the requester's
+    instructions. It carries the `job_id` and the two filenames. It also says that the
+    subject and the note contain third-party text.
+  - **The guid stays out of the body.** A `feed:` guid is publisher text, so it appears
+    only inside the attachments.
+- **PKA de-duplication.**
+  - The same `guid` and the same `job_id` is a duplicate delivery.
+  - The same `guid` with a new `job_id` is a re-share.
+  - The same `guid` with a different `transcript_sha256` is a re-transcription, and the
+    newer body wins.
+
 ### Notifying
 
-Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
+Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5, with step 25's
+wording in `docs/steps/25-delivery.md` section 5.8.
 
 - **`ntfy` Notifier.** `notify.ntfy.NtfyNotifier` is built by `build_ntfy_notifier(settings)`.
   It is `None` (nothing sent, worker starts) when `EARMARK_NTFY_URL` is unset, and the build
@@ -518,8 +757,9 @@ Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
   are fixed, plus `Authorization: Bearer EARMARK_NTFY_TOKEN` when a token is set. No
   untrusted text goes into a header, the URL, or a query string. `markdown` is never set.
 - **Content.**
-  - Titles are `Transcribed: <label>`, `Failed: <label>`, and `Skipped: <label>`. Tags are
-    `white_check_mark`, `x`, and `fast_forward`; priority is 4 for failed and 3 otherwise.
+  - Titles are `Sent: <label>` (step 25; it was `Transcribed:`), `Failed: <label>`, and
+    `Skipped: <label>`. Tags are `white_check_mark`, `x`, and `fast_forward`; priority is 4
+    for failed and 3 otherwise.
   - **Labels and the first message line, by source** (step 24):
     - podcast: the episode title (`podcast episode` when unknown), then the show
       (`Apple Podcasts episode` when unknown);
@@ -528,14 +768,18 @@ Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
     - direct URL: the request's title, else `audio from <host>`, then `Audio from <host>`.
       A URL job's episode title is never used, because it can come from the URL path.
   - The rest of the message:
-    - Done adds `Duration: HH:MM:SS` and the warning count with the first warning.
-    - Failed adds the stage, `Reason: <job.error>`, and `Gave up after N attempts.` when
-      there was more than one.
+    - Done (sent) adds `To: <masked recipient>`, `Duration: HH:MM:SS`, `Resent after an
+      interruption.` when the job's `resent` is set, and the warning count with the first
+      warning.
+    - Failed adds `To: <masked recipient>` when the job has one, the stage, `Reason:
+      <job.error>`, and `Gave up after N attempts.` when there was more than one. It adds
+      `The email may already have been delivered.` when the job was left `sending`.
     - Skipped adds the reason.
 
     Reasons and warnings pass through `log.scrub_urls` as well.
-  - No push carries a URL path or query, the instructions, the recipient address, or a
-    path, and none has a `click` link. Step 25 adds the masked recipient.
+  - No push carries a URL path or query, the instructions, the full recipient address (only
+    `recipients.mask_address`), the guid, the subject, the `Message-ID`, or a path. None
+    has a `click` link.
   - Every value is cleaned: NFC; control, format (except ZWJ/ZWNJ), private-use,
     unassigned, and line or paragraph separator characters removed; whitespace collapsed;
     `=?` defused, because ntfy RFC-2047-decodes titles even in JSON mode; secrets
@@ -547,8 +791,6 @@ Step 15; exact rules in `docs/steps/15-notify-doctor.md` sections 4 and 5.
   token. There is one attempt, with no retry. The notifier raises; `Pipeline.notify` logs
   the failure and records `notify failed: …` as a job warning, so a notification problem
   never changes a job's status or escapes the worker.
-
-This wording is interim; step 25 changes it to "sent" or "failed".
 
 ### Doctor
 
@@ -577,6 +819,10 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
     `vcs_info`/`dir_info`) is not checked by version. Then `asr model`: whether the Whisper
     model is local or in the cache, through faster-whisper's
     `download_model(local_files_only=True)`.
+  - `mail` (step 25), built through the `MAILERS` registry:
+    - `warn` for `fake`;
+    - `FAIL` naming the missing `EARMARK_SMTP_*` settings;
+    - otherwise `ok`, with the host, port, security, from domain and timeout.
   - `notify`.
 
   Offline doctor makes no network call, loads no model, downloads nothing, and creates no
@@ -586,9 +832,13 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
   - the iTunes lookup (`?id=1&entity=podcast`) through `fetch.py`, so the address guard
     applies;
   - `GET {ASR_BASE_URL}/models` for the `remote` backend;
-  - ntfy `GET /v1/health` and, with a token, `GET /v1/account`.
+  - ntfy `GET /v1/health` and, with a token, `GET /v1/account`;
+  - `smtp` (step 25), for the `smtp` backend: `SmtpMailer.check_login` connects,
+    negotiates TLS, logs in and quits. It sends no `MAIL`, `RCPT` or `DATA`, and it reports
+    the TLS version. Its timeout is the smaller of 10 s and `EARMARK_SMTP_TIMEOUT_S`.
 
-  Doctor never publishes a notification.
+  Doctor never publishes a notification and never sends mail. `Probes` injects the SMTP
+  socket and TLS context factories for tests.
 - **Redaction.** Details never contain secret values, their prefixes, or their lengths.
   Endpoints appear as host labels only, and server error text goes through
   `endpoint.error_detail`. Every line is passed through `log.redact` with all `Settings`
@@ -615,6 +865,14 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
   row but not in `Job`. `heartbeat`, `set_stage`, `set_episode_key`, `complete`,
   `fail`, `skip`, and `release` take the `Claim` and raise `LeaseLostError` if the
   token no longer matches, so a worker that lost its lease cannot touch the job.
+- **Delivery writes** (step 25) are fenced the same way.
+  - `mark_sending(claim, message_id)` sets `sending` and the `Message-ID`, and sets
+    `resent` when the state was already `sending`.
+  - `clear_sending(claim)` clears `sending` after a definite failure.
+  - `complete_sent(claim, result)` requires `sending` and writes `sent`, `sent_at`, `done`
+    and the result in one update.
+  - `release`, `fail`, `requeue_stale` and `complete` leave the delivery columns alone, so a
+    crashed or stale `sending` job is resent on its next claim.
 - **Attempts and retries.** `attempts` counts claims. `fail(transient=True)` requeues
   with `run_after = now + retry_delay(attempts, retry_after_s)` (60 s × 4ⁿ⁻¹, capped
   at 6 h, raised to `retry_after_s`) until `attempts` reaches `JOB_MAX_ATTEMPTS`, then
@@ -649,8 +907,9 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
 - **Warnings.** `add_warning(job_id, message)` appends unless the same text is already
   there, and works on terminal jobs (notifier failures are recorded after `done`).
 - **Time.** Clocks are injected so tests control time. Timestamps are stored as
-  fixed-width UTC ISO strings, so SQL compares them as text; a `shared_at` offset is
-  kept as an instant, read back in UTC.
+  fixed-width UTC ISO strings, so SQL compares them as text; `shared_at` is kept as an
+  instant, read back in UTC. The request's offset is stored separately as
+  `utc_offset_min` (step 25), or `NULL` when the request had no `timestamp`.
 
 ### Database identity
 
@@ -659,7 +918,7 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 - The migration list restarted in step 22 with `0001_jobs` (the `jobs` table with
   `CHECK (kind IN ('ingest'))`, `jobs_active_dedupe`, `jobs_by_status`). Migrations stay
   append-only.
-- Step 24 appended `0002_requests`, so `SCHEMA_VERSION` is 2. It adds these columns:
+- Step 24 appended `0002_requests` (schema version 2). It adds these columns:
   - `source` (`NOT NULL DEFAULT 'apple_podcasts'`, `CHECK` in the three sources);
   - `recipient`, which is the `Job.to` field (`TO` is an SQL keyword);
   - `instructions` (`NOT NULL DEFAULT ''`);
@@ -668,6 +927,13 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
   It copies `prompt` into `instructions`, drops `prompt`, and adds
   `jobs_by_dedupe (dedupe_key, status, updated_at)`. Rows from before it keep `recipient`
   NULL and their status.
+- Step 25 appended `0003_delivery`, so `SCHEMA_VERSION` is 3. It adds these columns:
+  - `utc_offset_min` (`INTEGER`, `CHECK` in ±1439);
+  - `delivery_state` (`CHECK IN ('sending', 'sent')`);
+  - `message_id` and `sent_at`;
+  - `resent` (`INTEGER NOT NULL DEFAULT 0`, `CHECK IN (0, 1)`).
+
+  Earlier rows get `NULL` and `0`.
 - The lineage is marked by `PRAGMA application_id = 0x45524D4B` (`b"ERMK"`), stamped in
   the same transaction that creates `jobs`.
 - `identity_error(path, application_id, user_version)` decides:
@@ -696,7 +962,9 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
-  earmark.db                    jobs (application id ERMK, schema 2); WAL mode
+  earmark.db                    jobs (application id ERMK, schema 3); WAL mode
+  outbox/<job_id>.eml           only with EARMARK_MAIL_BACKEND=fake: the message the fake
+                                mailer "sent" (0o600; step 25)
   uploads/                      staging.Staging, owned by the API (mode 0o700; step 24)
     .<upload_id>.<ext>.part     an upload still streaming (0o600); swept at API startup
     <upload_id>.<ext>           a received upload (0o600); deleted when its job ends, or by the
@@ -789,10 +1057,11 @@ section 5).
 - `instructions`, cut to 200 characters (199 and `…`);
 - `title`, `episode_key`, `attempts`, `run_after`;
 - `error` and `warnings`, passed through `log.scrub_urls`;
-- `result`, `shared_at`, `created_at`, `updated_at`.
+- `result`, `shared_at`, `created_at`, `updated_at`;
+- `delivery_state` and `sent_at` (step 25).
 
 It never carries `heartbeat_at`, the lease token, the staged file name, the upload's file
-name or the content hash.
+name, the content hash, the `Message-ID` or `resent`.
 
 ## Configuration
 
@@ -810,6 +1079,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `RESOLVER_BACKEND` | `apple` | `apple`, `fake` |
 | `FETCH_BACKEND` | `http` | `http`, `fake` |
 | `ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, `fake` |
+| `MAIL_BACKEND` | `smtp` | `smtp`, `fake` (step 25). `smtp` without its required settings is a startup `ConfigError`; `fake` sends nothing and writes `data/outbox/<job_id>.eml` |
 | `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing (the worker still starts) |
 | `ASR_MODEL`, `ASR_DEVICE`, `ASR_COMPUTE_TYPE`, `ASR_LANGUAGE` | `large-v3`, `auto`, `auto`, unset (auto-detect) | faster-whisper options (step 08); `remote` also uses `ASR_MODEL` (sent as the server's model id, e.g. `openai/whisper-large-v3`) and `ASR_LANGUAGE`. Model: a size such as `tiny`, `small`, `large-v3`, `distil-large-v3`, `large-v3-turbo`, a Hugging Face repo id, or a local directory. Device: `auto`, `cpu`, `cuda`. Compute type: `auto`, `default`, `int8`, `int8_float32`, `int8_float16`, `int8_bfloat16`, `int16`, `float16`, `bfloat16`, `float32` (device and compute type case-insensitive). Language: a lower-case code such as `en`; `auto` means detect |
 | `ASR_MODEL_DIR` | unset (the Hugging Face cache, `$HF_HOME/hub` or `~/.cache/huggingface/hub`) | Where faster-whisper downloads models |
@@ -821,6 +1091,14 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `ALLOWED_RECIPIENTS` | unset (every request refused) | Comma-separated exact addresses, or `all` (any address; a written acceptance of risk, warned about at `serve` startup and by doctor). Matching is exact on the local part and case-insensitive on the domain. Cannot mix `all` with addresses. Shown masked by `earmark config` (step 24) |
 | `MAX_UPLOAD_MB` | `1024` | Upload size cap in MiB, for `POST /transcriptions` and `earmark submit FILE` (step 24) |
 | `DEDUPE_WINDOW_S` | `600` | Seconds a `done` job is returned for an identical request (same source, `to` and `instructions`); `0` dedupes active jobs only (step 24) |
+| `SMTP_HOST` | unset; required for `smtp` | The SMTP submission server (a host name, no scheme) (step 25) |
+| `SMTP_PORT` | unset: `587` for `starttls`, `465` for `tls` | SMTP port |
+| `SMTP_SECURITY` | `starttls` | `starttls` (STARTTLS required; delivery fails if the server does not offer it) or `tls` (implicit TLS). There is no plaintext option |
+| `SMTP_USERNAME` | unset; required for `smtp` | Login name: printable ASCII without spaces |
+| `SMTP_PASSWORD` | unset; required for `smtp` | Login password (secret): printable ASCII, spaces allowed (app passwords), no control characters |
+| `SMTP_FROM` | unset; required for `smtp`, never defaulted | The sending address (`From` and envelope sender). Its domain is the EHLO name and the `Message-ID` domain |
+| `SMTP_TIMEOUT_S` | `60` | Whole-session deadline and socket timeout for one delivery, at most 90 so a stopping worker finishes within its grace period |
+| `MAX_ATTACHMENT_MB` | `10` | Cap in MiB on the two attachments' raw bytes together; a job over it fails permanently |
 | `JOB_MAX_ATTEMPTS`, `JOB_LEASE_SECONDS`, `WORKER_POLL_SECONDS` | `4`, `900`, `2` | Queue behaviour |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (case-insensitive) |
 
@@ -866,7 +1144,9 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   - Exposure: only `api` publishes a port, `${API_BIND:-127.0.0.1:8787}`. Hardening:
     `init: true`, `no-new-privileges`, `cap_drop: ALL`. `api` has a healthcheck that
     fetches `/healthz`.
-  - The worker gets `stop_grace_period: 2m`; SIGTERM releases the running job.
+  - The worker gets `stop_grace_period: 2m`. SIGTERM releases the running job, or lets a
+    delivery in progress finish (at most `EARMARK_SMTP_TIMEOUT_S`, 90 s, plus a 30 s
+    margin; step 25).
   - The `gpu` profile adds `asr`: NVIDIA's arm64 CUDA 13 vLLM container (pinned by digest)
     serving `EARMARK_ASR_MODEL`, with its API key from `EARMARK_ASR_API_KEY`, raised
     audio limits, a GPU reservation, and no published port. The worker uses it with
@@ -938,7 +1218,7 @@ and handles text they wrote.
     domain.
   - Unset or empty refuses every request.
   - `all` is the operator's written acceptance of a risk. Anyone holding the API token can
-    then have earmark mail anyone, from step 25, and can instruct both PKAs. `serve` logs a
+    then have earmark mail anyone, and can instruct both PKAs. `serve` logs a
     WARNING at startup, and doctor reports it. earmark never defaults `to`.
 - **Leak rules** (step 24). Each has a test that captures the log, the push or the API
   response (`tests/test_leaks.py`, `tests/test_api.py`):
@@ -953,6 +1233,25 @@ and handles text they wrote.
 
   earmark's one enqueue log line names the source (the canonical Apple URL, `audio URL on
   <host>`, or `upload of <n> bytes`), the masked `to`, and whether instructions were given.
+- **Leak rules for delivery** (step 25), each tested (`tests/test_leaks.py`,
+  `tests/test_delivery.py`):
+  - No job error, push or log line contains the recipient address unmasked, or the SMTP
+    server's reply text. The reply text echoes addresses, so errors carry codes only.
+  - `EARMARK_SMTP_PASSWORD` never appears in logs, job errors, pushes, `earmark config` or
+    doctor output.
+  - The guid appears only inside the attachments: not in the body, the subject or a push.
+- **Untrusted text in mail** (step 25).
+  - Titles, show names, upload names, URL path segments, feed guids and transcripts reach
+    the attachments only, through `mail.note.contract_text` and `yaml_quote`. The one
+    exception is the cleaned title in the subject.
+  - Instructions reach only the instructions attachment, verbatim, base64-encoded.
+  - The body is a fixed ASCII template (job id and slug file names), and says that the
+    subject and the note are third-party text.
+  - Header values are cleaned of control and separator characters, and `=?` is defused.
+    The `email` package also refuses CR or LF in a header value. So no header can be
+    injected.
+  - The envelope has exactly one recipient, the validated `to`. Delivery checks it against
+    the allowlist again before sending.
 - **Outbound fetches.** Feed and enclosure URLs come from podcast publishers. Every such
   fetch goes through `fetch.py`:
   - http and https only, checked on the first URL and on every redirect target; URLs
@@ -1030,6 +1329,16 @@ and handles text they wrote.
   because it may be public ntfy.sh or a self-hosted server on a private address. Both
   share `endpoint.error_detail` and `endpoint.host_label`. `earmark doctor --online`
   reaches both read-only, and the iTunes lookup through `fetch.py`, guard included.
+- **The SMTP server** (step 25, `EARMARK_SMTP_HOST`) is the third operator endpoint,
+  reached by `smtplib` in `mail/smtp.py`, without the address guard.
+  - **TLS.** It is always TLS-protected, with `ssl.create_default_context()`, so the
+    certificate and host name are verified. STARTTLS is mandatory in `starttls` mode, and
+    there is no plaintext mode.
+  - **AUTH** happens only after TLS.
+  - **No `socket.getfqdn()`.** The EHLO name is the From domain.
+  - **No debug output.** `set_debuglevel` is never called, so smtplib prints nothing.
+  - **Bounded.** One session is bounded by `EARMARK_SMTP_TIMEOUT_S`.
+  - **Replies are untrusted**, and only their codes are kept.
 - **Notifications** (step 15). Episode and show titles come from feeds, and `job.error` and
   warnings can quote them.
   - Every value is cleaned before it is sent (control, format, and separator characters
@@ -1040,9 +1349,10 @@ and handles text they wrote.
     instructions, recipient address, or file path. There is no `click` link. A direct URL
     job is labelled by its host only (step 24).
 - **Untrusted text to names and YAML.** `earmark.sanitize` (`clean_unicode`, `fit_bytes`,
-  `file_component`, `yaml_quote`, `emit_frontmatter`; standard library only, step 22).
-  Today only the ntfy client uses it (`clean_unicode`, `fit_bytes`); step 25 renders the
-  note and the instructions file with it.
+  `fit_chars`, `file_component`, `yaml_quote`, `emit_frontmatter`; standard library only,
+  step 22). The ntfy client uses `clean_unicode` and `fit_bytes`; the note and the
+  instructions file are rendered with `yaml_quote` and `emit_frontmatter` (step 25). File
+  names in mail are slugs (`[a-z0-9-]`), not `file_component`.
 - **Model downloads.** faster-whisper fetches models from Hugging Face with
   `huggingface_hub`, not through `fetch.py`: the repository is chosen by the operator
   (`ASR_MODEL`), not by a third party, and it honours the usual `HF_*` and proxy
@@ -1075,7 +1385,8 @@ and handles text they wrote.
     units (see Deployment). Setting it to `0` (or leaving it empty outside compose) turns
     telemetry back on, unless one of the other variables is set. earmark's Python code does
     not set it.
-- **Secrets.** `API_TOKEN`, `ASR_API_KEY`, `NTFY_URL` and `NTFY_TOKEN` are `SecretStr`,
+- **Secrets.** `API_TOKEN`, `ASR_API_KEY`, `NTFY_URL`, `NTFY_TOKEN` and `SMTP_PASSWORD`
+  (step 25) are `SecretStr`,
   redacted in `earmark config` and `earmark doctor`, and never logged. `EARMARK_NTFY_URL`
   is a `SecretStr` because on public ntfy.sh the topic is the password. Doctor prints only
   its host. `Settings.secret_values()` also returns the bare topic when it is at least 12
@@ -1089,8 +1400,8 @@ and handles text they wrote.
 needs no network, GPU, or credentials; `pytest-socket` blocks sockets so a test that
 reaches out fails. Unix-domain sockets stay allowed (`--allow-unix-socket`) because the
 asyncio event loop, and so FastAPI's `TestClient`, needs a socketpair. Tests carrying
-`network` or `slow` get sockets back automatically (`tests/conftest.py`). The
-default `-m` expression deselects all three; passing `-m` on the command line
+`network`, `slow` or `smtp` get sockets back automatically (`tests/conftest.py`). The
+default `-m` expression deselects all four opt-in markers; passing `-m` on the command line
 replaces it, so `-m network` runs only network tests. Opt-in markers:
 
 - `network`: hits real Apple and feed endpoints. These tests call
@@ -1111,6 +1422,12 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   sockets blocked, and checks that no URL path or query reaches earmark's log output; the
   default suite does the same for `httpx2`/`httpcore2` and uvicorn.
 - `gpu`: needs CUDA; it does not get sockets back.
+- `smtp` (step 25): `tests/test_smtp_live.py` logs in to a real SMTP server and sends one
+  message, to `SMTP_TEST_TO`, from the `SMTP_TEST_*` settings. Those are separate names
+  because `conftest` strips `EARMARK_*`. It is skipped unless they are all set, gets
+  sockets back, and no workflow runs it. Only the operator runs it.
+
+The default `-m` expression deselects `network`, `slow`, `gpu` and `smtp`.
 
 For every test without `network` or `slow`, `tests/conftest.py` sets `HF_HUB_OFFLINE=1`,
 so no default test can download a model even if the extra is installed. Every test starts
@@ -1134,7 +1451,21 @@ Upload tests (step 24) use two helpers:
 
 `TestClient` reads a request body whole and sends it as one message, so it cannot test
 streaming, a lying `Content-Length`, a mid-body disconnect, or that `receive` was never
-called. The leak tests configure earmark's real handler on a `StringIO` at DEBUG, and
+called.
+
+Delivery tests (step 25) run against `tests/smtp_stub.py`. It is a hand-written SMTP server
+on a `socket.socketpair()`, served from a thread, so it works with sockets blocked. The
+stdlib `smtpd` is gone in 3.13.
+
+- **TLS.** It speaks real TLS, implicit or after STARTTLS, with the committed test
+  certificate for `smtp.test` in `tests/fixtures/tls/`. The client trusts it through an
+  injected `ssl.create_default_context(cadata=…)`.
+- **Scripting.** Every reply can be scripted, and so can a disconnect at each phase, a stall
+  and a dripping reply.
+- **Recording.** It records the EHLO names, the commands with their TLS state, the AUTH
+  credentials, the envelope and the message bytes.
+- **Exact bytes.** Message tests compare exact bytes, with an injected date, job id and
+  boundary. The leak tests configure earmark's real handler on a `StringIO` at DEBUG, and
 capture ntfy bodies with `httpx2.MockTransport`.
 
 Documents are tested against the code (step 16).
@@ -1145,7 +1476,7 @@ Documents are tested against the code (step 16).
 - **What `tests/test_docs.py` checks.**
   - The README's settings reference lists every `Settings` field exactly once, one
     variable per table row.
-  - The README quickstart sets all four backends to `fake`.
+  - The README quickstart sets all five backends to `fake`.
   - `docs/shortcut.md`'s example request body validates against `TranscriptionRequest`
     and is accepted by `POST /transcriptions`, and the example response matches the route
     (step 24).
@@ -1170,9 +1501,10 @@ runs in the sandbox:
 2. `curl` a `POST /transcriptions`, with a podcast link, a direct URL (the fake fetcher
    serves it), or a multipart upload;
 3. `earmark worker --once`;
-4. `GET /jobs/{id}` shows the job `done` with `result.duration_s`, the transcript is
-   cached under `data/episodes/<key>/`, and `data/uploads/` and `data/downloads/` are
-   empty.
+4. `GET /jobs/{id}` shows the job `done` with `result.duration_s`, `delivery_state` `sent`
+   and `sent_at`. The transcript is cached under `data/episodes/<key>/`, and `data/uploads/`
+   and `data/downloads/` are empty. The fake mailer's message is `data/outbox/<job_id>.eml`,
+   and its note's `transcript_sha256` verifies (step 25).
 
 Verifiers use this as the live smoke test from step 05 onward.
 
@@ -1187,7 +1519,7 @@ then runs exactly `uv sync --locked` and `make check`. Python comes from
 cancels the run in progress, and the job times out after 15 minutes.
 
 CI runs the default suite only. It does **not** run the opt-in markers (`network`, `slow`,
-`gpu`), does not install the `transcribe` extra, never runs on a GPU, and does not build or
+`gpu`, `smtp`), does not install the `transcribe` extra, never runs on a GPU, and does not build or
 run the container. There are exactly three workflows
 (`tests/test_ci.py::test_workflow_files_are_the_known_three`):
 
@@ -1308,16 +1640,11 @@ Step planners should check these against current documentation instead of assumi
    The `transcribe` extra pins `av>=18.1,<19` until a faster-whisper release includes the
    fix already on its `master`. The weekly `slow` job would catch a regression.
 
-## Planned (steps 25–26)
+## Re-scope decisions (2026-11-23)
 
-Nothing in this section is built yet, except where a bullet says "Built in step NN". It is
-what steps 25–26 build against. It carries the operator's decisions and the mail contract
-from `docs/PLAN.md` "Re-scope" verbatim, and restates the briefs of steps 25–26 as
-contracts. A revision changes both files in the same commit. Each step's planner may settle
-what is listed under "Open questions", and records its choice here. Step 24's request
-model, source identity, allowlist, dedupe, retention and leak rules are built. They moved
-from here into the sections above, and `docs/steps/24-transcription-requests.md` has the
-exact rules.
+These are the operator's decisions and the inputs that re-scoped earmark into a
+transcription and delivery service. They are copied from `docs/PLAN.md` "Re-scope", and a
+revision changes both files in the same commit. Each bullet says where it was built.
 
 ### What changes
 
@@ -1348,11 +1675,13 @@ context. earmark's job is:
   then mail anyone from the operator's domain, and can instruct both PKAs. When the
   setting is unset, every request is refused. The caller chooses personal or work, since
   the Shortcut fills in `to`; earmark never defaults it.
-  Built in step 24: see "The recipient allowlist is the gate" under Security.
+  Built in step 24: see "The recipient allowlist is the gate" under Security. Step 25
+  checks it again at delivery.
 - **Delivery is at-least-once.** A crash after the SMTP server accepts the message, but
   before earmark records it as sent, cannot be told apart from a failure. In that case
   earmark resends with the same `Message-ID` and the same `job_id`. The PKA treats the
   same `guid` plus the same `job_id` as a duplicate, and ignores it.
+  Built in step 25: see "Delivering" under Stage contracts.
 - **Re-shares resend the whole transcript.** Email is stateless, and 300 KB is small. A
   re-share is a new job, so it gets a new `job_id` and the same `guid`. The PKA keeps one
   note and runs the new instructions against it. earmark stays send-only and reads no
@@ -1367,191 +1696,29 @@ context. earmark's job is:
   a clear message saying to move it aside. It is not migrated.
   Built in step 22: see "Database identity" under Jobs.
 - **No "analysis done" relay for now.** ntfy stays for "sent" and "failed".
+  Built in step 25: see "Notifying".
 - **No PKA-side skill is needed from earmark.** PKA is gaining inbound email.
-- **The attachment size cap is configurable.**
+- **The attachment size cap is configurable.** Built in step 25:
+  `EARMARK_MAX_ATTACHMENT_MB`.
 - **Removed code is deleted.** It stays recoverable from the `v0.1.0-full-pipeline` tag.
   Done in step 22: see "History: removed in step 22".
 
-### Delivery (step 25)
+### Inputs from the other agents
 
-Step 25 builds to the mail contract below, which is `contract: 1` and still a draft. If
-pka-skills sends a revision before step 25 is dispatched, the orchestrator updates PLAN's
-"Re-scope" section first, and this copy with it.
+- amap-spec: mail to an agent's bound address arrives on the mail lane. earmark learns
+  nothing beyond the SMTP reply: there is no receipt and no dedupe. Attachment caps are
+  set per deployment.
+- earshot: its offload is not an API. Its build recipe for CTranslate2 with CUDA on the
+  GB10 is in `docs/decisions/2026-11-23-gpu-build-recipe.md`, with what was measured and
+  what was not.
 
-- **Where it runs.** Delivery runs after transcription and before the job completes; the
-  push then says the transcript was sent. The stage's name is step 25's.
-- **Leak rules.** Step 25 keeps step 24's leak rules (see Security) and adds two more: no
-  job error contains the recipient address or the SMTP server's reply text, and
-  `EARMARK_SMTP_PASSWORD` never appears in logs, job errors, `earmark config` or doctor
-  output. The mail contract keeps the guid out of the mail body.
-- **Jobs without `to`.** Jobs enqueued before step 24 have `to` set to `None`. Delivery
-  fails them permanently with a message saying to share again.
-- **The request offset.** The request's optional `timestamp` (kept by step 24) sets
-  `shared_at`. It is one candidate source for the requester's offset (see "Open
-  questions").
-- **Ordinary email.** earmark is not part of AMAP. It sends ordinary email from a sending
-  mailbox on a domain the operator owns. Each PKA runtime reads an attachment only from an
-  allowlisted sender that passes DMARC. earmark is send-only and reads no mail; it learns
-  nothing beyond the SMTP reply.
-- **The mail backend.** `EARMARK_MAIL_BACKEND=smtp|fake` selects it, through a `Mailer`
-  stage Protocol with a fake, registered in the factory. An smtp backend that is missing any
-  required setting is a `ConfigError` at startup. The fake records messages for tests and
-  the quickstart.
-- **The note and the instructions file** are rendered exactly to the contract: every key
-  and its required or omit rule, the slug and date rules, the guid prefixes, stripping and
-  the query-omission rule for `source_url`, the `transcript_sha256` scope, and the paragraph
-  merge.
-- **SMTP settings.**
-  - `EARMARK_SMTP_HOST` and `EARMARK_SMTP_PORT`.
-  - `EARMARK_SMTP_SECURITY`, which is `starttls` or `tls`. There is no plaintext option.
-  - `EARMARK_SMTP_USERNAME`.
-  - `EARMARK_SMTP_PASSWORD`, a secret. It has its own validator, which allows the spaces
-    app passwords contain and rejects control characters.
-  - `EARMARK_SMTP_FROM`, which has no default.
-  - `EARMARK_SMTP_TIMEOUT_S`, which must stay below the stop grace period.
-  - `EARMARK_MAX_ATTACHMENT_MB`.
-- **TLS and identity.**
-  - `ssl.create_default_context()` for both `SMTP_SSL(context=…)` and
-    `starttls(context=…)`, so the certificate and hostname are verified.
-  - If STARTTLS is not offered, delivery fails. It never continues in plaintext.
-  - AUTH happens only after TLS is up.
-  - `local_hostname` is passed explicitly, set to the domain of `SMTP_FROM`, so EHLO never
-    calls `socket.getfqdn()`.
-  - The debug level is never set.
-  - The envelope recipient is passed explicitly: the one validated `to`.
-- **The message.**
-  - `Message-ID` is deterministic per job, `<earmark.<job_id>@<from domain>>`, never
-    `make_msgid()`.
-  - The subject follows the contract, encoded by the email policy for non-ASCII text.
-  - The body is earmark-generated only, as the contract says.
-  - Both attachments are base64-encoded `text/markdown; charset=utf-8`, so the hash survives
-    transport.
-  - `EARMARK_MAX_ATTACHMENT_MB` caps the raw size of the two attachments together, before
-    encoding. A job over it fails permanently with a message naming the setting. Nothing is
-    truncated or split.
-  - A title, guid or instructions text cannot inject email headers. Untrusted text never
-    appears in the body.
-- **Doctor.** `earmark doctor --online` connects, negotiates TLS, logs in and quits,
-  sending nothing.
-- **Tests.** They run against a hand-written SMTP stub on a socketpair or unix socket, after
-  `tests/uds_http.py`, with sockets blocked (the stdlib `smtpd` is gone in 3.13), and assert
-  on the exact bytes of the message, with an injected clock, `Message-ID` and MIME boundary.
-  An opt-in test under a new `smtp` marker sends one message to an operator-supplied
-  address; it never runs by default. Only the operator can check TLS against the real
-  server, DMARC passing at the recipient, and the PKA reading both attachments.
+## Planned (step 26)
 
-### Delivery state, at-least-once (step 25)
-
-- A migration adds delivery columns: state `sending`, with the `Message-ID` recorded before
-  DATA, then `sent`, with a timestamp, after the 250 reply. They are written through
-  lease-fenced updates.
-- Delivery runs outside the worker's interruptible window. A SIGTERM waits for it, bounded
-  by `EARMARK_SMTP_TIMEOUT_S`, which is kept below compose's `stop_grace_period` (2m today)
-  and systemd's `TimeoutStopSec` (120 s for the worker unit today). A test pins that
-  relation.
-- A job found in `sending` after a crash or lease expiry is resent with the same
-  `Message-ID` and `job_id`, and its push says "resent after an interruption".
-- A `sent` job is never sent again, on retry, restart or lease expiry.
-- So delivery is at-least-once: a crash after the server accepts the message but before
-  `sent` is recorded cannot be told apart from a failure, and the PKA treats the same `guid`
-  with the same `job_id` as a duplicate.
-
-### Failure classes (step 25)
-
-- A 4xx reply, or a connection error before DATA completes, is transient.
-- A disconnect after DATA, with no reply, is ambiguous. It is retried, which is
-  at-least-once.
-- A 5xx reply is permanent.
-- An authentication failure is permanent, with a message naming the settings.
-- Job errors store the reply code, the enhanced status code and an earmark-written summary,
-  never the server's reply text, which echoes addresses.
-
-### The mail contract (pka-skills, `contract: 1`, 2026-11-23)
-
-Status: **DRAFT**. It
-becomes final once the operator approves the PKA's receiving procedure. A revision would
-come with a contract version bump. Step 25 builds to this text.
-
-- **Both files**
-  - **Encoding:** UTF-8 with no BOM and LF line endings. The extension is a lower-case
-    `.md`, and the media type is `text/markdown`.
-  - **Frontmatter:** YAML between `---` lines at the very top of the file.
-  - **Feed- or caller-supplied strings:** double-quoted and escaped, on one line, with
-    control characters stripped. They are capped at 300 characters, and `title` at 200.
-  - **Unknown values:** the key is omitted. A value is never an empty string or null.
-  - **Formats:** timestamps are RFC 3339 with an offset, and dates are `YYYY-MM-DD`.
-  - **Filenames:** `YYYY-MM-DD-<slug>.md`. The slug is lower-case ASCII `a-z0-9` joined
-    by single hyphens, at most 80 characters. A podcast slug is
-    `<show-slug>-<title-slug>`, truncated as a whole.
-  - **Filename date:** the publish date when known, otherwise the date of `shared_at` in
-    the requester's offset.
-- **Attachment 1, the note: `YYYY-MM-DD-<slug>.md`.** Podcasts and audio share one
-  schema.
-
-  | key | type | podcast | audio | notes |
-  |---|---|---|---|---|
-  | `type` | string | required | required | `podcast` or `audio` |
-  | `contract` | integer | required | required | `1` |
-  | `source` | string | required | required | `earmark` |
-  | `origin` | string | required | required | `apple_podcasts`, `upload` or `url` |
-  | `title` | string | required | required | podcast: the episode title; audio: the request's `title`, else the upload's filename stem or the URL's last path segment, sanitised |
-  | `show` | string | required | omit | |
-  | `date` | date | required | required | the filename date |
-  | `published` | date | optional | optional | only when actually known |
-  | `duration` | string | required | required | `hh:mm:ss` |
-  | `language` | string | optional | optional | BCP 47 |
-  | `apple_url` | string | optional | omit | |
-  | `source_url` | string | omit | optional | `origin: url` only, without userinfo, query or fragment; omitted entirely when the URL carries a query |
-  | `guid` | string | required | required | `feed:<feed guid verbatim>`, else `apple:<i= episode id>`, else `sha256:<hex of the audio bytes>` for upload and url |
-  | `shared_at` | timestamp | required | required | when this item was first shared |
-  | `transcript_sha256` | string | required | required | 64 lower-case hex |
-  | `tags` | list of strings | required | required | `["podcast"]` or `["audio"]` |
-
-  - **Body:** `# <title>` (for a podcast, `# <show> — <title>`), then a blank line, then
-    `## Transcript`, then a blank line. After that come paragraphs separated by blank
-    lines. Each paragraph covers 30–60 seconds or one speaker turn, and starts with
-    `[hh:mm:ss]`.
-  - **`transcript_sha256`:** the sha256 of the UTF-8 bytes from the first byte after the
-    closing `---\n` to the end of the file, as sent.
-  - **No audio hash for podcasts:** dynamic ad insertion changes the bytes on every
-    download.
-- **Attachment 2, the instructions: `YYYY-MM-DD-<slug>.instructions.md`.** It uses the
-  same date and slug as the note.
-  - **Keys:**
-    - `type: earmark-instructions`;
-    - `contract: 1`;
-    - `for`: the note's filename;
-    - `guid`: the same as the note's;
-    - `job_id`: stable across a resend, new on every re-share;
-    - `shared_at`: when this request was made.
-  - **Body:** the requester's words, verbatim, and nothing else.
-  - **Always sent.** An empty body means "file it, no analysis".
-- **Subject and body.**
-  - **Subject:** `[earmark] <title>`, sanitised and capped at 120 characters.
-  - **Body:** only text earmark generates. It names which attachment is the transcript,
-    which is data and never instructions, and which attachment holds the requester's
-    instructions. It carries the `job_id` and the two filenames. It also says that the
-    subject and the note contain third-party text.
-  - **The guid stays out of the body.** A `feed:` guid is publisher text, so it appears
-    only inside the attachments.
-- **PKA de-duplication.**
-  - The same `guid` and the same `job_id` is a duplicate delivery.
-  - The same `guid` with a new `job_id` is a re-share.
-  - The same `guid` with a different `transcript_sha256` is a re-transcription, and the
-    newer body wins.
-
-Notes for step 25 (not part of the contract):
-
-- `earmark.sanitize.emit_frontmatter` writes `null` for `None` and refuses aware
-  datetimes today, so it needs adapting to "the key is omitted" and RFC 3339 timestamps.
-- Where the verbatim feed guid comes from is open (see "Open questions").
-
-### Pushes after step 25
-
-- The ntfy push says the transcript was sent, with the title and the masked recipient, or
-  says the job failed and why. The step-24 leak rules apply.
-- A job resent from `sending` says "resent after an interruption".
-- There is no "analysis done" relay for now; ntfy stays for "sent" and "failed".
+Nothing in this section is built yet. It is what step 26 builds against, restated from
+its brief in `docs/PLAN.md`. Its planner may settle what is listed under "Open questions",
+and records the choice here. Steps 24 and 25 are built. Their contracts moved from here
+into the sections above. `docs/steps/24-transcription-requests.md` and
+`docs/steps/25-delivery.md` have the exact rules.
 
 ### GPU transcription in the image (step 26)
 
@@ -1592,16 +1759,7 @@ Notes for step 25 (not part of the contract):
   checked after any uv command; `doctor`; transcribe a short public clip on `cuda` and see
   `float16` in the log.
 
-### Inputs from the other agents
-
-- amap-spec: mail to an agent's bound address arrives on the mail lane. earmark learns
-  nothing beyond the SMTP reply: there is no receipt and no dedupe. Attachment caps are
-  set per deployment.
-- earshot: its offload is not an API. Its build recipe for CTranslate2 with CUDA on the
-  GB10 is in `docs/decisions/2026-11-23-gpu-build-recipe.md`, with what was measured and
-  what was not.
-
-### Open questions, owned by later steps
+### Open questions
 
 - **Settled by step 24** (see `docs/steps/24-transcription-requests.md` section 8):
   - the caps: `instructions` 4000 characters, `title` 200;
@@ -1611,19 +1769,28 @@ Notes for step 25 (not part of the contract):
   - `prompt` became `instructions`, carried over;
   - for uploads and URLs, the resolve stage builds the episode from the job and the bytes;
   - the dedupe window applies to `done` jobs only.
-- **Step 25:**
-  - The time zone: where the requester's offset comes from, the request (the Shortcut can
-    send it), a re-added setting, or UTC. Today the job stores `shared_at` as a UTC
-    instant, and step 22 removed `EARMARK_TZ` and `tzdata`. The request's `timestamp`
-    field still exists (step 24 kept it), but its offset is not stored.
-  - The feed guid: the contract wants `feed:<feed guid verbatim>`, else `apple:<i= episode
-    id>`. Today `Episode.guid` prefers Apple's `episodeGuid` over the matched feed item's
-    GUID and falls back to `apple-podcasts:<episode_id>`; Apple's and the feed's GUIDs can
-    differ (Known risk 2), and `Episode.guid` feeds the episode key.
-  - The delivery stage and column names; the defaults of `EARMARK_SMTP_PORT`,
-    `EARMARK_SMTP_TIMEOUT_S` and `EARMARK_MAX_ATTACHMENT_MB`; how paragraphs are merged
-    within the 30–60 seconds or speaker-turn rule; the exact push wording.
-  - The contract is final only once the operator approves the PKA's receiving procedure.
+- **Settled by step 25** (see `docs/steps/25-delivery.md` section 8):
+  - **The time zone.** It is the offset of the request's `timestamp`, stored as
+    `utc_offset_min`, or UTC when there is none. No setting and no zone database. The
+    Shortcut must send `timestamp` (step 27), and `earmark submit` sends none.
+  - **The `published` date** is shown in the requester's offset, with Apple's date-only
+    values kept.
+  - **The feed guid.** It is the matched feed item's `<guid>`, in the new
+    `Episode.feed_guid`, used as `feed:<guid>` only when verbatim and at most 300
+    characters. Otherwise it is `apple:<episode id>`. Episode keys are unchanged. An
+    episode that drops out of its feed between two shares changes from `feed:` to
+    `apple:`.
+  - **Names.** The stage is `deliver`. The columns are `utc_offset_min`, `delivery_state`,
+    `message_id`, `sent_at` and `resent` (migration `0003_delivery`).
+  - **Defaults.** `EARMARK_SMTP_PORT` defaults to 587 for `starttls` and 465 for `tls`.
+    `EARMARK_SMTP_TIMEOUT_S` defaults to 60, at most 90. `EARMARK_MAX_ATTACHMENT_MB`
+    defaults to 10.
+  - **Paragraphs.** A new one starts on a speaker change, once the current one spans 30 s,
+    or before a segment that would take it past 60 s.
+  - **Push wording.** "Sent: …" with `To:` masked, and the resent and
+    may-already-be-delivered lines.
+  - **Still open:** the contract is final only once the operator approves the PKA's
+    receiving procedure.
 - **Step 26:** the base image, the slim `nvidia/cuda` devel and runtime pair (nobody has
   tried it) or the NGC base (earshot proved it), with the reason; whether CI builds the GPU
   image at all, given the free runner's roughly 14 GB of disk; whether it is a separate

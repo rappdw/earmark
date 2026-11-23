@@ -40,10 +40,10 @@ def test_unix_socketpair_allowed() -> None:
 
 def test_live_markers_registered(pytestconfig: pytest.Config) -> None:
     markers = pytestconfig.getini("markers")
-    for name in ("network", "slow", "gpu"):
+    for name in ("network", "slow", "gpu", "smtp"):
         assert any(m.startswith(f"{name}:") for m in markers), name
     declared = _pyproject()["tool"]["pytest"]["markers"]
-    assert {m.split(":", 1)[0] for m in declared} == {"network", "slow", "gpu"}
+    assert {m.split(":", 1)[0] for m in declared} == {"network", "slow", "gpu", "smtp"}
 
 
 def _make_inner(pytester: pytest.Pytester, inner_test: str) -> None:
@@ -72,19 +72,29 @@ def test_slow():
 @pytest.mark.gpu
 def test_gpu():
     pass
+
+@pytest.mark.smtp
+def test_smtp():
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
 """
 
 
 def test_live_markers_deselected_by_default(pytester: pytest.Pytester) -> None:
     _make_inner(pytester, _INNER_MARKERS)
     result = pytester.runpytest_subprocess()
-    result.assert_outcomes(passed=1, deselected=3)
+    result.assert_outcomes(passed=1, deselected=4)
+
+
+def test_smtp_opt_in_reenables_sockets(pytester: pytest.Pytester) -> None:
+    _make_inner(pytester, _INNER_MARKERS)
+    result = pytester.runpytest_subprocess("-m", "smtp")
+    result.assert_outcomes(passed=1, deselected=4)
 
 
 def test_network_opt_in_reenables_sockets(pytester: pytest.Pytester) -> None:
     _make_inner(pytester, _INNER_MARKERS)
     result = pytester.runpytest_subprocess("-m", "network")
-    result.assert_outcomes(passed=1, deselected=3)
+    result.assert_outcomes(passed=1, deselected=4)
 
 
 _INNER_GPU = """

@@ -112,6 +112,25 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             "CREATE INDEX jobs_by_dedupe ON jobs (dedupe_key, status, updated_at)",
         ),
     ),
+    Migration(
+        "0003_delivery",
+        (
+            """
+            ALTER TABLE jobs ADD COLUMN utc_offset_min INTEGER
+                CHECK (utc_offset_min BETWEEN -1439 AND 1439)
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN delivery_state TEXT
+                CHECK (delivery_state IN ('sending', 'sent'))
+            """,
+            "ALTER TABLE jobs ADD COLUMN message_id TEXT",
+            "ALTER TABLE jobs ADD COLUMN sent_at TEXT",
+            """
+            ALTER TABLE jobs ADD COLUMN resent INTEGER NOT NULL DEFAULT 0
+                CHECK (resent IN (0, 1))
+            """,
+        ),
+    ),
 )
 SCHEMA_VERSION: Final = len(MIGRATIONS)
 

@@ -30,6 +30,7 @@ from earmark.errors import PermanentError, TransientError
 from earmark.fetch import USER_AGENT, parse_retry_after
 from earmark.log import redact, scrub_urls
 from earmark.models import Episode, Job, JobStatus, format_hms, utc_now
+from earmark.recipients import mask_address
 from earmark.sanitize import clean_unicode, fit_bytes
 from earmark.sources import url_host
 
@@ -50,7 +51,7 @@ TAGS: Final[Mapping[JobStatus, str]] = {
     "skipped": "fast_forward",
 }
 TITLE_PREFIX: Final[Mapping[JobStatus, str]] = {
-    "done": "Transcribed",
+    "done": "Sent",
     "failed": "Failed",
     "skipped": "Skipped",
 }
@@ -146,9 +147,13 @@ def compose(
     title = fit_bytes(f"{TITLE_PREFIX[status]}: {name}", TITLE_MAX_BYTES)
 
     lines: list[str] = [first_line]
+    if job.to is not None and status in ("done", "failed"):
+        lines.append(f"To: {field(mask_address(job.to), LINE_MAX_BYTES)}")
     if status == "done":
         if job.result is not None:
             lines.append(f"Duration: {format_hms(job.result.duration_s)}")
+        if job.resent:
+            lines.append("Resent after an interruption.")
         if job.warnings:
             first = field(scrub_urls(job.warnings[0]), LINE_MAX_BYTES)
             count = len(job.warnings)
@@ -160,6 +165,8 @@ def compose(
         lines.append(f"Reason: {reason or 'no reason recorded'}")
         if status == "failed" and job.attempts > 1:
             lines.append(f"Gave up after {job.attempts} attempts.")
+        if status == "failed" and job.delivery_state == "sending":
+            lines.append("The email may already have been delivered.")
 
     message = fit_bytes("\n".join(lines), MESSAGE_MAX_BYTES)
     return Notification(

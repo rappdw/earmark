@@ -27,6 +27,11 @@ class PermanentError(EarmarkError):
     """Retrying cannot help; the job fails."""
 
 
+class MaybeDelivered(TransientError):  # noqa: N818  # name fixed by the plan; an outcome
+    """The server may have accepted the message: the connection ended after the message
+    data was sent and before the final reply. The runner keeps the delivery in `sending`."""
+
+
 class SkipEpisode(EarmarkError):  # noqa: N818  # name fixed by the plan; a job outcome, not an error
     """The episode cannot be processed (no public feed, subscriber-only); the job is skipped."""
 

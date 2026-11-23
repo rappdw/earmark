@@ -34,7 +34,9 @@ from tests.ntfy_stub import (
     UNAUTHORIZED,
     json_reply,
 )
+from tests.smtp_stub import REPLY_SENTINEL, SmtpStub, stub_factory, trusted_test_context
 
+make_stub = pytest.fixture(stub_factory)
 TOKEN_OK = "t" * 40
 ASR_URL = "http://asr.test:8000/v1"
 NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
@@ -44,6 +46,7 @@ FAKES: dict[str, Any] = {
     "fetch_backend": "fake",
     "asr_backend": "fake",
     "notify_backend": "none",
+    "mail_backend": "fake",
 }
 
 
@@ -892,6 +895,7 @@ def test_doctor_check_names_in_order(tmp_path: Path) -> None:
         "resolver",
         "fetch",
         "asr",
+        "mail",
         "notify",
     ]
 
@@ -942,3 +946,110 @@ def test_doctor_recipients_all_warns(tmp_path: Path) -> None:
 def test_doctor_recipients_listed_right_after_api_token(tmp_path: Path) -> None:
     names = [r.name for r in run_doctor(make_settings(tmp_path))]
     assert names[:2] == ["api token", "recipients"]
+
+
+# -- the mail checks (step 25) -----------------------------------------------------------
+
+SMTP_PASSWORD = "abcd efgh ijkl mnop"
+
+
+def smtp_settings(tmp_path: Path, **overrides: Any) -> Settings:
+    values: dict[str, Any] = {
+        "mail_backend": "smtp",
+        "smtp_host": "smtp.test",
+        "smtp_username": "mailer-user",
+        "smtp_password": SecretStr(SMTP_PASSWORD),
+        "smtp_from": "earmark@example.org",
+    }
+    values.update(overrides)
+    return make_settings(tmp_path, **values)
+
+
+def smtp_probes(stub: SmtpStub) -> Probes:
+    return Probes(
+        smtp_socket_factory=stub.socket_factory,
+        smtp_context_factory=trusted_test_context,
+        timeout_s=5.0,
+    )
+
+
+def test_mail_check_fake_warns(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path), "mail")
+    assert result == CheckResult("mail", "warn", "fake mailer (for tests): nothing is sent")
+
+
+def test_mail_check_smtp_missing_fails(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path, mail_backend="smtp"), "mail")
+    assert result.status == "fail"
+    for name in ("HOST", "FROM", "USERNAME", "PASSWORD"):
+        assert f"EARMARK_SMTP_{name}" in result.detail
+
+
+def test_mail_check_smtp_ok_names_host_not_secrets(tmp_path: Path) -> None:
+    result = status(smtp_settings(tmp_path), "mail")
+    assert result == CheckResult(
+        "mail", "ok", "smtp to smtp.test:587 (starttls), from @example.org, timeout 60 s"
+    )
+    tls = status(smtp_settings(tmp_path, smtp_security="tls", smtp_timeout_s=12.5), "mail")
+    assert tls.detail == "smtp to smtp.test:465 (tls), from @example.org, timeout 12.5 s"
+    for text in (result.detail, tls.detail):
+        assert SMTP_PASSWORD not in text
+        assert "mailer-user" not in text
+
+
+def test_mail_check_makes_no_connection(tmp_path: Path) -> None:
+    check(smtp_settings(tmp_path))  # sockets are blocked: a connect would be a failure
+
+
+def test_online_smtp_login_sends_nothing(
+    tmp_path: Path, make_stub: Callable[..., SmtpStub]
+) -> None:
+    stub = make_stub()
+    results = check(smtp_settings(tmp_path), online=True, probes=smtp_probes(stub))
+    result = results["smtp"]
+    assert result.status == "ok"
+    assert result.detail.startswith("smtp.test:587: TLSv1.")
+    assert result.detail.endswith(", login accepted, nothing sent")
+    stub.join()
+    verbs = {verb.upper() for verb in stub.verbs}
+    assert verbs == {"EHLO", "STARTTLS", "AUTH", "QUIT"}
+    assert stub.messages == []
+    assert stub.mail_from == [] == stub.rcpt_to
+    for text in (result.detail, *(r.detail for r in results.values())):
+        assert SMTP_PASSWORD not in text
+        assert "mailer-user" not in text
+        assert REPLY_SENTINEL not in text
+
+
+def test_online_smtp_auth_failure_fails_with_settings(
+    tmp_path: Path, make_stub: Callable[..., SmtpStub]
+) -> None:
+    stub = make_stub(auth_reply=f"535 5.7.8 bad {{user}} {{password}} {REPLY_SENTINEL}")
+    result = status(smtp_settings(tmp_path), "smtp", online=True, probes=smtp_probes(stub))
+    assert result.status == "fail"
+    assert "EARMARK_SMTP_USERNAME" in result.detail
+    assert "EARMARK_SMTP_PASSWORD" in result.detail
+    assert "reply 535, 5.7.8" in result.detail
+    for text in (SMTP_PASSWORD, "mailer-user", REPLY_SENTINEL):
+        assert text not in result.detail
+
+
+def test_online_smtp_unverified_certificate_fails(
+    tmp_path: Path, make_stub: Callable[..., SmtpStub]
+) -> None:
+    stub = make_stub()
+    probes = Probes(smtp_socket_factory=stub.socket_factory, timeout_s=5.0)  # system trust store
+    result = status(smtp_settings(tmp_path), "smtp", online=True, probes=probes)
+    assert result.status == "fail"
+    assert "did not verify" in result.detail
+    assert "EARMARK_SMTP_HOST" in result.detail
+
+
+def test_online_smtp_skipped_when_offline_mail_failed(tmp_path: Path) -> None:
+    results = check(make_settings(tmp_path, mail_backend="smtp"), online=True)
+    assert results["mail"].status == "fail"
+    assert results["smtp"] == CheckResult("smtp", "skip", "offline check failed")
+
+
+def test_online_smtp_not_listed_for_the_fake_backend(tmp_path: Path) -> None:
+    assert "smtp" not in check(make_settings(tmp_path), online=True)

@@ -14,10 +14,11 @@ from typing import Final
 from earmark.artifacts import ArtifactStore, atomic_write_bytes
 from earmark.errors import PermanentError
 from earmark.models import Clock, Episode, Job, Segment, Transcript, episode_key
-from earmark.pipeline.stages import Backends
+from earmark.pipeline.stages import Backends, OutgoingMail
 from earmark.transcribe.base import asr_profile
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
+FAKE_SENDER: Final = "earmark@example.org"  # the fake sends nothing; never used by smtp
 
 
 def fixed_clock(at: datetime = FAKE_NOW) -> Clock:
@@ -101,6 +102,7 @@ class FakeResolver(FakeStage[ResolveCall]):
             feed_url="https://fake.invalid/feed.xml",
             url=url,
             description="A synthetic episode for tests.",
+            feed_guid=guid,
         )
 
 
@@ -193,6 +195,20 @@ class FakeTranscriber(FakeStage[TranscribeCall]):
         return transcript
 
 
+class FakeMailer(FakeStage[OutgoingMail]):
+    """Records each message; with ``outbox`` set also writes ``<job_id>.eml`` (mode 0600)."""
+
+    def __init__(self, sender: str = FAKE_SENDER, outbox: Path | None = None) -> None:
+        super().__init__()
+        self.sender = sender
+        self._outbox = outbox
+
+    def send(self, mail: OutgoingMail) -> None:
+        self._enter(mail)
+        if self._outbox is not None:
+            atomic_write_bytes(self._outbox / f"{mail.job_id}.eml", mail.data, mode=0o600)
+
+
 class FakeNotifier(FakeStage[NotifyCall]):
     def notify(self, job: Job, episode: Episode | None) -> None:
         self._enter(NotifyCall(job, episode))
@@ -204,6 +220,7 @@ class FakeBackends:
     resolver: FakeResolver
     fetcher: FakeAudioFetcher
     transcriber: FakeTranscriber
+    mailer: FakeMailer
     notifier: FakeNotifier
 
     def backends(self) -> Backends:
@@ -211,6 +228,7 @@ class FakeBackends:
             resolver=self.resolver,
             fetcher=self.fetcher,
             transcriber=self.transcriber,
+            mailer=self.mailer,
             notifier=self.notifier,
         )
 
@@ -222,5 +240,6 @@ def make_fake_backends(data_dir: Path) -> FakeBackends:
         resolver=FakeResolver(),
         fetcher=FakeAudioFetcher(artifacts),
         transcriber=FakeTranscriber(artifacts),
+        mailer=FakeMailer(),
         notifier=FakeNotifier(),
     )

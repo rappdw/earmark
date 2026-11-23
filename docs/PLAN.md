@@ -42,7 +42,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 22 | Re-scope I: remove analysis, vault, entities, search, re-run, digest | 21 | done |
 | 23 | Re-scope II: architecture and CLAUDE.md | 22 | done |
 | 24 | Transcription requests: audio upload or URL, destination, instructions | 23 | done |
-| 25 | Delivery: the transcript note and the email | 24 | todo |
+| 25 | Delivery: the transcript note and the email | 24 | done |
 | 26 | GPU transcription inside the image | 25 | todo |
 | 27 | Docs, runbook and Shortcut for the transcription service | 26 | todo |
 

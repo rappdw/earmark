@@ -6,7 +6,7 @@ Import this package only from the CLI's ``doctor`` command: it loads httpx2.
 """
 
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import httpx2
 
@@ -14,6 +14,9 @@ from earmark.config import Settings
 from earmark.doctor.report import CheckResult
 from earmark.fetch import GuardedFetcher
 from earmark.transcribe.compat import Lookup, installed
+
+if TYPE_CHECKING:
+    from earmark.mail.smtp import ContextFactory, SocketFactory
 
 ONLINE_TIMEOUT_S: Final = 10.0
 
@@ -26,6 +29,8 @@ class Probes:
     fetcher: GuardedFetcher | None = None  # the iTunes lookup
     timeout_s: float = ONLINE_TIMEOUT_S
     installed: Lookup = installed  # package metadata, for the asr libraries check
+    smtp_socket_factory: "SocketFactory | None" = None  # the SMTP login check's socket
+    smtp_context_factory: "ContextFactory | None" = None  # and its TLS context
 
 
 def run_doctor(

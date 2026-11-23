@@ -87,13 +87,14 @@ def test_secret_fields_are_secretstr() -> None:
     }
     for n in names:
         assert Settings.model_fields[n].annotation == SecretStr | None, n
-    assert names == {"api_token", "asr_api_key", "ntfy_token"}
+    assert names == {"api_token", "asr_api_key", "ntfy_token", "smtp_password"}
 
 
 _SECRETS = {
     "EARMARK_API_TOKEN": "sentinel-a1",
     "EARMARK_ASR_API_KEY": "sentinel-b2",
     "EARMARK_NTFY_TOKEN": "sentinel-c3",
+    "EARMARK_SMTP_PASSWORD": "sentinel d4 with spaces",
 }
 
 
@@ -164,10 +165,12 @@ def test_all_backends_accept_fake(monkeypatch: pytest.MonkeyPatch) -> None:
         "FETCH_BACKEND",
         "ASR_BACKEND",
         "NOTIFY_BACKEND",
+        "MAIL_BACKEND",
     ):
         monkeypatch.setenv(f"EARMARK_{name}", "fake")
     s = load_settings(env_file=None)
     assert s.resolver_backend == s.fetch_backend == s.asr_backend == s.notify_backend == "fake"
+    assert s.mail_backend == "fake"
 
 
 def test_log_level_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,6 +331,7 @@ def test_settings_fields_are_exactly() -> None:
         "fetch_backend",
         "asr_backend",
         "notify_backend",
+        "mail_backend",
         "asr_model",
         "asr_device",
         "asr_compute_type",
@@ -349,6 +353,14 @@ def test_settings_fields_are_exactly() -> None:
         "job_max_attempts",
         "job_lease_seconds",
         "worker_poll_seconds",
+        "smtp_host",
+        "smtp_port",
+        "smtp_security",
+        "smtp_username",
+        "smtp_password",
+        "smtp_from",
+        "smtp_timeout_s",
+        "max_attachment_mb",
         "log_level",
     )
 
@@ -438,3 +450,112 @@ def test_request_limits_validated(monkeypatch: pytest.MonkeyPatch, name: str) ->
     assert [e.split(":")[0] for e in info.value.errors] == ["EARMARK_MAX_UPLOAD_MB"]
     monkeypatch.setenv("EARMARK_MAX_UPLOAD_MB", "5")
     assert load_settings(env_file=None).dedupe_window_s == 0
+
+
+# -- mail settings (step 25) ---------------------------------------------------------------
+
+
+def test_mail_defaults() -> None:
+    s = Settings(_env_file=None)
+    assert s.mail_backend == "smtp"
+    assert (s.smtp_host, s.smtp_port, s.smtp_username, s.smtp_password, s.smtp_from) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert s.smtp_security == "starttls"
+    assert s.smtp_timeout_s == 60.0
+    assert s.max_attachment_mb == 10
+
+
+def test_smtp_password_allows_spaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_SMTP_PASSWORD", "  abcd efgh ijkl mnop \t")
+    s = load_settings(env_file=None)
+    assert s.smtp_password is not None
+    assert s.smtp_password.get_secret_value() == "abcd efgh ijkl mnop"
+    assert "abcd" not in repr(s)
+    assert s.secret_values() == ["abcd efgh ijkl mnop"]
+    assert ("EARMARK_SMTP_PASSWORD", "**********") in s.redacted_items()
+
+
+@pytest.mark.parametrize("bad", ["abc\x01def", "pa\u00e9ss", "tab\tinside", "emoji\U0001f600"])
+def test_smtp_password_rejects_control_and_non_ascii(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    monkeypatch.setenv("EARMARK_SMTP_PASSWORD", bad)
+    with pytest.raises(ConfigError) as info:
+        load_settings(env_file=None)
+    [line] = info.value.errors
+    assert line == (
+        "EARMARK_SMTP_PASSWORD: Value error, must be printable ASCII (spaces allowed), "
+        "without control characters"
+    )
+    assert bad not in str(info.value)
+
+
+def test_smtp_username_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_SMTP_USERNAME", "  me@example.org ")
+    assert load_settings(env_file=None).smtp_username == "me@example.org"
+    for bad in ("two words", "caf\u00e9"):
+        monkeypatch.setenv("EARMARK_SMTP_USERNAME", bad)
+        with pytest.raises(ConfigError, match="must be printable ASCII without spaces"):
+            load_settings(env_file=None)
+
+
+def test_smtp_from_is_an_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_SMTP_FROM", " Earmark@Example.ORG ")
+    assert load_settings(env_file=None).smtp_from == "Earmark@example.org"
+    for bad in ("not an address", "a@b", "Name <a@example.org>", "a@example.org, b@example.org"):
+        monkeypatch.setenv("EARMARK_SMTP_FROM", bad)
+        with pytest.raises(ConfigError) as info:
+            load_settings(env_file=None)
+        assert info.value.errors == ["EARMARK_SMTP_FROM: Value error, must be one email address"]
+
+
+def test_smtp_host_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_SMTP_HOST", " smtp.example.org ")
+    assert load_settings(env_file=None).smtp_host == "smtp.example.org"
+    for bad in ("smtp://smtp.example.org", "smtp.example.org/x", "me@smtp.example.org", "a b"):
+        monkeypatch.setenv("EARMARK_SMTP_HOST", bad)
+        with pytest.raises(ConfigError, match=r"must be a host name such as smtp\.example\.org"):
+            load_settings(env_file=None)
+
+
+def test_smtp_timeout_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.config import SMTP_TIMEOUT_MAX_S
+
+    monkeypatch.setenv("EARMARK_SMTP_TIMEOUT_S", str(SMTP_TIMEOUT_MAX_S))
+    assert load_settings(env_file=None).smtp_timeout_s == SMTP_TIMEOUT_MAX_S
+    for bad in (str(SMTP_TIMEOUT_MAX_S + 1), "0", "-5"):
+        monkeypatch.setenv("EARMARK_SMTP_TIMEOUT_S", bad)
+        with pytest.raises(ConfigError, match="EARMARK_SMTP_TIMEOUT_S"):
+            load_settings(env_file=None)
+
+
+def test_smtp_port_effective() -> None:
+    assert Settings(_env_file=None).smtp_port_effective == 587
+    assert Settings(_env_file=None, smtp_security="tls").smtp_port_effective == 465
+    assert Settings(_env_file=None, smtp_port=2525).smtp_port_effective == 2525
+    assert Settings(_env_file=None, smtp_port=2525, smtp_security="tls").smtp_port_effective == 2525
+
+
+def test_smtp_security_is_lowercased_and_has_no_plaintext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EARMARK_SMTP_SECURITY", " TLS ")
+    assert load_settings(env_file=None).smtp_security == "tls"
+    for bad in ("none", "plain", "ssl"):
+        monkeypatch.setenv("EARMARK_SMTP_SECURITY", bad)
+        with pytest.raises(ConfigError, match="EARMARK_SMTP_SECURITY"):
+            load_settings(env_file=None)
+
+
+def test_max_attachment_mb_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_MAX_ATTACHMENT_MB", "25")
+    assert load_settings(env_file=None).max_attachment_mb == 25
+    for bad in ("0", "-1"):
+        monkeypatch.setenv("EARMARK_MAX_ATTACHMENT_MB", bad)
+        with pytest.raises(ConfigError, match="EARMARK_MAX_ATTACHMENT_MB"):
+            load_settings(env_file=None)

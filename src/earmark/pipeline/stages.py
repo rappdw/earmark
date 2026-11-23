@@ -64,10 +64,38 @@ class Notifier(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class OutgoingMail:
+    """One composed message, ready to hand to a Mailer."""
+
+    job_id: str
+    message_id: str  # "<earmark.<job_id>@<from domain>>"
+    sender: str  # the envelope MAIL FROM and the From header
+    recipient: str  # the one envelope RCPT TO and the To header: the job's validated `to`
+    data: bytes  # the whole message, ASCII, CRLF line endings
+    note_filename: str
+    instructions_filename: str
+
+
+class Mailer(Protocol):
+    @property
+    def sender(self) -> str:
+        """The From address. The smtp backend's is EARMARK_SMTP_FROM."""
+        ...
+
+    def send(self, mail: OutgoingMail, /) -> None:
+        """Deliver ``mail`` or raise.
+
+        Raises TransientError, PermanentError, or MaybeDelivered when the outcome is unknown.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
 class Backends:
-    """The four stage implementations the runner drives."""
+    """The five stage implementations the runner drives."""
 
     resolver: Resolver
     fetcher: AudioFetcher
     transcriber: Transcriber
+    mailer: Mailer
     notifier: Notifier | None  # None when EARMARK_NOTIFY_BACKEND=none

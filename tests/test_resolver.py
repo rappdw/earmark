@@ -740,3 +740,80 @@ def test_live_resolves_out_of_window_episode() -> None:
     assert resolution.source == "page"
     assert resolution.episode.guid == PM_OLD_GUID
     assert resolution.episode.title == "Why Gold? (Classic)"
+
+
+# -- the note's feed guid and publish-date flag (step 25) ------------------------------------------
+
+
+def test_feed_guid_is_matched_item_guid() -> None:
+    episode = resolver_for(default_server()).resolve(DAILY)
+    assert episode.feed_guid == DAILY_GUID
+    assert episode.published_date_only is False
+
+
+def test_feed_guid_none_when_feed_does_not_list_episode() -> None:
+    server = default_server()
+    server.feeds[DAILY_FEED] = _feed_without_item("feed_daily.xml", DAILY_GUID)
+    resolution = resolver_for(server).resolve_details(DAILY)
+    assert resolution.match is None
+    assert resolution.episode.feed_guid is None
+    assert resolution.episode.guid == DAILY_GUID  # Apple's guid still keys the cache
+
+
+def test_episode_key_unchanged_by_feed_guid() -> None:
+    # The same key as before step 25 (test_resolves_daily_episode): feed_guid is not part of it.
+    server = default_server()
+    with_item = resolver_for(server).resolve(DAILY)
+    server.feeds[DAILY_FEED] = _feed_without_item("feed_daily.xml", DAILY_GUID)
+    without_item = resolver_for(server).resolve(DAILY)
+    assert with_item.key == without_item.key == "f2faca69c9811409f6a6"
+    assert with_item.feed_guid != without_item.feed_guid
+
+
+def _built(*, date_only: bool, item_date: datetime | None, apple_date: datetime | None) -> Episode:
+    from earmark.models import EpisodeRef
+    from earmark.resolve.itunes import AppleEpisode, AppleShow
+    from earmark.resolve.resolver import _build_episode
+    from earmark.resolve.rss import Feed, FeedItem
+
+    ref = EpisodeRef(
+        source="apple_podcasts", show_id="1", episode_id="2", country="us", url="https://x/y"
+    )
+    show = AppleShow(show_id="1", title="S", feed_url="https://feed.example/f.xml")
+    apple = AppleEpisode(
+        episode_id="2",
+        guid="apple-guid",
+        title="T",
+        published_at=apple_date,
+        date_only=date_only,
+        duration_s=None,
+        audio_url=None,
+        description="",
+        subscriber_only=False,
+    )
+    item = FeedItem(
+        index=0,
+        guid="  feed-guid  ",
+        title="T",
+        published_at=item_date,
+        duration_s=None,
+        enclosure_url="https://a.example/a.mp3",
+        description="",
+    )
+    return _build_episode(ref, show, apple, Feed(title="S", items=(item,)), item, "https://a")
+
+
+def test_published_date_only_flag() -> None:
+    midnight = datetime(2026, 1, 2, tzinfo=UTC)
+    exact = datetime(2026, 1, 2, 7, 30, tzinfo=UTC)
+    # Apple's date-only publish time stays flagged when the feed has no better one.
+    only = _built(date_only=True, item_date=None, apple_date=midnight)
+    assert (only.published_at, only.published_date_only) == (midnight, True)
+    # A feed item with a real time replaces it, and the flag goes.
+    replaced = _built(date_only=True, item_date=exact, apple_date=midnight)
+    assert (replaced.published_at, replaced.published_date_only) == (exact, False)
+    # A full Apple time is never flagged.
+    full = _built(date_only=False, item_date=exact, apple_date=exact)
+    assert full.published_date_only is False
+    assert full.feed_guid == "feed-guid"  # stripped by valid_guid
+    assert full.guid == "apple-guid"

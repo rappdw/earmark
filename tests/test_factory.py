@@ -9,9 +9,15 @@ from pydantic import SecretStr
 from earmark import config
 from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings, env_var
-from earmark.fakes import FakeAudioFetcher, FakeNotifier, FakeResolver, FakeTranscriber
+from earmark.fakes import (
+    FakeAudioFetcher,
+    FakeMailer,
+    FakeNotifier,
+    FakeResolver,
+    FakeTranscriber,
+)
 from earmark.pipeline import factory
-from tests.factories import new_podcast_job
+from tests.factories import TO, new_podcast_job
 
 SHARE = "https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981&uo=4"
 
@@ -19,6 +25,7 @@ FIELDS: dict[str, tuple[typing.Any, typing.Mapping[str, object]]] = {
     "resolver_backend": (config.ResolverBackend, factory.RESOLVERS),
     "fetch_backend": (config.FetchBackend, factory.FETCHERS),
     "asr_backend": (config.AsrBackend, factory.TRANSCRIBERS),
+    "mail_backend": (config.MailBackend, factory.MAILERS),
     "notify_backend": (config.NotifyBackend, factory.NOTIFIERS),
 }
 
@@ -76,6 +83,7 @@ def test_all_fake_builds_fakes(tmp_path: Path) -> None:
     assert isinstance(b.resolver, FakeResolver)
     assert isinstance(b.fetcher, FakeAudioFetcher)
     assert isinstance(b.transcriber, FakeTranscriber)
+    assert isinstance(b.mailer, FakeMailer)
     assert isinstance(b.notifier, FakeNotifier)
     none = factory.build_backends(_fake_settings(tmp_path, notify_backend="none"), artifacts)
     assert none.notifier is None
@@ -88,7 +96,7 @@ def test_registries_match_settings() -> None:
 
 
 def test_build_worker_runs_a_job(tmp_path: Path) -> None:
-    settings = _fake_settings(tmp_path)
+    settings = _fake_settings(tmp_path, allowed_recipients=(TO,))
     worker = factory.build_worker(settings)
     from earmark.jobs import open_job_store
 
@@ -212,3 +220,106 @@ def test_build_worker_sweeps_downloads(tmp_path: Path) -> None:
     assert sorted(p.name for p in downloads.iterdir()) == sorted(
         [f"{running}.mp3", f".{running}.mp3.abc.part"]
     )
+
+
+# -- the mail backend (step 25) ----------------------------------------------------------
+
+
+def test_mailers_registry_matches_literal() -> None:
+    assert set(factory.MAILERS) == set(typing.get_args(config.MailBackend)) == {"smtp", "fake"}
+
+
+def test_smtp_missing_settings_is_config_error(tmp_path: Path) -> None:
+    settings = _fake_settings(tmp_path, mail_backend="smtp")
+    with pytest.raises(ConfigError) as info:
+        factory.build_worker(settings)
+    errors = info.value.errors
+    assert [e.split(":")[0] for e in errors] == [
+        "EARMARK_SMTP_HOST",
+        "EARMARK_SMTP_FROM",
+        "EARMARK_SMTP_USERNAME",
+        "EARMARK_SMTP_PASSWORD",
+    ]
+    assert not (tmp_path / "data").exists()  # raised before the database was opened
+
+
+def test_smtp_complete_builds_without_connecting(tmp_path: Path) -> None:
+    from earmark.mail.smtp import SmtpMailer
+
+    settings = _fake_settings(
+        tmp_path,
+        mail_backend="smtp",
+        smtp_host="smtp.example.org",
+        smtp_username="mailer",
+        smtp_password=SecretStr("pw"),
+        smtp_from="earmark@example.org",
+    )
+    backends = factory.build_backends(settings, ArtifactStore(tmp_path / "data"))  # sockets blocked
+    assert isinstance(backends.mailer, SmtpMailer)
+    assert backends.mailer.sender == "earmark@example.org"
+    assert backends.mailer.options.port == 587
+
+
+def test_fake_mailer_writes_outbox(tmp_path: Path) -> None:
+    settings = _fake_settings(tmp_path, allowed_recipients=(TO,))
+    worker = factory.build_worker(settings)
+    from earmark.jobs import open_job_store
+
+    job = open_job_store(settings).enqueue(new_podcast_job(SHARE)).job
+    done = worker.run_once()
+    assert done is not None
+    assert done.delivery_state == "sent"
+    eml = tmp_path / "data" / "outbox" / f"{job.id}.eml"
+    assert eml.stat().st_mode & 0o777 == 0o600
+    assert f"Message-ID: <earmark.{job.id}@example.org>".encode() in eml.read_bytes()
+    assert b"From: earmark@example.org\r\n" in eml.read_bytes()  # FAKE_SENDER
+    custom = _fake_settings(tmp_path / "other", smtp_from="me@example.net")
+    mailer = factory.build_backends(custom, ArtifactStore(tmp_path / "other" / "data")).mailer
+    assert mailer.sender == "me@example.net"
+
+
+def test_build_worker_logs_mail_backend(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level("INFO", logger="earmark.pipeline.factory"):
+        factory.build_worker(_fake_settings(tmp_path))
+    assert "backends: resolver=fake fetch=fake asr=fake mail=fake notify=fake" in caplog.text
+
+
+def test_build_worker_passes_recipient_policy(tmp_path: Path) -> None:
+    from earmark.jobs import open_job_store
+
+    settings = _fake_settings(tmp_path, allowed_recipients=("someone.else@example.org",))
+    worker = factory.build_worker(settings)
+    open_job_store(settings).enqueue(new_podcast_job(SHARE))  # to=TO, no longer allowed
+    job = worker.run_once()
+    assert job is not None
+    assert job.status == "failed"
+    assert job.error is not None
+    assert "EARMARK_ALLOWED_RECIPIENTS" in job.error
+    outbox = tmp_path / "data" / "outbox"
+    assert not outbox.exists() or not list(outbox.iterdir())
+
+
+def test_build_worker_passes_clock_and_attachment_cap(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from earmark.jobs import open_job_store
+
+    settings = _fake_settings(tmp_path, allowed_recipients=(TO,))
+    at = datetime(2030, 5, 6, 7, 8, 9, tzinfo=UTC)
+    worker = factory.build_worker(settings, clock=lambda: at)
+    open_job_store(settings, clock=lambda: at).enqueue(new_podcast_job(SHARE))
+    job = worker.run_once()
+    assert job is not None
+    [eml] = (tmp_path / "data" / "outbox").iterdir()
+    assert b"Date: Mon, 06 May 2030 07:08:09 +0000\r\n" in eml.read_bytes()
+    assert settings.max_attachment_mb == 10
+
+
+def test_factory_does_not_import_smtp_module() -> None:
+    code = (
+        "import sys\n"
+        "import earmark.pipeline.factory\n"
+        "print(sorted(m for m in ('earmark.mail.smtp', 'smtplib') if m in sys.modules))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "[]"

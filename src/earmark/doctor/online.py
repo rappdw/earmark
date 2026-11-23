@@ -19,6 +19,7 @@ from earmark.doctor.report import CheckResult, doctor_secrets
 from earmark.endpoint import error_detail, host_label
 from earmark.errors import EarmarkError
 from earmark.fetch import USER_AGENT, BlockedAddressError, GuardedFetcher
+from earmark.mail.smtp import DEFAULT_CONTEXT_FACTORY, SmtpMailer, SmtpOptions
 from earmark.notify.ntfy import NtfyAuthError, NtfyClient, NtfyOptions
 from earmark.resolve.itunes import LOOKUP_URL
 
@@ -177,6 +178,12 @@ def run_online(
             )
         else:
             results.append(skipped("asr server"))
+    if s.mail_backend == "smtp":
+        results.append(
+            guarded("smtp", lambda: smtp_login(s, probes))
+            if _needs_ok(offline, "mail")
+            else skipped("smtp")
+        )
     if s.notify_backend == "ntfy" and s.ntfy_url is not None:
         if _needs_ok(offline, "notify"):
             server, token = ntfy_checks(s, probes)
@@ -186,6 +193,26 @@ def run_online(
         else:
             results.append(skipped("ntfy server"))
     return results
+
+
+def smtp_login(settings: Settings, probes: Probes) -> CheckResult:
+    """Log in to the SMTP server and quit. Sends no MAIL, RCPT or DATA."""
+    name = "smtp"
+    options = SmtpOptions.from_settings(settings)
+    mailer = SmtpMailer(
+        options,
+        socket_factory=probes.smtp_socket_factory,
+        context_factory=probes.smtp_context_factory or DEFAULT_CONTEXT_FACTORY,
+    )
+    try:
+        report = mailer.check_login(timeout_s=min(probes.timeout_s, options.timeout_s))
+    except EarmarkError as exc:
+        return CheckResult(name, "fail", exc.message)
+    return CheckResult(
+        name,
+        "ok",
+        f"{options.host}:{options.port}: {report.tls_version}, login accepted, nothing sent",
+    )
 
 
 def apple_lookup(settings: Settings, probes: Probes) -> CheckResult:

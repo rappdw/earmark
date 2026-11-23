@@ -2,7 +2,7 @@ import random
 import subprocess
 import sys
 import unicodedata
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import yaml
@@ -13,6 +13,7 @@ from earmark.sanitize import (
     emit_frontmatter,
     file_component,
     fit_bytes,
+    fit_chars,
     is_safe_component,
     yaml_quote,
 )
@@ -205,26 +206,43 @@ def test_emit_frontmatter_shapes() -> None:
             ("a", 'x: "y"'),
             ("b", None),
             ("c", date(2026, 1, 2)),
-            ("d", datetime(2026, 1, 2, 3, 4, 5, 999)),  # noqa: DTZ001  # naive by design
-            ("e", ()),
+            ("d", datetime(2026, 1, 2, 3, 4, 5, 999, tzinfo=timezone(timedelta(hours=-8)))),
+            ("e", 1),
             ("f", ("p", "q")),
+            ("g", 0),
         ]
     )
     assert lines == [
         'a: "x: \\"y\\""\n',
-        "b: null\n",
         "c: 2026-01-02\n",
-        "d: 2026-01-02T03:04:05\n",
-        "e: []\n",
+        "d: 2026-01-02T03:04:05-08:00\n",
+        "e: 1\n",
         "f:\n",
         '  - "p"\n',
         '  - "q"\n',
+        "g: 0\n",
     ]
-    with pytest.raises(ValueError, match="naive"):
-        emit_frontmatter([("a", datetime(2026, 1, 1, tzinfo=UTC))])
+    naive = datetime(2026, 1, 1)  # noqa: DTZ001  # naive on purpose: it must be refused
+    with pytest.raises(ValueError, match="aware"):
+        emit_frontmatter([("a", naive)])
+    for refused in (True, False, "", ()):
+        with pytest.raises(ValueError, match="must not be"):
+            emit_frontmatter([("a", refused)])
     for bad in ("A", "1a", "a-b", "", "a b"):
         with pytest.raises(ValueError, match="key"):
             emit_frontmatter([(bad, "x")])
+
+
+def test_fit_chars() -> None:
+    assert fit_chars("abc", 3) == "abc"
+    assert fit_chars("abcd", 3) == "ab…"
+    assert fit_chars("", 2) == ""
+    assert len(fit_chars("x" * 500, 300)) == 300
+    # A cut that would leave a dangling accent or joiner is repaired.
+    assert fit_chars("ab\u0301cd", 4) == "ab…"
+    assert fit_chars("ab\u200dcd", 4) == "ab…"
+    with pytest.raises(ValueError, match="max_chars"):
+        fit_chars("abc", 1)
 
 
 def test_sanitize_is_stdlib_only() -> None:

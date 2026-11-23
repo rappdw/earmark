@@ -10,9 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from earmark.fakes import FakeNotifier, make_fake_backends
+from earmark.fakes import FakeMailer, FakeNotifier, make_fake_backends
 from earmark.models import Episode, Job
 from earmark.pipeline.runner import Pipeline
+from earmark.pipeline.stages import OutgoingMail
 from earmark.pipeline.worker import Heartbeat, Worker, heartbeat_interval
 from tests.factories import make_episode, new_podcast_job, new_upload_job, new_url_job
 from tests.pipeline_env import (
@@ -321,3 +322,62 @@ def test_run_forever_processes_then_stops(tmp_path: Path) -> None:
         timer.cancel()
         timer.join()
     assert _stored(env, enqueued.job).status == "done"
+
+
+# -- delivery and shutdown (step 25) -----------------------------------------------------
+
+
+class _SignalingMailer(FakeMailer):
+    """Sends itself SIGTERM in the middle of delivery, then finishes the send."""
+
+    def send(self, mail: OutgoingMail) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+        super().send(mail)
+
+
+def test_sigterm_during_delivery_finishes(tmp_path: Path) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+    mailer = _SignalingMailer()
+    env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), mailer=mailer))
+    first = env.jobs.enqueue(new_podcast_job(CANON, instructions="one")).job
+    second = env.jobs.enqueue(new_podcast_job(CANON, instructions="two")).job
+    before = signal.getsignal(signal.SIGTERM)
+    env.worker.run_forever()
+    assert signal.getsignal(signal.SIGTERM) is before
+    done = _stored(env, first)
+    assert (done.status, done.delivery_state) == ("done", "sent")
+    assert mailer.call_count == 1
+    assert fakes.notifier.call_count == 1
+    left = _stored(env, second)
+    assert (left.status, left.attempts, left.delivery_state) == ("queued", 0, None)
+
+
+class _SignalingSender(FakeMailer):
+    """Signals from the ``sender`` property, which the runner reads while composing."""
+
+    @property
+    def sender(self) -> str:
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(5)
+        return "earmark@example.org"
+
+    @sender.setter
+    def sender(self, value: str) -> None:
+        pass
+
+
+def test_sigterm_while_composing_releases_the_job(tmp_path: Path) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+    mailer = _SignalingSender()
+    env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), mailer=mailer))
+    queued = env.jobs.enqueue(new_podcast_job(CANON)).job
+    started = time.monotonic()
+    with env.worker.handle_signals():
+        job = env.worker.run_once()
+    assert time.monotonic() - started < 2
+    assert job is not None
+    assert (job.id, job.status, job.attempts, job.stage) == (queued.id, "queued", 0, "deliver")
+    assert job.delivery_state is None
+    assert mailer.call_count == 0
+    assert env.fakes.notifier.call_count == 0

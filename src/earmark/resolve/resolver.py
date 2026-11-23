@@ -186,12 +186,14 @@ def _build_episode(
         or f"Show {ref.show_id}"
     )
     published_at = apple.published_at
+    date_only = apple.date_only
     if (
         item is not None
         and item.published_at is not None
         and (published_at is None or apple.date_only)
     ):
         published_at = item.published_at
+        date_only = False
     duration_s = apple.duration_s
     if duration_s is None and item is not None:
         duration_s = item.duration_s
@@ -214,6 +216,8 @@ def _build_episode(
         feed_url=show.feed_url,
         url=ref.url,
         description=description,
+        feed_guid=valid_guid(item.guid) if item else None,
+        published_date_only=date_only,
     )
 
 

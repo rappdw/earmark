@@ -5,11 +5,12 @@ Shortcut sends it a podcast episode or a piece of audio, a worker transcribes it
 transcript goes to the operator's PKA instances, which do the analysis and filing, each
 with its own context. earmark itself files nothing.
 
-Today (after step 22) a request is an Apple Podcasts episode link. The worker resolves
-the audio, transcribes it, caches the transcript, and sends an ntfy push. Steps 24–26 add
-uploads and direct audio URLs with a destination address and instructions, delivery by
-email as two Markdown attachments, and GPU transcription inside the image. Their
-contracts are in "Planned (steps 24–26)" in `docs/ARCHITECTURE.md`.
+Today (after step 25) a request is an Apple Podcasts episode link, a direct audio URL, or
+an uploaded file, with a destination address and instructions. The worker resolves or
+downloads the audio, transcribes it, caches the transcript, emails the transcript note and
+the instructions to the destination as two Markdown attachments, and sends an ntfy push.
+Step 26 adds GPU transcription inside the image. Its contract is in "Planned (step 26)" in
+`docs/ARCHITECTURE.md`.
 
 ## Status
 
@@ -18,9 +19,8 @@ assuming a module exists.
 
 - `docs/ARCHITECTURE.md`: the design. Decisions, module layout, contracts, data layout,
   config, security rules. This is the source of truth for how pieces fit; update it in
-  the same change whenever a contract changes. Its "Planned (steps 24–26)" section holds
-  what those steps build against, including the operator's decisions and the mail
-  contract.
+  the same change whenever a contract changes. Its "Planned (step 26)" section holds
+  what that step builds against.
 - `docs/PLAN.md`: the ordered steps, their acceptance criteria, and the build loop. Its
   "Re-scope" section is the record of the operator's decisions and the mail contract.
 - `docs/steps/NN-<slug>.md`: the detailed plan written for each step when it is dispatched.
@@ -40,7 +40,7 @@ green, `main` is fast-forwarded to that commit. Do not push otherwise without be
 uv sync                      # install (add --extra transcribe for local Whisper)
 make check                   # the gate: ruff check + ruff format --check + mypy + pytest
 uv run pytest tests/test_jobs.py -k claim     # one test
-uv run pytest -m network     # opt-in tests (markers: network, slow, gpu); publishes to ntfy.sh
+uv run pytest -m network     # opt-in tests (markers: network, slow, gpu, smtp); publishes to ntfy.sh
 uv run earmark serve         # the API
 uv run earmark worker        # job runner (--once to drain one job)
 uv run earmark doctor        # check config and backends
@@ -53,10 +53,8 @@ configuration to make it pass.
 
 ```
 POST /transcriptions ─► jobs table (SQLite) ─► worker ─► Pipeline
-  resolve ─► fetch ─► transcribe ─► notify
+  resolve ─► fetch ─► transcribe ─► deliver ─► notify
 ```
-
-Planned: email delivery runs between transcribe and notify (step 25).
 
 - Every stage is a `Protocol` in `earmark/pipeline/stages.py` with a real backend and a
   fake in `earmark/fakes.py`. Backends are chosen by config in

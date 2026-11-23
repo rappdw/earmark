@@ -1,6 +1,7 @@
 """Settings: EARMARK_* environment variables, then .env, then defaults."""
 
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Final, Literal
 from urllib.parse import urlsplit
@@ -14,6 +15,8 @@ ResolverBackend = Literal["apple", "fake"]
 FetchBackend = Literal["http", "fake"]
 AsrBackend = Literal["faster_whisper", "remote", "fake"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
+MailBackend = Literal["smtp", "fake"]
+SmtpSecurity = Literal["starttls", "tls"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 AsrDevice = Literal["auto", "cpu", "cuda"]
 AsrComputeType = Literal[
@@ -28,6 +31,13 @@ AsrComputeType = Literal[
     "bfloat16",
     "float32",
 ]
+
+SMTP_DEFAULT_PORTS: Final[Mapping[str, int]] = {"starttls": 587, "tls": 465}
+SMTP_TIMEOUT_MAX_S: Final = 90.0
+# The worker's stop grace (compose stop_grace_period, systemd TimeoutStopSec) must be at least
+# SMTP_TIMEOUT_MAX_S + WORKER_STOP_MARGIN_S. The margin covers the push (ntfy: 5 s connect,
+# 10 s write, 10 s read) and the job-store writes. tests/test_deploy.py pins this.
+WORKER_STOP_MARGIN_S: Final = 30.0
 
 ENV_PREFIX: Final = "EARMARK_"
 REDACTED: Final = "**********"
@@ -66,6 +76,7 @@ class Settings(BaseSettings):
     fetch_backend: FetchBackend = Field("http", description="Audio/feed fetcher.")
     asr_backend: AsrBackend = Field("faster_whisper", description="Transcription backend.")
     notify_backend: NotifyBackend = Field("ntfy", description="Notifier.")
+    mail_backend: MailBackend = Field("smtp", description="Mail sender.")
     asr_model: str = Field("large-v3", description="Whisper model name.")
     asr_device: AsrDevice = Field("auto", description="Whisper device.")
     asr_compute_type: AsrComputeType = Field("auto", description="Whisper compute type.")
@@ -97,6 +108,20 @@ class Settings(BaseSettings):
     job_max_attempts: int = Field(4, ge=1, description="Attempts before a job fails.")
     job_lease_seconds: int = Field(900, gt=0, description="Job lease duration.")
     worker_poll_seconds: float = Field(2.0, gt=0, description="Worker poll interval.")
+    smtp_host: str | None = Field(None, description="SMTP submission server host name.")
+    smtp_port: int | None = Field(
+        None, ge=1, le=65535, description="SMTP port (default 587, or 465 for tls)."
+    )
+    smtp_security: SmtpSecurity = Field("starttls", description="starttls or tls (implicit).")
+    smtp_username: str | None = Field(None, description="SMTP login name.")
+    smtp_password: SecretStr | None = Field(None, description="SMTP login password.")
+    smtp_from: str | None = Field(None, description="The sender address (the From header).")
+    smtp_timeout_s: float = Field(
+        60.0, gt=0, le=SMTP_TIMEOUT_MAX_S, description="Whole-session SMTP deadline (seconds)."
+    )
+    max_attachment_mb: int = Field(
+        10, gt=0, description="Cap on the transcript and instructions together (MiB)."
+    )
     log_level: LogLevel = Field("INFO", description="Log level.")
 
     @field_validator("log_level", mode="before")
@@ -206,6 +231,55 @@ class Settings(BaseSettings):
             )
         return SecretStr(url[:-1] if url.endswith("/") else url)
 
+    @field_validator("smtp_security", mode="before")
+    @classmethod
+    def _lower_smtp_security(cls, v: object) -> object:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("smtp_host")
+    @classmethod
+    def _check_smtp_host(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v or any(c.isspace() for c in v) or "/" in v or "@" in v or "://" in v:
+            raise ValueError("must be a host name such as smtp.example.org")
+        return v
+
+    @field_validator("smtp_username")
+    @classmethod
+    def _check_smtp_username(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if not all("!" <= c <= "~" for c in v):
+            raise ValueError("must be printable ASCII without spaces")
+        return v
+
+    @field_validator("smtp_password")
+    @classmethod
+    def _check_smtp_password(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None:
+            return None
+        stripped = v.get_secret_value().strip()
+        if not stripped:
+            return None
+        if not all(" " <= c <= "~" for c in stripped):
+            raise ValueError("must be printable ASCII (spaces allowed), without control characters")
+        return SecretStr(stripped)
+
+    @field_validator("smtp_from")
+    @classmethod
+    def _check_smtp_from(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            return normalize_address(v)
+        except ValueError:
+            raise ValueError("must be one email address") from None
+
     @field_validator("asr_api_key", "ntfy_token")
     @classmethod
     def _check_api_key(cls, v: SecretStr | None) -> SecretStr | None:
@@ -217,6 +291,10 @@ class Settings(BaseSettings):
         if not all("!" <= c <= "~" for c in stripped):
             raise ValueError("must be printable ASCII without spaces")
         return SecretStr(stripped)
+
+    @property
+    def smtp_port_effective(self) -> int:
+        return self.smtp_port or SMTP_DEFAULT_PORTS[self.smtp_security]
 
     def recipient_policy(self) -> RecipientPolicy:
         return RecipientPolicy.from_setting(self.allowed_recipients)

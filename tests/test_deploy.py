@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 import yaml
 
-from earmark.config import Settings, env_var
+from earmark.config import SMTP_TIMEOUT_MAX_S, WORKER_STOP_MARGIN_S, Settings, env_var
 from tests.doc_helpers import ROOT, read_doc
 
 DOCKERFILE = (ROOT / "Dockerfile").read_text()
@@ -251,6 +251,20 @@ def test_compose_worker_stop_grace() -> None:
     assert match
     seconds = int(match[1]) * (60 if match[2] == "m" else 1)
     assert seconds >= 60
+
+
+def test_smtp_timeout_below_worker_stop_grace() -> None:
+    """A SIGTERM during delivery waits for the SMTP session, so the grace must cover it."""
+    needed = SMTP_TIMEOUT_MAX_S + WORKER_STOP_MARGIN_S
+    match = re.fullmatch(r"(\d+)(s|m)", SERVICES["worker"]["stop_grace_period"])
+    assert match
+    assert int(match[1]) * (60 if match[2] == "m" else 1) >= needed
+    unit = _parse_unit(ROOT / "deploy" / "systemd" / UNITS["worker"])
+    [timeout] = unit["Service"]["TimeoutStopSec"]
+    assert int(timeout) >= needed
+    Settings(_env_file=None, smtp_timeout_s=SMTP_TIMEOUT_MAX_S)
+    with pytest.raises(ValueError, match="smtp_timeout_s"):
+        Settings(_env_file=None, smtp_timeout_s=SMTP_TIMEOUT_MAX_S + 1)
 
 
 def test_compose_hardening() -> None:

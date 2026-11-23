@@ -97,6 +97,7 @@ class OfflineChecks:
         if s.asr_backend == "faster_whisper" and asr.status == "ok":
             results.append(guarded("asr libraries", self.asr_libraries))
             results.append(guarded("asr model", self.asr_model))
+        results.append(guarded("mail", self.mail))
         results.append(guarded("notify", self.notify))
         return results
 
@@ -299,6 +300,27 @@ class OfflineChecks:
             "warn",
             f"{options.model} is not downloaded yet; the worker downloads it on the first "
             "transcription (into EARMARK_ASR_MODEL_DIR or the Hugging Face cache)",
+        )
+
+    def mail(self) -> CheckResult:
+        from earmark.pipeline.factory import MAILERS
+
+        s = self.settings
+        if s.mail_backend == "fake":
+            return CheckResult("mail", "warn", "fake mailer (for tests): nothing is sent")
+        try:
+            built = MAILERS[s.mail_backend](self._context())
+        except ConfigError as exc:
+            return CheckResult("mail", "fail", config_text(exc))
+        close_quietly(built)
+        from earmark.mail.smtp import SmtpOptions
+
+        options = SmtpOptions.from_settings(s)
+        return CheckResult(
+            "mail",
+            "ok",
+            f"smtp to {options.host}:{options.port} ({options.security}), "
+            f"from @{options.local_hostname}, timeout {options.timeout_s:g} s",
         )
 
     def notify(self) -> CheckResult:

@@ -43,14 +43,21 @@ def make_env(
     backends: Backends | None = None,
     store_type: type[JobStore] = JobStore,
     fakes: FakeBackends | None = None,
+    **pipeline_kwargs: Any,
 ) -> PipelineEnv:
     clock = MutableClock()
     db = open_database(tmp_path / "data" / "earmark.db")
     jobs = store_type(db, clock=clock, max_attempts=max_attempts, lease=timedelta(seconds=lease_s))
     fakes = fakes or make_fake_backends(tmp_path / "data")
     staging = Staging(tmp_path / "data")
+    pipeline_kwargs.setdefault("clock", clock)
     pipeline = Pipeline(
-        backends or fakes.backends(), fakes.artifacts, jobs, staging=staging, secrets=(SECRET,)
+        backends or fakes.backends(),
+        fakes.artifacts,
+        jobs,
+        staging=staging,
+        secrets=(SECRET,),
+        **pipeline_kwargs,
     )
     worker = Worker(jobs, pipeline, poll_seconds=0.01, heartbeat_seconds=heartbeat_s)
     return PipelineEnv(clock, jobs, fakes, pipeline, worker, staging)

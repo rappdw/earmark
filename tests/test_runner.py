@@ -228,11 +228,11 @@ def test_stage_order_and_inputs(tmp_path: Path) -> None:
     env = make_env(tmp_path, store_type=CountingJobStore)
     env.jobs.enqueue(new_podcast_job(CANON, instructions="why?"))
     job = _run(env)
-    assert counting_store(env).stages == ["resolve", "fetch", "transcribe"]
+    assert counting_store(env).stages == ["resolve", "fetch", "transcribe", "deliver"]
     key = job.episode_key
     assert key is not None
     assert env.fakes.transcriber.calls[0].audio == env.fakes.artifacts.find_audio(key)
-    assert job.stage == "transcribe"
+    assert job.stage == "deliver"
 
 
 def test_stage_order_cached_transcript(tmp_path: Path) -> None:
@@ -241,7 +241,7 @@ def test_stage_order_cached_transcript(tmp_path: Path) -> None:
     store = counting_store(env)
     store.stages.clear()
     _enqueue_and_run(env, "again?")
-    assert store.stages == ["resolve"]
+    assert store.stages == ["resolve", "deliver"]
 
 
 def test_notifier_none(tmp_path: Path) -> None:
@@ -481,7 +481,7 @@ def test_direct_url_stage_order_and_fields(tmp_path: Path) -> None:
     env = make_env(tmp_path, store_type=CountingJobStore)
     env.jobs.enqueue(new_url_job(AUDIO_URL, title="My clip"))
     job = _run(env)
-    assert counting_store(env).stages == ["resolve", "fetch", "transcribe"]
+    assert counting_store(env).stages == ["resolve", "fetch", "transcribe", "deliver"]
     assert job.status == "done"
     assert job.episode_key is not None
     episode = env.fakes.artifacts.read_episode(job.episode_key)
@@ -500,7 +500,7 @@ def test_cached_url_transcript_skips_transcribe_stage(tmp_path: Path) -> None:
     store.stages.clear()
     env.jobs.enqueue(new_url_job(AUDIO_URL, to="b@example.org"))
     _run(env)
-    assert store.stages == ["resolve", "fetch"]
+    assert store.stages == ["resolve", "fetch", "deliver"]
 
 
 def test_two_urls_same_bytes_share_transcript(tmp_path: Path) -> None:
@@ -557,7 +557,7 @@ def test_upload_transcribes_without_fetching(tmp_path: Path) -> None:
     env = make_env(tmp_path, store_type=CountingJobStore)
     _enqueue_upload(env, title="Voice memo")
     job = _run(env)
-    assert counting_store(env).stages == ["resolve", "transcribe"]
+    assert counting_store(env).stages == ["resolve", "transcribe", "deliver"]
     assert job.status == "done"
     assert env.fakes.fetcher.call_count == 0
     assert env.fakes.resolver.call_count == 0

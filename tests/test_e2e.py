@@ -13,6 +13,7 @@ from earmark.fakes import ResolveCall
 from earmark.models import JobResult, content_key
 from earmark.notify.ntfy import compose
 from tests.factories import TO
+from tests.mail_helpers import assert_note_hash_verifies, parse_mail
 from tests.pipeline_env import CANON, PipelineEnv, make_env
 
 TOKEN = "e2e-token-1a2b3c"
@@ -60,10 +61,19 @@ def test_podcast_request_transcribes_on_fakes(
     assert key is not None
     assert (job.status, job.stage, job.error, job.source) == (
         "done",
-        "transcribe",
+        "deliver",
         None,
         "apple_podcasts",
     )
+    assert job.delivery_state == "sent"
+    assert job.sent_at is not None
+    [mail] = env.fakes.mailer.calls
+    assert mail.recipient == TO
+    parsed = parse_mail(mail.data)
+    front = assert_note_hash_verifies(parsed.note)
+    assert front["title"] == "Fake episode " + front["guid"].rsplit(":", 1)[-1][:6]
+    assert parsed.note_name == mail.note_filename
+    assert parsed.instructions.endswith(b"---\n" + instructions.encode())
     assert job.result == JobResult(duration_s=900.0)
     assert job.to == TO
     assert job.instructions == instructions
@@ -86,13 +96,13 @@ def test_podcast_request_transcribes_on_fakes(
 
     note = compose(notify_call.job, notify_call.episode)
     assert note is not None
-    assert note.title == "Transcribed: " + episode.title
+    assert note.title == "Sent: " + episode.title
     assert "Duration: 00:15:00" in note.message
     for text in (note.title, note.message):
         assert "://" not in text
         assert "podcasts.apple.com" not in text
         assert instructions not in text
-        assert "@" not in text
+        assert TO not in text
 
 
 def test_direct_url_request_transcribes_on_fakes(
@@ -118,7 +128,9 @@ def test_direct_url_request_transcribes_on_fakes(
     [call] = env.fakes.notifier.calls
     note = compose(call.job, call.episode)
     assert note is not None
-    assert note.title == "Transcribed: A clip"
+    assert note.title == "Sent: A clip"
+    assert (job.delivery_state, env.fakes.mailer.call_count) == ("sent", 1)
+    assert_note_hash_verifies(parse_mail(env.fakes.mailer.calls[0].data).note)
     assert "audio.example.net" in note.message
     assert "/shows/" not in note.title + note.message
 
@@ -147,6 +159,9 @@ def test_upload_request_transcribes_on_fakes(
     assert list((tmp_path / "data" / "uploads").iterdir()) == []  # retention: gone when done
     [call] = env.fakes.notifier.calls
     assert call.job.status == "done"
+    assert (job.delivery_state, env.fakes.mailer.call_count) == ("sent", 1)
+    assert env.fakes.mailer.calls[0].recipient == TO
+    assert_note_hash_verifies(parse_mail(env.fakes.mailer.calls[0].data).note)
 
 
 def test_run_once_empty_queue(tmp_path: Path) -> None:

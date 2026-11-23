@@ -6,9 +6,11 @@ import pytest
 
 from earmark.errors import PermanentError, TransientError
 from earmark.fakes import (
+    FAKE_SENDER,
     DownloadCall,
     FakeAudioFetcher,
     FakeBackends,
+    FakeMailer,
     FakeNotifier,
     FakeResolver,
     FakeTranscriber,
@@ -18,6 +20,7 @@ from earmark.fakes import (
     make_fake_backends,
 )
 from earmark.models import Episode, Transcript
+from earmark.pipeline.stages import OutgoingMail
 from tests.factories import make_episode, make_job
 
 URL = "https://podcasts.apple.com/us/podcast/x/id1?i=2"
@@ -237,3 +240,60 @@ def test_fake_transcriber_cache_follows_profile(tmp_path: Path) -> None:
     legacy = transcript.model_copy(update={"asr_profile": None})
     fb.artifacts.write_transcript(legacy)
     assert fb.transcriber.cached(ep) is None
+
+
+def _mail(job_id: str = "a" * 32, data: bytes = b"Subject: x\r\n\r\nbody\r\n") -> OutgoingMail:
+    return OutgoingMail(
+        job_id=job_id,
+        message_id=f"<earmark.{job_id}@example.org>",
+        sender=FAKE_SENDER,
+        recipient="you@example.org",
+        data=data,
+        note_filename="n.md",
+        instructions_filename="n.instructions.md",
+    )
+
+
+def test_fake_mailer_records_and_fails_on_request() -> None:
+    mailer = FakeMailer()
+    assert mailer.sender == FAKE_SENDER
+    mail = _mail()
+    mailer.send(mail)
+    assert mailer.calls == [mail]
+    mailer.fail_next(TransientError("later"))
+    with pytest.raises(TransientError, match="later"):
+        mailer.send(mail)
+    assert mailer.call_count == 2
+    mailer.send(mail)
+    assert mailer.call_count == 3
+    assert FakeMailer(sender="me@example.net").sender == "me@example.net"
+
+
+def test_fake_mailer_outbox_is_private_and_overwritten_on_resend(tmp_path: Path) -> None:
+    outbox = tmp_path / "outbox"
+    mailer = FakeMailer(outbox=outbox)
+    mailer.send(_mail(data=b"first\r\n"))
+    path = outbox / f"{'a' * 32}.eml"
+    assert path.read_bytes() == b"first\r\n"
+    assert path.stat().st_mode & 0o777 == 0o600
+    mailer.send(_mail(data=b"second\r\n"))  # a resend of the same job
+    assert path.read_bytes() == b"second\r\n"
+    assert [p.name for p in outbox.iterdir()] == [path.name]
+    failing = FakeMailer(outbox=outbox)
+    failing.fail_next(PermanentError("no"))
+    with pytest.raises(PermanentError):
+        failing.send(_mail(job_id="b" * 32))
+    assert not (outbox / f"{'b' * 32}.eml").exists()  # nothing is written for a failed send
+
+
+def test_fake_backends_carry_a_mailer(tmp_path: Path) -> None:
+    fb = make_fake_backends(tmp_path / "data")
+    assert fb.backends().mailer is fb.mailer
+    assert fb.mailer.sender == FAKE_SENDER
+    assert not (tmp_path / "data" / "outbox").exists()  # the test fake keeps mail in memory only
+
+
+def test_fake_resolver_sets_feed_guid() -> None:
+    episode = FakeResolver().resolve(URL)
+    assert episode.feed_guid == episode.guid
+    assert episode.published_date_only is False

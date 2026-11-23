@@ -719,8 +719,8 @@ def test_job_view_fields(client: TestClient) -> None:
         assert hidden not in view
     assert set(view) == {
         "id", "status", "stage", "source", "url", "to", "instructions", "title", "episode_key",
-        "attempts", "run_after", "error", "warnings", "result", "shared_at", "created_at",
-        "updated_at",
+        "attempts", "run_after", "error", "warnings", "result", "delivery_state", "sent_at",
+        "shared_at", "created_at", "updated_at",
     }  # fmt: skip
     assert view["to"] == TO
 
@@ -795,3 +795,61 @@ def test_create_app_sweeps_stale_uploads(settings: Settings, store: JobStore) ->
     store.enqueue(new_upload_job("d" * 64, upload_file=kept))
     create_app(settings, store=store)
     assert [p.name for p in uploads.iterdir()] == [kept]
+
+
+# -- the requester's offset and delivery (step 25) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "minutes"),
+    [
+        ("2026-03-04T05:06:07-08:00", -480),
+        ("2026-03-04T05:06:07Z", 0),
+        ("2026-03-04T05:06:07+0530", 330),
+    ],
+)
+def test_timestamp_offset_reaches_job(
+    client: TestClient, store: JobStore, timestamp: str, minutes: int
+) -> None:
+    job_id = _ingest(client, timestamp=timestamp).json()["job_id"]
+    job = store.get(job_id)
+    assert job is not None
+    assert job.utc_offset_min == minutes
+    upload = client.post(
+        "/transcriptions",
+        files={"file": ("a.mp3", b"ID3" + bytes(100), "audio/mpeg")},
+        data={"to": TO, "timestamp": timestamp},
+    )
+    stored = store.get(upload.json()["job_id"])
+    assert stored is not None
+    assert stored.utc_offset_min == minutes
+
+
+def test_no_timestamp_means_no_offset(client: TestClient, store: JobStore) -> None:
+    job = store.get(_ingest(client).json()["job_id"])
+    assert job is not None
+    assert job.utc_offset_min is None
+
+
+def test_job_view_shows_delivery_state_and_sent_at(
+    client: TestClient, store: JobStore, clock: MutableClock
+) -> None:
+    from earmark.models import JobResult
+
+    job_id = _ingest(client).json()["job_id"]
+    queued = _view(client, job_id)
+    assert (queued["delivery_state"], queued["sent_at"]) == (None, None)
+    claim = store.claim_next()
+    assert claim is not None
+    store.mark_sending(claim, "<earmark.secret-message-id@example.org>")
+    sending = _view(client, job_id)
+    assert (sending["delivery_state"], sending["sent_at"]) == ("sending", None)
+    clock.advance(30)
+    store.complete_sent(claim, JobResult(duration_s=1.0))
+    sent = _view(client, job_id)
+    assert sent["delivery_state"] == "sent"
+    assert sent["sent_at"] == "2026-01-01T12:00:30Z"
+    assert sent["status"] == "done"
+    assert "message_id" not in sent
+    assert "resent" not in sent
+    assert "secret-message-id" not in json.dumps(sent)

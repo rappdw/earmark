@@ -2,6 +2,7 @@
 
 import io
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from tests.factories import new_podcast_job, new_upload_job, new_url_job
 from tests.http_helpers import mock_fetcher
 from tests.ntfy_stub import PUBLISHED, TOPIC_URL, json_reply
 from tests.pipeline_env import CANON, PipelineEnv, make_env
+from tests.smtp_stub import SmtpStub, stub_factory, trusted_test_context
 
 pytestmark = pytest.mark.usefixtures("restore_root_logging", "restore_library_loggers")
 
@@ -210,8 +212,10 @@ def test_push_has_no_instructions_url_path_or_address(
 ) -> None:
     text = _push_for(tmp_path, source, status)
     assert text
-    for token in ("INSTR-TOKEN", "summarise", SECRET_TO, "zelda", "@", *URL_TOKENS):
+    for token in ("INSTR-TOKEN", "summarise", SECRET_TO, "zelda", *URL_TOKENS):
         assert token not in text
+    assert text.count("@") == text.count("To: z…@example.org")
+    assert "To: z…@example.org" in text
     if source == "url":
         assert "audio.example.net" in text
 
@@ -236,3 +240,90 @@ def test_failed_push_scrubs_urls_from_the_reason(tmp_path: Path) -> None:
     assert "Reason:" in text
     assert "PATH-TOKEN" not in text
     assert "QUERY-TOKEN" not in text
+
+
+# -- the SMTP password (step 25) ---------------------------------------------------------
+
+SMTP_PASSWORD = "abcd efgh ijkl mnop"
+make_stub = pytest.fixture(stub_factory)
+
+
+def _smtp_settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "mail_backend": "smtp",
+        "smtp_host": "smtp.test",
+        "smtp_username": "mailer",
+        "smtp_password": SecretStr(SMTP_PASSWORD),
+        "smtp_from": "earmark@example.org",
+        "resolver_backend": "fake",
+        "fetch_backend": "fake",
+        "asr_backend": "fake",
+        "notify_backend": "fake",
+        "api_token": SecretStr(TOKEN),
+        "data_dir": tmp_path / "data",
+        "allowed_recipients": (OTHER_TO,),
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)  # type: ignore[arg-type]
+
+
+def test_smtp_password_never_leaks(
+    tmp_path: Path,
+    log_stream: io.StringIO,
+    make_stub: Callable[..., SmtpStub],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    from earmark.cli import app
+    from earmark.doctor import Probes, run_doctor
+    from earmark.mail.smtp import SmtpMailer, SmtpOptions
+
+    stub = make_stub(auth_reply="535 5.7.8 rejected the password {password} for {user}")
+    settings = _smtp_settings(tmp_path)
+    options = SmtpOptions.from_settings(settings)
+    mailer = SmtpMailer(
+        options, socket_factory=stub.socket_factory, context_factory=trusted_test_context
+    )
+    fakes = make_fake_backends(tmp_path / "data")
+    env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), mailer=mailer))
+    env.jobs.enqueue(new_podcast_job(CANON, to=OTHER_TO))
+    failed = env.worker.run_once()
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error is not None
+    assert "EARMARK_SMTP_PASSWORD" in failed.error  # it names the setting, never the value
+    assert {auth[1] for auth in stub.auth} == {SMTP_PASSWORD}  # the stub did get it
+
+    # Doctor, offline and online (the stub rejects the login again).
+    probes = Probes(
+        smtp_socket_factory=stub.socket_factory,
+        smtp_context_factory=trusted_test_context,
+        timeout_s=5.0,
+    )
+    doctor = [
+        r.detail
+        for online in (False, True)
+        for r in run_doctor(settings, online=online, probes=probes)
+    ]
+
+    # `earmark config`, with the password in the environment.
+    monkeypatch.setenv("EARMARK_SMTP_PASSWORD", SMTP_PASSWORD)
+    monkeypatch.setenv("EARMARK_DATA_DIR", str(tmp_path / "data"))
+    config = CliRunner().invoke(app, ["config"])
+    assert config.exit_code == 0
+    assert "EARMARK_SMTP_PASSWORD=**********" in config.stdout
+
+    pushes = [repr(call.job) for call in fakes.notifier.calls]
+    haystacks = [
+        log_stream.getvalue(),
+        failed.error,
+        repr(failed),
+        config.output,
+        *doctor,
+        *pushes,
+    ]
+    for text in haystacks:
+        assert SMTP_PASSWORD not in text
+        assert "efgh" not in text
+    assert "smtp session failed" in log_stream.getvalue()  # the DEBUG log captured the run

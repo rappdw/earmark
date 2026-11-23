@@ -260,6 +260,7 @@ BACKEND_VARS = (
     "RESOLVER_BACKEND",
     "FETCH_BACKEND",
     "ASR_BACKEND",
+    "MAIL_BACKEND",
     "NOTIFY_BACKEND",
 )
 
@@ -511,7 +512,7 @@ def test_jobs_text_output(fake_env: Path) -> None:
     lines = runner.invoke(app, ["jobs"]).stdout.splitlines()
     assert [ln.split("  ")[0] for ln in lines] == [second, first]
     assert lines[0].split("  ")[1] == "queued"
-    assert lines[1].split("  ")[1:4] == ["done", "transcribe", "1"]
+    assert lines[1].split("  ")[1:4] == ["done", "deliver", "1"]
     assert lines[1].endswith("  https://podcasts.apple.com/us/podcast/id1200361736?i=1000802907981")
     done = runner.invoke(app, ["jobs", "--status", "done"]).stdout.splitlines()
     assert [ln.split("  ")[0] for ln in done] == [first]
@@ -890,6 +891,7 @@ def test_doctor_all_fake_exit_0(doctor_env: Path) -> None:
     lines = result.stdout.splitlines()
     assert lines[-1].startswith("doctor: all checks passed")
     assert any(line.startswith("warn  resolver") for line in lines)
+    assert any(line.startswith("warn  mail") for line in lines)
     assert not (doctor_env / "data").exists()
 
 
@@ -898,7 +900,7 @@ def test_doctor_failure_exit_1(doctor_env: Path, monkeypatch: pytest.MonkeyPatch
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1
     assert "FAIL  api token" in result.stdout
-    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 3 warnings"
+    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 4 warnings"
 
 
 def test_doctor_bad_settings_exit_2_no_echo(

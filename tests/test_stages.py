@@ -3,8 +3,15 @@ from pathlib import Path
 from mypy import api
 
 from earmark.artifacts import ArtifactStore
-from earmark.fakes import FakeAudioFetcher, FakeNotifier, FakeResolver, FakeTranscriber
-from earmark.pipeline.stages import AudioFetcher, Notifier, Resolver, Transcriber
+from earmark.fakes import (
+    FakeAudioFetcher,
+    FakeMailer,
+    FakeNotifier,
+    FakeResolver,
+    FakeTranscriber,
+)
+from earmark.mail.smtp import SmtpMailer
+from earmark.pipeline.stages import AudioFetcher, Mailer, Notifier, Resolver, Transcriber
 from tests.factories import make_job
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +33,14 @@ def test_fakes_satisfy_protocols(tmp_path: Path) -> None:
     assert downloaded.read_bytes() == b"fake audio\n"
     notifier.notify(make_job(), episode)
     assert transcript.episode_key == episode.key
+
+
+def test_mailers_satisfy_the_protocol(tmp_path: Path) -> None:
+    # Checked by mypy: both assignments fail the type check unless the classes fit `Mailer`.
+    fake: Mailer = FakeMailer()
+    real_class: type[Mailer] = SmtpMailer
+    assert fake.sender
+    assert real_class is SmtpMailer
 
 
 SNIPPET = """\

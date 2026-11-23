@@ -5,7 +5,16 @@ from typing import Final, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict
 
 from earmark.log import scrub_urls
-from earmark.models import EpisodeKey, Job, JobId, JobResult, JobStatus, Source, Stage
+from earmark.models import (
+    DeliveryState,
+    EpisodeKey,
+    Job,
+    JobId,
+    JobResult,
+    JobStatus,
+    Source,
+    Stage,
+)
 from earmark.sources import display_url
 
 VIEW_INSTRUCTIONS_CHARS: Final = 200
@@ -38,6 +47,8 @@ class JobView(ApiModel):
     error: str | None  # scrub_urls(job.error)
     warnings: tuple[str, ...]  # scrub_urls(each)
     result: JobResult | None
+    delivery_state: DeliveryState | None
+    sent_at: AwareDatetime | None
     shared_at: AwareDatetime
     created_at: AwareDatetime
     updated_at: AwareDatetime
@@ -72,6 +83,8 @@ def job_view(job: Job) -> JobView:
         error=None if job.error is None else scrub_urls(job.error),
         warnings=tuple(scrub_urls(w) for w in job.warnings),
         result=job.result,
+        delivery_state=job.delivery_state,
+        sent_at=job.sent_at,
         shared_at=job.shared_at,
         created_at=job.created_at,
         updated_at=job.updated_at,

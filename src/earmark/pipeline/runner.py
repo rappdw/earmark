@@ -6,21 +6,32 @@ import traceback
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final
 
 from earmark.artifacts import ArtifactStore
-from earmark.errors import EarmarkError, PermanentError, SkipEpisode, TransientError
+from earmark.errors import (
+    EarmarkError,
+    MaybeDelivered,
+    PermanentError,
+    SkipEpisode,
+    TransientError,
+)
 from earmark.jobs import Claim, JobStore, LeaseLostError
 from earmark.log import redact, scrub_urls
+from earmark.mail.message import DEFAULT_MAX_ATTACHMENT_BYTES, compose_mail
 from earmark.models import (
+    Clock,
     Episode,
     Job,
     JobResult,
     Transcript,
     scrub_surrogates,
+    utc_now,
 )
-from earmark.pipeline.stages import Backends
+from earmark.pipeline.stages import Backends, OutgoingMail
+from earmark.recipients import RecipientPolicy, mask_address
 from earmark.sources import audio_episode, audio_title, sha256_file
 from earmark.staging import Staging
 
@@ -30,6 +41,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _RunState:
     episode: Episode | None = None
+    first_shared_at: datetime | None = None
 
 
 MAX_ERROR_CHARS: Final = 500
@@ -65,7 +77,13 @@ class Pipeline:
         *,
         staging: Staging,
         secrets: Sequence[str] = (),
+        clock: Clock = utc_now,
+        max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+        recipient_policy: RecipientPolicy | None = None,
     ) -> None:
+        self._clock = clock
+        self._max_attachment_bytes = max_attachment_bytes
+        self._recipient_policy = recipient_policy
         self._b = backends
         self._artifacts = artifacts
         self._jobs = jobs
@@ -86,7 +104,10 @@ class Pipeline:
         try:
             with interruptible():
                 transcript = self._stage_work(claim, state)
-            done = self._jobs.complete(claim, JobResult(duration_s=transcript.duration_s))
+                self._jobs.set_stage(claim, "deliver")
+                mail = self._compose(job, state, transcript)
+            # Delivery runs outside the interruptible window: a SIGTERM waits for it.
+            done = self._deliver(claim, mail, JobResult(duration_s=transcript.duration_s))
         except LeaseLostError:
             logger.warning("lost the lease on job %s; abandoning it", job.id)
             return None
@@ -207,7 +228,7 @@ class Pipeline:
         state.episode = episode
         self._artifacts.write_episode(episode)
         jobs.set_episode_key(claim, episode.key)
-        self._artifacts.record_share(episode.key, job.shared_at)
+        state.first_shared_at = self._artifacts.record_share(episode.key, job.shared_at)
 
         transcript = b.transcriber.cached(episode)
         if transcript is None:
@@ -222,3 +243,46 @@ class Pipeline:
             raise PermanentError("transcriber returned a transcript for another episode")
         self._warn(job.id, transcript.warnings)
         return transcript
+
+    # -- delivery ---------------------------------------------------------------------
+
+    def _compose(self, job: Job, state: _RunState, transcript: Transcript) -> OutgoingMail:
+        episode = state.episode
+        first_shared_at = state.first_shared_at
+        if episode is None or first_shared_at is None:
+            raise PermanentError("no episode to deliver")  # unreachable after _stage_work
+        if job.to is None:
+            raise PermanentError("this request has no destination address; share it again")
+        policy = self._recipient_policy
+        if policy is not None and not policy.allows(job.to):
+            raise PermanentError(
+                "the destination is no longer allowed by EARMARK_ALLOWED_RECIPIENTS; "
+                "nothing was sent"
+            )
+        return compose_mail(
+            job,
+            episode,
+            transcript,
+            first_shared_at=first_shared_at,
+            sender=self._b.mailer.sender,
+            date=self._clock(),
+            max_attachment_bytes=self._max_attachment_bytes,
+        )
+
+    def _deliver(self, claim: Claim, mail: OutgoingMail, result: JobResult) -> Job:
+        """Send ``mail`` with the delivery state written around it; return the finished job."""
+        job = claim.job
+        if job.delivery_state == "sent":
+            logger.warning("job %s is already marked sent; completing it without sending", job.id)
+            return self._jobs.complete(claim, result)
+        self._jobs.mark_sending(claim, mail.message_id)
+        try:
+            self._b.mailer.send(mail)
+        except MaybeDelivered:
+            raise  # the state stays `sending`: the next attempt resends and says so
+        except Exception:
+            self._jobs.clear_sending(claim)
+            raise
+        done = self._jobs.complete_sent(claim, result)
+        logger.info("job %s: sent to %s", job.id, mask_address(mail.recipient))
+        return done

@@ -23,6 +23,7 @@ from typing import Final
 from earmark.config import Settings
 from earmark.db import Database, database_path, open_database
 from earmark.models import (
+    MAX_UTC_OFFSET_MIN,
     Clock,
     Job,
     JobKind,
@@ -108,6 +109,15 @@ def _opt_from_db(value: str | None) -> datetime | None:
     return None if value is None else _from_db(value)
 
 
+def _offset_minutes(dt: datetime) -> int:
+    """The whole-minute UTC offset of an aware datetime; ValueError outside +-1439."""
+    offset = _check_aware(dt).utcoffset()
+    seconds = 0.0 if offset is None else offset.total_seconds()  # _check_aware: never None
+    if seconds % 60 != 0 or abs(seconds) > MAX_UTC_OFFSET_MIN * 60:
+        raise ValueError("the UTC offset must be a whole number of minutes within 23:59")
+    return int(seconds) // 60
+
+
 def _require_text(value: str, name: str) -> None:
     if not value.strip():
         raise ValueError(f"{name} must not be empty")
@@ -145,6 +155,11 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         created_at=_from_db(row["created_at"]),
         updated_at=_from_db(row["updated_at"]),
         heartbeat_at=_opt_from_db(row["heartbeat_at"]),
+        utc_offset_min=row["utc_offset_min"],
+        delivery_state=row["delivery_state"],
+        message_id=row["message_id"],
+        sent_at=_opt_from_db(row["sent_at"]),
+        resent=bool(row["resent"]),
     )
 
 
@@ -180,6 +195,7 @@ class JobStore:
         subject = self._validate(new)
         now = self._now()
         shared = now if new.shared_at is None else _check_aware(new.shared_at)
+        offset_min = None if new.shared_at is None else _offset_minutes(new.shared_at)
         job = Job(
             id=uuid.uuid4().hex,
             kind="ingest",
@@ -196,6 +212,7 @@ class JobStore:
             shared_at=shared,
             created_at=now,
             updated_at=now,
+            utc_offset_min=offset_min,
         )
         key = _dedupe_key("ingest", new.source, subject, new.to, new.instructions)
         cutoff = _to_db(now - self._dedupe_window)
@@ -219,10 +236,10 @@ class JobStore:
                 INSERT INTO jobs (id, kind, status, source, url, recipient, instructions,
                                   title, upload_file, upload_name, content_sha256, dedupe_key,
                                   attempts, run_after, warnings, shared_at, created_at,
-                                  updated_at)
+                                  updated_at, utc_offset_min)
                 VALUES (:id, 'ingest', 'queued', :source, :url, :to, :instructions, :title,
                         :upload_file, :upload_name, :content_sha256, :key, 0, :now, '[]',
-                        :shared, :now, :now)
+                        :shared, :now, :now, :offset_min)
                 """,
                 {
                     "id": job.id,
@@ -237,6 +254,7 @@ class JobStore:
                     "key": key,
                     "now": _to_db(now),
                     "shared": _to_db(shared),
+                    "offset_min": offset_min,
                 },
             )
         return Enqueued(job, True)
@@ -339,6 +357,57 @@ class JobStore:
             RETURNING *
             """,
             {"result": None if result is None else result.model_dump_json()},
+        )
+
+    def mark_sending(self, claim: Claim, message_id: str) -> Job:
+        """Record that the SMTP conversation is about to start (before the first command).
+
+        A second ``mark_sending`` on a job still ``sending`` means an earlier attempt was
+        interrupted, so ``resent`` is set.
+        """
+        _require_text(message_id, "message_id")
+        return self._fenced(
+            claim,
+            """
+            UPDATE jobs
+            SET delivery_state = 'sending', message_id = :mid,
+                resent = CASE WHEN delivery_state = 'sending' THEN 1 ELSE resent END,
+                heartbeat_at = :now, updated_at = :now
+            WHERE id = :id AND status = 'running' AND lease_token = :token
+              AND (delivery_state IS NULL OR delivery_state = 'sending')
+            RETURNING *
+            """,
+            {"mid": message_id},
+        )
+
+    def clear_sending(self, claim: Claim) -> Job:
+        """A definite delivery failure: the message was not accepted."""
+        return self._fenced(
+            claim,
+            """
+            UPDATE jobs
+            SET delivery_state = CASE WHEN delivery_state = 'sending' THEN NULL
+                                      ELSE delivery_state END,
+                updated_at = :now
+            WHERE id = :id AND status = 'running' AND lease_token = :token
+            RETURNING *
+            """,
+            {},
+        )
+
+    def complete_sent(self, claim: Claim, result: JobResult) -> Job:
+        """The server accepted the message: ``sent`` and ``done`` in one write."""
+        return self._fenced(
+            claim,
+            """
+            UPDATE jobs
+            SET status = 'done', error = NULL, result = :result, delivery_state = 'sent',
+                sent_at = :now, lease_token = NULL, updated_at = :now
+            WHERE id = :id AND status = 'running' AND lease_token = :token
+              AND delivery_state = 'sending'
+            RETURNING *
+            """,
+            {"result": result.model_dump_json()},
         )
 
     def skip(self, claim: Claim, reason: str) -> Job:

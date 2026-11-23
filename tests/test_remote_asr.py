@@ -819,6 +819,7 @@ def test_factory_builds_remote(tmp_path: Path) -> None:
         resolver_backend="fake",
         fetch_backend="fake",
         notify_backend="fake",
+        mail_backend="fake",
         asr_api_key="k-1",
     )
     b = factory.build_backends(settings, ArtifactStore(settings.data_dir))
@@ -856,6 +857,7 @@ def test_missing_base_url_is_config_error(tmp_path: Path) -> None:
         resolver_backend="fake",
         fetch_backend="fake",
         notify_backend="fake",
+        mail_backend="fake",
     )
     with pytest.raises(ConfigError) as info:
         factory.build_backends(settings, ArtifactStore(settings.data_dir))

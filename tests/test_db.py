@@ -350,7 +350,7 @@ def test_fresh_database_identity(tmp_path: Path) -> None:
     path = tmp_path / "earmark.db"
     db = open_database(path)
     assert db.identity() == (APPLICATION_ID, SCHEMA_VERSION)
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     with db.connect() as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert names == {"jobs"}
@@ -404,7 +404,7 @@ def test_migration_0002_from_v1(tmp_path: Path) -> None:
     finally:
         conn.close()
     db = open_database(path)
-    assert db.schema_version() == 2
+    assert db.schema_version() == SCHEMA_VERSION
     with db.connect() as conn:
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
         row = conn.execute("SELECT * FROM jobs").fetchone()
@@ -414,6 +414,41 @@ def test_migration_0002_from_v1(tmp_path: Path) -> None:
     job = JobStore(db).get("a" * 32)
     assert isinstance(job, Job)
     assert (job.to, job.instructions, job.source, job.url) == (None, "p", "apple_podcasts", URL)
+
+
+def test_migration_0003_adds_delivery_columns(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    open_database(path, migrations=MIGRATIONS[:2])
+    stamp = "2026-01-01T12:00:00.000000+00:00"
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        conn.execute(
+            """
+            INSERT INTO jobs (id, kind, status, url, recipient, instructions, dedupe_key,
+                              attempts, run_after, warnings, shared_at, created_at, updated_at)
+            VALUES (?, 'ingest', 'done', ?, 'you@example.org', 'q', 'k', 1, ?, '[]', ?, ?, ?)
+            """,
+            ("c" * 32, URL, stamp, stamp, stamp, stamp),
+        )
+    finally:
+        conn.close()
+    db = open_database(path)
+    assert db.schema_version() == SCHEMA_VERSION == 3
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM jobs").fetchone()
+        for bad in (
+            "UPDATE jobs SET utc_offset_min = 1440",
+            "UPDATE jobs SET delivery_state = 'maybe'",
+            "UPDATE jobs SET resent = 2",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(bad)
+    assert (row["utc_offset_min"], row["delivery_state"], row["message_id"]) == (None, None, None)
+    assert (row["sent_at"], row["resent"]) == (None, 0)
+    job = JobStore(db).get("c" * 32)
+    assert job is not None
+    assert (job.to, job.instructions, job.status) == ("you@example.org", "q", "done")
+    assert (job.utc_offset_min, job.delivery_state, job.resent) == (None, None, False)
 
 
 def test_migration_0002_carries_null_prompt_as_empty(tmp_path: Path) -> None:
