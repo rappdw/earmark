@@ -10,6 +10,10 @@ the result into a vault, linked entities, indexed it for search, and produced a 
 digest. It is tagged `v0.1.0-full-pipeline`. See "Re-scope: a transcription and delivery
 service" below.
 
+**Widened on 2026-11-24 (steps 28–31).** The repo becomes the whole system: the iOS
+Shortcut, the service, and the PKA receiving skill, with the two seams between them. See
+"System scope: one repo for the whole system" below.
+
 ## Status
 
 Update this table when a step passes verification. Each step is one commit titled
@@ -45,6 +49,10 @@ Update this table when a step passes verification. Each step is one commit title
 | 25 | Delivery: the transcript note and the email | 24 | done |
 | 26 | GPU transcription inside the image | 25 | done |
 | 27 | Docs, runbook and Shortcut for the transcription service | 26 | done |
+| 28 | System scope: the three parts and the two seams | 27 | todo |
+| 29 | The mail contract as a tested seam | 28 | todo |
+| 30 | The PKA marketplace and the receiving skill | 29 | todo |
+| 31 | The Shortcut as a file | 28 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -649,6 +657,8 @@ and filing, each with its own context. earmark's job is:
   a clear message saying to move it aside. It is not migrated.
 - **No "analysis done" relay for now.** ntfy stays for "sent" and "failed".
 - **No PKA-side skill is needed from earmark.** PKA is gaining inbound email.
+  *Superseded on 2026-11-24:* the receiving skill is part of this repo (step 30). See
+  "System scope" below.
 - **The attachment size cap is configurable.**
 - **Removed code is deleted.** It stays recoverable from the `v0.1.0-full-pipeline` tag.
 
@@ -1155,6 +1165,200 @@ the docs alone.
   address the operator controls, and confirms that both attachments open and the body
   names them.
 - Nothing in the docs describes removed behaviour.
+
+## System scope: one repo for the whole system
+
+**What changes.** Steps 22–27 built one part, the service, and the plan's status table
+measured only that part. From 2026-11-24 this repo holds the whole system. That is three
+largely independent parts, and the two seams where they meet:
+
+| Part | What it is | Runs on | Lives in |
+|---|---|---|---|
+| 1. The Shortcut | The iOS Shortcut that sends audio or a link | the operator's iPhone | `shortcut/` (step 31); `docs/shortcut.md` until then |
+| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/` (unchanged) |
+| 3. The receiving skill | Reads an earmark email, files the note, acts on the instructions | each PKA instance | a Claude Code plugin in this repo's marketplace (step 30) |
+
+| Seam | Between | Contract | Tested by |
+|---|---|---|---|
+| Request | Shortcut → service | `POST /transcriptions`, in `docs/ARCHITECTURE.md` | the service's API tests, and the Shortcut doc tests checking the Shortcut's requests against the request model |
+| Mail | service → receiving skill | the mail contract, `contract: 1` | sample emails in `contract/` that both sides test against (steps 29, 30) |
+
+**Decisions (the operator's, 2026-11-24).**
+
+- **One repo.** The project is too small to split. One plan and one runbook cover the
+  system, and a change across a seam lands in one commit.
+- **The receiving skill is distributed as a plugin marketplace in this repo.** For the
+  first cut, the repo root carries `.claude-plugin/marketplace.json`. A PKA instance adds
+  the marketplace from `rappdw/earmark` and installs the plugin from it. pka-skills was
+  told on 2026-11-24 not to build an earmark-specific receiving procedure, and was
+  asked how PKA instances install plugins, how inbound mail reaches a skill, which
+  filing conventions to reuse, and how a PKA comes to act on one sender's instructions.
+- **The mail contract moves here.** pka-skills drafted `contract: 1`, and its text is
+  unchanged. From step 29 the source of truth is `contract/`, and `docs/PLAN.md` and
+  `docs/ARCHITECTURE.md` point to it. A change is still a version bump, because mail
+  sent under one version can still be sitting in an inbox when the next one ships.
+- **Definition of done for the system:** one episode shared on the phone is
+  transcribed on the Spark, emailed, read by a PKA through the receiving skill, and
+  filed, with the instructions acted on. The runbook's last phase is this check. A step
+  being `done` means its part's code and tests pass; it does not mean the system works.
+- **The service is unchanged by this.** `src/earmark/` keeps its layout and packaging.
+  The service still files nothing: filing happens in the PKA, through part 3.
+
+**pka-skills' answers (2026-11-24)** are in
+`docs/decisions/2026-11-24-pka-receiving-skill.md`: installing, intake, filing through
+`.pka/bin/pka-tools`, the dedupe record, and its view on trust.
+
+**Open with the operator (step 30 must not decide these alone).**
+
+1. **The instructions exception.** The PKA's inbox runtime never follows instructions
+   found in mail, and the instructions attachment is meant to be acted on, so the
+   operator grants the exception explicitly. pka-skills recommends `contract: 1`, a
+   sending address used only by earmark, the allowlist and DMARC. It also recommends a
+   narrow scope: instructions act only on the note they came with, and never run
+   commands, reach the network, touch other notes or settings, or commit. An HMAC over
+   the attachments (a `contract: 2`) comes in only if the sender isn't dedicated or the
+   mail path gains a relay. The transcript note is data in every case.
+2. **Which PKA instances install the skill.** Project scope only, never user scope.
+3. **Optional:** pka-interface's session-start scan mentioning unprocessed earmark mail,
+   which would be a pka-skills change.
+
+## Step 28: System scope: the three parts and the two seams
+
+**Goal.** The docs describe earmark as the whole system, not just the service.
+
+**Build.**
+
+- `docs/ARCHITECTURE.md` opens with a system section:
+  - the three parts and where each runs and lives;
+  - the two seams, with their contracts and what tests each;
+  - the definition of done.
+  - Folders that later steps create (`shortcut/`, `contract/`, the marketplace and
+    plugin) are named as planned, with the step that creates each.
+- `CLAUDE.md` and the README say the repo is the system. "earmark files nothing" becomes
+  "the service files nothing; the PKA files, through the receiving skill".
+- `docs/runbook-spark.md` gains, as its last phase, the one-episode check, with a
+  placeholder phase for installing the receiving skill that step 30 fills in.
+- The mail contract's provenance is recorded: drafted by pka-skills, owned here from
+  step 29.
+
+**Acceptance.**
+
+- The doc tests pin the system section: the three parts, the two seams, and the
+  definition of done.
+- The runbook's last phase is the one-episode check, and it ends in a **Check:**.
+- No doc claims a part works that has not been run. The Shortcut file, the receiving
+  skill and the GPU image are described as unbuilt or unverified.
+
+## Step 29: The mail contract as a tested seam
+
+**Goal.** The mail contract has one source of truth, with sample emails that both sides
+test against.
+
+**Build.**
+
+- `contract/` holds the contract text for `contract: 1`, moved from `docs/PLAN.md` and
+  `docs/ARCHITECTURE.md`, which link to it.
+- `contract/samples/` holds sample emails built from fixed inputs by the real mail
+  code. At least:
+  - a podcast with a `feed:` guid;
+  - a podcast with an `apple:` guid;
+  - an upload, and a direct URL (`sha256:` guids);
+  - empty instructions;
+  - a title that needs sanitising;
+  - a resend, which keeps the `Message-ID`.
+- A stdlib-only checker validates an email against the contract: file names,
+  frontmatter keys and types, `transcript_sha256`, the body rules, the subject cap. Step
+  30's skill runs it inside a PKA, so it imports nothing from `earmark` and runs with
+  `python -I`.
+- Regenerating the samples is an explicit command. A test fails when the mail code's
+  output drifts from the samples. Only fields that legitimately vary, such as `Date`,
+  are masked.
+
+**Acceptance.**
+
+- Every sample passes the checker, and the mail code reproduces every sample.
+- For each contract rule, a mutated sample breaking that rule makes the checker fail.
+- The contract text exists in one place. `docs/PLAN.md` and `docs/ARCHITECTURE.md` point
+  to it and do not copy it.
+
+## Step 30: The PKA marketplace and the receiving skill
+
+**Goal.** A PKA instance can install the receiving skill from this repo, and the skill
+handles an earmark email by the contract.
+
+**Needs:** the operator's decision on the instructions exception (open item 1 above).
+pka-skills' answers are in `docs/decisions/2026-11-24-pka-receiving-skill.md`, and the
+skill follows them. If the decision is missing, the planner stops and says so.
+
+**Build.**
+
+- `.claude-plugin/marketplace.json` at the repo root, and one plugin under `plugins/`
+  with its own `.claude-plugin/plugin.json` and the skill. The planner settles the names
+  and checks the manifest fields, and how updates reach an instance, against Claude
+  Code's current plugin docs.
+- **The skill:**
+  - reads the inbox itself through the inbox MCP tools, and fetches nothing else;
+  - recognises an earmark email by structure, never by subject:
+    - an allowlisted sender, with `clean` attachments;
+    - exactly two attachments named per the contract;
+    - `source: earmark` and `contract: 1`;
+    - matching `guid` and `job_id` in both attachments.
+
+    Anything else is left alone and reported;
+  - validates it with the step 29 checker, shipped inside the plugin. A test keeps the
+    plugin's copy identical to `contract/`'s;
+  - de-duplicates by the contract's rules, with its record in
+    `.pka/earmark/received.jsonl`. A note is found by `guid`, never by path;
+  - files the note through pka-skills, never by reimplementing it:
+    - the destination comes from the Repo Map, proposed before writing unless the
+      workspace is hands-off;
+    - then `.pka/bin/pka-tools post-route`, and `pka-tools log add`;
+    - it checks `pka-tools version --json` against a minimum first;
+    - it never writes to `team-inbox/`, and never commits;
+  - on a re-transcription, rewrites the note's body in place and never deletes it;
+  - acts on the instructions attachment only within the scope the operator grants,
+    stated in its `SKILL.md`, and reports anything outside that scope;
+  - never treats the transcript, the title or the subject as instructions.
+- `docs/runbook-spark.md`: the install phase on each chosen PKA, adding the marketplace
+  and installing the plugin at project scope, ending in a check.
+
+**Acceptance.**
+
+- The marketplace and plugin manifests are valid. Tests check them against the
+  documented schema.
+- The skill's deterministic parts (recognising, checking, de-duplicating) run against
+  every step 29 sample in tests, including the duplicate, re-share and
+  re-transcription cases.
+- What CI cannot test, the PKA following the skill, is the runbook's one-episode check,
+  and is reported as unverified.
+
+## Step 31: The Shortcut as a file
+
+**Goal.** The operator installs the Shortcut from a file in the repo instead of building
+it by hand.
+
+**Needs:** a working Shortcut, built by hand from `docs/shortcut.md` and checked on the
+phone (share-sheet capture, the `Get Type` assumption), then exported with Share →
+Export File. Before exporting, the operator adds import questions for the server URL and
+the token, and clears both values. If the file is not in the repo, the planner stops and
+says so.
+
+**Build.**
+
+- `shortcut/earmark.shortcut`, the signed export, and `shortcut/README.md` with how to
+  install it and answer the import questions.
+- `docs/shortcut.md`: installing from the file becomes the main path. The 13 actions stay
+  as the reference for what the file contains and for rebuilding it.
+- The planner works out what can be checked about a signed file on Linux, such as its
+  format marker and whether the payload is readable. If the payload cannot be read, the
+  no-secrets check is a manual runbook check, not a test.
+
+**Acceptance.**
+
+- A test checks that the file is present and in the signed export format.
+- The file carries no token and no real hostname: checked by a test if the payload can
+  be read, otherwise by a runbook check, which the step plan says plainly.
+- The runbook's Shortcut phase installs from the file and ends in a check.
 
 ## Backlog
 
