@@ -1328,10 +1328,10 @@ test against.
 
 **Build.**
 
-**Needs:** confirmation that a PKA instance's sandbox has `python3` (asked of pka-skills
-2026-11-24, recorded in `docs/decisions/2026-11-24-pka-receiving-skill.md`). If it is
-not guaranteed, the planner stops: the checker's form (a pka-tools subcommand, a shell
-script) is then a decision to bring back.
+**Inputs:** pka-skills' answer on Python (2026-11-24, in
+`docs/decisions/2026-11-24-pka-receiving-skill.md`). Every bootstrapped PKA instance has
+`python3` 3.9 or newer; pka-bootstrap requires it. The checker stays in the plugin, not
+in pka-tools, because the contract belongs to this repo.
 
 - `contract/` covers the mail seam only, versioned in its layout (step 28's layout):
   - `contract/README.md` says what the seam is, lists the versions, and says where the
@@ -1352,10 +1352,23 @@ script) is then a decision to bring back.
   - **One copy, at its final path:** `plugins/earmark-pka/skills/earmark-receive/scripts/`.
     A plugin installs only its own folder, so the checker must live there. Step 30 adds
     the manifests around it.
-  - It imports nothing from `earmark` and runs with `python -I`. The service's tests run
+  - It imports nothing from `earmark` and runs as `python3 -I`. The service's tests run
     it from that path.
-  - `[tool.mypy] files` gains `plugins`, so the gate type-checks it. Ruff already checks
-    the whole tree.
+  - **Python 3.9 floor.** No `match`, no `X | Y` unions evaluated at run time, and no
+    3.10+ stdlib APIs. `from __future__ import annotations` is allowed.
+  - A `sys.version_info < (3, 9)` guard comes first, in old syntax, so an old
+    interpreter prints a clear message instead of a `SyntaxError`.
+  - It sets `sys.dont_write_bytecode = True`, because `-I` doesn't stop `.pyc` files
+    being written into the plugin cache.
+  - Exit codes match pka-tools: 0 ok, 1 failed check, 2 prerequisite missing, 64 usage
+    error.
+  - **The gate enforces the floor, so it isn't left to review.** The planner settles
+    how. The likely route:
+    - ruff's per-file target version `py39` for `plugins/`;
+    - a mypy pass over `plugins/` with `--python-version 3.9`;
+    - CI running the checker's tests under a 3.9 interpreter.
+
+    None of this loosens the 3.13 settings for `src/` and `tests/`.
 - Regenerating the samples is an explicit command. A test fails when the mail code's
   output drifts from the samples. Only fields that legitimately vary, such as `Date`,
   are masked.
@@ -1367,7 +1380,9 @@ script) is then a decision to bring back.
 - The contract text exists in one place. `docs/PLAN.md` and `docs/ARCHITECTURE.md` point
   to it and do not copy it.
 - The checker exists in one place. A test fails if a second copy appears in the repo.
-- mypy checks the checker as part of `make check`.
+- `make check` type-checks and lints the checker against Python 3.9, and CI runs its
+  tests on 3.9. A 3.10+ construct in it fails the gate.
+- Its exit codes are tested: 0, 1, 2 and 64.
 
 ## Step 30: The PKA marketplace and the receiving skill
 
@@ -1407,7 +1422,10 @@ handles an earmark email by the contract.
     - the destination comes from the Repo Map, proposed before writing unless the
       workspace is hands-off;
     - then `.pka/bin/pka-tools post-route`, and `pka-tools log add`;
-    - it checks `pka-tools version --json` against a minimum first;
+    - its first step, and precondition, is `.pka/bin/pka-tools version --json`, checked
+      against a minimum. If that fails or the helper is missing, it isn't a ready PKA:
+      the skill stops there and doesn't run the checker. A passing check also
+      guarantees `python3` 3.9 or newer;
     - it never writes to `team-inbox/`, and never commits;
   - on a re-transcription, rewrites the note's body in place and never deletes it;
   - acts on the instructions attachment only within the narrow scope (item 1 above),

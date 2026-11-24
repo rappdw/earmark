@@ -141,14 +141,27 @@ exception as the authority, and the scope stays.
 - The sender allowlist is AMAP router config, not a PKA's responsibility.
 - The attachment cap stays 10 MB until AMAP's deployment limit is known.
 
-## Asked of pka-skills, awaiting an answer (2026-11-24)
+## 5. Python in a PKA (pka-skills, 2026-11-24)
 
-- Is `python3` guaranteed in a PKA instance's sandbox, and from which version?
-- Is `.pka/bin/pka-tools` itself Python?
-- If `python3` isn't guaranteed, should the contract check be a pka-tools subcommand or a
-  shell script?
-
-Step 29 needs the answer, because the checker's form depends on it.
+- **python3 3.9 or newer is guaranteed** in every bootstrapped PKA instance, since
+  pka-skills v1.7.0.
+  - pka-bootstrap installs the helper with
+    `python3 <plugin>/bootstrap-assets/tools/pka-tools install`.
+  - Bootstrap stops on anything older.
+  - So wherever `.pka/bin/pka-tools` exists, python3 is at least 3.9.
+- **pka-tools is Python.**
+  - `.pka/bin/pka-tools` is a `#!/usr/bin/env python3` launcher. It checks for 3.9 and
+    exits 2 on anything older.
+  - It imports the stdlib-only `pka_tools` package from the same folder.
+  - It sets `dont_write_bytecode`.
+- **The checker stays in earmark's plugin.** A pka-tools subcommand would couple
+  `contract: 1` to the pka-skills release cycle, and the contract belongs to earmark.
+- **Their suggestions, adopted in step 29 and step 30:**
+  - make `pka-tools version --json` the skill's first step and precondition;
+  - write the checker to the 3.9 floor, with an old-syntax version guard at the top;
+  - set `sys.dont_write_bytecode = True`;
+  - use pka-tools' exit codes: 0 ok, 1 failed check, 2 prerequisite missing, 64 usage
+    error.
 
 ## Operator decisions still open
 
