@@ -1232,7 +1232,8 @@ largely independent parts, and the two seams where they meet:
 `docs/decisions/2026-11-24-pka-receiving-skill.md`: installing, intake, filing through
 `.pka/bin/pka-tools`, the dedupe record, and its view on trust.
 
-**Open with the operator (step 30 must not decide these alone).**
+**Trust, and what is still open with the operator.** Step 30 does not decide these
+alone.
 
 1. **The trust gap, and what the skill does until it closes.** AMAP's two rule sets
    disagree for earmark mail:
