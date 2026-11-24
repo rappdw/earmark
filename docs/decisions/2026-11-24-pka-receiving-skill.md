@@ -141,6 +141,15 @@ exception as the authority, and the scope stays.
 - The sender allowlist is AMAP router config, not a PKA's responsibility.
 - The attachment cap stays 10 MB until AMAP's deployment limit is known.
 
+## Asked of pka-skills, awaiting an answer (2026-11-24)
+
+- Is `python3` guaranteed in a PKA instance's sandbox, and from which version?
+- Is `.pka/bin/pka-tools` itself Python?
+- If `python3` isn't guaranteed, should the contract check be a pka-tools subcommand or a
+  shell script?
+
+Step 29 needs the answer, because the checker's form depends on it.
+
 ## Operator decisions still open
 
 1. Which PKA instances install the skill.

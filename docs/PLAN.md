@@ -1176,7 +1176,7 @@ largely independent parts, and the two seams where they meet:
 |---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link | the operator's iPhone | `shortcut/` (step 31); `docs/shortcut.md` until then |
 | 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/` (unchanged) |
-| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions | each PKA instance | a Claude Code plugin in this repo's marketplace (step 30) |
+| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions | each PKA instance | `plugins/earmark-pka/`, listed in this repo's marketplace (steps 29, 30) |
 
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
@@ -1274,9 +1274,32 @@ alone.
 - `docs/ARCHITECTURE.md` opens with a system section:
   - the three parts and where each runs and lives;
   - the two seams, with their contracts and what tests each;
-  - the definition of done.
-  - Folders that later steps create (`shortcut/`, `contract/`, the marketplace and
-    plugin) are named as planned, with the step that creates each.
+  - the definition of done;
+  - the repo layout below. Folders that later steps create are named as planned, with
+    the step that creates each.
+
+  ```
+  .claude-plugin/marketplace.json   the marketplace "earmark", listing ./plugins/earmark-pka (step 30)
+  plugins/earmark-pka/              part 3: the plugin (step 30)
+    .claude-plugin/plugin.json
+    skills/earmark-receive/SKILL.md
+    skills/earmark-receive/scripts/   the contract checker, its only copy (step 29)
+  contract/                         the mail seam only (step 29)
+    README.md                         what the seam is, its versions, where the checker lives
+    mail-v1.md                        the contract 1 text
+    samples/v1/                       sample emails
+  shortcut/earmark.shortcut         part 1: the signed export, the folder's only file (step 31)
+  src/earmark/                      part 2: the service
+  deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment
+  tests/                            every part's tests, one gate
+  docs/                             architecture, plan, runbook, deploy and Shortcut docs
+  .claude/                          the build loop's agents and /step (development only)
+  ```
+
+  - The request seam has no folder. Its contract is the request model in code plus
+    `docs/ARCHITECTURE.md`.
+  - The service keeps its conventional layout (`src/earmark/` with its deployment files
+    at the top level). It is not moved into a part folder.
 - `CLAUDE.md` and the README say the repo is the system. "earmark files nothing" becomes
   "the service files nothing; the PKA files, through the receiving skill".
 - `docs/runbook-spark.md` gains, as its last phase, the one-episode check, with a
@@ -1305,10 +1328,19 @@ test against.
 
 **Build.**
 
-- `contract/` holds the contract text for `contract: 1`, moved from `docs/PLAN.md` and
-  `docs/ARCHITECTURE.md`, which link to it.
-- `contract/samples/` holds sample emails built from fixed inputs by the real mail
-  code. At least:
+**Needs:** confirmation that a PKA instance's sandbox has `python3` (asked of pka-skills
+2026-11-24, recorded in `docs/decisions/2026-11-24-pka-receiving-skill.md`). If it is
+not guaranteed, the planner stops: the checker's form (a pka-tools subcommand, a shell
+script) is then a decision to bring back.
+
+- `contract/` covers the mail seam only, versioned in its layout (step 28's layout):
+  - `contract/README.md` says what the seam is, lists the versions, and says where the
+    checker lives;
+  - `contract/mail-v1.md` holds the `contract: 1` text, moved from `docs/PLAN.md` and
+    `docs/ARCHITECTURE.md`, which link to it.
+- `contract/samples/v1/` holds sample emails built from fixed inputs by the real mail
+  code. A later version gets its own folder beside it, and the v1 samples stay, because
+  v1 mail can still be waiting in an inbox. At least:
   - a podcast with a `feed:` guid;
   - a podcast with an `apple:` guid;
   - an upload, and a direct URL (`sha256:` guids);
@@ -1316,9 +1348,14 @@ test against.
   - a title that needs sanitising;
   - a resend, which keeps the `Message-ID`.
 - A stdlib-only checker validates an email against the contract: file names,
-  frontmatter keys and types, `transcript_sha256`, the body rules, the subject cap. Step
-  30's skill runs it inside a PKA, so it imports nothing from `earmark` and runs with
-  `python -I`.
+  frontmatter keys and types, `transcript_sha256`, the body rules, the subject cap.
+  - **One copy, at its final path:** `plugins/earmark-pka/skills/earmark-receive/scripts/`.
+    A plugin installs only its own folder, so the checker must live there. Step 30 adds
+    the manifests around it.
+  - It imports nothing from `earmark` and runs with `python -I`. The service's tests run
+    it from that path.
+  - `[tool.mypy] files` gains `plugins`, so the gate type-checks it. Ruff already checks
+    the whole tree.
 - Regenerating the samples is an explicit command. A test fails when the mail code's
   output drifts from the samples. Only fields that legitimately vary, such as `Date`,
   are masked.
@@ -1329,6 +1366,8 @@ test against.
 - For each contract rule, a mutated sample breaking that rule makes the checker fail.
 - The contract text exists in one place. `docs/PLAN.md` and `docs/ARCHITECTURE.md` point
   to it and do not copy it.
+- The checker exists in one place. A test fails if a second copy appears in the repo.
+- mypy checks the checker as part of `make check`.
 
 ## Step 30: The PKA marketplace and the receiving skill
 
@@ -1340,10 +1379,16 @@ handles an earmark email by the contract.
 
 **Build.**
 
-- `.claude-plugin/marketplace.json` at the repo root, and one plugin under `plugins/`
-  with its own `.claude-plugin/plugin.json` and the skill. The planner settles the names
-  and checks the manifest fields, and how updates reach an instance, against Claude
-  Code's current plugin docs.
+- `.claude-plugin/marketplace.json` at the repo root, and the plugin at
+  `plugins/earmark-pka/` with its own `.claude-plugin/plugin.json` and the skill, around
+  the checker step 29 placed there.
+  - **Names (fixed):** marketplace `earmark`, plugin `earmark-pka`, skill
+    `earmark-receive`.
+  - **Install, at project scope:** `/plugin marketplace add rappdw/earmark`, then
+    `/plugin install earmark-pka@earmark`.
+  - The marketplace lists the plugin by relative path (`./plugins/earmark-pka`).
+  - The planner checks the manifest fields, and how updates reach an instance, against
+    Claude Code's current plugin docs.
 - **The skill:**
   - reads no mail itself. AMAP delivers it, and the PKA reads it with the `inbox` tools
     after the doorbell. The skill applies to a message the PKA is already handling, and
@@ -1355,8 +1400,7 @@ handles an earmark email by the contract.
     - matching `guid` and `job_id` in both attachments.
 
     Anything else is left alone and reported;
-  - validates it with the step 29 checker, shipped inside the plugin. A test keeps the
-    plugin's copy identical to `contract/`'s;
+  - validates it with the step 29 checker, from the plugin's own `scripts/`;
   - de-duplicates by the contract's rules, with its record in
     `.pka/earmark/received.jsonl`. A note is found by `guid`, never by path;
   - files the note through pka-skills, never by reimplementing it:
@@ -1396,10 +1440,10 @@ says so.
 
 **Build.**
 
-- `shortcut/earmark.shortcut`, the signed export, and `shortcut/README.md` with how to
-  install it and answer the import questions.
-- `docs/shortcut.md`: installing from the file becomes the main path. The 13 actions stay
-  as the reference for what the file contains and for rebuilding it.
+- `shortcut/earmark.shortcut`, the signed export, and nothing else in that folder.
+- `docs/shortcut.md` stays the Shortcut's only doc. Installing from the file, and
+  answering the import questions, becomes its main path. The 13 actions stay as the
+  reference for what the file contains and for rebuilding it.
 - The planner works out what can be checked about a signed file on Linux, such as its
   format marker and whether the payload is readable. If the payload cannot be read, the
   no-secrets check is a manual runbook check, not a test.
