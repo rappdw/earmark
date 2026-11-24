@@ -268,8 +268,19 @@ def test_ci_job_has_timeout() -> None:
 # --- B1 / B2 ----------------------------------------------------------------------------
 
 
+def _without_glob(options: dict[str, Any]) -> dict[str, Any]:
+    """setup-uv's options minus the lock glob: the live jobs never run the gate's floor mypy."""
+    return {k: v for k, v in options.items() if k != "cache-dependency-glob"}
+
+
 def test_ci_caches_uv() -> None:
     assert _ci_step(SETUP_UV)["with"]["enable-cache"] is True
+
+
+def test_ci_cache_covers_both_locks() -> None:
+    glob = _ci_step(SETUP_UV)["with"]["cache-dependency-glob"]
+    assert sorted(glob.split()) == ["tools/py39/uv.lock", "uv.lock"]
+    assert _ci_step(SETUP_UV)["with"]["cache-python"] is True
 
 
 def test_ci_checkout_does_not_persist_credentials() -> None:
@@ -381,7 +392,7 @@ def test_network_workflow_pins_match_ci() -> None:
     job = _network_job("network")
     assert _job_remote_uses(job) == _remote_uses(_ci())
     [network_uv] = [s for s in _steps(job) if _action(s) == SETUP_UV]
-    assert network_uv["with"] == _ci_step(SETUP_UV)["with"]
+    assert _without_glob(network_uv["with"]) == _without_glob(_ci_step(SETUP_UV)["with"])
 
 
 def test_network_workflow_is_not_the_gate() -> None:
@@ -439,7 +450,8 @@ def test_slow_job_pins() -> None:
     job = _network_job("slow")
     assert _job_remote_uses(job) == [*_remote_uses(_ci()), CACHE_PIN]
     [slow_uv] = [s for s in _steps(job) if _action(s) == SETUP_UV]
-    assert slow_uv["with"] == {**_ci_step(SETUP_UV)["with"], "cache-suffix": "slow"}
+    expected = {**_without_glob(_ci_step(SETUP_UV)["with"]), "cache-suffix": "slow"}
+    assert _without_glob(slow_uv["with"]) == expected
 
 
 def test_slow_job_caches_test_assets() -> None:

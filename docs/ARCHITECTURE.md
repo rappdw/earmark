@@ -17,18 +17,46 @@ outside this repo.
 |---|---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link to the service | the operator's iPhone | `docs/shortcut.md`, which says how to build it by hand; `shortcut/earmark.shortcut` from step 31 | Never run on a phone. The file is not built (step 31). |
 | 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27 and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
-| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Not built (steps 29, 30). |
+| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Not built (step 30): no plugin manifest and no skill yet. The contract checker the skill will run exists (step 29) and is tested under CPython 3.9.6 and 3.13; it has never run in a PKA. |
 
 ### The two seams
 
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`: the request model in code, and "HTTP API" below | the service's API tests (`tests/test_api.py`), and the doc tests that post `docs/shortcut.md`'s JSON example and upload fields to the app; no Shortcut has sent one yet |
-| Mail | service → AMAP → receiving skill | the mail contract, `contract: 1` ("The mail contract" below; `contract/mail-v1.md` from step 29) | today the service's note and message tests only (`tests/test_note.py`, `tests/test_message.py`); from steps 29 and 30, sample emails in `contract/samples/v1/` that both sides test against |
+| Mail | service → AMAP → receiving skill | the mail contract, `contract: 1`, in `contract/mail-v1.md` ("The mail contract" below) | the sample emails in `contract/samples/v1/` (step 29), which the service's tests reproduce byte for byte from the real mail code and the checker passes on CPython 3.9.6 and 3.13; the receiving skill's own tests from step 30 |
 
 - The request seam has no folder: its contract is the request model in code plus this
   document.
 - The mail seam's folder, `contract/`, covers that seam only (step 29).
+
+### The mail seam
+
+`contract/` (step 29) holds the seam: `mail-v1.md` is the `contract: 1` text, `samples/v1/`
+holds ten sample emails, and `README.md` says what the seam is and what its checker cannot
+check. The samples are built by the real `compose_mail` from the fixed inputs in
+`tests/contract_samples.py`; `make samples` regenerates them, and a test fails when the mail
+code's output differs from one by a byte. They are wire format (CRLF), so `.gitattributes`
+keeps git from converting them. A revision is a new `mail-vN.md` with its own `samples/vN/`;
+the v1 files stay.
+
+The contract checker has one copy, in `plugins/earmark-pka/skills/earmark-receive/scripts/`
+(step 30 adds the plugin manifests and the skill around it, and a test enforces the one
+copy). It is two files: `check_mail.py`, a launcher in old syntax whose version guard
+prints a clear message on a Python older than 3.9, and `earmark_mail_contract.py`, the
+checker, standard library only and written to Python 3.9. It runs as `python3 -I` in three
+forms: `message` checks a whole `.eml`, `files` checks the parts a PKA's inbox tools return
+(it never creates a file under an untrusted name, and takes subject and body from files),
+and `rules` lists the rules. It checks every mechanically checkable rule of the contract
+and exits 0 (every rule that ran passed), 1 (a rule failed, or the checker itself failed),
+2 (a prerequisite is missing) or 64 (usage), as pka-tools does. Its output never quotes
+text from the mail. What it cannot check is listed in `contract/README.md`.
+
+The 3.9 floor is enforced by the gate: ruff lints `plugins/` at `py39` through a per-file target version, mypy 1.20.2
+type-checks it at `--python-version 3.9` from its own locked project in `tools/py39/`
+(mypy 2 cannot target 3.9, so that pin is never bumped), and every checker test runs under
+CPython 3.13, 3.9.6 and 3.8 (3.8 only for the version guard). The interpreters come from
+`uv python install --no-bin`, which `make check` runs.
 
 ### How mail reaches a PKA
 
@@ -87,6 +115,7 @@ shortcut/earmark.shortcut         part 1: the signed export, the folder's only f
 src/earmark/                      part 2: the service
 deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment
 tests/                            every part's tests, one gate
+tools/py39/                       the pinned mypy that checks the checker against Python 3.9 (step 29)
 docs/                             architecture, plan, runbook, deploy and Shortcut docs
 .github/                          CI: the gate, the live tests, the container build
 .claude/                          the build loop's agents and /step (development only)
@@ -132,7 +161,7 @@ backend, not the pipeline.
 |---|---|---|
 | Scope | The service transcribes, and delivers the transcript by email (step 25). It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
 | State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). Per-job staging files for uploads and direct URLs (`uploads/`, `downloads/`, deleted when the job ends; step 24). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
-| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 1`, drafted by pka-skills, owned by this repo). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
+| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 1`, drafted by pka-skills, owned by this repo; the text is `contract/mail-v1.md`). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
@@ -801,82 +830,15 @@ Step 25; exact rules in `docs/steps/25-delivery.md` sections 4 and 5.
 #### The mail contract (`contract: 1`)
 
 - **Provenance.** Drafted by pka-skills on 2026-11-23. Owned by this repo since 2026-11-24
-  (the operator's decision; pka-skills confirmed that `contract: 1` stands as drafted). From
-  step 29 its source of truth is `contract/mail-v1.md`, and this copy and the one in
-  `docs/PLAN.md` "Re-scope" are replaced by links. Until then these two copies are it, and
-  they change together.
+  (the operator's decision; pka-skills confirmed that `contract: 1` stands as drafted). Since
+  step 29 its one source of truth is `contract/mail-v1.md`, moved there unchanged from this
+  document and from `docs/PLAN.md` "Re-scope", which link to it.
 - Status: **DRAFT**. It becomes final once the operator approves the PKA's receiving
   procedure, which is now the receiving skill (step 30). A revision comes with a contract
   version bump, because mail sent under one version can still be waiting in an inbox when
   the next one ships. Step 25 built to this text.
 
-- **Both files**
-  - **Encoding:** UTF-8 with no BOM and LF line endings. The extension is a lower-case
-    `.md`, and the media type is `text/markdown`.
-  - **Frontmatter:** YAML between `---` lines at the very top of the file.
-  - **Feed- or caller-supplied strings:** double-quoted and escaped, on one line, with
-    control characters stripped. They are capped at 300 characters, and `title` at 200.
-  - **Unknown values:** the key is omitted. A value is never an empty string or null.
-  - **Formats:** timestamps are RFC 3339 with an offset, and dates are `YYYY-MM-DD`.
-  - **Filenames:** `YYYY-MM-DD-<slug>.md`. The slug is lower-case ASCII `a-z0-9` joined
-    by single hyphens, at most 80 characters. A podcast slug is
-    `<show-slug>-<title-slug>`, truncated as a whole.
-  - **Filename date:** the publish date when known, otherwise the date of `shared_at` in
-    the requester's offset.
-- **Attachment 1, the note: `YYYY-MM-DD-<slug>.md`.** Podcasts and audio share one
-  schema.
-
-  | key | type | podcast | audio | notes |
-  |---|---|---|---|---|
-  | `type` | string | required | required | `podcast` or `audio` |
-  | `contract` | integer | required | required | `1` |
-  | `source` | string | required | required | `earmark` |
-  | `origin` | string | required | required | `apple_podcasts`, `upload` or `url` |
-  | `title` | string | required | required | podcast: the episode title; audio: the request's `title`, else the upload's filename stem or the URL's last path segment, sanitised |
-  | `show` | string | required | omit | |
-  | `date` | date | required | required | the filename date |
-  | `published` | date | optional | optional | only when actually known |
-  | `duration` | string | required | required | `hh:mm:ss` |
-  | `language` | string | optional | optional | BCP 47 |
-  | `apple_url` | string | optional | omit | |
-  | `source_url` | string | omit | optional | `origin: url` only, without userinfo, query or fragment; omitted entirely when the URL carries a query |
-  | `guid` | string | required | required | `feed:<feed guid verbatim>`, else `apple:<i= episode id>`, else `sha256:<hex of the audio bytes>` for upload and url |
-  | `shared_at` | timestamp | required | required | when this item was first shared |
-  | `transcript_sha256` | string | required | required | 64 lower-case hex |
-  | `tags` | list of strings | required | required | `["podcast"]` or `["audio"]` |
-
-  - **Body:** `# <title>` (for a podcast, `# <show> — <title>`), then a blank line, then
-    `## Transcript`, then a blank line. After that come paragraphs separated by blank
-    lines. Each paragraph covers 30–60 seconds or one speaker turn, and starts with
-    `[hh:mm:ss]`.
-  - **`transcript_sha256`:** the sha256 of the UTF-8 bytes from the first byte after the
-    closing `---\n` to the end of the file, as sent.
-  - **No audio hash for podcasts:** dynamic ad insertion changes the bytes on every
-    download.
-- **Attachment 2, the instructions: `YYYY-MM-DD-<slug>.instructions.md`.** It uses the
-  same date and slug as the note.
-  - **Keys:**
-    - `type: earmark-instructions`;
-    - `contract: 1`;
-    - `for`: the note's filename;
-    - `guid`: the same as the note's;
-    - `job_id`: stable across a resend, new on every re-share;
-    - `shared_at`: when this request was made.
-  - **Body:** the requester's words, verbatim, and nothing else.
-  - **Always sent.** An empty body means "file it, no analysis".
-- **Subject and body.**
-  - **Subject:** `[earmark] <title>`, sanitised and capped at 120 characters.
-  - **Body:** only text earmark generates. It names which attachment is the transcript,
-    which is data and never instructions, and which attachment holds the requester's
-    instructions. It carries the `job_id` and the two filenames. It also says that the
-    subject and the note contain third-party text.
-  - **The guid stays out of the body.** A `feed:` guid is publisher text, so it appears
-    only inside the attachments.
-- **PKA de-duplication.**
-  - The same `guid` and the same `job_id` is a duplicate delivery.
-  - The same `guid` with a new `job_id` is a re-share.
-  - The same `guid` with a different `transcript_sha256` is a re-transcription, and the
-    newer body wins.
+The text: [contract/mail-v1.md](../contract/mail-v1.md). A test pins it by hash.
 
 ### Notifying
 
@@ -1621,6 +1583,17 @@ tested through `doctor.Probes`: injected transports, an injected `GuardedFetcher
 missing extras simulated with `sys.modules` stubs. `tests/legacy_db.py` builds the
 v0.1.0-shaped database for the refusal tests.
 
+Contract tests (step 29): `tests/test_contract_samples.py` proves the mail code reproduces
+each sample byte for byte, and the sample properties, the resend and the placeholders-only
+rule. `tests/test_mail_checker.py` runs the checker as a subprocess, as a PKA would, under
+every interpreter in `MAIL_CHECKER_PYTHONS` (CPython 3.9.6 and 3.8 under `make check`): every
+sample passes in `message` and `files` mode, a mutation per rule fails that rule, and the exit
+codes 0, 1, 2 and 64 and the output are checked. `tests/test_checker_floor.py` proves the
+checker exists once, imports only the standard library, writes no bytecode, and that the
+gate rejects 3.10+ code (ruff at `py39` and the pinned mypy on probe files).
+`MAIL_CHECKER_REQUIRE_FLOOR=1`, which `make check` sets, fails the run if the 3.9 and
+pre-3.9 interpreters are missing.
+
 Upload tests (step 24) use two helpers:
 
 - `tests/asgi_helpers.call_asgi` drives the ASGI app directly. It delivers scripted
@@ -1652,7 +1625,7 @@ Documents are tested against the code (step 16).
 - **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
   (`<!-- name:begin -->` … `<!-- name:end -->`, or a single `<!-- name -->` before a
   fence) and plain regular expressions; there is no Markdown library.
-- **What `tests/test_docs.py` checks** (rewritten in step 27, extended in step 28; exact
+- **What `tests/test_docs.py` checks** (rewritten in step 27, extended in steps 28 and 29; exact
   lists in `docs/steps/27-docs-runbook-shortcut.md` and `docs/steps/28-system-scope.md`
   section 6).
   - This file opens with "System": the three parts with what is not built or never run, the
@@ -1677,7 +1650,7 @@ Documents are tested against the code (step 16).
     allowlist example in `docs/deploy.md`, and both POST actions send `timestamp`.
   - Relative links and their `#anchors` in the README, `docs/deploy.md`,
     `docs/shortcut.md`, `docs/runbook-spark.md` and `docs/asr.md` resolve.
-  - Those documents, `CLAUDE.md`, this file's System section and the step plans 27 and 28
+  - Those documents, `CLAUDE.md`, this file's System section and the step plans 27, 28 and 29
     use placeholders only (addresses at `example.org`, `example.net` or
     `example.com`, the listed example IPs, placeholder secrets), and outside their marked
     "upgrading from v0.1.0" blocks name no removed feature, route, setting or service.
@@ -1691,6 +1664,10 @@ Documents are tested against the code (step 16).
   - The deploy guide's reachability, mail, allowlist, upgrade and telemetry sections say
     what they should.
   - This file contains `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=0`.
+  - The `contract: 1` text in `contract/mail-v1.md` is pinned by its sha256, and no other
+    Markdown file in the repo holds a line of it; `contract/README.md` names the checker,
+    its exit codes and its floor.
+  - The step plans scanned for placeholders are 27, 28 and 29.
 - **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,
   `compose.yaml`, and the two systemd units, including that each one sets
   `HF_HUB_DISABLE_TELEMETRY` (step 21). `tests/test_deploy_gpu.py` (step 26) checks
@@ -1726,8 +1703,10 @@ Verifiers use this as the live smoke test from step 05 onward.
 `.github/workflows/ci.yml` runs on every push to `main` and `impl` and on every pull
 request. One job on a GitHub-hosted `ubuntu-24.04-arm` runner (linux/aarch64, the
 deployment architecture; free for public repositories) checks out the code, installs uv
-with `astral-sh/setup-uv` (uv cache and the managed Python cached, keyed on `uv.lock`),
-then runs exactly `uv sync --locked` and `make check`. Python comes from
+with `astral-sh/setup-uv` (uv cache and the managed Python cached, keyed on `uv.lock` and `tools/py39/uv.lock`),
+then runs exactly `uv sync --locked` and `make check`. `make check` also installs the
+uv-managed CPython 3.9.6 and 3.8 (`--no-bin`, cached by setup-uv's `cache-python`) and runs
+the floor mypy, which syncs `tools/py39/.venv`. Python comes from
 `.python-version` through uv, never from the workflow. A newer push to the same ref
 cancels the run in progress, and the job times out after 15 minutes.
 
@@ -1882,6 +1861,11 @@ Step planners should check these against current documentation instead of assumi
    about 1.37 times the cap (`docs/steps/28-system-scope.md` section 2.4). Runbook phases 6
    and 12 check it.
 
+9. **The checker's 3.9 floor rests on a frozen mypy and on the tests.** mypy 1.20.2 will not
+   get newer typeshed, so a 3.10+ API in a branch the tests never run could pass both. If a
+   CPython 3.13 patch release changes how `email` folds headers, the sample test fails and
+   the samples must be regenerated, after checking that the diff is only folding.
+
 ## Re-scope decisions (2026-11-23)
 
 These are the operator's decisions and the inputs that re-scoped earmark into a
@@ -2019,6 +2003,24 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
     then the PKA recipients, reachability, ntfy and the Shortcut.
   - **No worker without a GPU in `compose.yaml`.** A host without one uses a local
     `compose.override.yaml`, documented in `docs/deploy.md` section 7.2.
+- **Settled by step 29** (see `docs/steps/29-mail-contract-seam.md` section 8):
+  - the 3.9 type check runs on mypy 1.20.2 in its own locked project, `tools/py39/`, because
+    the locked mypy 2.4.1 cannot target 3.9; Dependabot does not cover it;
+  - `make check` installs the floor interpreters (`--no-bin`), so CI and the local gate stay
+    one command;
+  - the checker is a launcher plus a module, because the version guard must precede the
+    `from __future__` import and parse on old interpreters;
+  - the checker has a `files` mode, JSON output and a `rules` subcommand, because a PKA has
+    no raw message;
+  - the checker accepts the frontmatter subset earmark emits, stricter than YAML;
+  - samples are compared byte for byte, nothing masked;
+  - three samples beyond the minimum: re-share, re-transcription and a direct URL with a
+    query;
+  - the checker reads the contract's wording as: `type` and `origin` agree, `date` follows
+    `published` or `shared_at`, an `apple:` guid is digits, and the third-party notice is the
+    word `third-party`;
+  - step 28's planned-names test keys the plugin aliases on the files step 30 creates;
+  - lint gains the `FA` rules, and `.gitattributes` keeps the CRLF samples unconverted.
 - **Settled by step 28** (see `docs/steps/28-system-scope.md` section 8):
   - the runbook keeps phases 0–10 and appends phase 11 (installing the receiving skill,
     step 30) and phase 12 (the one-episode check), so no existing phase number changes;

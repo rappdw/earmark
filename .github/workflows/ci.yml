@@ -30,7 +30,9 @@ jobs:
           # Same minor as the uv_build bound in pyproject.toml; bump both together.
           version: ">=0.13.9,<0.14"
           enable-cache: true
-          cache-dependency-glob: uv.lock
+          cache-dependency-glob: |
+            uv.lock
+            tools/py39/uv.lock
           prune-cache: true
           cache-python: true
       - name: Install dependencies

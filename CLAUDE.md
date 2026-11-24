@@ -7,7 +7,7 @@ own context.
 - Part 1, the iOS Shortcut: `docs/shortcut.md`, and a file to import from step 31.
 - Part 2, the service on the homelab's DGX Spark: `src/earmark/`.
 - Part 3, the receiving skill each chosen PKA instance installs from this repo's plugin
-  marketplace: `plugins/earmark-pka/` (steps 29–30, not built yet).
+  marketplace: `plugins/earmark-pka/` (step 30, not built yet; its contract checker exists, step 29).
 
 The two seams are the request (`POST /transcriptions`) and the mail contract
 (`contract: 1`). AMAP, outside this repo, carries the mail from the service to each PKA.
@@ -49,6 +49,7 @@ green, `main` is fast-forwarded to that commit. Do not push otherwise without be
 ```bash
 uv sync                      # install (add --extra transcribe for local Whisper)
 make check                   # the gate: ruff check + ruff format --check + mypy + pytest
+make samples                 # regenerate contract/samples/v1/ from the mail code
 uv run pytest tests/test_jobs.py -k claim     # one test
 uv run pytest -m network     # opt-in tests (markers: network, slow, gpu, smtp); publishes to ntfy.sh
 uv run earmark serve         # the API
@@ -105,11 +106,17 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   written acceptance of a risk, warned about at startup and by doctor. earmark never
   defaults the recipient or the sender.
 - **Mail follows the contract exactly** (step 25): `contract: 1`, drafted by pka-skills
-  and owned by this repo, still a draft. Until step 29 moves it to `contract/`, it is copied
-  in `docs/PLAN.md` and `docs/ARCHITECTURE.md`. A change to a key, file name, format, or rule is a
-  contract revision with a version bump, made in `docs/PLAN.md` and
-  `docs/ARCHITECTURE.md` together, never a quiet edit. Delivery is at-least-once: a
-  resend keeps its `Message-ID` and `job_id`.
+  and owned by this repo, still a draft. The text is `contract/mail-v1.md` (step 29), pinned
+  by a hash test. A change to a key, file name, format, or rule is a contract revision with
+  a version bump: a new `contract/mail-vN.md` and `contract/samples/vN/`, with
+  `docs/PLAN.md` and `docs/ARCHITECTURE.md` updated together, never a quiet edit. Delivery
+  is at-least-once: a resend keeps its `Message-ID` and `job_id`.
+- **The contract checker has one copy and a 3.9 floor** (step 29). It lives in
+  `plugins/earmark-pka/skills/earmark-receive/scripts/` (step 30 adds the plugin and the
+  skill around it). It is standard library only, imports nothing from `earmark`, and is
+  written to Python 3.9: ruff lints it at `py39`, mypy 1.20.2 in `tools/py39/` type-checks
+  it (never bump it: mypy 2 cannot target 3.9), and its tests run under 3.9.6 and 3.8. Never
+  copy it.
 - **Intake is AMAP's job** (2026-11-24). AMAP is outside this repo. The service sends plain
   SMTP to a PKA instance's address and embeds no agent; no earmark code reads, polls or
   selects mail. The sender allowlist and DMARC are AMAP router config, which the operator
@@ -131,6 +138,8 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
 ## Environment
 
 This sandbox is aarch64 Linux with Python 3.13 and uv, and has no GPU, Docker, or ffmpeg.
+`make check` downloads uv-managed CPython 3.9.6 and 3.8 the first time (with `--no-bin`, so
+nothing lands in `~/.local/bin`), and syncs `tools/py39/.venv`.
 The deployment target is a homelab with an NVIDIA GPU (DGX Spark, also aarch64). GPU
 transcription and container builds cannot be verified here; say so rather than claiming
 they work. The GPU image of step 26 is checked only by the operator's smoke test on the

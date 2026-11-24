@@ -22,7 +22,8 @@ that address as two Markdown attachments, and an ntfy push follows. Python 3.13.
 - **3. The receiving skill**, in each chosen PKA instance: checks an earmark email, files
   the note, and acts on the instructions within a narrow scope. It will be the
   `earmark-pka` plugin in `plugins/earmark-pka/`, from this repository's plugin
-  marketplace. Not built yet (steps 29, 30).
+  marketplace. Not built yet (step 30). Its contract checker exists (step 29) and is tested
+  under Python 3.9; it has never run in a PKA.
 
 The two seams are the request (`POST /transcriptions`) and the mail contract
 (`contract: 1`). AMAP, outside this repository, delivers the mail to each PKA. The service
@@ -302,6 +303,7 @@ The variables that only Docker Compose uses (`API_BIND`, `APP_UID`, `APP_GID`, `
 ```bash
 uv sync                      # core and dev dependencies
 make check                   # ruff, ruff format (including Markdown code blocks), mypy strict, pytest
+make samples                 # regenerate contract/samples/v1/ from the mail code
 uv run pytest -m network     # opt-in: live Apple and feed endpoints
 ```
 

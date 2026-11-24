@@ -1,7 +1,9 @@
 """The README, Shortcut guide, deployment guide and runbook are tested against the code."""
 
+import hashlib
 import itertools
 import json
+import os
 import re
 import shlex
 from pathlib import Path
@@ -46,7 +48,17 @@ from tests.multipart_helpers import Part, audio, content_type, multipart_body
 
 TOKEN = "docs-test-token-91c"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-PLANS = ["docs/steps/27-docs-runbook-shortcut.md", "docs/steps/28-system-scope.md"]
+PLANS = [
+    "docs/steps/27-docs-runbook-shortcut.md",
+    "docs/steps/28-system-scope.md",
+    "docs/steps/29-mail-contract-seam.md",
+]
+CONTRACT_DOCS = [
+    "contract/README.md",
+    "contract/mail-v1.md",
+    "contract/samples/v1/README.md",
+]
+CONTRACT_V1_SHA256 = "7361f3d0fb20fa3edb0c5b98529c0c998532ba035f53ac8392fb47aea9dcd82d"
 ARCH = "docs/ARCHITECTURE.md"
 DOCS = [
     "README.md",
@@ -1152,7 +1164,7 @@ def test_architecture_mail_contract_provenance() -> None:
     text = read_doc(ARCH)
     headings = [ln for ln in text.splitlines() if ln.startswith("#### The mail contract")]
     assert headings == ["#### The mail contract (`contract: 1`)"]
-    preamble = section(text, "#### The mail contract").partition("- **Both files**")[0]
+    preamble = section(text, "#### The mail contract")
     flat = _flat(preamble).lower()
     for needle in (
         "drafted by pka-skills",
@@ -1191,8 +1203,8 @@ def _planned_names() -> dict[str, str]:
         if e.step is not None and _planned(e.step, e.path)
     }
     aliases = (
-        ("earmark-pka", "30", "plugins/earmark-pka/"),
-        ("earmark-receive", "30", "plugins/earmark-pka/skills/earmark-receive/"),
+        ("earmark-pka", "30", "plugins/earmark-pka/.claude-plugin/plugin.json"),
+        ("earmark-receive", "30", "plugins/earmark-pka/skills/earmark-receive/SKILL.md"),
         ("earmark.shortcut", "31", "shortcut/earmark.shortcut"),
         ("marketplace.json", "30", ".claude-plugin/marketplace.json"),
     )
@@ -1203,7 +1215,15 @@ def _planned_names() -> dict[str, str]:
 @pytest.mark.parametrize("doc", [*DOCS, "CLAUDE.md", ARCH])
 def test_planned_paths_are_marked_planned(doc: str) -> None:
     names = _planned_names()
-    assert "contract/" in names
+    missing = [e for e in _layout() if e.step is not None and not (ROOT / e.path).exists()]
+    assert missing, "steps 30 and 31 are still to build"
+    for entry in missing:
+        derived = (
+            entry.path
+            if entry.path.count("/") == 1 and entry.path.endswith("/")
+            else entry.path.rstrip("/")
+        )
+        assert derived in names, derived
     for paragraph in paragraphs(read_doc(doc)):
         for name, step in names.items():
             if name in paragraph:
@@ -1253,3 +1273,58 @@ def test_rescope_pka_skill_bullet_superseded_in_both() -> None:
     note = "*Superseded on 2026-11-24:* the receiving skill is part of this repo (step 30)."
     for doc in ("docs/PLAN.md", ARCH):
         assert note in _flat(read_doc(doc)), doc
+
+
+def _contract_block() -> str:
+    text = read_doc("contract/mail-v1.md")
+    return between_markers(text, "contract-v1").strip("\n") + "\n"
+
+
+def test_contract_v1_text_is_pinned() -> None:
+    digest = hashlib.sha256(_contract_block().encode("utf-8")).hexdigest()
+    assert digest == CONTRACT_V1_SHA256
+
+
+def test_contract_text_exists_once() -> None:
+    lines = {ln.strip() for ln in _contract_block().splitlines() if len(ln.strip()) >= 40}
+    assert len(lines) >= 40
+    contract = ROOT / "contract" / "mail-v1.md"
+    for directory, names, files in os.walk(ROOT):
+        names[:] = [n for n in names if n not in {".git", ".venv"}]
+        for name in files:
+            path = Path(directory) / name
+            if path.suffix != ".md" or path == contract:
+                continue
+            text = path.read_text(encoding="utf-8")
+            hits = [ln for ln in lines if ln in text]
+            assert not hits, (str(path.relative_to(ROOT)), hits[:2])
+
+
+def test_plan_and_architecture_point_to_contract() -> None:
+    for doc in ("docs/PLAN.md", ARCH):
+        assert "contract/mail-v1.md" in read_doc(doc), doc
+    mail = section(read_doc(ARCH), "#### The mail contract")
+    assert "- **Both files**" not in mail
+
+
+def test_contract_readme() -> None:
+    text = _flat(read_doc("contract/README.md"))
+    for needle in (
+        "plugins/earmark-pka/skills/earmark-receive/scripts/check_mail.py",
+        "python3 -I",
+        "mail-v1.md",
+        "samples/v1/",
+        "DRAFT",
+        "make samples",
+        "3.9",
+        "step 30",
+    ):
+        assert needle in text, needle
+    for code in ("0", "1", "2", "64"):
+        assert re.search(rf"\b{code}\b", text), code
+    assert "## What the checker cannot check" in read_doc("contract/README.md")
+
+
+@pytest.mark.parametrize("doc", CONTRACT_DOCS)
+def test_contract_docs_use_placeholders_only(doc: str) -> None:
+    _assert_placeholders(read_doc(doc), doc)

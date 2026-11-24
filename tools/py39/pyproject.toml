@@ -1,0 +1,27 @@
+# The type checker for code written to the PKA's Python 3.9 floor (the contract checker in
+# plugins/). mypy 2 cannot target 3.9, so this stays on 1.20.2, the last release that can.
+# Not covered by Dependabot on purpose. See docs/steps/29-mail-contract-seam.md 2.1.
+[project]
+name = "earmark-py39-gate"
+version = "0"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+[dependency-groups]
+dev = ["mypy==1.20.2"]
+
+[tool.uv]
+package = false
+required-environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unreachable = true
+enable_error_code = [
+  "ignore-without-code",
+  "redundant-expr",
+  "truthy-bool",
+  "possibly-undefined",
+  "deprecated",
+]

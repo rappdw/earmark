@@ -94,13 +94,14 @@ warn_required_dynamic_aliases = true
 
 [tool.ruff]
 target-version = "py313"
+per-file-target-version = { "plugins/**/*.py" = "py39" }
 line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = [
   "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "DTZ", "T20", "PT", "PIE", "RET",
-  "SIM", "PTH", "S", "BLE", "LOG", "G", "ASYNC", "FAST", "PGH", "PERF", "RUF",
+  "SIM", "PTH", "S", "BLE", "LOG", "G", "ASYNC", "FAST", "PGH", "PERF", "RUF", "FA",
 ]
 # Not selected on purpose: PL (PLC0415 conflicts with lazy imports of heavy deps),
 # TC (moves runtime-needed annotations under TYPE_CHECKING; breaks pydantic/typer/FastAPI).
