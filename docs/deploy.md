@@ -19,8 +19,9 @@ through this guide in order, with a check after each phase.
   has never been built or run. The Spark smoke test in section 7 is the only real check.
 - The systemd units are examples, reviewed but never run.
 - Email delivery is tested only against an in-process SMTP stub. TLS against your server,
-  DMARC at the recipient, and a PKA reading the attachments are operator checks (runbook
-  phases 5 and 6).
+  DMARC at the recipient, and AMAP delivering the mail to a PKA are operator checks
+  (runbook phases 5 and 6). The receiving skill is not built yet (step 30), and the whole
+  system has never run (runbook phase 12).
 - The Shortcut has never run on a phone.
 - The reachability setup is not verified by the earmark build. That covers the DNS-only
   Cloudflare record, the WireGuard split tunnel, Caddy with the DNS-01 challenge,
@@ -42,8 +43,11 @@ through this guide in order, with a check after each phase.
 iPhone / Mac ──(home Wi-Fi, or WireGuard split tunnel)──► 192.168.1.10:443
   Caddy (TLS for earmark.example.com) ──► 127.0.0.1:8787 earmark API
 Cloudflare DNS: earmark.example.com A 192.168.1.10 (DNS only, never proxied)
-worker ──(SMTP submission, TLS)──► smtp.example.org ──► PKA mailboxes
+worker ──(SMTP submission, TLS)──► smtp.example.org ──► each PKA's address ──(AMAP)──► the PKA
 ```
+
+- AMAP, outside this repo, applies the sender allowlist and DMARC, and hands the mail to the
+  PKA (section 8.5).
 
 ## 3. Requirements
 
@@ -456,18 +460,21 @@ image size (`docker image ls earmark:gpu`). The runbook's phase 3 asks for them.
 - Delivery is at-least-once. A resend keeps the `Message-ID` and the job id, and the PKA
   ignores a duplicate.
 
-The mail contract is in "Delivering" in [docs/ARCHITECTURE.md](ARCHITECTURE.md). It is
-**DRAFT** until you approve the PKA's receiving procedure.
+The mail contract is in "Delivering" in [docs/ARCHITECTURE.md](ARCHITECTURE.md), drafted by
+pka-skills and owned by this repo. It is
+**DRAFT** until you approve the receiving procedure, which is now the receiving skill (step 30).
 
 ### 8.2 A sending mailbox on your domain
 
 - Create `earmark@example.org` at a provider that offers SMTP submission (587 with
   STARTTLS, or 465 with TLS) and per-app passwords.
-- Use a dedicated mailbox, not your personal one: the PKAs allowlist this sender.
+- Use a dedicated mailbox, for nothing but earmark: AMAP's router allowlists this sender for
+  each PKA address, and the receiving skill's trust in the instructions rests on no one else
+  sending from it.
 
 ### 8.3 SPF, DKIM and DMARC
 
-Each PKA's runtime reads attachments only from an allowlisted sender whose mail passes
+AMAP's router makes attachments readable only for an allowlisted sender whose mail passes
 DMARC. The provider supplies the exact values. The records have this shape:
 
 - SPF: `example.org TXT "v=spf1 include:<provider's SPF domain> -all"`. Keep one SPF
@@ -501,8 +508,10 @@ EARMARK_SMTP_FROM=earmark@example.org
 
 - `EARMARK_SMTP_PORT` defaults to 587 for `starttls` and 465 for `tls`.
 - `EARMARK_SMTP_TIMEOUT_S` defaults to 60 and is at most 90.
-- `EARMARK_MAX_ATTACHMENT_MB` defaults to 10 MiB. A three-hour transcript is about 300 KB.
-  Set it at or below any attachment cap the PKAs' mail lane has.
+- `EARMARK_MAX_ATTACHMENT_MB` defaults to 10 MiB, for the two attachments together. A
+  three-hour transcript is about 300 KB. Keep it at or below AMAP's attachment limit for the
+  PKA addresses, which is not known yet (runbook phase 6 finds it). If AMAP limits the whole
+  message, base64 makes the message about 1.37 times the attachments.
 - The password is printable ASCII, and spaces are allowed: single-quote it in `.env`.
 - TLS is always verified, AUTH happens only after TLS, and there is no plaintext mode. A
   server without STARTTLS fails delivery.
@@ -514,10 +523,16 @@ the server's). Doctor never sends mail.
 
 ### 8.5 The PKA side
 
-- Ask each PKA to allowlist `earmark@example.org` at its runtime. You arrange this with
-  those agents. earmark cannot do it, and cannot see whether it was done: SMTP's 250 reply
-  is all it learns.
-- The test is a PKA confirming that it read both attachments.
+- How mail reaches a PKA: earmark sends plain email to the PKA's address; AMAP, outside this
+  repo, applies the allowlist and DMARC and provides it to the PKA through AMMP; the PKA
+  reads it with its `inbox` tools after a doorbell in its session. See
+  [ARCHITECTURE.md "System"](ARCHITECTURE.md#system-three-parts-and-two-seams).
+- **The sender allowlist is AMAP router configuration.** Add `earmark@example.org` to the
+  AMAP router's allowlist for each PKA's address. You set it; it is not something to ask a
+  PKA for. earmark cannot see whether it was done: SMTP's 250 reply is all it learns.
+- **AMAP's attachment limit** must be at least `EARMARK_MAX_ATTACHMENT_MB` (8.4).
+- **The test** is the PKA's `inbox` tools showing both attachments with disposition
+  `clean` (runbook phase 6). Filing needs the receiving skill (step 30, not built yet).
 
 ### 8.6 Reading a message without sending
 
@@ -691,7 +706,8 @@ grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PA
 | job failed, naming `EARMARK_SMTP_HOST` | The certificate was not verified. |
 | job failed: the server does not offer STARTTLS | Use `EARMARK_SMTP_SECURITY=tls` if the provider uses port 465. |
 | job failed, naming `EARMARK_MAX_ATTACHMENT_MB` | The attachments are over the cap. |
-| mail arrives, but the PKA does not file it | The sender is not allowlisted there, or DMARC fails (the 8.3 check). |
+| the PKA gets the mail, but its attachments are not readable (not `clean`) | `earmark@example.org` is not on the AMAP router's allowlist for that address, or DMARC fails (the 8.3 check). |
+| the PKA reads the mail but does not file it | The receiving skill is not installed there (runbook phase 11; step 30, not built yet). |
 | a PKA got the same message twice | Delivery is at-least-once; the PKA's dedupe drops it. |
 | doctor or startup: `was created by earmark 0.1.0` | Section 14. |
 | the worker exits "sees no CUDA device" | Section 7.4. |

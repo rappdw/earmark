@@ -1,20 +1,122 @@
 # Architecture
 
-earmark is a self-hosted transcription and delivery service. A request (step 24) carries an
-Apple Podcasts episode link, a direct audio URL, or an uploaded audio file, plus a
-destination address checked against an allowlist, free-form instructions, and optionally a
-title. The worker resolves or downloads the audio and transcribes it, then caches the
-transcript. It emails the transcript note and the instructions to the destination as two
-Markdown attachments, in the mail contract's format (step 25). Last, it sends an ntfy push.
-The operator's PKA instances do the analysis and filing.
+This repo holds a small system in three parts, the iOS Shortcut, the service and the
+receiving skill, joined at two seams. "System" below says how they fit. The rest of this
+document describes part 2, the service.
+
+## System: three parts and two seams
+
+One repo holds the whole system. That is the operator's decision of 2026-11-24: the project
+is too small to split, one plan and one runbook cover the system, and a change across a seam
+lands in one commit. AMAP, the mail system that carries the service's mail to each PKA, is
+outside this repo.
+
+### The three parts
+
+| Part | What it is | Runs on | Lives in | Built and run |
+|---|---|---|---|---|
+| 1. The Shortcut | The iOS Shortcut that sends audio or a link to the service | the operator's iPhone | `docs/shortcut.md`, which says how to build it by hand; `shortcut/earmark.shortcut` from step 31 | Never run on a phone. The file is not built (step 31). |
+| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27 and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
+| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Not built (steps 29, 30). |
+
+### The two seams
+
+| Seam | Between | Contract | Tested by |
+|---|---|---|---|
+| Request | Shortcut → service | `POST /transcriptions`: the request model in code, and "HTTP API" below | the service's API tests (`tests/test_api.py`), and the doc tests that post `docs/shortcut.md`'s JSON example and upload fields to the app; no Shortcut has sent one yet |
+| Mail | service → AMAP → receiving skill | the mail contract, `contract: 1` ("The mail contract" below; `contract/mail-v1.md` from step 29) | today the service's note and message tests only (`tests/test_note.py`, `tests/test_message.py`); from steps 29 and 30, sample emails in `contract/samples/v1/` that both sides test against |
+
+- The request seam has no folder: its contract is the request model in code plus this
+  document.
+- The mail seam's folder, `contract/`, covers that seam only (step 29).
+
+### How mail reaches a PKA
+
+AMAP is outside this repo, and earmark only relies on it.
+
+1. The service sends ordinary SMTP email to the PKA instance's email address. earmark is not
+   an AMAP fleet member, just an outside sender.
+2. AMAP takes the email delivered to that address and provides it to the PKA through AMMP
+   (the Agent Mediated Messaging Protocol). The AMAP router applies the sender allowlist and
+   DMARC. Attachments are readable (disposition `clean`) only for an allowlisted sender that
+   passes DMARC.
+3. Inside the PKA's sandbox, AMAP rings a content-free doorbell in the live session: "you
+   have mail; use the inbox read tool". With no session running, the mail waits for the next
+   one.
+4. The PKA reads the message and its attachments with the `inbox` tools. The receiving skill
+   takes over from there (step 30).
+
+- **Intake is AMAP's job.** No earmark code reads, polls or selects mail. The service sends
+  plain email, embeds no agent, and is deterministic apart from ASR output.
+- **The sender allowlist is AMAP router config**, set by the operator for each PKA's address.
+  It is not a PKA's responsibility, and not something to ask a PKA for. earmark cannot see
+  it: SMTP's reply is all it learns.
+- **AMAP's attachment limit is not known yet.** `EARMARK_MAX_ATTACHMENT_MB` (10) must not
+  exceed it. If AMAP counts the whole message, base64 makes the message about 1.37 times the
+  attachments. Runbook phase 6 checks it.
+- **Trust.** earmark is not an enrolled peer, so the `inbox` tools' strict rule applies to
+  its mail. The receiving skill acts on the instructions only within the narrow scope the
+  operator granted as an explicit exception (`docs/PLAN.md` "Trust"), and the transcript note
+  is always data. That rests on the sending address being used for nothing but earmark.
+
+### Definition of done
+
+One episode shared on the phone is transcribed on the Spark, emailed, read by a PKA through
+the receiving skill, and filed, with the instructions acted on. The runbook's last phase
+(phase 12) is this check.
+
+A step being `done` means its part's code and tests pass; it does not mean the system works.
+
+The system has not met this yet. Parts 1 and 3 are incomplete (steps 30, 31), and the system
+has never run end to end.
+
+### Repo layout
+
+<!-- repo-layout -->
+```text
+.claude-plugin/marketplace.json   the marketplace "earmark", listing ./plugins/earmark-pka (step 30)
+plugins/earmark-pka/              part 3: the plugin (step 30)
+  .claude-plugin/plugin.json
+  skills/earmark-receive/SKILL.md
+  skills/earmark-receive/scripts/   the contract checker, its only copy (step 29)
+contract/                         the mail seam only (step 29)
+  README.md                         what the seam is, its versions, where the checker lives
+  mail-v1.md                        the contract 1 text
+  samples/v1/                       sample emails
+shortcut/earmark.shortcut         part 1: the signed export, the folder's only file (step 31)
+src/earmark/                      part 2: the service
+deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment
+tests/                            every part's tests, one gate
+docs/                             architecture, plan, runbook, deploy and Shortcut docs
+.github/                          CI: the gate, the live tests, the container build
+.claude/                          the build loop's agents and /step (development only)
+```
+
+- Planned paths carry the step that creates them; a path without one exists now.
+- The service keeps its conventional layout (`src/earmark/` with its deployment files at the
+  top level). It is not moved into a part folder.
+
+## The service
+
+The service (part 2) is a self-hosted transcription and delivery service. A request (step
+24) carries an Apple Podcasts episode link, a direct audio URL, or an uploaded audio file,
+plus a destination address checked against an allowlist, free-form instructions, and
+optionally a title. The worker resolves or downloads the audio and transcribes it, then
+caches the transcript. It emails the transcript note and the instructions to the destination
+as two Markdown attachments, in the mail contract's format (step 25). Last, it sends an ntfy
+push. The operator's PKA instances do the analysis and filing, through the receiving skill
+(part 3).
 
 On the DGX Spark the worker transcribes on the GB10 GPU in-process, from a GPU build of the
 image that compiles CTranslate2 with CUDA (step 26).
 
 How to read this document:
 
-- The sections before "Settled questions" describe the code as it is.
-- "Settled questions" records what the planners of steps 24–27 decided, and why.
+- "System" describes the whole repo, including parts that later steps build, each marked
+  with its step.
+- The sections after "The service", up to "Settled questions", describe the service's code
+  as it is.
+- "Settled questions" records what the planners of steps 24–28 decided, and why.
 - "History: removed in step 22" lists what step 22 removed.
 
 When a step changes a contract described here, it changes this file in the same commit.
@@ -28,9 +130,9 @@ backend, not the pipeline.
 
 | Question | Decision | How to change it |
 |---|---|---|
-| Scope | earmark transcribes, and delivers the transcript by email (step 25). The operator's PKA instances do the analysis and filing. | See "Re-scope decisions" and "Delivering". |
+| Scope | The service transcribes, and delivers the transcript by email (step 25). It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
 | State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). Per-job staging files for uploads and direct URLs (`uploads/`, `downloads/`, deleted when the job ends; step 24). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
-| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the pka-skills mail contract (`contract: 1`). Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
+| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 1`, drafted by pka-skills, owned by this repo). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
@@ -71,6 +173,8 @@ After enqueue, only delivery reads `to` and `instructions` (step 25). `title` na
 and direct URLs, and is ignored for podcasts.
 
 ## Module layout
+
+These are the service's modules. The whole repo's layout is "Repo layout" under "System".
 
 ```
 src/earmark/
@@ -694,11 +798,17 @@ Step 25; exact rules in `docs/steps/25-delivery.md` sections 4 and 5.
     They never carry the server's reply text, which echoes addresses: errors made from
     smtplib exceptions are raised `from None`.
 
-#### The mail contract (pka-skills, `contract: 1`, 2026-11-23)
+#### The mail contract (`contract: 1`)
 
-Status: **DRAFT**. It becomes final once the operator approves the PKA's receiving
-procedure. A revision would come with a contract version bump, and would change
-`docs/PLAN.md` "Re-scope" and this copy together. Step 25 built to this text.
+- **Provenance.** Drafted by pka-skills on 2026-11-23. Owned by this repo since 2026-11-24
+  (the operator's decision; pka-skills confirmed that `contract: 1` stands as drafted). From
+  step 29 its source of truth is `contract/mail-v1.md`, and this copy and the one in
+  `docs/PLAN.md` "Re-scope" are replaced by links. Until then these two copies are it, and
+  they change together.
+- Status: **DRAFT**. It becomes final once the operator approves the PKA's receiving
+  procedure, which is now the receiving skill (step 30). A revision comes with a contract
+  version bump, because mail sent under one version can still be waiting in an inbox when
+  the next one ships. Step 25 built to this text.
 
 - **Both files**
   - **Encoding:** UTF-8 with no BOM and LF line endings. The extension is a lower-case
@@ -1542,8 +1652,18 @@ Documents are tested against the code (step 16).
 - **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
   (`<!-- name:begin -->` … `<!-- name:end -->`, or a single `<!-- name -->` before a
   fence) and plain regular expressions; there is no Markdown library.
-- **What `tests/test_docs.py` checks** (rewritten in step 27; exact list in
-  `docs/steps/27-docs-runbook-shortcut.md` section 6).
+- **What `tests/test_docs.py` checks** (rewritten in step 27, extended in step 28; exact
+  lists in `docs/steps/27-docs-runbook-shortcut.md` and `docs/steps/28-system-scope.md`
+  section 6).
+  - This file opens with "System": the three parts with what is not built or never run, the
+    two seams, how mail reaches a PKA through AMAP, and the definition of done.
+  - The repo layout's paths exist or carry a `todo` step from the `docs/PLAN.md` status
+    table, and it names every top-level directory.
+  - While a planned path does not exist, no doc names it in a paragraph without the step
+    that builds it.
+  - The sender allowlist is AMAP router config in every doc, never something to ask a PKA
+    for.
+  - `CLAUDE.md` and the README say the service files nothing and the PKA files.
   - The README's settings reference lists every `Settings` field exactly once, one
     variable per table row.
   - The README quickstart sets all five backends to `fake`, exports only `Settings`
@@ -1557,11 +1677,13 @@ Documents are tested against the code (step 16).
     allowlist example in `docs/deploy.md`, and both POST actions send `timestamp`.
   - Relative links and their `#anchors` in the README, `docs/deploy.md`,
     `docs/shortcut.md`, `docs/runbook-spark.md` and `docs/asr.md` resolve.
-  - Those documents use placeholders only (addresses at `example.org`, `example.net` or
+  - Those documents, `CLAUDE.md`, this file's System section and the step plans 27 and 28
+    use placeholders only (addresses at `example.org`, `example.net` or
     `example.com`, the listed example IPs, placeholder secrets), and outside their marked
     "upgrading from v0.1.0" blocks name no removed feature, route, setting or service.
   - Every runbook phase ends in a check, and one check is a real delivery to the
-    operator's own address.
+    operator's own address; phase 11 is the receiving skill's install (step 30) and the
+    last phase, 12, is the one-episode check of the whole system.
   - The README's command table names every CLI command, and its HTTP API sentence names
     every route of `build_router` (step 17).
   - Real share-sheet captures in `tests/fixtures/share_sheet.json` canonicalise as
@@ -1737,6 +1859,7 @@ Step planners should check these against current documentation instead of assumi
    `multipart/form-data`, the file part's content type, whether `Ask for Input` accepts an
    empty answer, and how long `Get Contents of URL` waits on a large upload. The CPU-only
    worker override in `docs/deploy.md` section 7.2 (`gpus: !reset null`) has not run either.
+   The receiving skill and the Shortcut file do not exist yet (steps 30, 31).
 5. **The dev sandbox intercepts DNS.** Found in step 06 (2026-11-20): every name,
    including `.invalid` ones, resolves to `10.200.9.2`, so the address guard refuses
    every real fetch there. That is correct behaviour; `network` tests detect it and run
@@ -1751,6 +1874,13 @@ Step planners should check these against current documentation instead of assumi
    `av.open`, which PyAV 19.0.0 removed, so every transcription fails with a `TypeError`.
    The `transcribe` extra pins `av>=18.1,<19` until a faster-whisper release includes the
    fix already on its `master`. The weekly `slow` job would catch a regression.
+
+8. **AMAP, outside this repo.** earmark relies on AMAP to deliver its mail to each PKA: the
+   router's sender allowlist and DMARC, `clean` attachments, the doorbell. None of it can be
+   exercised here, and earmark learns only the SMTP reply. AMAP's attachment limit is not
+   known; `EARMARK_MAX_ATTACHMENT_MB` must not exceed it, and a whole-message limit needs
+   about 1.37 times the cap (`docs/steps/28-system-scope.md` section 2.4). Runbook phases 6
+   and 12 check it.
 
 ## Re-scope decisions (2026-11-23)
 
@@ -1810,6 +1940,8 @@ context. earmark's job is:
 - **No "analysis done" relay for now.** ntfy stays for "sent" and "failed".
   Built in step 25: see "Notifying".
 - **No PKA-side skill is needed from earmark.** PKA is gaining inbound email.
+  *Superseded on 2026-11-24:* the receiving skill is part of this repo (step 30). See
+  "System" above.
 - **The attachment size cap is configurable.** Built in step 25:
   `EARMARK_MAX_ATTACHMENT_MB`.
 - **Removed code is deleted.** It stays recoverable from the `v0.1.0-full-pipeline` tag.
@@ -1826,7 +1958,7 @@ context. earmark's job is:
 
 ## Settled questions
 
-The planners of steps 24–27 settled these. Each step plan, section 8, has the reasons.
+The planners of steps 24–28 settled these. Each step plan, section 8, has the reasons.
 
 - **Settled by step 24** (see `docs/steps/24-transcription-requests.md` section 8):
   - the caps: `instructions` 4000 characters, `title` 200;
@@ -1857,8 +1989,8 @@ The planners of steps 24–27 settled these. Each step plan, section 8, has the 
     or before a segment that would take it past 60 s.
   - **Push wording.** "Sent: …" with `To:` masked, and the resent and
     may-already-be-delivered lines.
-  - **Still open:** the contract is final only once the operator approves the PKA's
-    receiving procedure.
+  - **Still open:** the contract is final only once the operator approves the receiving
+    procedure, now the receiving skill (step 30).
 - **Settled by step 26** (see `docs/steps/26-gpu-image.md` sections 2 and 8):
   - **The base** is the slim pair `nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04` and
     `-cudnn-runtime-ubuntu24.04`, not the NGC PyTorch image:
@@ -1887,6 +2019,14 @@ The planners of steps 24–27 settled these. Each step plan, section 8, has the 
     then the PKA recipients, reachability, ntfy and the Shortcut.
   - **No worker without a GPU in `compose.yaml`.** A host without one uses a local
     `compose.override.yaml`, documented in `docs/deploy.md` section 7.2.
+- **Settled by step 28** (see `docs/steps/28-system-scope.md` section 8):
+  - the runbook keeps phases 0–10 and appends phase 11 (installing the receiving skill,
+    step 30) and phase 12 (the one-episode check), so no existing phase number changes;
+  - the repo layout is a `text` fence after `<!-- repo-layout -->`, checked against the
+    repo and the status table, and it also names `.github/`;
+  - AMAP's attachment limit is checked both ways: decoded attachments against the cap, or
+    the whole message against about 1.37 times the cap;
+  - `deploy.md` keeps section 8.5's heading, so its anchor stays.
 
 ## Not planned
 

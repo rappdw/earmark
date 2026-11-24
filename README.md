@@ -1,11 +1,34 @@
 # earmark
 
-A self-hosted transcription and delivery service. An iOS Shortcut, curl or `earmark
-submit` sends an Apple Podcasts episode link, a direct audio URL or an audio file, plus a
+earmark turns a podcast episode or a piece of audio, shared from an iPhone, into a note
+filed by the operator's personal knowledge assistants (PKAs). This repository holds the
+whole system, in three parts (below).
+
+Most of this README is about part 2, the service: a self-hosted transcription and delivery
+service. An iOS Shortcut, curl or `earmark submit` sends an Apple Podcasts episode link, a direct audio URL or an audio file, plus a
 destination address and instructions. A worker transcribes it with faster-whisper, on the
 DGX Spark's GPU in the GPU image. The transcript note and the instructions are emailed to
-that address as two Markdown attachments, and an ntfy push follows. The operator's
-personal knowledge assistants (PKAs) do the analysis and filing. Python 3.13.
+that address as two Markdown attachments, and an ntfy push follows. Python 3.13.
+
+## The system
+
+- **1. The Shortcut**, on the iPhone: sends a link or a file with the destination and the
+  instructions. Built by hand from [docs/shortcut.md](docs/shortcut.md). It has never run
+  on a phone, and a file to import comes in step 31.
+
+- **2. The service**, on the DGX Spark, in `src/earmark/`: transcribes and emails the
+  transcript. The rest of this README. The GPU image has never been built or run.
+
+- **3. The receiving skill**, in each chosen PKA instance: checks an earmark email, files
+  the note, and acts on the instructions within a narrow scope. It will be the
+  `earmark-pka` plugin in `plugins/earmark-pka/`, from this repository's plugin
+  marketplace. Not built yet (steps 29, 30).
+
+The two seams are the request (`POST /transcriptions`) and the mail contract
+(`contract: 1`). AMAP, outside this repository, delivers the mail to each PKA. The service
+files nothing; the PKA files, through the receiving skill. The parts, the seams, the
+definition of done and the repo layout are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#system-three-parts-and-two-seams).
 
 ## How it works
 
@@ -37,7 +60,7 @@ the duplicate. Sharing the same item again is a new job that reuses the cached t
 "Delivering" and the mail contract in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) have the
 details.
 
-**What earmark keeps.** The job table and a transcript cache, both under
+**What the service keeps.** The job table and a transcript cache, both under
 `EARMARK_DATA_DIR`. It is not a system of record: the notes live with the PKAs.
 
 ## Quickstart (fake backends)
@@ -134,7 +157,8 @@ reaches the API.
 - [docs/runbook-spark.md](docs/runbook-spark.md): a step-by-step first setup on a DGX
   Spark, with a check after each phase.
 - [docs/asr.md](docs/asr.md): remote transcription servers.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the design, contracts, and security rules.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the system, the service's design, contracts,
+  and security rules.
 - [docs/PLAN.md](docs/PLAN.md): the build plan and what is built so far.
 
 ## Commands

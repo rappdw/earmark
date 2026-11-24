@@ -49,7 +49,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 25 | Delivery: the transcript note and the email | 24 | done |
 | 26 | GPU transcription inside the image | 25 | done |
 | 27 | Docs, runbook and Shortcut for the transcription service | 26 | done |
-| 28 | System scope: the three parts and the two seams | 27 | todo |
+| 28 | System scope: the three parts and the two seams | 27 | done |
 | 29 | The mail contract as a tested seam | 28 | todo |
 | 30 | The PKA marketplace and the receiving skill | 29 | todo |
 | 31 | The Shortcut as a file | 28 | todo |

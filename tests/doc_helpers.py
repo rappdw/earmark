@@ -244,3 +244,94 @@ def section(text: str, heading: str) -> str:
             end = i
             break
     return "\n".join(lines[first:end])
+
+
+@dataclass(frozen=True)
+class LayoutEntry:
+    path: str  # full path from the repo root, as written
+    description: str  # the text after the path field, stripped ("" when none)
+    step: str | None  # the entry's own "(step NN)", else the nearest ancestor's, else None
+
+
+_STEP_IN_TEXT: Final = re.compile(r"\(step (\d+[a-z]?)\)")
+_FIELD_GAP: Final = re.compile(r" {2,}")
+
+
+def layout_entries(body: str) -> list[LayoutEntry]:
+    """Entries of a repo-layout fence body. A line's path field ends at the first run of two
+    or more spaces; it may hold several paths separated by ', ', each an entry with the same
+    description and step. A line indented more than the line above is a child of the nearest
+    preceding line with less indentation, which must be a single path ending in '/'; the
+    child's path is joined to it. Blank lines are skipped. AssertionError for a child of a
+    multi-path line or of a path not ending in '/', and for indentation that is not a
+    multiple of two."""
+    entries: list[LayoutEntry] = []
+    # (indent, path-as-parent or None when the line cannot have children, step)
+    stack: list[tuple[int, str | None, str | None]] = []
+    for raw in body.splitlines():
+        if not raw.strip():
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        assert indent % 2 == 0, f"indentation is not a multiple of two: {raw!r}"
+        parts = _FIELD_GAP.split(raw.strip(), maxsplit=1)
+        field = parts[0]
+        description = parts[1].strip() if len(parts) > 1 else ""
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        prefix = ""
+        inherited: str | None = None
+        if indent > 0:
+            assert stack, f"indented line with no parent: {raw!r}"
+            _, parent, inherited = stack[-1]
+            assert parent is not None, f"child of a line that cannot be a parent: {raw!r}"
+            prefix = parent
+        own = _STEP_IN_TEXT.search(description)
+        step = own[1] if own else inherited
+        paths = field.split(", ")
+        entries.extend(LayoutEntry(prefix + path, description, step) for path in paths)
+        single_directory = len(paths) == 1 and field.endswith("/")
+        stack.append((indent, prefix + field if single_directory else None, step))
+    return entries
+
+
+def plan_status(plan_text: str) -> dict[str, str]:
+    """Step number -> status from the table in docs/PLAN.md's '## Status' section, both
+    stripped, for example {'01': 'done', '01a': 'done', '28': 'todo'}. AssertionError if
+    the table has no rows."""
+    rows = table_rows(section(plan_text, "## Status"))
+    status = {r[0]: r[-1] for r in rows if len(r) >= 2 and re.fullmatch(r"\d+[a-z]?", r[0])}
+    assert status, "the status table has no rows"
+    return status
+
+
+_STEPS: Final = re.compile(
+    r"\bsteps?\s+(\d+[a-z]?(?:(?:\s*,\s*|\s+and\s+|\s*[\u2013-]\s*)\d+[a-z]?)*)", re.IGNORECASE
+)
+_STEP_SEPARATOR: Final = re.compile(r"(\s*,\s*|\s+and\s+|\s*[\u2013-]\s*)")
+
+
+def _pad(number: str) -> str:
+    return number.zfill(2) if number.isdigit() else number
+
+
+def step_numbers(text: str) -> set[str]:
+    """Every step number that text mentions as 'step NN' or 'steps NN, MM and KK', with
+    ranges 'NN-MM' (hyphen or en dash) expanded, each zero-padded to two digits; a suffixed number
+    such as '01a' is kept as written. Case-insensitive."""
+    found: set[str] = set()
+    for match in _STEPS.finditer(text):
+        tokens = _STEP_SEPARATOR.split(match[1])
+        numbers = tokens[0::2]
+        separators = tokens[1::2]
+        for number in numbers:
+            found.add(_pad(number))
+        for left, sep, right in zip(numbers, separators, numbers[1:], strict=False):
+            if sep.strip() in {"\u2013", "-"} and left.isdigit() and right.isdigit():
+                found.update(_pad(str(n)) for n in range(int(left), int(right) + 1))
+    return found
+
+
+def paragraphs(text: str) -> list[str]:
+    """Blocks of text outside fences separated by blank lines, each stripped, empty ones
+    dropped. A table, or a list with no blank lines between its items, is one block."""
+    return [block.strip() for block in re.split(r"\n\s*\n", _outside_fences(text)) if block.strip()]

@@ -24,15 +24,20 @@ from earmark.staging import Staging
 from earmark.submission import Intake
 from tests.doc_helpers import (
     ROOT,
+    LayoutEntry,
     after_marker,
     anchored_links,
     between_markers,
     fences,
     first_fence,
     heading_anchors,
+    layout_entries,
+    paragraphs,
+    plan_status,
     read_doc,
     relative_links,
     section,
+    step_numbers,
     table_rows,
     table_variables,
     without_blocks,
@@ -41,7 +46,8 @@ from tests.multipart_helpers import Part, audio, content_type, multipart_body
 
 TOKEN = "docs-test-token-91c"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-PLAN = "docs/steps/27-docs-runbook-shortcut.md"
+PLANS = ["docs/steps/27-docs-runbook-shortcut.md", "docs/steps/28-system-scope.md"]
+ARCH = "docs/ARCHITECTURE.md"
 DOCS = [
     "README.md",
     "docs/deploy.md",
@@ -82,6 +88,18 @@ def _allowlist() -> tuple[str, ...]:
 
 
 ALLOWLIST = _allowlist()
+
+
+def _system() -> str:
+    return section(read_doc(ARCH), "## System: ")
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _layout() -> list[LayoutEntry]:
+    return layout_entries(first_fence(after_marker(_system(), "repo-layout"), "text").body)
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -543,16 +561,14 @@ SECRET_LINE = re.compile(
 )
 
 
-@pytest.mark.parametrize("doc", [*DOCS, PLAN])
-def test_docs_use_placeholders_only(doc: str) -> None:
-    text = read_doc(doc)
+def _assert_placeholders(text: str, label: str) -> None:
     for match in EMAIL.finditer(text):
         domain = match[0].rsplit("@", 1)[1].lower()
-        assert domain in {"example.org", "example.net", "example.com"}, match[0]
+        assert domain in {"example.org", "example.net", "example.com"}, (label, match[0])
     # "0.0.0.0" is the documented example bind address, not a bind made here.
     allowed_ips = {"127.0.0.1", "0.0.0.0", "1.1.1.1", "192.168.1.10", "192.168.1.0"}  # noqa: S104
     for match in IPV4.finditer(text):
-        assert match[0] in allowed_ips, match[0]
+        assert match[0] in allowed_ips, (label, match[0])
     for host in re.findall(r"[\w.-]+\.ts\.net\b", text):
         assert host.endswith("tailnet-name.ts.net"), host
     assert re.search(r"tk_[A-Za-z0-9]{8,}", text) is None
@@ -564,10 +580,21 @@ def test_docs_use_placeholders_only(doc: str) -> None:
                 assert value in ("", "demo-token") or "<" in value, line
 
 
+@pytest.mark.parametrize("doc", [*DOCS, *PLANS, "CLAUDE.md"])
+def test_docs_use_placeholders_only(doc: str) -> None:
+    _assert_placeholders(read_doc(doc), doc)
+
+
+def test_architecture_system_section_uses_placeholders() -> None:
+    _assert_placeholders(_system(), "ARCHITECTURE System")
+
+
 def test_deploy_doc_states_test_status() -> None:
     text = read_doc("docs/deploy.md")
     head = text.split("\n## ")[1]  # the first section, "What is tested"
-    flat = head.lower().replace("`", "")
+    flat = _flat(head).lower().replace("`", "")
+    for needle in ("receiving skill", "not built", "phase 12"):
+        assert needle in flat, needle
     assert "build-tested in ci" in flat
     assert "not run-tested" in flat
     assert "gpu image is untested" in flat
@@ -702,14 +729,14 @@ def test_deploy_doc_cpu_worker_override() -> None:
 def _phases() -> list[str]:
     text = read_doc("docs/runbook-spark.md")
     titles = re.findall(r"^## (Phase \d+|Send back)\b", text, re.MULTILINE)
-    assert titles == [f"Phase {n}" for n in range(11)] + ["Send back"]
+    assert titles == [f"Phase {n}" for n in range(13)] + ["Send back"]
     parts = re.split(r"^## ", text, flags=re.MULTILINE)
     return [p for p in parts if p.startswith("Phase ")]
 
 
 def test_runbook_phases_end_in_checks() -> None:
     phases = _phases()
-    assert len(phases) == 11
+    assert len(phases) == 13
     for phase in phases:
         title = phase.splitlines()[0]
         assert phase.count("**Check:**") == 1, title
@@ -737,6 +764,76 @@ def test_runbook_real_delivery_check() -> None:
     assert len(found) == 1
 
 
+def _phase(number: int) -> str:
+    [found] = [p for p in _phases() if p.startswith(f"Phase {number}:")]
+    return found
+
+
+def test_runbook_last_phase_is_the_system_check() -> None:
+    last = _phases()[-1]
+    assert last.startswith("Phase 12: ")
+    assert "one episode" in last.splitlines()[0]
+    assert "ARCHITECTURE.md#definition-of-done" in last
+    check = _flat(last.partition("**Check:**")[2])
+    for needle in (
+        "job_id",
+        "Sent:",
+        "cuda",
+        "inbox",
+        "receiving skill",
+        'source: "earmark"',
+        "guid",
+        "commits nothing",
+        "instructions",
+    ):
+        assert needle in check, needle
+
+
+def test_runbook_skill_install_placeholder() -> None:
+    phase = _phase(11)
+    title = phase.splitlines()[0]
+    assert "receiving skill" in title
+    assert "step 30" in title
+    body, _, check = phase.partition("**Check:**")
+    flat = _flat(body)
+    assert "not built" in flat
+    assert "project scope" in flat
+    assert any("step 30" in p for p in paragraphs(body.split("\n", 1)[1]))
+    assert "phase 12 cannot pass" in _flat(check)
+
+
+def test_runbook_phase_6_uses_amap() -> None:
+    body, _, check = _flat(_phase(6)).partition("**Check:**")
+    for needle in (
+        "AMAP",
+        "router",
+        "allowlist",
+        "earmark@example.org",
+        "EARMARK_MAX_ATTACHMENT_MB",
+        "1.37",
+    ):
+        assert needle in body, needle
+    for needle in ("attachment limit", "EARMARK_MAX_ATTACHMENT_MB", "`clean`"):
+        assert needle in check, needle
+
+
+def test_deploy_doc_pka_side_is_amap() -> None:
+    text = read_doc("docs/deploy.md")
+    side = _flat(section(text, "### 8.5 "))
+    for needle in (
+        "AMAP",
+        "router",
+        "allowlist",
+        "outside this repo",
+        "`clean`",
+        "EARMARK_MAX_ATTACHMENT_MB",
+    ):
+        assert needle in side, needle
+    limit = _flat(section(text, "### 8.4 "))
+    assert "AMAP" in limit
+    assert "1.37" in limit
+
+
 def test_runbook_covers_the_brief() -> None:
     text = read_doc("docs/runbook-spark.md")
     for needle in (
@@ -753,6 +850,7 @@ def test_runbook_covers_the_brief() -> None:
         "lancedb/",
         "models/embed/",
         "vault is no longer touched",
+        "AMAP",
     ):
         assert needle in text, needle
     assert "Dockerfile.gpu" in text or "GPU image" in text
@@ -928,3 +1026,230 @@ def test_deploy_doc_hf_telemetry_section() -> None:
     architecture = read_doc("docs/ARCHITECTURE.md")
     assert "HF_HUB_DISABLE_TELEMETRY=1" in architecture
     assert "HF_HUB_DISABLE_TELEMETRY=0" in architecture
+
+
+# --- the system scope (step 28) -------------------------------------------------------------
+
+SYSTEM_HEADING = "## System: three parts and two seams"
+DONE_SENTENCE = (
+    "One episode shared on the phone is transcribed on the Spark, emailed, read by a PKA "
+    "through the receiving skill, and filed, with the instructions acted on."
+)
+DONE_MEANS = (
+    "A step being `done` means its part's code and tests pass; it does not mean the system works."
+)
+
+
+def _table(text: str, heading: str) -> list[list[str]]:
+    return table_rows(section(text, heading))
+
+
+def test_architecture_opens_with_system_section() -> None:
+    heads = [p.splitlines()[0] for p in paragraphs(read_doc(ARCH)) if p.startswith("## ")]
+    assert heads[:3] == [SYSTEM_HEADING, "## The service", "## Decisions"]
+
+
+def test_architecture_system_parts() -> None:
+    rows = _table(_system(), "### The three parts")
+    assert [r[0] for r in rows] == ["1. The Shortcut", "2. The service", "3. The receiving skill"]
+    for row, runs_on, lives_in in zip(
+        rows,
+        ["iPhone", "DGX Spark", "PKA"],
+        ["shortcut/earmark.shortcut", "src/earmark/", "plugins/earmark-pka/"],
+        strict=True,
+    ):
+        assert runs_on in row[2], row[0]
+        assert lives_in in row[3], row[0]
+
+
+def test_architecture_system_seams() -> None:
+    rows = _table(_system(), "### The two seams")
+    assert [r[0] for r in rows] == ["Request", "Mail"]
+    request, mail = rows
+    assert "POST /transcriptions" in request[2]
+    assert "contract: 1" in mail[2]
+    assert "contract/samples/v1/" in mail[3]
+    assert "29" in step_numbers(mail[3])
+
+
+def test_architecture_mail_reaches_pka_through_amap() -> None:
+    text = _flat(section(_system(), "### How mail reaches a PKA"))
+    for needle in (
+        "AMAP",
+        "outside this repo",
+        "AMMP",
+        "allowlist",
+        "DMARC",
+        "router",
+        "doorbell",
+        "`clean`",
+        "inbox",
+        "EARMARK_MAX_ATTACHMENT_MB",
+        "No earmark code reads, polls or selects mail",
+    ):
+        assert needle in text, needle
+
+
+def test_architecture_definition_of_done() -> None:
+    text = _flat(section(_system(), "### Definition of done"))
+    assert DONE_SENTENCE in text
+    assert DONE_MEANS in text
+    assert "phase 12" in text
+
+
+def _planned(entry_step: str | None, path: str) -> bool:
+    return entry_step is not None and not (ROOT / path).exists()
+
+
+def test_architecture_repo_layout_matches_repo() -> None:
+    entries = _layout()
+    status = plan_status(read_doc("docs/PLAN.md"))
+    for entry in entries:
+        if (ROOT / entry.path).exists():
+            continue
+        assert entry.step is not None, f"{entry.path} is missing and names no step"
+        assert status.get(entry.step) == "todo", f"{entry.path}: step {entry.step} is not todo"
+    assert all((ROOT / e.path).exists() for e in entries if e.step is None)
+    paths = {e.path for e in entries}
+    brief = {
+        ".claude-plugin/marketplace.json",
+        "plugins/earmark-pka/skills/earmark-receive/SKILL.md",
+        "plugins/earmark-pka/skills/earmark-receive/scripts/",
+        "contract/mail-v1.md",
+        "contract/samples/v1/",
+        "shortcut/earmark.shortcut",
+        "src/earmark/",
+        "compose.yaml",
+    }
+    assert brief <= paths, sorted(brief - paths)
+
+
+IGNORED_DIRECTORIES = {
+    ".git",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "dist",
+    "build",
+    "data",
+    "htmlcov",
+}
+
+
+def test_architecture_repo_layout_covers_top_level() -> None:
+    covered = {e.path.split("/", 1)[0] for e in _layout()}
+    present = {
+        p.name
+        for p in ROOT.iterdir()
+        if p.is_dir() and p.name not in IGNORED_DIRECTORIES and not p.name.endswith(".egg-info")
+    }
+    assert present <= covered, sorted(present - covered)
+
+
+def test_architecture_mail_contract_provenance() -> None:
+    text = read_doc(ARCH)
+    headings = [ln for ln in text.splitlines() if ln.startswith("#### The mail contract")]
+    assert headings == ["#### The mail contract (`contract: 1`)"]
+    preamble = section(text, "#### The mail contract").partition("- **Both files**")[0]
+    flat = _flat(preamble).lower()
+    for needle in (
+        "drafted by pka-skills",
+        "2026-11-23",
+        "2026-11-24",
+        "owned by this repo",
+        "contract/mail-v1.md",
+        "**draft**",
+    ):
+        assert needle in flat, needle
+    assert {"29", "30"} <= step_numbers(preamble)
+
+
+def test_architecture_parts_say_what_is_unbuilt() -> None:
+    shortcut, service, skill = (r[4] for r in _table(_system(), "### The three parts"))
+    assert "Never run on a phone" in shortcut
+    assert "31" in step_numbers(shortcut)
+    assert "never been built" in service
+    assert "GPU image" in service
+    assert "Not built" in skill
+    assert "30" in step_numbers(skill)
+    assert "has never run end to end" in _flat(section(_system(), "### Definition of done"))
+
+
+def test_readme_system_section_says_what_is_unbuilt() -> None:
+    text = _flat(section(read_doc("README.md"), "## The system"))
+    for needle in ("never run on a phone", "step 31", "never been built", "Not built yet"):
+        assert needle in text, needle
+    assert {"29", "30"} <= step_numbers(text)
+
+
+def _planned_names() -> dict[str, str]:
+    names = {
+        (e.path if e.path.count("/") == 1 and e.path.endswith("/") else e.path.rstrip("/")): e.step
+        for e in _layout()
+        if e.step is not None and _planned(e.step, e.path)
+    }
+    aliases = (
+        ("earmark-pka", "30", "plugins/earmark-pka/"),
+        ("earmark-receive", "30", "plugins/earmark-pka/skills/earmark-receive/"),
+        ("earmark.shortcut", "31", "shortcut/earmark.shortcut"),
+        ("marketplace.json", "30", ".claude-plugin/marketplace.json"),
+    )
+    names.update({t: st for t, st, path in aliases if not (ROOT / path).exists()})
+    return names
+
+
+@pytest.mark.parametrize("doc", [*DOCS, "CLAUDE.md", ARCH])
+def test_planned_paths_are_marked_planned(doc: str) -> None:
+    names = _planned_names()
+    assert "contract/" in names
+    for paragraph in paragraphs(read_doc(doc)):
+        for name, step in names.items():
+            if name in paragraph:
+                assert step in step_numbers(paragraph), (
+                    f"{doc} names {name} without step {step}: {paragraph[:80]!r}"
+                )
+
+
+ALLOWLIST_AS_PKA_JOB = [
+    r"ask (each|the|a) PKAs? to\b",
+    r"\bPKAs? (to )?allowlists?\b",
+    r"allowlisted at (each|the) PKA",
+    r"PKA's runtime",
+]
+
+
+@pytest.mark.parametrize("doc", [*DOCS, "CLAUDE.md", "system"])
+def test_sender_allowlist_is_amap_router_config(doc: str) -> None:
+    text = _system() if doc == "system" else read_doc(doc)
+    patterns = [*ALLOWLIST_AS_PKA_JOB, *([r"mail lane"] if doc in DOCS else [])]
+    for pattern in patterns:
+        hits = [m[0] for m in re.finditer(pattern, _flat(text), re.IGNORECASE)]
+        assert not hits, f"{doc}: {hits[:3]!r}"
+
+
+def test_readme_and_claude_md_name_the_system() -> None:
+    sentence = "The service files nothing; the PKA files, through the receiving skill."
+    for doc in ("README.md", "CLAUDE.md"):
+        flat = _flat(read_doc(doc))
+        assert sentence in flat, doc
+        for banned in ("earmark itself files nothing", "earmark files nothing"):
+            assert banned not in flat, doc
+        for needle in (
+            "receiving skill",
+            "AMAP",
+            "contract: 1",
+            "POST /transcriptions",
+            "plugins/earmark-pka/",
+        ):
+            assert needle in flat, (doc, needle)
+    claude = _flat(read_doc("CLAUDE.md"))
+    assert "Intake is AMAP's job" in claude
+    assert "does not mean the system works" in claude
+
+
+def test_rescope_pka_skill_bullet_superseded_in_both() -> None:
+    note = "*Superseded on 2026-11-24:* the receiving skill is part of this repo (step 30)."
+    for doc in ("docs/PLAN.md", ARCH):
+        assert note in _flat(read_doc(doc)), doc

@@ -1,14 +1,20 @@
 import pytest
 
 from tests.doc_helpers import (
+    LayoutEntry,
     after_marker,
     anchored_links,
     between_markers,
     fences,
     first_fence,
     heading_anchors,
+    layout_entries,
+    paragraphs,
+    plan_status,
+    read_doc,
     relative_links,
     section,
+    step_numbers,
     table_rows,
     table_variables,
     without_blocks,
@@ -194,3 +200,74 @@ def test_section() -> None:
         section(text, "## 9. ")
     with pytest.raises(AssertionError):
         section(text + "## 8. again\n", "## 8. ")
+
+
+LAYOUT = """\
+.claude-plugin/marketplace.json   the marketplace "earmark", listing ./plugins/earmark-pka (step 30)
+plugins/earmark-pka/              part 3: the plugin (step 30)
+  .claude-plugin/plugin.json
+  skills/earmark-receive/SKILL.md
+  skills/earmark-receive/scripts/   the contract checker, its only copy (step 29)
+contract/                         the mail seam only (step 29)
+  README.md                         what the seam is
+  samples/v1/                       sample emails
+src/earmark/                      part 2: the service
+deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment
+"""
+
+
+def test_layout_entries_children_and_steps() -> None:
+    entries = layout_entries(LAYOUT)
+    assert LayoutEntry("plugins/earmark-pka/.claude-plugin/plugin.json", "", "30") in entries
+    assert (
+        LayoutEntry(
+            "plugins/earmark-pka/skills/earmark-receive/scripts/",
+            "the contract checker, its only copy (step 29)",
+            "29",
+        )
+        in entries
+    )
+    assert LayoutEntry("contract/samples/v1/", "sample emails", "29") in entries
+    assert LayoutEntry("src/earmark/", "part 2: the service", None) in entries
+
+
+def test_layout_entries_multi_path_line() -> None:
+    line = "deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment"
+    entries = layout_entries(line)
+    assert [e.path for e in entries] == ["deploy/", "Dockerfile", "Dockerfile.gpu", "compose.yaml"]
+    assert {e.description for e in entries} == {"part 2: deployment"}
+    assert {e.step for e in entries} == {None}
+
+
+def test_layout_entries_rejects_bad_nesting() -> None:
+    with pytest.raises(AssertionError):
+        layout_entries("deploy/, Dockerfile   x\n  child   y")
+    with pytest.raises(AssertionError):
+        layout_entries("file.txt   x\n  child   y")
+    with pytest.raises(AssertionError):
+        layout_entries("dir/   x\n   child   y")
+
+
+def test_plan_status() -> None:
+    sample = (
+        "# Plan\n\n## Status\n\n"
+        "| Step | Title | Depends on | Status |\n|---|---|---|---|\n"
+        "| 01 | A | - | done |\n| 01a | B | 01 | todo |\n\n## Next\n"
+    )
+    assert plan_status(sample) == {"01": "done", "01a": "todo"}
+    real = plan_status(read_doc("docs/PLAN.md"))
+    assert real["27"] == "done"
+    assert {"28", "29", "30", "31"} <= set(real)
+    with pytest.raises(AssertionError):
+        plan_status("## Status\n\nno table\n")
+
+
+def test_step_numbers() -> None:
+    text = "steps 29, 30 and 31; step 28; steps 22\u201324; Step 9; step 01a"
+    assert step_numbers(text) == {"09", "01a", "22", "23", "24", "28", "29", "30", "31"}
+    assert step_numbers("no steps here") == set()
+
+
+def test_paragraphs() -> None:
+    text = "one\ntwo\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```text\nhidden\n\nalso\n```\n\nlast"
+    assert paragraphs(text) == ["one\ntwo", "| a | b |\n|---|---|\n| 1 | 2 |", "last"]

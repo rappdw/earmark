@@ -1,16 +1,25 @@
 # earmark
 
-Self-hosted transcription and delivery service on the homelab's DGX Spark. An iOS
-Shortcut sends it a podcast episode or a piece of audio, a worker transcribes it, and the
-transcript goes to the operator's PKA instances, which do the analysis and filing, each
-with its own context. earmark itself files nothing.
+One repo for a small system: a podcast episode or a piece of audio, shared from the
+operator's iPhone, ends up as a note filed by the operator's PKA instances, each with its
+own context.
 
-Today (after step 25) a request is an Apple Podcasts episode link, a direct audio URL, or
-an uploaded file, with a destination address and instructions. The worker resolves or
-downloads the audio, transcribes it, caches the transcript, emails the transcript note and
-the instructions to the destination as two Markdown attachments, and sends an ntfy push.
-On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26), which builds
-CTranslate2 with CUDA.
+- Part 1, the iOS Shortcut: `docs/shortcut.md`, and a file to import from step 31.
+- Part 2, the service on the homelab's DGX Spark: `src/earmark/`.
+- Part 3, the receiving skill each chosen PKA instance installs from this repo's plugin
+  marketplace: `plugins/earmark-pka/` (steps 29–30, not built yet).
+
+The two seams are the request (`POST /transcriptions`) and the mail contract
+(`contract: 1`). AMAP, outside this repo, carries the mail from the service to each PKA.
+`docs/ARCHITECTURE.md` "System" has the parts, the seams, the definition of done and the
+repo layout. The service files nothing; the PKA files, through the receiving skill.
+
+The service today (after step 27): a request is an Apple Podcasts episode link, a direct
+audio URL, or an uploaded file, with a destination address and instructions. The worker
+resolves or downloads the audio, transcribes it, caches the transcript, emails the
+transcript note and the instructions to the destination as two Markdown attachments, and
+sends an ntfy push. On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26),
+which builds CTranslate2 with CUDA.
 
 ## Status
 
@@ -23,6 +32,8 @@ assuming a module exists.
 - `docs/PLAN.md`: the ordered steps, their acceptance criteria, and the build loop. Its
   "Re-scope" section is the record of the operator's decisions and the mail contract.
 - `docs/steps/NN-<slug>.md`: the detailed plan written for each step when it is dispatched.
+- A step being `done` means its part's code and tests pass. It does not mean the system
+  works: that is the runbook's last phase, the one-episode check.
 
 ## Build loop
 
@@ -48,12 +59,14 @@ uv run earmark doctor        # check config and backends
 `make check` must pass before a step is called done. Do not loosen lint, type, or test
 configuration to make it pass.
 
-## Shape of the code
+## Shape of the service
 
 ```
 POST /transcriptions ─► jobs table (SQLite) ─► worker ─► Pipeline
   resolve ─► fetch ─► transcribe ─► deliver ─► notify
 ```
+
+The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
 
 - Every stage is a `Protocol` in `earmark/pipeline/stages.py` with a real backend and a
   fake in `earmark/fakes.py`. Backends are chosen by config in
@@ -91,11 +104,16 @@ POST /transcriptions ─► jobs table (SQLite) ─► worker ─► Pipeline
   `EARMARK_ALLOWED_RECIPIENTS`. Unset refuses every request. `all` is the operator's
   written acceptance of a risk, warned about at startup and by doctor. earmark never
   defaults the recipient or the sender.
-- **Mail follows the contract exactly** (step 25): pka-skills `contract: 1`, a draft,
-  copied in `docs/ARCHITECTURE.md`. A change to a key, file name, format, or rule is a
+- **Mail follows the contract exactly** (step 25): `contract: 1`, drafted by pka-skills
+  and owned by this repo, still a draft. Until step 29 moves it to `contract/`, it is copied
+  in `docs/PLAN.md` and `docs/ARCHITECTURE.md`. A change to a key, file name, format, or rule is a
   contract revision with a version bump, made in `docs/PLAN.md` and
   `docs/ARCHITECTURE.md` together, never a quiet edit. Delivery is at-least-once: a
   resend keeps its `Message-ID` and `job_id`.
+- **Intake is AMAP's job** (2026-11-24). AMAP is outside this repo. The service sends plain
+  SMTP to a PKA instance's address and embeds no agent; no earmark code reads, polls or
+  selects mail. The sender allowlist and DMARC are AMAP router config, which the operator
+  sets for each PKA address; never write it up as something to ask a PKA for.
 - **Untrusted text in mail** (step 25). The body carries only text earmark generates.
   The subject carries the sanitised title, and the body says that the subject and the
   note contain third-party text. A title, guid, or instructions text can never inject a

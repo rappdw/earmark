@@ -8,6 +8,8 @@ This runbook takes the setup in the order of the choices already made:
 4. The PKA recipients.
 5. A DNS-only Cloudflare name, served by Caddy on the LAN and reached over WireGuard.
 6. ntfy notifications, then the iOS Shortcut.
+7. The receiving skill on each PKA (step 30, not built yet), then one episode through the
+   whole system.
 
 Each phase ends with a **Check**. Stop at the first check that fails: later phases add
 layers on top, and debugging is much easier one layer at a time.
@@ -17,7 +19,9 @@ sections rather than repeating them.
 **What has never run.** None of this has been run on real hardware yet. The build sandbox
 had no Docker, GPU, iPhone, mail server or network of yours. The pipeline itself was run
 end to end on fake backends, and the GPU image has only been linted. Treat every phase as a
-first run, and note what differs from what is written here.
+first run, and note what differs from what is written here. The receiving skill and the
+Shortcut file are not built yet (steps 30 and 31), and the whole system has never run:
+phase 12 is its first run.
 
 ## Your values
 
@@ -66,7 +70,9 @@ Fill these in once. The commands below use the placeholders on the left.
 
 - [ ] A domain you control with DNS access, and a mail provider with SMTP submission and
   app passwords.
-- [ ] The two PKA addresses, and a channel to ask each PKA to allowlist a sender.
+- [ ] The two PKA addresses, and access to the AMAP router's configuration for them: you
+  add a sender to their allowlist, and read their attachment limit.
+- [ ] A session on each PKA instance, to see what arrives.
 - [ ] Access to the Cloudflare zone, and an existing WireGuard server on your network.
 - [ ] The ntfy app on the phone.
 
@@ -236,30 +242,45 @@ Then read the messages with the Python reader in the
   the instructions file shows your new instructions;
 - `GET /jobs/<job id>` shows `delivery_state` `sent` with `sent_at`;
 - the original message's `Authentication-Results` header shows `dkim=pass` with
-  `header.d=example.org`, and `dmarc=pass`. If DMARC fails, fix it before phase 6: the PKAs
-  will ignore this sender.
+  `header.d=example.org`, and `dmarc=pass`. If DMARC fails, fix it before phase 6: AMAP's
+  router does not make the attachments of mail that fails DMARC readable.
 
-## Phase 6: The PKA recipients
+## Phase 6: The PKA recipients and AMAP
 
-1. Ask each PKA to allowlist `earmark@example.org` ([deploy.md section
-   8.5](deploy.md#85-the-pka-side)).
-2. Set `EARMARK_ALLOWED_RECIPIENTS=pka-personal@example.net,pka-work@example.net` in
-   `.env`. Keep `you@example.org` in the list if you want test mail.
-3. Recreate the containers with `docker compose up -d`.
+1. For each PKA address, add `earmark@example.org` to the AMAP router's sender allowlist
+   for that address. This is AMAP router configuration, which you set. It is not something
+   to ask a PKA for, and earmark cannot see it: SMTP's reply is all it learns
+   ([deploy.md section 8.5](deploy.md#85-the-pka-side)).
+2. Find AMAP's attachment limit for each PKA address, and whether it counts the attachments
+   or the whole message. Compare it with `EARMARK_MAX_ATTACHMENT_MB` (default 10 MiB, the
+   two attachments together): a limit on the attachments must be at least the cap; a limit
+   on the whole message must be at least about 1.37 times the cap (about 14 MiB at the
+   default), because base64 adds about a third. If it is lower, set
+   `EARMARK_MAX_ATTACHMENT_MB` to a whole number of MiB that fits.
+3. Set `EARMARK_ALLOWED_RECIPIENTS=pka-personal@example.net,pka-work@example.net` in
+   `.env` (keep `you@example.org` for test mail), and recreate the containers with
+   `docker compose up -d`.
 4. Send one transcription to each PKA, with instructions such as "File this; no analysis".
 
 `all` is the other setting: it lets anyone holding the API token have earmark mail any
 address from your domain. Read [deploy.md section 9](deploy.md#9-recipients-earmark_allowed_recipients)
 before using it.
 
-The mail contract is DRAFT until you approve the PKA's receiving procedure.
+The mail contract is DRAFT until you approve the receiving procedure, which is the
+receiving skill (step 30).
 
 **Check:**
 
 - doctor shows `recipients ok 2 allowed: p…@example.net, p…@example.net` (or 3);
 - a request to `stranger@example.com` gets 422 `to is not an allowed recipient
   (EARMARK_ALLOWED_RECIPIENTS)`;
-- each PKA confirms it read both attachments and filed the note.
+- you have written down AMAP's attachment limit for each address and how it counts, and it
+  is at least `EARMARK_MAX_ATTACHMENT_MB` (or about 1.37 times it, for a whole-message
+  limit);
+- in each PKA's session, the message arrives (the doorbell rings, or it is there at the
+  next session), and the `inbox` tools show both attachments with disposition `clean`.
+
+Filing is not checked here: it needs the receiving skill (phases 11 and 12).
 
 ## Phase 7: Reaching the API from the phone and the Mac
 
@@ -355,6 +376,43 @@ choose Personal, and share a voice memo or an audio file from Files and choose W
 **Check:** after `docker compose stop` and `docker compose up -d`, `docker compose ps`
 shows `api` healthy, and `GET /jobs` still lists the earlier jobs.
 
+## Phase 11: Install the receiving skill on each PKA (step 30)
+
+Not written yet. The receiving skill, `earmark-receive` in the `earmark-pka` plugin from
+this repository's plugin marketplace, is not built: step 30 builds it and writes this
+phase. It installs at project scope, on the PKA instances you choose, never at user scope.
+
+**Check:** None yet. Until step 30 fills in this phase there is nothing to check, and
+phase 12 cannot pass.
+
+## Phase 12: The whole system: one episode, end to end
+
+This is the system's definition of done
+([ARCHITECTURE.md](ARCHITECTURE.md#definition-of-done)). Every earlier phase checks one
+part; this checks them together. It cannot pass before phase 11 exists (step 30).
+
+1. On the phone, in Apple Podcasts, share one episode to the Earmark Shortcut and choose a
+   PKA whose instance has the receiving skill.
+2. As instructions, give something inside the receiving skill's narrow scope, for example
+   "File this under podcasts/economics and tag it economics." (a destination folder and a
+   tag).
+3. Wait for the `Sent:` push, then let that PKA's session handle the mail (the doorbell, or
+   the next session).
+
+**Check:**
+
+- the Shortcut shows a `job_id`, and the push says `Sent: <title>` with
+  `To: p…@example.net`;
+- the worker log shows the episode transcribed on `cuda`, or the cached transcript reused
+  if it was shared before;
+- the PKA reads the message with the `inbox` tools and handles it through the receiving
+  skill, not by hand;
+- the note is filed in the PKA's workspace, with `source: "earmark"` and the same `guid` as
+  the attachment, and the PKA lists the changes it made and commits nothing;
+- the instructions were acted on: the note is in the folder you named and carries the tag;
+- step 30 adds the receiving skill's own evidence to this check. Until then, write down
+  what the PKA showed.
+
 ## Send back
 
 These close the remaining gaps:
@@ -366,3 +424,5 @@ These close the remaining gaps:
 3. **The `Authentication-Results` line from phase 5,** with the addresses removed.
 4. **Anything that differed from this runbook,** with `docker compose logs worker --since
    1h` (secrets and URL paths are already scrubbed from it) and the doctor output.
+5. **AMAP's attachment limit** for each PKA address, and how it counts (phase 6).
+6. **The phase 12 outcome:** pass, or the first thing that failed.
