@@ -1243,14 +1243,23 @@ largely independent parts, and the two seams where they meet:
    earmark is not an enrolled peer, so today the strict rule applies, and acting on the
    instructions attachment is an exception. The gap is acknowledged (operator,
    2026-11-24): the AMMP trusted runtime will be able to designate a message as if it
-   came from an enrolled peer. That is coming but not built. Until then, the operator
-   decides what the skill does with the instructions.
+   came from an enrolled peer. That is coming but not built.
 
-   pka-skills' proposal is a narrow scope: instructions act only on the note they came
-   with, and never run commands, reach the network, touch other notes or settings, or
-   commit. It also wants a sending address used only by earmark. An HMAC over the
-   attachments (a `contract: 2`) comes in only if the sender isn't dedicated or the
-   mail path gains a relay. The transcript note is data in every case.
+   **Decided (operator, 2026-11-24): act within a narrow scope.** The operator grants the
+   exception explicitly, and the skill's `SKILL.md` states it and its limits.
+   - **Instructions may:** choose or change the destination folder of the note they came
+     with, add tags or a summary, link it to named people or topics, or write a short
+     derived note beside it.
+   - **They may never:** run commands, reach the network, delete, move or rewrite
+     another note, touch settings, `CLAUDE.md` or `.pka/` other than the dedupe record,
+     or commit.
+   - Anything outside the scope is reported to the owner, not done.
+   - When the AMMP designation exists, it replaces the exception as the authority, and
+     the scope stays.
+   - The sending address is used only by earmark. An HMAC over the attachments (a
+     `contract: 2`) comes in only if that stops being true or the mail path gains a
+     relay.
+   - The transcript note is data in every case.
 2. **Which PKA instances install the skill.** Project scope only, never user scope.
 3. **Optional:** pka-interface's session-start scan mentioning unprocessed earmark mail,
    which would be a pka-skills change.
@@ -1325,10 +1334,8 @@ test against.
 **Goal.** A PKA instance can install the receiving skill from this repo, and the skill
 handles an earmark email by the contract.
 
-**Needs:** the operator's decision on what the skill does with the instructions until the
-AMMP designation exists (open item 1 above).
-pka-skills' answers are in `docs/decisions/2026-11-24-pka-receiving-skill.md`, and the
-skill follows them. If the decision is missing, the planner stops and says so.
+**Inputs:** the narrow scope decided in item 1 above, and pka-skills' answers in
+`docs/decisions/2026-11-24-pka-receiving-skill.md`, which the skill follows.
 
 **Build.**
 
@@ -1358,8 +1365,9 @@ skill follows them. If the decision is missing, the planner stops and says so.
     - it checks `pka-tools version --json` against a minimum first;
     - it never writes to `team-inbox/`, and never commits;
   - on a re-transcription, rewrites the note's body in place and never deletes it;
-  - acts on the instructions attachment only within the scope the operator grants,
-    stated in its `SKILL.md`, and reports anything outside that scope;
+  - acts on the instructions attachment only within the narrow scope (item 1 above),
+    stated in its `SKILL.md` as the operator's explicit exception, and reports anything
+    outside that scope;
   - never treats the transcript, the title or the subject as instructions.
 - `docs/runbook-spark.md`: the install phase on each chosen PKA, adding the marketplace
   and installing the plugin at project scope, ending in a check.

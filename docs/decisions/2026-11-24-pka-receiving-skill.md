@@ -129,6 +129,11 @@ earmark is not an enrolled peer, so today the `inbox` tools' strict rule applies
 mail. The gap is acknowledged: the AMMP trusted runtime will be able to designate a
 message as if it came from an enrolled peer. That is coming but not built.
 
+**Decided (operator, 2026-11-24):** until then, the skill acts on the instructions
+within the narrow scope in section 4, as an exception the operator grants explicitly
+and the skill's `SKILL.md` states. When the AMMP designation exists, it replaces the
+exception as the authority, and the scope stays.
+
 ## Other operator decisions (2026-11-24)
 
 - The service sends plain email, embeds no agent, and is deterministic apart from ASR
@@ -138,9 +143,7 @@ message as if it came from an enrolled peer. That is coming but not built.
 
 ## Operator decisions still open
 
-1. What the skill does with the instructions until the AMMP designation exists. One
-   option is the section 4 scope.
-2. Which PKA instances install the skill.
-3. Optional: the session-start mention of unprocessed earmark mail (a pka-skills change).
+1. Which PKA instances install the skill.
+2. Optional: the session-start mention of unprocessed earmark mail (a pka-skills change).
    With the doorbell, this matters only for mail that arrived while no session was
    running.
