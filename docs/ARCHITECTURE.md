@@ -17,14 +17,14 @@ outside this repo.
 |---|---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link to the service | the operator's iPhone | `docs/shortcut.md`, which says how to build it by hand; `shortcut/earmark.shortcut` from step 31 | Never run on a phone. The file is not built (step 31). |
 | 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27 and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
-| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Not built (step 30): no plugin manifest and no skill yet. The contract checker the skill will run exists (step 29) and is tested under CPython 3.9.6 and 3.13; it has never run in a PKA. |
+| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Built in step 30: the `earmark-pka` plugin, its marketplace and the skill, tested on the step 29 samples under CPython 3.9.6 and 3.13. It has never run in a PKA (runbook phase 12). |
 
 ### The two seams
 
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`: the request model in code, and "HTTP API" below | the service's API tests (`tests/test_api.py`), and the doc tests that post `docs/shortcut.md`'s JSON example and upload fields to the app; no Shortcut has sent one yet |
-| Mail | service → AMAP → receiving skill | the mail contract, `contract: 1`, in `contract/mail-v1.md` ("The mail contract" below) | the sample emails in `contract/samples/v1/` (step 29), which the service's tests reproduce byte for byte from the real mail code and the checker passes on CPython 3.9.6 and 3.13; the receiving skill's own tests from step 30 |
+| Mail | service → AMAP → receiving skill | the mail contract, `contract: 1`, in `contract/mail-v1.md` ("The mail contract" below) | the sample emails in `contract/samples/v1/` (step 29), which the service's tests reproduce byte for byte from the real mail code and the checker passes on CPython 3.9.6 and 3.13; the receiving skill's tests (step 30), which run its recognising, checking and de-duplicating over every sample |
 
 - The request seam has no folder: its contract is the request model in code plus this
   document.
@@ -41,8 +41,8 @@ keeps git from converting them. A revision is a new `mail-vN.md` with its own `s
 the v1 files stay.
 
 The contract checker has one copy, in `plugins/earmark-pka/skills/earmark-receive/scripts/`
-(step 30 adds the plugin manifests and the skill around it, and a test enforces the one
-copy). It is two files: `check_mail.py`, a launcher in old syntax whose version guard
+(the plugin and the skill around it are step 30's, and the receiver beside it imports it;
+a test enforces the one copy). It is two files: `check_mail.py`, a launcher in old syntax whose version guard
 prints a clear message on a Python older than 3.9, and `earmark_mail_contract.py`, the
 checker, standard library only and written to Python 3.9. It runs as `python3 -I` in three
 forms: `message` checks a whole `.eml`, `files` checks the parts a PKA's inbox tools return
@@ -72,7 +72,7 @@ AMAP is outside this repo, and earmark only relies on it.
    have mail; use the inbox read tool". With no session running, the mail waits for the next
    one.
 4. The PKA reads the message and its attachments with the `inbox` tools. The receiving skill
-   takes over from there (step 30).
+   takes over from there (step 30; "The receiving skill" below).
 
 - **Intake is AMAP's job.** No earmark code reads, polls or selects mail. The service sends
   plain email, embeds no agent, and is deterministic apart from ASR output.
@@ -87,6 +87,70 @@ AMAP is outside this repo, and earmark only relies on it.
   operator granted as an explicit exception (`docs/PLAN.md` "Trust"), and the transcript note
   is always data. That rests on the sending address being used for nothing but earmark.
 
+### The receiving skill
+
+The plugin is `plugins/earmark-pka/`, listed by `.claude-plugin/marketplace.json` (marketplace
+`earmark`, plugin `earmark-pka`, version 1.0.0 in its `plugin.json`). It holds exactly six
+files: `plugin.json`, `skills/earmark-receive/SKILL.md`, the checker's two files, and the
+receiver's two (`receive.py`, a launcher in old syntax, and `earmark_receive.py`). A plugin
+installs only its own folder, so everything the skill runs is in it.
+
+- **Install.** At project scope on each chosen PKA, from the PKA's workspace:
+  `claude plugin marketplace add rappdw/earmark --scope project` and
+  `claude plugin install earmark-pka@earmark --scope project`. The scope is explicit because
+  the command line installs at user scope by default, which would enable the skill in every
+  instance; the operator ruled that out. Only the workspace's own settings enable it, and it
+  loads only after that folder has been trusted once.
+- **Updates.** Auto-update is off for a third-party marketplace, and a new copy is fetched
+  only when the plugin's version changes. The version is pinned and bumped by hand, and
+  `PLUGIN_RELEASES` in `tests/test_plugin.py` holds each release's tree digest, so a change
+  to any file in the plugin without a new version fails the gate. The operator then runs
+  `claude plugin marketplace update earmark` and
+  `claude plugin update earmark-pka@earmark --scope project`; a session picks it up at its
+  next start or after `/reload-plugins`, and a session that already loaded the old copy keeps
+  it.
+- **What the skill does, in order.** A shape check on what `read_message` showed; preflight;
+  `read_attachment` for both attachments; `classify`; one path per outcome (`new` files the
+  note, `reshare` and `retranscription` find it); acting on the instructions within the
+  narrow scope; `record`; `pka-tools log add`; a list of every file changed. It reads, polls
+  and fetches no mail, never writes to `team-inbox/`, never runs version control and commits
+  nothing. `SKILL.md` states the narrow scope as the operator's explicit exception
+  (`docs/PLAN.md` "Trust"); changing that scope is the operator's decision.
+- **The receiver.** `python3 -I receive.py` has seven subcommands. `preflight` runs
+  `.pka/bin/pka-tools version --json` and needs 1.8.0 or newer, the first release whose
+  `post-route` commits nothing. `classify` recognises earmark mail, checks it with the step 29
+  checker (the media-type rule is skipped, because AMAP's media types are sender-chosen text),
+  and de-duplicates it. `file`, `rewrite`, `move`, `annotate` and `record` are the guarded
+  writes: each re-runs `classify` first, accepts only the note that came with the message,
+  and `--dry-run` writes nothing. Exit codes are pka-tools': 0, 1 (refused or failed), 2
+  (prerequisite missing), 3 (workspace not ready), 64 (usage). Every result is one ASCII JSON
+  line, and no output quotes text from the mail.
+- **The bytes.** The skill never retypes an attachment. It passes the `path:` of each
+  attachment that the `inbox` tool's `read_attachment` returns (the sidecar file holding the
+  exact bytes, inbox-lab-vol 0.1), and the receiver reads it; `note.hash` would catch any
+  change. Subject and body reach the receiver as files. If a connector gives no `path:`, the
+  skill stops.
+- **The record.** `.pka/earmark/received.jsonl`, one JSON object per line, appended with an
+  fsync: `v`, `at`, `event` (`filed`, `rewritten`, `moved` or `done`), `guid`, `job_id`,
+  `message_id` (the inbox id, since `read_message` shows no `Message-ID`), `path`,
+  `shared_at` and `transcript_sha256`. It is a cache of what the workspace shows; if it is
+  lost, notes are found again by their frontmatter and only the `done` lines and the order of
+  bodies are lost.
+- **De-duplicating.** A `done` line with the same `job_id` makes the message a duplicate (a
+  resend). Otherwise the note is found by guid, first by the record's last path, then by
+  scanning the workspace. None found: `new`. Several: `ambiguous`. Found with the same
+  `transcript_sha256`: `reshare`, so the instructions are applied again to the existing
+  note. Found with a different one: `retranscription`, and the body is rewritten only when
+  this request's instructions `shared_at` is later than the request whose body is in the note
+  (`rewrite_body` true); an older request keeps the body, and an unknown order is the
+  owner's call.
+- **Where it writes.** The filed note, written once with exclusive create into a folder the
+  receiver checks (never `team-inbox/`, `owner-inbox/`, a hidden folder, a symlink or an
+  earshot capture), and `.pka/earmark/`. It starts one process, `pka-tools version`.
+- **The manifests** are checked by tests against the documented field tables, since no
+  official JSON Schema exists. `claude plugin validate --strict` is run by hand, not by the
+  gate, because the CLI is not in CI.
+
 ### Definition of done
 
 One episode shared on the phone is transcribed on the Spark, emailed, read by a PKA through
@@ -95,18 +159,18 @@ the receiving skill, and filed, with the instructions acted on. The runbook's la
 
 A step being `done` means its part's code and tests pass; it does not mean the system works.
 
-The system has not met this yet. Parts 1 and 3 are incomplete (steps 30, 31), and the system
-has never run end to end.
+The system has not met this yet. Part 1's file is not built (step 31), part 3 has never run
+in a PKA, and the system has never run end to end.
 
 ### Repo layout
 
 <!-- repo-layout -->
 ```text
-.claude-plugin/marketplace.json   the marketplace "earmark", listing ./plugins/earmark-pka (step 30)
-plugins/earmark-pka/              part 3: the plugin (step 30)
+.claude-plugin/marketplace.json   the marketplace "earmark", listing ./plugins/earmark-pka
+plugins/earmark-pka/              part 3: the plugin
   .claude-plugin/plugin.json
   skills/earmark-receive/SKILL.md
-  skills/earmark-receive/scripts/   the contract checker, its only copy (step 29)
+  skills/earmark-receive/scripts/   the contract checker (step 29) and the receiver (step 30)
 contract/                         the mail seam only (step 29)
   README.md                         what the seam is, its versions, where the checker lives
   mail-v1.md                        the contract 1 text
@@ -1583,6 +1647,17 @@ tested through `doctor.Probes`: injected transports, an injected `GuardedFetcher
 missing extras simulated with `sys.modules` stubs. `tests/legacy_db.py` builds the
 v0.1.0-shaped database for the refusal tests.
 
+Receiving skill tests (step 30): `tests/test_plugin.py` checks both manifests against the
+documented fields, that the plugin holds exactly its six files, the release pin
+(`PLUGIN_RELEASES`), and the statements `SKILL.md` must make (the exception, the preflight
+first, no mail read by the skill, no version control, the outcomes). `tests/test_receiver.py`
+runs the receiver as a subprocess under CPython 3.13 and 3.9.6 against a fake `pka-tools`:
+every step 29 sample classifies `new`, and the resend, re-share, re-transcription and their
+out-of-order arrival, a lost record, a moved or deleted note and an ambiguous one each give
+the documented outcome; the write commands are checked for exact bytes, refused destinations,
+and touching only the note. `tests/test_checker_floor.py` covers both scripts. Whether a PKA
+follows `SKILL.md` is not tested; it is runbook phase 12.
+
 Contract tests (step 29): `tests/test_contract_samples.py` proves the mail code reproduces
 each sample byte for byte, and the sample properties, the resend and the placeholders-only
 rule. `tests/test_mail_checker.py` runs the checker as a subprocess, as a PKA would, under
@@ -1625,7 +1700,7 @@ Documents are tested against the code (step 16).
 - **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
   (`<!-- name:begin -->` … `<!-- name:end -->`, or a single `<!-- name -->` before a
   fence) and plain regular expressions; there is no Markdown library.
-- **What `tests/test_docs.py` checks** (rewritten in step 27, extended in steps 28 and 29; exact
+- **What `tests/test_docs.py` checks** (rewritten in step 27, extended in steps 28, 29 and 30; exact
   lists in `docs/steps/27-docs-runbook-shortcut.md` and `docs/steps/28-system-scope.md`
   section 6).
   - This file opens with "System": the three parts with what is not built or never run, the
@@ -1650,7 +1725,7 @@ Documents are tested against the code (step 16).
     allowlist example in `docs/deploy.md`, and both POST actions send `timestamp`.
   - Relative links and their `#anchors` in the README, `docs/deploy.md`,
     `docs/shortcut.md`, `docs/runbook-spark.md` and `docs/asr.md` resolve.
-  - Those documents, `CLAUDE.md`, this file's System section and the step plans 27, 28 and 29
+  - Those documents, `CLAUDE.md`, this file's System section and the step plans 27 to 30
     use placeholders only (addresses at `example.org`, `example.net` or
     `example.com`, the listed example IPs, placeholder secrets), and outside their marked
     "upgrading from v0.1.0" blocks name no removed feature, route, setting or service.
@@ -1667,7 +1742,10 @@ Documents are tested against the code (step 16).
   - The `contract: 1` text in `contract/mail-v1.md` is pinned by its sha256, and no other
     Markdown file in the repo holds a line of it; `contract/README.md` names the checker,
     its exit codes and its floor.
-  - The step plans scanned for placeholders are 27, 28 and 29.
+  - Runbook phase 11 installs the receiving skill at project scope and ends in a check. The
+    literals `claude plugin ` and `.claude/settings.json` are the one exception to the scan for
+    removed wording, in phase 11 only, and a test confines them there.
+  - The step plans scanned for placeholders are 27 to 30.
 - **What `tests/test_deploy.py` checks**, statically: the Dockerfile, `.dockerignore`,
   `compose.yaml`, and the two systemd units, including that each one sets
   `HF_HUB_DISABLE_TELEMETRY` (step 21). `tests/test_deploy_gpu.py` (step 26) checks
@@ -1838,7 +1916,8 @@ Step planners should check these against current documentation instead of assumi
    `multipart/form-data`, the file part's content type, whether `Ask for Input` accepts an
    empty answer, and how long `Get Contents of URL` waits on a large upload. The CPU-only
    worker override in `docs/deploy.md` section 7.2 (`gpus: !reset null`) has not run either.
-   The receiving skill and the Shortcut file do not exist yet (steps 30, 31).
+   The Shortcut file does not exist yet (step 31), and the receiving skill (step 30) has never run
+   in a PKA.
 5. **The dev sandbox intercepts DNS.** Found in step 06 (2026-11-20): every name,
    including `.invalid` ones, resolves to `10.200.9.2`, so the address guard refuses
    every real fetch there. That is correct behaviour; `network` tests detect it and run
@@ -1865,6 +1944,12 @@ Step planners should check these against current documentation instead of assumi
    get newer typeshed, so a 3.10+ API in a branch the tests never run could pass both. If a
    CPython 3.13 patch release changes how `email` folds headers, the sample test fails and
    the samples must be regenerated, after checking that the diff is only folding.
+
+10. **The receiving skill depends on what the PKA does and on AMAP's connector.** The PKA
+    following `SKILL.md` is untested until runbook phase 12. The receiver relies on
+    `read_attachment` giving a `path:` (inbox-lab-vol 0.1). A pka-tools release could change
+    `post-route`'s behaviour without the receiver knowing; 1.8.0 is the minimum and 1.11.0
+    was the version read.
 
 ## Re-scope decisions (2026-11-23)
 
@@ -2003,6 +2088,29 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
     then the PKA recipients, reachability, ntfy and the Shortcut.
   - **No worker without a GPU in `compose.yaml`.** A host without one uses a local
     `compose.override.yaml`, documented in `docs/deploy.md` section 7.2.
+- **Settled by step 30** (see `docs/steps/30-pka-receiving-skill.md` section 8):
+  - the install commands name `--scope project`, because the command line defaults to user
+    scope;
+  - the deterministic work is a second script beside the checker (`receive.py`), so the
+    scripts folder holds four files;
+  - the plugin's version is pinned and bumped by hand, enforced by a release pin, because
+    `--strict` needs a version and a pinned version is the only way a commit reaches no PKA
+    unannounced;
+  - recognition reads "matching `guid` and `job_id`" as: the same guid line in both
+    attachments, `for` naming the note, and the `job_id` in the body, since the note has no
+    `job_id`;
+  - "the newer body wins" is ordered by the instructions' `shared_at`; an unknown order is
+    the owner's call;
+  - the manifests are checked against the documented field tables, not a schema;
+  - the record has `v`, `event` and `shared_at` beyond pka-skills' list and is rebuilt by
+    scanning, not by a command;
+  - preflight is a subcommand and compares versions as numbers;
+  - runbook phase 11 may name `claude plugin` and `.claude/settings.json`, nowhere else;
+  - the media-type rule is skipped in the PKA;
+  - the skill reads bytes from `read_attachment`'s `path:`;
+  - the minimum pka-tools is 1.8.0;
+  - the write subcommands (`file`, `rewrite`, `move`, `annotate`, `record`) confine each
+    allowed action to the note that came with the message.
 - **Settled by step 29** (see `docs/steps/29-mail-contract-seam.md` section 8):
   - the 3.9 type check runs on mypy 1.20.2 in its own locked project, `tools/py39/`, because
     the locked mypy 2.4.1 cannot target 3.9; Dependabot does not cover it;

@@ -20,10 +20,10 @@ that address as two Markdown attachments, and an ntfy push follows. Python 3.13.
   transcript. The rest of this README. The GPU image has never been built or run.
 
 - **3. The receiving skill**, in each chosen PKA instance: checks an earmark email, files
-  the note, and acts on the instructions within a narrow scope. It will be the
+  the note, and acts on the instructions within a narrow scope. It is the
   `earmark-pka` plugin in `plugins/earmark-pka/`, from this repository's plugin
-  marketplace. Not built yet (step 30). Its contract checker exists (step 29) and is tested
-  under Python 3.9; it has never run in a PKA.
+  marketplace, built in step 30 and installed per PKA in runbook phase 11. It has never run
+  in a PKA. Its contract checker (step 29) and its receiver are tested under Python 3.9.
 
 The two seams are the request (`POST /transcriptions`) and the mail contract
 (`contract: 1`). AMAP, outside this repository, delivers the mail to each PKA. The service

@@ -1,0 +1,10 @@
+{
+  "name": "earmark-pka",
+  "version": "1.0.0",
+  "description": "Checks and files the earmark transcript emails that AMAP delivers to a PKA",
+  "author": {
+    "name": "rappdw",
+    "url": "https://github.com/rappdw"
+  },
+  "repository": "https://github.com/rappdw/earmark"
+}

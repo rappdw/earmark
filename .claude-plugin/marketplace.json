@@ -1,0 +1,15 @@
+{
+  "name": "earmark",
+  "description": "The earmark receiving skill for PKA instances",
+  "owner": {
+    "name": "rappdw",
+    "url": "https://github.com/rappdw"
+  },
+  "plugins": [
+    {
+      "name": "earmark-pka",
+      "source": "./plugins/earmark-pka",
+      "description": "Checks and files the earmark transcript emails that AMAP delivers to a PKA"
+    }
+  ]
+}

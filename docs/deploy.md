@@ -20,7 +20,7 @@ through this guide in order, with a check after each phase.
 - The systemd units are examples, reviewed but never run.
 - Email delivery is tested only against an in-process SMTP stub. TLS against your server,
   DMARC at the recipient, and AMAP delivering the mail to a PKA are operator checks
-  (runbook phases 5 and 6). The receiving skill is not built yet (step 30), and the whole
+  (runbook phases 5 and 6). The receiving skill is built (step 30) but has never run in a PKA, and the whole
   system has never run (runbook phase 12).
 - The Shortcut has never run on a phone.
 - The reachability setup is not verified by the earmark build. That covers the DNS-only
@@ -532,7 +532,7 @@ the server's). Doctor never sends mail.
   PKA for. earmark cannot see whether it was done: SMTP's 250 reply is all it learns.
 - **AMAP's attachment limit** must be at least `EARMARK_MAX_ATTACHMENT_MB` (8.4).
 - **The test** is the PKA's `inbox` tools showing both attachments with disposition
-  `clean` (runbook phase 6). Filing needs the receiving skill (step 30, not built yet).
+  `clean` (runbook phase 6). Filing needs the receiving skill (runbook phase 11).
 
 ### 8.6 Reading a message without sending
 
@@ -707,7 +707,9 @@ grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PA
 | job failed: the server does not offer STARTTLS | Use `EARMARK_SMTP_SECURITY=tls` if the provider uses port 465. |
 | job failed, naming `EARMARK_MAX_ATTACHMENT_MB` | The attachments are over the cap. |
 | the PKA gets the mail, but its attachments are not readable (not `clean`) | `earmark@example.org` is not on the AMAP router's allowlist for that address, or DMARC fails (the 8.3 check). |
-| the PKA reads the mail but does not file it | The receiving skill is not installed there (runbook phase 11; step 30, not built yet). |
+| the PKA reads the mail but does not file it | The receiving skill is not installed there (runbook phase 11). |
+| the skill stops at its preflight | `.pka/bin/pka-tools` is missing or older than 1.8.0: run `bootstrap upgrade` in that PKA. |
+| the skill reports `invalid` with `note.hash` | The attachment's bytes changed on the way: check AMAP's attachment handling (runbook phase 6). |
 | a PKA got the same message twice | Delivery is at-least-once; the PKA's dedupe drops it. |
 | doctor or startup: `was created by earmark 0.1.0` | Section 14. |
 | the worker exits "sees no CUDA device" | Section 7.4. |

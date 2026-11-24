@@ -51,7 +51,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 27 | Docs, runbook and Shortcut for the transcription service | 26 | done |
 | 28 | System scope: the three parts and the two seams | 27 | done |
 | 29 | The mail contract as a tested seam | 28 | done |
-| 30 | The PKA marketplace and the receiving skill | 29 | todo |
+| 30 | The PKA marketplace and the receiving skill | 29 | done |
 | 31 | The Shortcut as a file | 28 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline

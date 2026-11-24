@@ -20,6 +20,7 @@ from typing import Any, Final, cast
 ROOT: Final = Path(__file__).resolve().parents[1]
 CHECKER: Final = ROOT / "plugins/earmark-pka/skills/earmark-receive/scripts/check_mail.py"
 SCRIPTS: Final = CHECKER.parent
+RECEIVER: Final = SCRIPTS / "receive.py"
 _BOUNDARY: Final = "=_earmark_checker_test"
 
 
@@ -63,6 +64,17 @@ def old_interpreters() -> list[Interpreter]:
 def run_checker(python: Interpreter, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [python.path, "-I", str(CHECKER), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+
+
+def run_receiver(python: Interpreter, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [python.path, "-I", str(RECEIVER), *args],
         capture_output=True,
         text=True,
         encoding="utf-8",

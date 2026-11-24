@@ -20,7 +20,7 @@ an edit to it cannot pass quietly.
 ## The checker
 
 `plugins/earmark-pka/skills/earmark-receive/scripts/check_mail.py` is the only copy (a test
-enforces it), and the plugin and skill around it arrive in step 30. It reads the standard
+enforces it), and the plugin and skill around it are step 30's, and its receiver imports it. It reads the standard
 library only, needs Python 3.9 or newer, and is run as `python3 -I`:
 
 ```text

@@ -52,6 +52,7 @@ PLANS = [
     "docs/steps/27-docs-runbook-shortcut.md",
     "docs/steps/28-system-scope.md",
     "docs/steps/29-mail-contract-seam.md",
+    "docs/steps/30-pka-receiving-skill.md",
 ]
 CONTRACT_DOCS = [
     "contract/README.md",
@@ -557,13 +558,63 @@ REMOVED = [
 ]
 
 
+# The plugin tool's own command and settings file, named only in the runbook's phase 11.
+PLUGIN_CLI_TERMS = ("claude plugin ", ".claude/settings.json")
+RUNBOOK = "docs/runbook-spark.md"
+
+
+def _phase_11_bounds(text: str) -> tuple[int, int]:
+    start, end = text.index("## Phase 11:"), text.index("## Phase 12:")
+    assert start < end
+    return start, end
+
+
+def _without_plugin_cli_terms(text: str) -> str:
+    start, end = _phase_11_bounds(text)
+    phase = text[start:end]
+    for term in PLUGIN_CLI_TERMS:
+        phase = phase.replace(term, "")
+    return text[:start] + phase + text[end:]
+
+
+def _removed_hits(doc: str, text: str) -> list[str]:
+    text = without_blocks(text, "upgrade-v0.1.0")
+    if doc == RUNBOOK:
+        text = _without_plugin_cli_terms(text)
+    patterns = REMOVED if doc == "docs/asr.md" else [*REMOVED, r"\bvllm\b"]
+    return [m[0] for pattern in patterns for m in re.finditer(pattern, text, re.IGNORECASE)]
+
+
 @pytest.mark.parametrize("doc", DOCS)
 def test_docs_describe_no_removed_behaviour(doc: str) -> None:
-    text = without_blocks(read_doc(doc), "upgrade-v0.1.0")
-    patterns = REMOVED if doc == "docs/asr.md" else [*REMOVED, r"\bvllm\b"]
-    for pattern in patterns:
-        hits = [m[0] for m in re.finditer(pattern, text, re.IGNORECASE)]
-        assert not hits, f"{doc} mentions removed behaviour: {hits[:3]!r}"
+    hits = _removed_hits(doc, read_doc(doc))
+    assert not hits, f"{doc} mentions removed behaviour: {hits[:3]!r}"
+
+
+def test_removed_scan_exception_is_narrow() -> None:
+    text = read_doc(RUNBOOK)
+    assert _removed_hits(RUNBOOK, text) == []
+    start, end = _phase_11_bounds(text)
+    inside = text[:start] + text[start:end] + "\nThe Claude assistant.\n" + text[end:]
+    assert _removed_hits(RUNBOOK, inside)
+    for term in PLUGIN_CLI_TERMS:
+        outside = text[:start] + "\nRun " + term + "list here.\n" + text[start:]
+        assert _removed_hits(RUNBOOK, outside), term
+        assert _removed_hits(
+            RUNBOOK, text[:start] + text[start:end].replace(term, "claude ") + text[end:]
+        )
+
+
+def test_plugin_cli_terms_only_in_phase_11() -> None:
+    for doc in DOCS:
+        text = read_doc(doc)
+        for term in PLUGIN_CLI_TERMS:
+            if doc != RUNBOOK:
+                assert term not in text, (doc, term)
+                continue
+            start, end = _phase_11_bounds(text)
+            assert term in text[start:end], term
+            assert term not in text[:start] + text[end:], term
 
 
 EMAIL = re.compile(r"[\w.+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
@@ -605,7 +656,7 @@ def test_deploy_doc_states_test_status() -> None:
     text = read_doc("docs/deploy.md")
     head = text.split("\n## ")[1]  # the first section, "What is tested"
     flat = _flat(head).lower().replace("`", "")
-    for needle in ("receiving skill", "not built", "phase 12"):
+    for needle in ("receiving skill", "never run in a pka", "phase 12"):
         assert needle in flat, needle
     assert "build-tested in ci" in flat
     assert "not run-tested" in flat
@@ -797,21 +848,40 @@ def test_runbook_last_phase_is_the_system_check() -> None:
         "guid",
         "commits nothing",
         "instructions",
+        "received.jsonl",
+        "reshare",
+        "done",
+        "earmark-receive",
     ):
         assert needle in check, needle
+    assert "step 30 adds" not in check
 
 
-def test_runbook_skill_install_placeholder() -> None:
+def test_runbook_skill_install_phase() -> None:
     phase = _phase(11)
-    title = phase.splitlines()[0]
-    assert "receiving skill" in title
-    assert "step 30" in title
+    assert "receiving skill" in phase.splitlines()[0]
     body, _, check = phase.partition("**Check:**")
     flat = _flat(body)
-    assert "not built" in flat
-    assert "project scope" in flat
-    assert any("step 30" in p for p in paragraphs(body.split("\n", 1)[1]))
-    assert "phase 12 cannot pass" in _flat(check)
+    for needle in (
+        "claude plugin marketplace add rappdw/earmark --scope project",
+        "claude plugin install earmark-pka@earmark --scope project",
+        "project scope",
+        "never user scope",
+        "/reload-plugins",
+        "claude plugin update earmark-pka@earmark --scope project",
+        "claude plugin marketplace update earmark",
+        "1.8.0",
+        "/path/to/pka-workspace",
+    ):
+        assert needle in flat, needle
+    for needle in (
+        '"scope": "project"',
+        "enabledPlugins",
+        "~/.claude/settings.json",
+        "earmark-pka:earmark-receive",
+    ):
+        assert needle in _flat(check), needle
+    assert "/path/to/pka-workspace" in read_doc(RUNBOOK).split("## Phase 0:")[0]
 
 
 def test_runbook_phase_6_uses_amap() -> None:
@@ -1184,16 +1254,30 @@ def test_architecture_parts_say_what_is_unbuilt() -> None:
     assert "31" in step_numbers(shortcut)
     assert "never been built" in service
     assert "GPU image" in service
-    assert "Not built" in skill
+    assert "never run in a PKA" in skill
     assert "30" in step_numbers(skill)
     assert "has never run end to end" in _flat(section(_system(), "### Definition of done"))
 
 
 def test_readme_system_section_says_what_is_unbuilt() -> None:
     text = _flat(section(read_doc("README.md"), "## The system"))
-    for needle in ("never run on a phone", "step 31", "never been built", "Not built yet"):
+    for needle in ("never run on a phone", "step 31", "never been built", "never run in a PKA"):
         assert needle in text, needle
     assert {"29", "30"} <= step_numbers(text)
+
+
+def test_architecture_receiving_skill_section() -> None:
+    text = _flat(section(_system(), "### The receiving skill"))
+    for needle in (
+        "--scope project",
+        "/reload-plugins",
+        "received.jsonl",
+        "1.8.0",
+        "PLUGIN_RELEASES",
+        "path:",
+        "claude plugin validate --strict",
+    ):
+        assert needle in text, needle
 
 
 def _planned_names() -> dict[str, str]:
@@ -1323,6 +1407,12 @@ def test_contract_readme() -> None:
     for code in ("0", "1", "2", "64"):
         assert re.search(rf"\b{code}\b", text), code
     assert "## What the checker cannot check" in read_doc("contract/README.md")
+
+
+def test_contract_still_draft() -> None:
+    versions = section(read_doc("contract/README.md"), "## Versions")
+    assert "DRAFT" in versions
+    assert "Status: **DRAFT**" in read_doc("contract/mail-v1.md")
 
 
 @pytest.mark.parametrize("doc", CONTRACT_DOCS)

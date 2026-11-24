@@ -8,8 +8,8 @@ This runbook takes the setup in the order of the choices already made:
 4. The PKA recipients.
 5. A DNS-only Cloudflare name, served by Caddy on the LAN and reached over WireGuard.
 6. ntfy notifications, then the iOS Shortcut.
-7. The receiving skill on each PKA (step 30, not built yet), then one episode through the
-   whole system.
+7. The receiving skill on each PKA (step 30, built and never run in a PKA), then one episode
+   through the whole system.
 
 Each phase ends with a **Check**. Stop at the first check that fails: later phases add
 layers on top, and debugging is much easier one layer at a time.
@@ -19,9 +19,9 @@ sections rather than repeating them.
 **What has never run.** None of this has been run on real hardware yet. The build sandbox
 had no Docker, GPU, iPhone, mail server or network of yours. The pipeline itself was run
 end to end on fake backends, and the GPU image has only been linted. Treat every phase as a
-first run, and note what differs from what is written here. The receiving skill and the
-Shortcut file are not built yet (steps 30 and 31), and the whole system has never run:
-phase 12 is its first run.
+first run, and note what differs from what is written here. The receiving skill is built
+(step 30) and has never run in a PKA, the Shortcut file is not built yet (step 31), and the
+whole system has never run: phase 12 is its first run.
 
 ## Your values
 
@@ -39,6 +39,7 @@ Fill these in once. The commands below use the placeholders on the left.
 | `you@example.org` | Your own inbox, for test mail. | |
 | `pka-personal@example.net`, `pka-work@example.net` | The two PKA addresses. | |
 | `/path/to/earmark` | The checkout on the Spark. | |
+| `/path/to/pka-workspace` | A PKA instance's workspace root. | |
 
 ## Phase 0: Before you start
 
@@ -376,20 +377,52 @@ choose Personal, and share a voice memo or an audio file from Files and choose W
 **Check:** after `docker compose stop` and `docker compose up -d`, `docker compose ps`
 shows `api` healthy, and `GET /jobs` still lists the earlier jobs.
 
-## Phase 11: Install the receiving skill on each PKA (step 30)
+## Phase 11: Install the receiving skill on each PKA
 
-Not written yet. The receiving skill, `earmark-receive` in the `earmark-pka` plugin from
-this repository's plugin marketplace, is not built: step 30 builds it and writes this
-phase. It installs at project scope, on the PKA instances you choose, never at user scope.
+The PKA instances that get the skill are your choice. The install is at project scope only,
+never user scope, so the skill is enabled only in the workspace it is installed in. The
+plugin, `earmark-pka`, comes from `main` of `rappdw/earmark`, at the version in
+the `plugin.json` of the plugin in `plugins/earmark-pka/`.
 
-**Check:** None yet. Until step 30 fills in this phase there is nothing to check, and
-phase 12 cannot pass.
+Before you start, the workspace is a bootstrapped PKA: `.pka/bin/pka-tools version` prints
+1.8.0 or newer (otherwise run `bootstrap upgrade` first), and its folder has been trusted
+once in a session. A project-scope plugin loads only after that trust prompt is accepted.
+
+From the workspace root:
+
+```bash
+cd /path/to/pka-workspace
+claude plugin marketplace add rappdw/earmark --scope project
+claude plugin install earmark-pka@earmark --scope project
+```
+
+The command line installs at user scope unless `--scope project` is given, so keep the flag.
+Inside a running session, `/plugin marketplace add rappdw/earmark` and
+`/plugin install earmark-pka@earmark` do the same if you choose project scope in the panel.
+Then start a new session in that workspace, or run `/reload-plugins` in a running one.
+
+**Updates.** Auto-update is off for this marketplace, and a new copy is fetched only when
+the plugin's version changes. When a new version is released, run
+`claude plugin marketplace update earmark` and
+`claude plugin update earmark-pka@earmark --scope project`, then start a new session or run
+`/reload-plugins`. A session that already loaded the old copy keeps using it.
+
+**Check:**
+
+- in the workspace, `claude plugin list --json` shows `earmark-pka@earmark` with
+  `"scope": "project"`, `"enabled": true` and the version in `plugin.json`;
+- the workspace's `.claude/settings.json` has `"earmark-pka@earmark": true` under
+  `enabledPlugins`, and `~/.claude/settings.json` has no `earmark-pka` entry;
+- run in a PKA instance that you did not choose, the same list shows the plugin not enabled
+  there, or not at all;
+- in a session in the workspace, the skill `earmark-pka:earmark-receive` is listed, and
+  asking it for its preflight prints `"ok": true` with the pka-tools version.
 
 ## Phase 12: The whole system: one episode, end to end
 
 This is the system's definition of done
 ([ARCHITECTURE.md](ARCHITECTURE.md#definition-of-done)). Every earlier phase checks one
-part; this checks them together. It cannot pass before phase 11 exists (step 30).
+part; this checks them together. It needs phase 11 on that PKA.
 
 1. On the phone, in Apple Podcasts, share one episode to the Earmark Shortcut and choose a
    PKA whose instance has the receiving skill.
@@ -410,8 +443,14 @@ part; this checks them together. It cannot pass before phase 11 exists (step 30)
 - the note is filed in the PKA's workspace, with `source: "earmark"` and the same `guid` as
   the attachment, and the PKA lists the changes it made and commits nothing;
 - the instructions were acted on: the note is in the folder you named and carries the tag;
-- step 30 adds the receiving skill's own evidence to this check. Until then, write down
-  what the PKA showed.
+- the PKA ran the skill: its preflight passed, `classify` said `new`, and the note was
+  written by `receive.py file`, not by hand;
+- `.pka/earmark/received.jsonl` has a `filed` line and a `done` line with the push's
+  `job_id`;
+- `.pka/session-log.md` has an `earmark-receive` entry;
+- a second share of the same episode with new instructions ("tag it listening") gives
+  `reshare`: no second note, the tag is on the first one, and the record gains a `done`
+  line with the new `job_id`.
 
 ## Send back
 
@@ -425,4 +464,7 @@ These close the remaining gaps:
 4. **Anything that differed from this runbook,** with `docker compose logs worker --since
    1h` (secrets and URL paths are already scrubbed from it) and the doctor output.
 5. **AMAP's attachment limit** for each PKA address, and how it counts (phase 6).
-6. **The phase 12 outcome:** pass, or the first thing that failed.
+6. **The phase 12 outcome:** pass, or the first thing that failed, with the receiver's
+   JSON lines from `classify` and the write commands (they carry no mail text).
+7. **Your decision on contract 1.** Once phase 12 passes, approving the receiving skill
+   makes `contract: 1` final.

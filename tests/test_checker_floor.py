@@ -14,14 +14,18 @@ import pytest
 
 from tests.checker_helpers import (
     CHECKER,
+    RECEIVER,
     ROOT,
     SCRIPTS,
     Interpreter,
     floor_interpreters,
 )
 from tests.contract_samples import SAMPLES_DIR
+from tests.receiver_helpers import workspace
 
 MODULE = SCRIPTS / "earmark_mail_contract.py"
+RECEIVE_MODULE = SCRIPTS / "earmark_receive.py"
+SKILL_SCRIPTS = (CHECKER, MODULE, RECEIVE_MODULE, RECEIVER)
 SKIPPED_DIRECTORIES = {
     ".git",
     ".venv",
@@ -42,21 +46,25 @@ def _all_files() -> list[Path]:
 
 
 def test_checker_has_one_copy() -> None:
-    digests = {hashlib.sha256(p.read_bytes()).digest(): p for p in (CHECKER, MODULE)}
+    digests = {hashlib.sha256(p.read_bytes()).digest(): p for p in SKILL_SCRIPTS}
+    names = {p.name for p in SKILL_SCRIPTS}
     for path in _all_files():
         if path.parent == SCRIPTS:
             continue
-        assert path.name not in {CHECKER.name, MODULE.name}, path
+        assert path.name not in names, path
         if path.stat().st_size and hashlib.sha256(path.read_bytes()).digest() in digests:
-            pytest.fail(f"{path} is a copy of the checker")
+            pytest.fail(f"{path} is a copy of the checker or the receiver")
 
 
-def test_scripts_folder_holds_only_the_checker() -> None:
-    assert sorted(p.name for p in SCRIPTS.iterdir()) == [CHECKER.name, MODULE.name]
+def test_scripts_folder_holds_only_the_skill_scripts() -> None:
+    assert sorted(p.name for p in SCRIPTS.iterdir()) == sorted(p.name for p in SKILL_SCRIPTS)
+    for path in SKILL_SCRIPTS:
+        assert path.stem not in sys.stdlib_module_names, path
 
 
 def test_checker_imports_only_stdlib() -> None:
-    for path in (CHECKER, MODULE):
+    local = {"earmark_mail_contract", "earmark_receive"}
+    for path in SKILL_SCRIPTS:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             names: list[str] = []
@@ -66,7 +74,7 @@ def test_checker_imports_only_stdlib() -> None:
                 assert node.level == 0, path
                 names = [(node.module or "").split(".")[0]]
             for name in names:
-                assert name in sys.stdlib_module_names or name == "earmark_mail_contract", (
+                assert name in sys.stdlib_module_names or name in local, (
                     path.name,
                     name,
                 )
@@ -85,8 +93,13 @@ def _is_exit_2(node: ast.stmt) -> bool:
     )
 
 
-def test_launcher_is_old_syntax() -> None:
-    source = CHECKER.read_text(encoding="utf-8")
+@pytest.mark.parametrize(
+    ("launcher", "module"),
+    [(CHECKER, "earmark_mail_contract"), (RECEIVER, "earmark_receive")],
+    ids=lambda v: v.name if isinstance(v, Path) else str(v),
+)
+def test_launcher_is_old_syntax(launcher: Path, module: str) -> None:
+    source = launcher.read_text(encoding="utf-8")
     tree = ast.parse(source, feature_version=(3, 4))
     for node in ast.walk(tree):
         assert not isinstance(
@@ -109,8 +122,8 @@ def test_launcher_is_old_syntax() -> None:
     assert _is_exit_2(guard.body[-1])
     assert ast.unparse(body[3]) == "sys.dont_write_bytecode = True"
     later = [ast.unparse(node) for node in body[4:]]
-    assert any(text == "import earmark_mail_contract" for text in later)
-    assert ast.unparse(body[-1]) == "sys.exit(earmark_mail_contract.main(sys.argv[1:]))"
+    assert any(text == f"import {module}" for text in later)
+    assert ast.unparse(body[-1]) == f"sys.exit({module}.main(sys.argv[1:]))"
 
 
 @pytest.mark.parametrize("python", FLOOR, ids=lambda i: i.id)
@@ -125,6 +138,23 @@ def test_checker_writes_no_bytecode(python: Interpreter, tmp_path: Path) -> None
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    ws = workspace(tmp_path)
+    received = subprocess.run(
+        [
+            python.path,
+            "-I",
+            str(scripts / RECEIVER.name),
+            "classify",
+            "--workspace",
+            str(ws),
+            "--eml",
+            str(sample),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert received.returncode == 0, received.stdout + received.stderr
     assert not list(tmp_path.rglob("__pycache__"))
     assert not list(tmp_path.rglob("*.pyc"))
 

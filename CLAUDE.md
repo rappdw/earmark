@@ -7,7 +7,7 @@ own context.
 - Part 1, the iOS Shortcut: `docs/shortcut.md`, and a file to import from step 31.
 - Part 2, the service on the homelab's DGX Spark: `src/earmark/`.
 - Part 3, the receiving skill each chosen PKA instance installs from this repo's plugin
-  marketplace: `plugins/earmark-pka/` (step 30, not built yet; its contract checker exists, step 29).
+  marketplace: `plugins/earmark-pka/` (built in step 30, never run in a PKA; its contract checker is step 29).
 
 The two seams are the request (`POST /transcriptions`) and the mail contract
 (`contract: 1`). AMAP, outside this repo, carries the mail from the service to each PKA.
@@ -50,6 +50,7 @@ green, `main` is fast-forwarded to that commit. Do not push otherwise without be
 uv sync                      # install (add --extra transcribe for local Whisper)
 make check                   # the gate: ruff check + ruff format --check + mypy + pytest
 make samples                 # regenerate contract/samples/v1/ from the mail code
+claude plugin validate --strict .   # the manifests (by hand; not in CI)
 uv run pytest tests/test_jobs.py -k claim     # one test
 uv run pytest -m network     # opt-in tests (markers: network, slow, gpu, smtp); publishes to ntfy.sh
 uv run earmark serve         # the API
@@ -112,8 +113,8 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   `docs/PLAN.md` and `docs/ARCHITECTURE.md` updated together, never a quiet edit. Delivery
   is at-least-once: a resend keeps its `Message-ID` and `job_id`.
 - **The contract checker has one copy and a 3.9 floor** (step 29). It lives in
-  `plugins/earmark-pka/skills/earmark-receive/scripts/` (step 30 adds the plugin and the
-  skill around it). It is standard library only, imports nothing from `earmark`, and is
+  `plugins/earmark-pka/skills/earmark-receive/scripts/`, which holds the checker and the
+  receiver (step 30), both to the 3.9 floor. It is standard library only, imports nothing from `earmark`, and is
   written to Python 3.9: ruff lints it at `py39`, mypy 1.20.2 in `tools/py39/` type-checks
   it (never bump it: mypy 2 cannot target 3.9), and its tests run under 3.9.6 and 3.8. Never
   copy it.
@@ -121,6 +122,11 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   SMTP to a PKA instance's address and embeds no agent; no earmark code reads, polls or
   selects mail. The sender allowlist and DMARC are AMAP router config, which the operator
   sets for each PKA address; never write it up as something to ask a PKA for.
+- **The receiving skill** (step 30). `SKILL.md` states the narrow scope as the operator's
+  exception, and changing that scope is the operator's decision. Every change under
+  `plugins/` needs a new plugin version in `plugin.json` and a `PLUGIN_RELEASES` row in
+  `tests/test_plugin.py`. The receiver reads only the paths it is given, starts no process
+  but `pka-tools version`, and writes only the filed note and `.pka/earmark/`.
 - **Untrusted text in mail** (step 25). The body carries only text earmark generates.
   The subject carries the sanitised title, and the body says that the subject and the
   note contain third-party text. A title, guid, or instructions text can never inject a
