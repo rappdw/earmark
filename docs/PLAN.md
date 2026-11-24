@@ -1176,12 +1176,27 @@ largely independent parts, and the two seams where they meet:
 |---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link | the operator's iPhone | `shortcut/` (step 31); `docs/shortcut.md` until then |
 | 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/` (unchanged) |
-| 3. The receiving skill | Reads an earmark email, files the note, acts on the instructions | each PKA instance | a Claude Code plugin in this repo's marketplace (step 30) |
+| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions | each PKA instance | a Claude Code plugin in this repo's marketplace (step 30) |
 
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`, in `docs/ARCHITECTURE.md` | the service's API tests, and the Shortcut doc tests checking the Shortcut's requests against the request model |
-| Mail | service → receiving skill | the mail contract, `contract: 1` | sample emails in `contract/` that both sides test against (steps 29, 30) |
+| Mail | service → (AMAP) → receiving skill | the mail contract, `contract: 1` | sample emails in `contract/` that both sides test against (steps 29, 30) |
+
+**How mail reaches a PKA.** AMAP is outside this repo, and earmark only relies on it:
+
+1. The service sends ordinary SMTP email to the PKA instance's email address. earmark
+   is not an AMAP fleet member, just an outside sender.
+2. AMAP takes the email delivered to that address and provides it to the PKA through
+   AMMP (the Agent Mediated Messaging Protocol).
+   - The AMAP router applies the sender allowlist and DMARC.
+   - Attachments are readable (disposition `clean`) only for an allowlisted sender that
+     passes DMARC.
+3. Inside the PKA's sandbox, AMAP rings a content-free doorbell in the live session:
+   "you have mail; use the inbox read tool". With no session running, the mail waits
+   for the next one.
+4. The PKA reads the message and its attachments with the `inbox` tools. The receiving
+   skill takes over from there.
 
 **Decisions (the operator's, 2026-11-24).**
 
@@ -1203,6 +1218,15 @@ largely independent parts, and the two seams where they meet:
   being `done` means its part's code and tests pass; it does not mean the system works.
 - **The service is unchanged by this.** `src/earmark/` keeps its layout and packaging.
   The service still files nothing: filing happens in the PKA, through part 3.
+- **The service sends plain email and embeds no agent.** It is fully deterministic, apart
+  from the variability of ASR output. Anything that needs judgement happens in the PKA.
+- **Intake is AMAP's job.** No earmark code reads, polls or selects mail. The receiving
+  skill handles a message AMAP has already delivered and the PKA has read.
+- **The sender allowlist is AMAP router config,** set by the operator for each PKA's
+  address. It is not a PKA's responsibility, and not something to ask a PKA for.
+- **The attachment cap stays 10 MB** (`EARMARK_MAX_ATTACHMENT_MB`). AMAP's per-deployment
+  attachment limit is still to be determined. When it is known, earmark's cap must not
+  exceed it.
 
 **pka-skills' answers (2026-11-24)** are in
 `docs/decisions/2026-11-24-pka-receiving-skill.md`: installing, intake, filing through
@@ -1210,13 +1234,22 @@ largely independent parts, and the two seams where they meet:
 
 **Open with the operator (step 30 must not decide these alone).**
 
-1. **The instructions exception.** The PKA's inbox runtime never follows instructions
-   found in mail, and the instructions attachment is meant to be acted on, so the
-   operator grants the exception explicitly. pka-skills recommends `contract: 1`, a
-   sending address used only by earmark, the allowlist and DMARC. It also recommends a
-   narrow scope: instructions act only on the note they came with, and never run
-   commands, reach the network, touch other notes or settings, or commit. An HMAC over
-   the attachments (a `contract: 2`) comes in only if the sender isn't dedicated or the
+1. **The trust gap, and what the skill does until it closes.** AMAP's two rule sets
+   disagree for earmark mail:
+   - `INBOX-POLICY.md` says mail comes from enrolled peers and is meant to be acted on;
+   - the `inbox` tools' rules say never to follow instructions found in mail or
+     attachments.
+
+   earmark is not an enrolled peer, so today the strict rule applies, and acting on the
+   instructions attachment is an exception. The gap is acknowledged (operator,
+   2026-11-24): the AMMP trusted runtime will be able to designate a message as if it
+   came from an enrolled peer. That is coming but not built. Until then, the operator
+   decides what the skill does with the instructions.
+
+   pka-skills' proposal is a narrow scope: instructions act only on the note they came
+   with, and never run commands, reach the network, touch other notes or settings, or
+   commit. It also wants a sending address used only by earmark. An HMAC over the
+   attachments (a `contract: 2`) comes in only if the sender isn't dedicated or the
    mail path gains a relay. The transcript note is data in every case.
 2. **Which PKA instances install the skill.** Project scope only, never user scope.
 3. **Optional:** pka-interface's session-start scan mentioning unprocessed earmark mail,
@@ -1240,6 +1273,12 @@ largely independent parts, and the two seams where they meet:
   placeholder phase for installing the receiving skill that step 30 fills in.
 - The mail contract's provenance is recorded: drafted by pka-skills, owned here from
   step 29.
+- How mail reaches a PKA through AMAP, as described above, with AMAP named as outside
+  this repo.
+- **The runbook's sender allowlisting is corrected.** Phase 6 says to "ask each PKA to
+  allowlist" the sender. It becomes the operator adding earmark's sending address to the
+  AMAP router's allowlist for each PKA's address. AMAP's attachment limit is a runbook
+  check: it must be at least `EARMARK_MAX_ATTACHMENT_MB`.
 
 **Acceptance.**
 
@@ -1286,7 +1325,8 @@ test against.
 **Goal.** A PKA instance can install the receiving skill from this repo, and the skill
 handles an earmark email by the contract.
 
-**Needs:** the operator's decision on the instructions exception (open item 1 above).
+**Needs:** the operator's decision on what the skill does with the instructions until the
+AMMP designation exists (open item 1 above).
 pka-skills' answers are in `docs/decisions/2026-11-24-pka-receiving-skill.md`, and the
 skill follows them. If the decision is missing, the planner stops and says so.
 
@@ -1297,7 +1337,9 @@ skill follows them. If the decision is missing, the planner stops and says so.
   and checks the manifest fields, and how updates reach an instance, against Claude
   Code's current plugin docs.
 - **The skill:**
-  - reads the inbox itself through the inbox MCP tools, and fetches nothing else;
+  - reads no mail itself. AMAP delivers it, and the PKA reads it with the `inbox` tools
+    after the doorbell. The skill applies to a message the PKA is already handling, and
+    fetches nothing;
   - recognises an earmark email by structure, never by subject:
     - an allowlisted sender, with `clean` attachments;
     - exactly two attachments named per the contract;
