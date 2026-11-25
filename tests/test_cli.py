@@ -245,7 +245,7 @@ def test_serve_store_error_exits_1(
 def test_cli_import_is_light() -> None:
     code = (
         "import sys, earmark.cli\n"
-        "heavy = {'fastapi', 'starlette', 'uvicorn'}\n"
+        "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
@@ -361,20 +361,20 @@ def test_submit_rejects_long_instructions(fake_env: Path) -> None:
     assert (
         f"instructions is too long (at most {MAX_INSTRUCTIONS_CHARS} characters)" in result.stderr
     )
-    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+    assert not (fake_env / "data").exists()
 
 
 def test_submit_prompt_option_is_gone(fake_env: Path) -> None:
     result = runner.invoke(app, ["submit", SHARE, "--to", TO, "--prompt", "q"])
     assert result.exit_code == 2
-    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+    assert not (fake_env / "data").exists()
 
 
 def test_submit_requires_to(fake_env: Path) -> None:
     result = runner.invoke(app, ["submit", SHARE])
     assert result.exit_code == 2
     assert "--to" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # CI forces colour
-    assert runner.invoke(app, ["jobs"]).stdout == "no jobs\n"
+    assert not (fake_env / "data").exists()
 
 
 @pytest.mark.parametrize("bad", ["not-an-address", "a@b.org, c@d.org"])
@@ -534,9 +534,98 @@ def test_jobs_sanitizes_control_chars(fake_env: Path) -> None:
 
 
 def test_jobs_empty(fake_env: Path) -> None:
+    open_job_store(Settings(_env_file=None))
     result = runner.invoke(app, ["jobs"])
     assert result.exit_code == 0
     assert result.stdout == "no jobs\n"
+
+
+# -- read-only commands, jobs <id>, help (step 34) ---------------------------------------------
+
+READ_ONLY_COMMANDS = [
+    ("jobs", ["jobs"]),
+    ("jobs", ["jobs", "a" * 32]),
+    ("transcript", ["transcript", "a" * 32]),
+]
+
+
+@pytest.mark.parametrize(("name", "args"), READ_ONLY_COMMANDS)
+def test_read_only_command_without_data_dir(fake_env: Path, name: str, args: list[str]) -> None:
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    first, second = result.stderr.splitlines()
+    assert first == (
+        f"earmark {name}: EARMARK_DATA_DIR ({(fake_env / 'data').absolute()}) does not exist; "
+        "nothing was created."
+    )
+    assert "EARMARK_API_URL" in second
+    assert f"docker compose exec api earmark {name}" in second
+    assert result.stdout == ""
+    assert not (fake_env / "data").exists()
+
+
+@pytest.mark.parametrize(("name", "args"), READ_ONLY_COMMANDS)
+def test_read_only_command_without_database(fake_env: Path, name: str, args: list[str]) -> None:
+    (fake_env / "data").mkdir()
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    first = result.stderr.splitlines()[0]
+    assert first == (
+        f"earmark {name}: there is no job database in EARMARK_DATA_DIR "
+        f"({(fake_env / 'data').absolute()}); nothing was created."
+    )
+    assert list((fake_env / "data").iterdir()) == []
+
+
+def test_local_submit_still_creates_the_database(fake_env: Path) -> None:
+    _submit(SHARE)
+    assert (fake_env / "data" / "earmark.db").is_file()
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_jobs_one_job(fake_env: Path, as_json: bool) -> None:
+    job_id = _submit(SHARE, "--instructions", "q").split()[0]
+    _submit(SHARE + "&x=1")
+    args = ["jobs", job_id, *(["--json"] if as_json else [])]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.stderr
+    if as_json:
+        view = JobView.model_validate_json(result.stdout)
+        assert view.id == job_id
+        assert result.stdout.count("\n") == 1
+    else:
+        [line] = result.stdout.splitlines()
+        assert line.startswith(f"{job_id}  queued")
+
+
+def test_jobs_one_job_not_found(fake_env: Path) -> None:
+    _submit(SHARE)
+    for bad in ("a" * 32, "../etc", "A" * 32):
+        result = runner.invoke(app, ["jobs", bad])
+        assert (result.exit_code, result.stdout, result.stderr) == (
+            1,
+            "",
+            "earmark jobs: job not found\n",
+        )
+
+
+@pytest.mark.parametrize("extra", [["--limit", "5"], ["--status", "done"]])
+def test_jobs_id_with_limit_or_status_exits_2(fake_env: Path, extra: list[str]) -> None:
+    result = runner.invoke(app, ["jobs", "a" * 32, *extra])
+    assert result.exit_code == 2
+    assert "--limit and --status are for the list" in result.stderr
+
+
+def test_submit_help_wording() -> None:
+    import typer.main
+
+    command = typer.main.get_group(app)
+    params = {p.name: p for p in command.commands["submit"].params}
+    instructions = getattr(params["instructions"], "help", "") or ""
+    assert "PKA" in instructions
+    assert "transcript" in instructions
+    assert "analysis" not in instructions
+    assert "YouTube" in (getattr(params["source"], "help", "") or "")
 
 
 # -- resolve ------------------------------------------------------------------------------
@@ -926,9 +1015,11 @@ def test_doctor_never_prints_secrets(doctor_env: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("EARMARK_ASR_BACKEND", "remote")
     monkeypatch.setenv("EARMARK_ASR_BASE_URL", "http://asr.test:8000/v1")
     monkeypatch.setenv("EARMARK_NOTIFY_BACKEND", "ntfy")
+    monkeypatch.setenv("EARMARK_API_URL", "https://earmark.example.com")
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0, result.output
     assert "ntfy at ntfy.test, token set" in result.stdout
+    assert "client mode" in result.stdout
     output = result.stdout + result.stderr
     for value in secrets.values():
         assert value not in output
@@ -948,6 +1039,7 @@ def test_doctor_never_prints_secrets(doctor_env: Path, monkeypatch: pytest.Monke
     results = run_doctor(settings, online=True, probes=probes)
     text = "\n".join(render(results, doctor_secrets(settings)))
     assert "FAIL  asr server" in text
+    assert "FAIL  api server" in text  # the echo answers 500; the probe sends no token
     for value in secrets.values():
         assert value not in text
     assert "sentinel-topic-91x" not in text
@@ -1032,6 +1124,7 @@ def test_fresh_database_after_moving_v010_aside(fake_env: Path) -> None:
         old = Path(f"{path}{suffix}")
         if old.exists():
             old.rename(Path(f"{path}.v010{suffix}"))
+    assert runner.invoke(app, ["worker", "--once"]).exit_code == 0  # makes a fresh database
     result = runner.invoke(app, ["jobs"])
     assert result.exit_code == 0
     assert result.stdout == "no jobs\n"
@@ -1100,6 +1193,7 @@ def test_transcript_command_matches_api(fake_env: Path, fmt: str) -> None:
 
 
 def test_transcript_command_unknown_job(fake_env: Path) -> None:
+    open_job_store(Settings(_env_file=None))
     result = runner.invoke(app, ["transcript", "a" * 32])
     assert result.exit_code == 1
     assert result.stderr == "earmark transcript: job not found\n"

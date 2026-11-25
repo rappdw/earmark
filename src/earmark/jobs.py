@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 
 from earmark.config import Settings
-from earmark.db import Database, database_path, open_database
+from earmark.db import Database, MissingDatabaseError, database_path, open_database
 from earmark.models import (
     MAX_UTC_OFFSET_MIN,
     Clock,
@@ -40,6 +40,8 @@ RETRY_FACTOR: Final = 4
 RETRY_MAX_S: Final = 6 * 3600.0
 LIST_LIMIT_MAX: Final = 500
 _MAX_EXPONENT: Final = 16
+NO_DATA_DIR: Final = "EARMARK_DATA_DIR ({path}) does not exist"
+NO_DATABASE: Final = "there is no job database in EARMARK_DATA_DIR ({path})"
 _JOB_ID_RE: Final = re.compile(r"[0-9a-f]{32}")
 
 
@@ -590,3 +592,14 @@ def open_job_store(settings: Settings, *, clock: Clock = utc_now) -> JobStore:
         lease=timedelta(seconds=settings.job_lease_seconds),
         dedupe_window=timedelta(seconds=settings.dedupe_window_s),
     )
+
+
+def open_existing_job_store(settings: Settings, *, clock: Clock = utc_now) -> JobStore:
+    """open_job_store for read-only commands: never creates the data directory or the
+    database. Raises MissingDatabaseError when either is missing."""
+    shown = settings.data_dir.absolute()
+    if not settings.data_dir.exists():
+        raise MissingDatabaseError(NO_DATA_DIR.format(path=shown))
+    if not database_path(settings.data_dir).is_file():
+        raise MissingDatabaseError(NO_DATABASE.format(path=shown))
+    return open_job_store(settings, clock=clock)

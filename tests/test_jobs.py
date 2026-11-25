@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from earmark.config import Settings
-from earmark.db import Database, open_database
+from earmark.db import Database, MissingDatabaseError, open_database
 from earmark.jobs import (
     LIST_LIMIT_MAX,
     RETRY_MAX_S,
@@ -857,3 +857,47 @@ def test_mark_sending_refuses_a_sent_job(tmp_path: Path, clock: MutableClock) ->
         )
     with pytest.raises(LeaseLostError):
         store.mark_sending(claim, "<m@example.org>")
+
+
+# -- open_existing_job_store (step 34) -------------------------------------------------------------
+
+
+def test_open_existing_job_store_missing_dir(tmp_path: Path) -> None:
+    from earmark.jobs import NO_DATA_DIR, open_existing_job_store
+
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data")
+    with pytest.raises(MissingDatabaseError) as caught:
+        open_existing_job_store(settings)
+    assert str(caught.value) == NO_DATA_DIR.format(path=(tmp_path / "data").absolute())
+    assert not (tmp_path / "data").exists()
+
+
+def test_open_existing_job_store_missing_db(tmp_path: Path) -> None:
+    from earmark.jobs import NO_DATABASE, open_existing_job_store
+
+    (tmp_path / "data").mkdir()
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data")
+    with pytest.raises(MissingDatabaseError) as caught:
+        open_existing_job_store(settings)
+    assert str(caught.value) == NO_DATABASE.format(path=(tmp_path / "data").absolute())
+    assert list((tmp_path / "data").iterdir()) == []
+
+
+def test_open_existing_job_store_when_data_dir_is_a_file(tmp_path: Path) -> None:
+    from earmark.jobs import open_existing_job_store
+
+    (tmp_path / "data").write_text("x")
+    with pytest.raises(MissingDatabaseError):
+        open_existing_job_store(Settings(_env_file=None, data_dir=tmp_path / "data"))
+
+
+def test_open_existing_job_store_opens_existing(tmp_path: Path) -> None:
+    from earmark.jobs import open_existing_job_store, open_job_store
+
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data")
+    first = open_job_store(settings)
+    first.enqueue(new_podcast_job("https://podcasts.apple.com/us/podcast/id1?i=2"))
+    again = open_existing_job_store(settings)
+    assert [j.id for j in again.list_recent(10, status=None)] == [
+        j.id for j in first.list_recent(10, status=None)
+    ]

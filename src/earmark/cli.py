@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Final, NoReturn
 
 import typer
 
@@ -19,11 +19,20 @@ from earmark.models import JobStatus, TranscriptFormat
 
 if TYPE_CHECKING:
     from earmark.api.schemas import JobView
-    from earmark.jobs import Enqueued
-    from earmark.models import UploadFields
+    from earmark.api_client import ApiClient, ApiError
+    from earmark.jobs import Enqueued, JobStore
+    from earmark.models import TranscriptionRequest, UploadFields
     from earmark.submission import Intake
 
 logger = logging.getLogger(__name__)
+
+NO_DATABASE_HINT: Final = (
+    "  To see the running service's jobs, set EARMARK_API_URL (with EARMARK_API_TOKEN) to "
+    "call its API, or run the command in its container: "
+    "docker compose exec api earmark {command} ..."
+)
+SUBMIT_REFUSED_STATUSES: Final = frozenset({413, 415, 422})
+DEFAULT_LIST_LIMIT: Final = 20
 
 app = typer.Typer(
     name="earmark",
@@ -60,6 +69,38 @@ def _load_or_exit() -> Settings:
     except ConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from None
+
+
+def _api_client_or_exit(settings: Settings, command: str) -> "ApiClient":
+    from earmark.api_client import ApiClient, ClientSetupError
+
+    try:
+        return ApiClient.from_settings(settings)
+    except ClientSetupError as exc:
+        typer.echo(f"earmark {command}: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+
+def _api_error_exit(
+    command: str, exc: "ApiError", *, usage: frozenset[int] = frozenset()
+) -> NoReturn:
+    typer.echo(f"earmark {command}: {exc.message}", err=True)
+    raise typer.Exit(code=2 if exc.status in usage else 1)
+
+
+def _existing_store_or_exit(settings: Settings, command: str) -> "JobStore":
+    from earmark.db import MissingDatabaseError
+    from earmark.jobs import open_existing_job_store
+
+    try:
+        return open_existing_job_store(settings)
+    except MissingDatabaseError as exc:
+        typer.echo(f"earmark {command}: {exc}; nothing was created.", err=True)
+        typer.echo(NO_DATABASE_HINT.format(command=command), err=True)
+        raise typer.Exit(code=1) from None
+    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
+        typer.echo(f"earmark {command}: cannot open the job store: {exc}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 @app.command("config")
@@ -154,25 +195,32 @@ def worker_command(
 @app.command("submit")
 def submit_command(
     source: Annotated[
-        str, typer.Argument(help="An Apple Podcasts episode URL, a direct audio URL, or a file.")
+        str,
+        typer.Argument(
+            help="An Apple Podcasts episode link, a YouTube video link, a direct audio URL, "
+            "or a local audio file."
+        ),
     ],
-    to: Annotated[str, typer.Option("--to", help="Destination address (must be allowed).")],
+    to: Annotated[
+        str, typer.Option("--to", help="Destination address (it must be allowed on the server).")
+    ],
     instructions: Annotated[
-        str | None, typer.Option("--instructions", help="Instructions for the analysis.")
+        str | None,
+        typer.Option(
+            "--instructions", help="Instructions for the PKA; they go to it with the transcript."
+        ),
     ] = None,
     title: Annotated[str | None, typer.Option("--title", help="A title for the audio.")] = None,
 ) -> None:
-    """Enqueue a transcription, the same way POST /transcriptions does."""
+    """Enqueue a transcription, the same way POST /transcriptions does.
+
+    Calls the API when EARMARK_API_URL is set.
+    """
     settings = _load_or_exit()
     configure_logging(settings.log_level, settings.secret_values())
     from pydantic import ValidationError
 
-    from earmark.jobs import open_job_store
     from earmark.models import TranscriptionRequest, UploadFields
-    from earmark.recipients import RecipientRefused
-    from earmark.resolve.apple import UnsupportedUrlError
-    from earmark.staging import Staging
-    from earmark.submission import Intake
 
     path = Path(source)
     fields: UploadFields | None = None
@@ -188,6 +236,15 @@ def submit_command(
         errors = exc.errors(include_input=False, include_url=False)
         typer.echo("earmark submit: " + "; ".join(str(e["msg"]) for e in errors), err=True)
         raise typer.Exit(code=2) from None
+    if settings.api_url is not None:
+        _submit_via_api(settings, path, fields, request)
+        return
+    from earmark.jobs import open_job_store
+    from earmark.recipients import RecipientRefused
+    from earmark.resolve.apple import UnsupportedUrlError
+    from earmark.staging import Staging
+    from earmark.submission import Intake
+
     enqueued: Enqueued
     try:
         intake = Intake(
@@ -209,19 +266,46 @@ def submit_command(
     except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
         typer.echo(f"earmark submit: cannot open the job store: {exc}", err=True)
         raise typer.Exit(code=1) from None
-    suffix = "" if enqueued.created else " (existing job)"
-    typer.echo(f"{enqueued.job.id} {enqueued.job.status}{suffix}")
+    _echo_submitted(enqueued.job.id, enqueued.job.status, enqueued.created)
+
+
+def _echo_submitted(job_id: str, status: str, created: bool) -> None:
+    suffix = "" if created else " (existing job)"
+    typer.echo(f"{job_id} {status}{suffix}")
+
+
+def _submit_via_api(
+    settings: Settings,
+    path: Path,
+    fields: "UploadFields | None",
+    request: "TranscriptionRequest | None",
+) -> None:
+    from earmark.api_client import ApiError
+
+    with _api_client_or_exit(settings, "submit") as client:
+        try:
+            if fields is not None:
+                try:
+                    _check_upload(path)
+                except _SubmitRefused as exc:
+                    typer.echo(f"earmark submit: {exc}", err=True)
+                    raise typer.Exit(code=2) from None
+                answer = client.submit_file(path, fields)
+            elif request is not None:
+                answer = client.submit_url(request)
+            else:  # pragma: no cover - one of the two was built by the caller
+                raise typer.Exit(code=2)
+        except ApiError as exc:
+            _api_error_exit("submit", exc, usage=SUBMIT_REFUSED_STATUSES)
+    _echo_submitted(answer.job_id, answer.status, answer.created)
 
 
 class _SubmitRefused(Exception):  # noqa: N818  # a usage problem with its own message
     """The input cannot be submitted; str(exc) is the message to show."""
 
 
-def _submit_file(
-    intake: "Intake", settings: Settings, path: Path, fields: "UploadFields"
-) -> "Enqueued":
-    from earmark.fetch import MIB
-    from earmark.sources import clean_upload_name, upload_extension
+def _check_extension(path: Path) -> str:
+    from earmark.sources import upload_extension
 
     ext = upload_extension(path.name, None)
     if ext is None:
@@ -229,6 +313,27 @@ def _submit_file(
             f"{_clean(path.name)} does not look like audio "
             "(use an audio file extension such as .mp3 or .m4a)"
         )
+    return ext
+
+
+def _empty_message(path: Path) -> str:
+    return f"{_clean(path.name)} is empty"
+
+
+def _check_upload(path: Path) -> None:
+    """The refusals that need no server: not an audio name, or an empty file."""
+    _check_extension(path)
+    if path.stat().st_size == 0:
+        raise _SubmitRefused(_empty_message(path))
+
+
+def _submit_file(
+    intake: "Intake", settings: Settings, path: Path, fields: "UploadFields"
+) -> "Enqueued":
+    from earmark.fetch import MIB
+    from earmark.sources import clean_upload_name
+
+    ext = _check_extension(path)
     limit = settings.max_upload_mb * MIB
     with intake.staging.begin_upload(ext) as writer, path.open("rb") as source:
         while chunk := source.read(MIB):
@@ -239,7 +344,7 @@ def _submit_file(
                     "(EARMARK_MAX_UPLOAD_MB)"
                 )
         if writer.size == 0:
-            raise _SubmitRefused(f"{_clean(path.name)} is empty")
+            raise _SubmitRefused(_empty_message(path))
         staged = writer.commit()
     return intake.submit_upload(fields, staged, upload_name=clean_upload_name(path.name))
 
@@ -264,23 +369,67 @@ def _job_lines(view: "JobView") -> list[str]:
 
 @app.command("jobs")
 def jobs_command(
+    job_id: Annotated[
+        str | None, typer.Argument(help="Show this job only.", show_default=False)
+    ] = None,
     limit: Annotated[
-        int, typer.Option("--limit", min=1, max=LIST_LIMIT_MAX, help="How many jobs to show.")
-    ] = 20,
+        int | None,
+        typer.Option(
+            "--limit", min=1, max=LIST_LIMIT_MAX, help="How many jobs to show (default 20)."
+        ),
+    ] = None,
     status: Annotated[JobStatus | None, typer.Option("--status", help="Only this status.")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
 ) -> None:
-    """List recent jobs, newest first."""
+    """List recent jobs, newest first, or show one job.
+
+    Calls the API when EARMARK_API_URL is set.
+    """
     settings = _load_or_exit()
     configure_logging(settings.log_level, settings.secret_values())
-    from earmark.api.schemas import job_view
-    from earmark.jobs import open_job_store
+    if job_id is not None and (limit is not None or status is not None):
+        typer.echo(
+            "earmark jobs: --limit and --status are for the list; leave them out to show one job",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    shown = limit or DEFAULT_LIST_LIMIT
+    one: JobView | None = None
+    jobs: list[JobView] = []
+    if settings.api_url is not None:
+        from earmark.api_client import ApiError
 
-    try:
-        jobs = [job_view(j) for j in open_job_store(settings).list_recent(limit, status=status)]
-    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
-        typer.echo(f"earmark jobs: cannot open the job store: {exc}", err=True)
-        raise typer.Exit(code=1) from None
+        with _api_client_or_exit(settings, "jobs") as client:
+            try:
+                if job_id is not None:
+                    one = client.get_job(job_id)
+                else:
+                    jobs = list(client.list_jobs(limit=shown, status=status))
+            except ApiError as exc:
+                _api_error_exit("jobs", exc)
+    else:
+        from earmark.api.schemas import job_view
+
+        store = _existing_store_or_exit(settings, "jobs")
+        try:
+            if job_id is not None:
+                found = store.get(job_id)
+                if found is None:
+                    typer.echo("earmark jobs: job not found", err=True)
+                    raise typer.Exit(code=1)
+                one = job_view(found)
+            else:
+                jobs = [job_view(j) for j in store.list_recent(shown, status=status)]
+        except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
+            typer.echo(f"earmark jobs: cannot open the job store: {exc}", err=True)
+            raise typer.Exit(code=1) from None
+    if one is not None:
+        if as_json:
+            typer.echo(json.dumps(one.model_dump(mode="json"), ensure_ascii=False))
+        else:
+            for line in _job_lines(one):
+                typer.echo(line)
+        return
     if as_json:
         payload = {"jobs": [view.model_dump(mode="json") for view in jobs]}
         typer.echo(json.dumps(payload, ensure_ascii=False))
@@ -304,6 +453,16 @@ def _stdout_is_terminal() -> bool:  # a seam for tests
     return sys.stdout.isatty()
 
 
+def _write_transcript(data: bytes) -> None:
+    """The output step of both modes: the terminal filter, or the exact bytes."""
+    if _stdout_is_terminal():
+        typer.echo(terminal_text(data), nl=False)
+        return
+    sys.stdout.flush()
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
 @app.command("transcript")
 def transcript_command(
     job_id: Annotated[str, typer.Argument(help="The job id that POST /transcriptions returned.")],
@@ -312,15 +471,28 @@ def transcript_command(
         typer.Option("--format", help="note (the mailed note; the default), text or json."),
     ] = "note",
 ) -> None:
-    """Print a job's transcript from the cache, as GET /jobs/{id}/transcript does."""
+    """Print a job's transcript, as GET /jobs/{id}/transcript serves it.
+
+    Calls the API when EARMARK_API_URL is set.
+    """
     settings = _load_or_exit()
     configure_logging(settings.log_level, settings.secret_values())
+    if settings.api_url is not None:
+        from earmark.api_client import ApiError
+
+        with _api_client_or_exit(settings, "transcript") as client:
+            try:
+                data = client.transcript(job_id, fmt)
+            except ApiError as exc:
+                _api_error_exit("transcript", exc)
+        _write_transcript(data)
+        return
     from earmark.artifacts import ArtifactStore
-    from earmark.jobs import open_job_store
     from earmark.transcripts import JOB_NOT_FOUND, TranscriptUnavailable, read_transcript_file
 
+    store = _existing_store_or_exit(settings, "transcript")
     try:
-        job = open_job_store(settings).get(job_id)
+        job = store.get(job_id)
     except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
         typer.echo(f"earmark transcript: cannot open the job store: {exc}", err=True)
         raise typer.Exit(code=1) from None
@@ -332,12 +504,7 @@ def transcript_command(
     except TranscriptUnavailable as exc:
         typer.echo(f"earmark transcript: {exc.detail}", err=True)
         raise typer.Exit(code=1) from None
-    if _stdout_is_terminal():
-        typer.echo(terminal_text(found.data), nl=False)
-        return
-    sys.stdout.flush()
-    sys.stdout.buffer.write(found.data)
-    sys.stdout.buffer.flush()
+    _write_transcript(found.data)
 
 
 @app.command("resolve")

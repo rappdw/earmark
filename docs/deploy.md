@@ -113,7 +113,8 @@ in `.env`, which compose also reads.
 Things to know:
 
 - **What compose overrides.** `EARMARK_DATA_DIR`, `EARMARK_HOST`, `EARMARK_PORT` and
-  `EARMARK_ASR_MODEL_DIR` (empty, so the default applies) for both services, whatever
+  `EARMARK_ASR_MODEL_DIR` (empty, so the default applies) and `EARMARK_API_URL` (empty, so
+  commands run in a container are never API clients) for both services, whatever
   `.env` says. For the worker, also `EARMARK_ASR_DEVICE=cuda` (forced) and
   `EARMARK_ASR_COMPUTE_TYPE` (default `float16`). A `.env` shared with a native install
   keeps working.
@@ -859,3 +860,89 @@ through `fetch.py`":
   not caught. The size cap is kept.
 - Logs and pushes name the video by its id and title, never a URL; yt-dlp's debug output
   never prints.
+
+## 19. The command line
+
+`earmark jobs`, `earmark submit` and `earmark transcript` work in two modes. Local mode reads
+and writes `EARMARK_DATA_DIR`. Client mode calls the running API, so they work from a machine
+that has no data directory of its own.
+
+### 19.1 In the containers
+
+Commands run in a container read the service's own data in `/data`:
+
+```bash
+docker compose exec api earmark jobs
+docker compose exec api earmark jobs <job_id>
+docker compose exec -T api earmark transcript <job_id> > note.md
+docker compose exec api earmark submit '<link>' --to <address>
+```
+
+Keep `-T` for `transcript`, as in 8.7. A local file is not visible inside the container, so
+submit a file from the host in client mode (19.3). Compose sets `EARMARK_API_URL` to empty in
+both containers, so a command run there is always local, whatever `.env` says.
+
+### 19.2 Client mode
+
+With `EARMARK_API_URL` set, `jobs`, `submit` and `transcript` call the API with
+`EARMARK_API_TOKEN` and never touch `EARMARK_DATA_DIR`. The other commands stay local. Their
+output and exit codes are the local ones. An error from the API is printed as
+`earmark <command>: <the API's detail>`.
+
+- **Transport.** The URL is `https://`, or `http://` to a loopback IP address such as
+  `http://127.0.0.1:8787`. Anything else is refused when settings load, so the token never
+  crosses a network unencrypted. `localhost` is a name, not an address, and is refused.
+- **Certificates** are always verified, against the system trust store (the Mac's keychain).
+  There is no way to turn that off. A certificate needs its intermediates, as 6.1 says.
+- **The token** goes only in the `Authorization` header, and is never printed or logged.
+- **Where to set it: in your shell, not in `.env`.** Compose passes `.env` into the
+  containers (it blanks this one there), a native install's units read `.env` too, and an
+  empty `EARMARK_API_URL=` on the command line does not override a value in `.env`.
+
+### 19.3 On the Spark's host
+
+Make a venv in the checkout with `uv sync`, then:
+
+```bash
+export EARMARK_API_URL=http://127.0.0.1:8787
+uv run earmark jobs
+```
+
+The token comes from the checkout's `.env`, which compose reads too. An earlier
+`earmark jobs` on the host may have created `./data/earmark.db`. Under compose that file is
+not the service's data (that is in the `data` volume), and it can be deleted. On a native
+install `./data` is the real data.
+
+### 19.4 On the Mac
+
+From a checkout, run `uv sync`, then:
+
+```bash
+export EARMARK_API_URL=https://earmark.example.com
+export EARMARK_API_TOKEN='<the token from the Spark>'
+uv run earmark jobs
+uv run earmark submit ~/Downloads/memo.m4a --to pka-personal@example.net \
+  --instructions "File this under ideas."
+uv run earmark transcript <job_id> > note.md
+```
+
+Add the port to the URL if the proxy does not listen on 443. Keep the token out of shell
+history and files others can read.
+
+### 19.5 Checking it
+
+`earmark doctor` shows a `client mode` line, and `earmark doctor --online` adds `api server`,
+which asks `/healthz`. On the Mac the other doctor lines check the Mac's own settings and can
+be ignored.
+
+### 19.6 What the answers mean
+
+| Answer | Meaning |
+|---|---|
+| `missing or invalid API token (check EARMARK_API_TOKEN)` | The token differs from the server's. |
+| `job not found` | No such job (404), or an id that is not 32 hex digits. |
+| 409, 410 | The job has no transcript yet, or its cache was deleted: as in 8.7. |
+| 422, 413 on `submit` (exit 2) | The server refused the request: a recipient it does not allow, a bad field, or an upload over its limit. |
+| `the certificate of <host> did not verify` | The server needs a certificate this machine trusts, with its intermediates. |
+| `could not reach the API at <host>` | Wrong `EARMARK_API_URL`, or the service is not running. |
+| `EARMARK_DATA_DIR (…) does not exist` (local mode) | Nothing was created. Set `EARMARK_API_URL`, or use `docker compose exec api earmark …`. |

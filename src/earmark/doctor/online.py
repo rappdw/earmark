@@ -12,6 +12,7 @@ from typing import Final
 import httpx2
 from pydantic import SecretStr
 
+from earmark.api_client import transport_error_message
 from earmark.config import Settings
 from earmark.doctor import Probes
 from earmark.doctor.checks import OfflineChecks, collapse, guarded
@@ -192,7 +193,63 @@ def run_online(
                 results.append(token)
         else:
             results.append(skipped("ntfy server"))
+    if s.api_url is not None:
+        results.append(
+            guarded("api server", lambda: api_health(s, probes))
+            if _needs_ok(offline, "client mode")
+            else skipped("api server")
+        )
     return results
+
+
+def api_health(settings: Settings, probes: Probes) -> CheckResult:
+    """``GET {api_url}/healthz``, without the token; never raises."""
+    name = "api server"
+    api_url = settings.api_url
+    if api_url is None:  # the caller checked EARMARK_API_URL
+        return CheckResult(name, "warn", "EARMARK_API_URL is not set")
+    host = host_label(api_url)
+    status = 0
+    body = b""
+    try:
+        with (
+            httpx2.Client(
+                transport=probes.http_transport or httpx2.HTTPTransport(),
+                trust_env=False,
+                follow_redirects=False,
+                timeout=_timeout(probes.timeout_s),
+            ) as client,
+            client.stream(
+                "GET", f"{api_url}/healthz", headers={"User-Agent": USER_AGENT}
+            ) as response,
+        ):
+            status = response.status_code
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= MAX_BODY_BYTES:
+                    break
+            body = b"".join(chunks)[:MAX_BODY_BYTES]
+    except httpx2.HTTPError as exc:
+        return CheckResult(name, "fail", transport_error_message(exc, host, probes.timeout_s))
+    if 300 <= status < 400:
+        return CheckResult(
+            name,
+            "fail",
+            f"{host} answered with a redirect (HTTP {status}); redirects are not "
+            "followed, check EARMARK_API_URL",
+        )
+    if status != 200:
+        return CheckResult(name, "fail", f"{host} answered HTTP {status} on /healthz")
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and data.get("status") == "ok":
+        return CheckResult(name, "ok", f"{host} answers /healthz")
+    return CheckResult(name, "warn", f"{host} answered /healthz, but not as earmark does")
 
 
 def smtp_login(settings: Settings, probes: Probes) -> CheckResult:

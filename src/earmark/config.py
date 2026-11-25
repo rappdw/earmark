@@ -1,5 +1,6 @@
 """Settings: EARMARK_* environment variables, then .env, then defaults."""
 
+import ipaddress
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -47,6 +48,17 @@ NTFY_TOPIC_PATTERN: Final = re.compile(r"[-_A-Za-z0-9]{1,64}")
 # A shorter bare topic is not redacted on its own: masking a common word would corrupt logs.
 NTFY_TOPIC_SECRET_MIN_CHARS: Final = 12
 
+API_URL_SHAPE: Final = (
+    "must be the API's root URL, such as https://earmark.example.com or http://127.0.0.1:8787"
+)
+API_URL_CREDENTIALS: Final = "must not contain credentials; use EARMARK_API_TOKEN"
+API_URL_QUERY: Final = "must not contain a query or fragment"
+API_URL_PATH: Final = "must be the API's root URL, without a path"
+API_URL_PLAIN_HTTP: Final = (
+    "plain http is allowed only to a loopback address such as http://127.0.0.1:8787; "
+    "use https, or the API token would cross the network unencrypted"
+)
+
 
 class ConfigError(Exception):
     """Settings could not be loaded. str(exc) is safe to show: it never contains input values."""
@@ -60,6 +72,38 @@ def env_var(field_name: str) -> str:
     return ENV_PREFIX + field_name.upper()
 
 
+def is_loopback_ip(host: str) -> bool:
+    """True for an IP literal in 127/8, ::1 or ::ffff:127.*; False for names and others."""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_api_url(url: str) -> str:
+    """The URL as 'scheme://netloc' (scheme lower-cased); ValueError with one of the
+    API_URL_* messages otherwise. Never puts the input in the message."""
+    text = url.strip()
+    try:
+        parts = urlsplit(text)
+        hostname = parts.hostname
+        _ = parts.port
+    except ValueError:
+        raise ValueError(API_URL_SHAPE) from None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not hostname:
+        raise ValueError(API_URL_SHAPE)
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError(API_URL_CREDENTIALS)
+    if parts.query or parts.fragment or "?" in text or "#" in text:
+        raise ValueError(API_URL_QUERY)
+    if parts.path not in ("", "/"):
+        raise ValueError(API_URL_PATH)
+    if scheme == "http" and not is_loopback_ip(hostname):
+        raise ValueError(API_URL_PLAIN_HTTP)
+    return f"{scheme}://{parts.netloc}"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix=ENV_PREFIX,
@@ -71,6 +115,9 @@ class Settings(BaseSettings):
     )
 
     api_token: SecretStr | None = Field(None, description="Bearer token for the ingest API.")
+    api_url: str | None = Field(
+        None, description="The running API's URL; jobs, submit and transcript then call it."
+    )
     host: str = Field("127.0.0.1", description="Address the API binds to.")
     port: int = Field(8787, ge=1, le=65535, description="Port the API binds to.")
     data_dir: Path = Field(Path("./data"), description="Working data (jobs DB, episode cache).")
@@ -162,6 +209,14 @@ class Settings(BaseSettings):
             if address not in out:
                 out.append(address)
         return tuple(out)
+
+    @field_validator("api_url")
+    @classmethod
+    def _check_api_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return check_api_url(v) if v else None
 
     @field_validator("asr_model")
     @classmethod

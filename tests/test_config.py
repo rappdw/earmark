@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from earmark import config as cfg
 from earmark.config import ConfigError, Settings, env_var, load_settings, redact_url
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -340,6 +341,7 @@ def test_secret_values_topic_with_path_prefix() -> None:
 def test_settings_fields_are_exactly() -> None:
     assert tuple(Settings.model_fields) == (
         "api_token",
+        "api_url",
         "host",
         "port",
         "data_dir",
@@ -577,3 +579,70 @@ def test_max_attachment_mb_positive(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("EARMARK_MAX_ATTACHMENT_MB", bad)
         with pytest.raises(ConfigError, match="EARMARK_MAX_ATTACHMENT_MB"):
             load_settings(env_file=None)
+
+
+# -- EARMARK_API_URL (step 34) -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("https://earmark.example.com", "https://earmark.example.com"),
+        ("https://earmark.example.com/", "https://earmark.example.com"),
+        ("https://earmark.example.com:8443", "https://earmark.example.com:8443"),
+        ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
+        ("http://[::1]:8787", "http://[::1]:8787"),
+        ("HTTPS://earmark.example.com", "https://earmark.example.com"),
+    ],
+)
+def test_api_url_accepted(given: str, expected: str) -> None:
+    assert Settings(_env_file=None, api_url=given).api_url == expected
+
+
+@pytest.mark.parametrize(
+    ("given", "message"),
+    [
+        ("http://192.168.1.10:8787", cfg.API_URL_PLAIN_HTTP),
+        ("http://localhost:8787", cfg.API_URL_PLAIN_HTTP),
+        ("http://earmark.example.com", cfg.API_URL_PLAIN_HTTP),
+        ("http://0.0.0.0:8787", cfg.API_URL_PLAIN_HTTP),
+        ("ftp://earmark.example.com", cfg.API_URL_SHAPE),
+        ("earmark.example.com", cfg.API_URL_SHAPE),
+        ("https://u:p@earmark.example.com", cfg.API_URL_CREDENTIALS),
+        ("https://earmark.example.com/api", cfg.API_URL_PATH),
+        ("https://earmark.example.com/?x=1", cfg.API_URL_QUERY),
+        ("https://earmark.example.com/#f", cfg.API_URL_QUERY),
+        ("https://earmark.example.com:99999", cfg.API_URL_SHAPE),
+    ],
+)
+def test_api_url_refused(monkeypatch: pytest.MonkeyPatch, given: str, message: str) -> None:
+    monkeypatch.setenv("EARMARK_API_URL", given)
+    with pytest.raises(ConfigError) as caught:
+        load_settings(env_file=None)
+    assert caught.value.errors == [f"EARMARK_API_URL: Value error, {message}"]
+    host = given.split("//")[-1].split("/")[0].split(":")[0].rpartition("@")[2]
+    if "." in host:
+        assert host not in str(caught.value).replace(message, "")
+
+
+def test_api_url_empty_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_API_URL", "")
+    assert load_settings(env_file=None).api_url is None
+    assert Settings(_env_file=None, api_url="  ").api_url is None
+
+
+@pytest.mark.parametrize(
+    ("host", "loopback"),
+    [
+        ("127.0.0.1", True),
+        ("127.1.2.3", True),
+        ("::1", True),
+        ("::ffff:127.0.0.1", True),
+        ("localhost", False),
+        ("0.0.0.0", False),  # noqa: S104 - must not count as loopback
+        ("192.168.1.10", False),
+        ("earmark.example.com", False),
+    ],
+)
+def test_is_loopback_ip(host: str, loopback: bool) -> None:
+    assert cfg.is_loopback_ip(host) is loopback

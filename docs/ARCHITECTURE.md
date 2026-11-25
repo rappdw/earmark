@@ -312,6 +312,9 @@ src/earmark/
                        emitter; standard library only (step 22)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
                        (remote ASR, ntfy)
+  api_client.py        ApiClient, ApiError, ClientSetupError: the CLI's client mode
+                       (`EARMARK_API_URL`): `jobs`, `submit` and `transcript` over the HTTP API;
+                       imports httpx2, so only the CLI's commands and doctor import it (step 34)
   fakes.py             a fake backend for each of the six stages (tests and smoke runs)
   youtube/             links.py (link forms, canonical URL, youtube_episode; light),
                        ytdlp.py (YtDlpYoutubeSource, the `ytdlp` YoutubeSource; imports yt-dlp
@@ -655,7 +658,13 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   - `earmark submit SOURCE --to … [--instructions …] [--title …]` enqueues through
     `submission.Intake`, like `POST /transcriptions`. SOURCE is an existing file, which is
     copied into `data/uploads/` under `EARMARK_MAX_UPLOAD_MB`, or a URL.
-  - `earmark jobs` lists recent jobs as `JobView`s.
+  - `earmark jobs [JOB_ID]` lists recent jobs as `JobView`s, or shows one (step 34).
+  - With `EARMARK_API_URL` set, `jobs`, `submit` and `transcript` call the API instead (client
+    mode, step 34; see the end of "HTTP API").
+  - `jobs` and `transcript` in local mode open the database only if it exists
+    (`jobs.open_existing_job_store`, step 34). A missing data directory or database is an
+    error that names `EARMARK_DATA_DIR`, and nothing is created. `serve`, `worker` and
+    `submit` create both, as before.
 - **Startup.** `build_worker` sweeps `data/downloads/` of every file not belonging to a
   `running` job, before the first poll.
 
@@ -1129,6 +1138,9 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
     - `FAIL` naming the missing `EARMARK_SMTP_*` settings;
     - otherwise `ok`, with the host, port, security, from domain and timeout.
   - `notify`.
+  - `client mode` (step 34), last: `ok` with `off` when `EARMARK_API_URL` is unset; `ok` with
+    the API's host when it is set and `EARMARK_API_TOKEN` is usable; `FAIL` when it is set
+    without a usable token.
 
   Offline doctor makes no network call, loads no model, downloads nothing, and creates no
   directory or database. Fake backends are warnings.
@@ -1141,6 +1153,9 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
   - `smtp` (step 25), for the `smtp` backend: `SmtpMailer.check_login` connects,
     negotiates TLS, logs in and quits. It sends no `MAIL`, `RCPT` or `DATA`, and it reports
     the TLS version. Its timeout is the smaller of 10 s and `EARMARK_SMTP_TIMEOUT_S`.
+  - `api server` (step 34), last, when `EARMARK_API_URL` is set: `GET {API_URL}/healthz`,
+    without the token, `ok` when it answers 200 `{"status": "ok"}`. `skip` when the `client
+    mode` check failed.
 
   Doctor never publishes a notification and never sends mail. `Probes` injects the SMTP
   socket and TLS context factories for tests.
@@ -1425,6 +1440,29 @@ and the same messages.
 - **Logs** name the job and the format, and the reason code of a refusal. Never the
   content, the recipient or the instructions.
 
+**Client mode** (step 34; exact rules in `docs/steps/34-cli-api-client.md` sections 4 and 5).
+With `EARMARK_API_URL` set, `earmark jobs`, `earmark jobs JOB_ID`, `earmark submit` and
+`earmark transcript` call the API with `EARMARK_API_TOKEN` through `api_client.ApiClient`, and
+never open `EARMARK_DATA_DIR`. `doctor`, `config`, `transcribe`, `resolve`, `serve` and `worker`
+stay local.
+
+- **Routes.** `GET /jobs?limit=&status=`, `GET /jobs/{id}`, `POST /transcriptions` (JSON for a
+  link, multipart for a local file, streamed from disk) and `GET /jobs/{id}/transcript?format=`.
+- **Same output.** The client parses the answers into `JobList`, `JobView` and
+  `TranscriptionResponse` and prints them with the local mode's code, so the output is the same
+  for the same jobs. A transcript's bytes are printed as the local command prints them.
+- **Errors.** An error answer is shown as `earmark <command>: <the API's detail>`, cleaned of
+  non-printable characters, redacted of the token and capped. Exit codes are the local mode's:
+  2 for a refused submission (413, 415, 422) and for client-mode setup (no usable token, an
+  invalid URL), 1 for everything else (401, 404, 409, 410, 5xx, an unreachable API).
+- **Transport.** `https://`, or `http://` to a loopback address only, checked when settings
+  load. Certificates are always verified (no setting turns that off). No redirects, no proxy
+  variables, no cookies kept, answers capped at 64 MiB. The token is sent only in the
+  per-request `Authorization` header.
+- **Containers.** `compose.yaml` sets `EARMARK_API_URL` to empty for both services, so every
+  command run in a container is local whatever `.env` says. `serve` and `worker` never read
+  it.
+
 ## Configuration
 
 Environment variables, `EARMARK_` prefix, also read from `.env` in the working
@@ -1436,6 +1474,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | Variable | Default | Meaning |
 |---|---|---|
 | `API_TOKEN` | unset; required to serve (step 04) | Bearer token for the API (secret) |
+| `API_URL` | unset (local mode) | The running API's root URL, for the CLI's client mode (step 34): `jobs`, `submit` and `transcript` call it with `API_TOKEN` instead of reading `DATA_DIR`. `https://` with a host and an optional port, or `http://` to a loopback IP address (`127.0.0.1`, any `127.*`, `::1`) only; no credentials, path, query or fragment; a trailing `/` is dropped. Set in the operator's shell, not in `.env`; compose blanks it in the containers |
 | `HOST`, `PORT` | `127.0.0.1`, `8787` | API bind address |
 | `DATA_DIR` | `./data` | Database and episode cache |
 | `RESOLVER_BACKEND` | `apple` | `apple`, `fake` |
@@ -1540,7 +1579,8 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
     Container Toolkit and Compose 2.30 or later. Both share the named volume `data` at
     `/data` and get `APP_UID`/`APP_GID` as build arguments.
   - Settings come from `env_file: .env`. `environment:` forces the in-container
-    `DATA_DIR`, `HOST`, `PORT`, an empty (so default) `ASR_MODEL_DIR`, and
+    `DATA_DIR`, `HOST`, `PORT`, an empty (so default) `ASR_MODEL_DIR`, an empty `API_URL`
+    (so no command in a container is an API client; step 34), and
     `HF_HUB_DISABLE_TELEMETRY`. The worker also gets `EARMARK_ASR_DEVICE: cuda` (forced) and
     `EARMARK_ASR_COMPUTE_TYPE: ${EARMARK_ASR_COMPUTE_TYPE:-float16}` (`.env` can override
     it; `.env.example` leaves it commented out for that reason).
@@ -1774,6 +1814,23 @@ and handles text they wrote.
   - **No debug output.** `set_debuglevel` is never called, so smtplib prints nothing.
   - **Bounded.** One session is bounded by `EARMARK_SMTP_TIMEOUT_S`.
   - **Replies are untrusted**, and only their codes are kept.
+- **The CLI as an API client** (step 34, `EARMARK_API_URL`). The API is the fourth operator
+  endpoint, reached by `api_client.ApiClient`'s own httpx2 client, without the address guard
+  (it is the operator's own service, usually on the LAN or loopback).
+  - **The token's transport.** It is sent only over `https://`, or over `http://` to a
+    loopback IP address. Any other `http://` URL is refused when settings load, so no command
+    starts with it. A host name such as `localhost` is not taken as loopback.
+  - **Certificates** are verified with httpx2's default context (the system trust store;
+    macOS's through `truststore`), and no setting, option or parameter turns that off.
+    `SSL_CERT_FILE` and `SSL_CERT_DIR` can only change which authorities are trusted.
+  - **The rest** as for the other endpoints: no redirects followed, no proxy variables
+    (`trust_env=False`), cookies cleared per request, answers capped (64 MiB), messages name
+    the host only.
+  - **Never shown.** The token is in no output, log line or error. Error details from the
+    server are cleaned of non-printable characters and redacted of the token before they are
+    shown. The client logs nothing itself.
+  - **Job ids** are checked against `[0-9a-f]{32}` before they go into a request path; any
+    other id is "job not found" without a request, as in local mode.
 - **Notifications** (step 15). Episode and show titles come from feeds, and `job.error` and
   warnings can quote them.
   - Every value is cleaned before it is sent (control, format, and separator characters
@@ -2414,6 +2471,15 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
     and profile stay private and the cache format can change;
   - `earmark transcript` writes the exact bytes when its output is not a terminal, and only
     printable characters, newlines and tabs when it is.
+- **Settled by step 34** (see `docs/steps/34-cli-api-client.md` section 8):
+  - client mode is explicit (`EARMARK_API_URL`), not detected from running containers;
+  - the containers ignore `EARMARK_API_URL` rather than refuse it: compose blanks it, and
+    `serve` and `worker` never read it, so a stray line in `.env` cannot stop the service;
+  - plain `http://` is allowed to loopback IP addresses only, and the rule is checked when
+    settings load;
+  - one job is `earmark jobs JOB_ID`, not a new command;
+  - a read-only command (`jobs`, `transcript`) in local mode never creates the data
+    directory or the database.
 - **Settled by step 28** (see `docs/steps/28-system-scope.md` section 8):
   - the runbook keeps phases 0–10 and appends phase 11 (installing the receiving skill,
     step 30) and phase 12 (the one-episode check), so no existing phase number changes;

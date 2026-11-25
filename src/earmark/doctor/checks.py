@@ -101,6 +101,7 @@ class OfflineChecks:
             results.append(guarded("asr cuda", self.asr_cuda))
         results.append(guarded("mail", self.mail))
         results.append(guarded("notify", self.notify))
+        results.append(guarded("client mode", self.client_mode))
         return results
 
     # -- local state ------------------------------------------------------------------------
@@ -382,6 +383,30 @@ class OfflineChecks:
             "ok",
             f"smtp to {options.host}:{options.port} ({options.security}), "
             f"from @{options.local_hostname}, timeout {options.timeout_s:g} s",
+        )
+
+    def client_mode(self) -> CheckResult:
+        from earmark.api_client import BAD_TOKEN, check_token
+        from earmark.endpoint import host_label
+
+        s = self.settings
+        if s.api_url is None:
+            return CheckResult(
+                "client mode", "ok", "off: jobs, submit and transcript read EARMARK_DATA_DIR"
+            )
+        problem = check_token(s.api_token)
+        if problem is None:
+            return CheckResult(
+                "client mode",
+                "ok",
+                f"on: jobs, submit and transcript call the API at {host_label(s.api_url)}",
+            )
+        if problem == BAD_TOKEN:
+            return CheckResult("client mode", "fail", BAD_TOKEN)
+        return CheckResult(
+            "client mode",
+            "fail",
+            "on, but EARMARK_API_TOKEN is not set; the API refuses every call without it",
         )
 
     def notify(self) -> CheckResult:

@@ -231,6 +231,7 @@ def test_compose_forces_container_paths() -> None:
         "EARMARK_HOST",
         "EARMARK_PORT",
         "EARMARK_ASR_MODEL_DIR",
+        "EARMARK_API_URL",
         "HF_HUB_DISABLE_TELEMETRY",
     }
     worker_only = {"EARMARK_ASR_DEVICE", "EARMARK_ASR_COMPUTE_TYPE"}
@@ -241,6 +242,7 @@ def test_compose_forces_container_paths() -> None:
         assert environment["EARMARK_HOST"] == "0.0.0.0"  # noqa: S104 - the in-container bind
         assert environment["EARMARK_PORT"] == "8787"
         assert environment["EARMARK_ASR_MODEL_DIR"] == ""
+        assert environment["EARMARK_API_URL"] == ""
         assert SERVICES[name]["env_file"] == ".env"
     worker_env = SERVICES["worker"]["environment"]
     assert worker_env["EARMARK_ASR_DEVICE"] == "cuda"

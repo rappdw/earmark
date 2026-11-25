@@ -1023,6 +1023,7 @@ def test_doctor_check_names_in_order(tmp_path: Path) -> None:
         "asr",
         "mail",
         "notify",
+        "client mode",
     ]
 
 
@@ -1219,3 +1220,114 @@ def test_youtube_missing_extra_fails(tmp_path: Path, monkeypatch: pytest.MonkeyP
     result = status(make_settings(tmp_path, youtube_backend="ytdlp"), "youtube")
     assert result.status == "fail"
     assert "uv sync --extra youtube" in result.detail
+
+
+# -- client mode and the api server (step 34) ----------------------------------------------------
+
+API = "https://earmark.example.com"
+
+
+def test_doctor_client_mode_off(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path), "client mode")
+    assert result.status == "ok"
+    assert result.detail == "off: jobs, submit and transcript read EARMARK_DATA_DIR"
+
+
+def test_doctor_client_mode_on(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path, api_url=API + ":8443"), "client mode")
+    assert result.status == "ok"
+    assert result.detail == (
+        "on: jobs, submit and transcript call the API at earmark.example.com:8443"
+    )
+    assert "https" not in result.detail
+
+
+def test_doctor_client_mode_without_token_fails(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path, api_url=API, api_token=None), "client mode")
+    assert result.status == "fail"
+    assert "EARMARK_API_TOKEN is not set" in result.detail
+
+
+def test_doctor_client_mode_bad_token_fails(tmp_path: Path) -> None:
+    from earmark.api_client import BAD_TOKEN
+
+    settings = make_settings(tmp_path, api_url=API, api_token=SecretStr("tök" * 20))
+    result = status(settings, "client mode")
+    assert (result.status, result.detail) == ("fail", BAD_TOKEN)
+
+
+def _health_probes(reply: Callable[[httpx2.Request], httpx2.Response]) -> Probes:
+    return Probes(http_transport=httpx2.MockTransport(reply))
+
+
+def test_doctor_online_api_server_ok(tmp_path: Path) -> None:
+    seen: list[httpx2.Request] = []
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json={"status": "ok"})
+
+    result = status(
+        make_settings(tmp_path, api_url=API),
+        "api server",
+        online=True,
+        probes=_health_probes(reply),
+    )
+    assert (result.status, result.detail) == ("ok", "earmark.example.com answers /healthz")
+    [request] = seen
+    assert request.url.path == "/healthz"
+    assert "authorization" not in request.headers
+
+
+def _unreachable(request: httpx2.Request) -> httpx2.Response:
+    raise httpx2.ConnectError("boom", request=request)
+
+
+def _bad_certificate(request: httpx2.Request) -> httpx2.Response:
+    import ssl
+
+    raise httpx2.ConnectError("boom", request=request) from ssl.SSLCertVerificationError(
+        1, "certificate verify failed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("reply", "level", "needle"),
+    [
+        (
+            lambda r: httpx2.Response(302, headers={"Location": "http://x.example.net/"}),
+            "fail",
+            "redirect",
+        ),
+        (lambda r: httpx2.Response(503), "fail", "answered HTTP 503 on /healthz"),
+        (_unreachable, "fail", "could not reach the API at earmark.example.com (ConnectError)"),
+        (_bad_certificate, "fail", "certificate of earmark.example.com did not verify"),
+        (lambda r: httpx2.Response(200, text="<html>"), "warn", "but not as earmark does"),
+    ],
+    ids=["redirect", "503", "unreachable", "certificate", "not earmark"],
+)
+def test_doctor_online_api_server_failures(
+    tmp_path: Path, reply: Callable[[httpx2.Request], httpx2.Response], level: str, needle: str
+) -> None:
+    result = status(
+        make_settings(tmp_path, api_url=API),
+        "api server",
+        online=True,
+        probes=_health_probes(reply),
+    )
+    assert result.status == level
+    assert needle in result.detail
+
+
+def test_doctor_online_api_server_skipped_without_token(tmp_path: Path) -> None:
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        raise AssertionError("no request expected")
+
+    settings = make_settings(tmp_path, api_url=API, api_token=None)
+    result = status(settings, "api server", online=True, probes=_health_probes(reply))
+    assert result.status == "skip"
+
+
+def test_doctor_online_no_api_server_line_when_off(tmp_path: Path) -> None:
+    results = check(make_settings(tmp_path), online=True, probes=_health_probes(_unreachable))
+    assert "api server" not in results

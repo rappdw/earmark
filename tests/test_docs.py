@@ -1494,3 +1494,19 @@ def test_deploy_doc_youtube() -> None:
 @pytest.mark.parametrize("doc", CONTRACT_DOCS)
 def test_contract_docs_use_placeholders_only(doc: str) -> None:
     _assert_placeholders(read_doc(doc), doc)
+
+
+def test_deploy_doc_cli_section() -> None:
+    text = read_doc("docs/deploy.md")
+    assert "\n## 19. The command line\n" in text
+    section = text.split("\n## 19. The command line\n", 1)[1].split("\n## ", 1)[0]
+    flat = _flat(section).lower().replace("`", "")
+    for needle in (
+        "earmark_api_url",
+        "http://127.0.0.1:8787",
+        "https://earmark.example.com",
+        "docker compose exec api earmark jobs",
+        "in your shell",
+        "not in .env",
+    ):
+        assert needle in flat, needle

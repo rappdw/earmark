@@ -25,6 +25,10 @@ class DatabaseSetupError(Exception):
     """The database cannot be used: newer schema than this code, another lineage, or no WAL."""
 
 
+class MissingDatabaseError(DatabaseSetupError):
+    """A read-only command found no data directory or no database; str(exc) says which."""
+
+
 class LegacyDatabaseError(DatabaseSetupError):
     """The file was made by earmark v0.1.0 (or a pre-release build of it)."""
 

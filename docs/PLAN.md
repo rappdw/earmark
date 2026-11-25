@@ -60,7 +60,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 31 | The Shortcut as a file | 28 | todo |
 | 32 | YouTube as a source | 30 | done |
 | 33 | The transcript by job id | 32 | done |
-| 34 | The CLI as an API client | 33 | todo |
+| 34 | The CLI as an API client | 33 | done |
 | 35 | Your own certificate | 34 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline

@@ -19,6 +19,8 @@ x-earmark: &earmark
     EARMARK_PORT: "8787"
     # Empty means unset: models go to the volume (`HF_HOME`).
     EARMARK_ASR_MODEL_DIR: ""
+    # Empty means unset: commands run in a container read /data, never the API (step 34).
+    EARMARK_API_URL: ""
     # Hugging Face telemetry off; HF_HUB_DISABLE_TELEMETRY=0 in .env turns it back on.
     HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY:-1}
   volumes:

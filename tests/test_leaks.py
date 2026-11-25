@@ -442,3 +442,60 @@ def test_unreadable_cache_logs_no_content(tmp_path: Path, log_stream: io.StringI
     for haystack in (text, got.text):
         for banned in ("SPOKEN-TOKEN", "Traceback", "input_value"):
             assert banned not in haystack
+
+
+def test_api_client_leaks_no_token(tmp_path: Path, log_stream: io.StringIO) -> None:
+    from earmark import api_client as ac
+    from earmark.models import TranscriptionRequest
+    from tests.api_client_helpers import CLIENT_TOKEN, api_settings, in_process_transport
+
+    token = SecretStr(CLIENT_TOKEN)
+    url = "https://earmark.example.com"
+    messages: list[str] = []
+
+    def attempt(call: Callable[[], object]) -> None:
+        try:
+            call()
+        except ac.ApiError as exc:
+            for text in (exc.message, str(exc), repr(exc)):
+                assert CLIENT_TOKEN not in text
+            messages.append(exc.message)
+
+    app = create_app(api_settings(tmp_path / "data"))
+    real = ac.ApiClient(url, token, transport=in_process_transport(app))
+    with real:
+        accepted = real.submit_url(TranscriptionRequest(url=DIRECT_URL, to=OTHER_TO))
+        attempt(lambda: real.submit_url(TranscriptionRequest(url=DIRECT_URL, to="x@example.com")))
+        real.list_jobs(limit=5, status=None)
+        real.get_job(accepted.job_id)
+        attempt(lambda: real.get_job("a" * 32))
+        attempt(lambda: real.transcript(accepted.job_id, "note"))
+    wrong_app = create_app(api_settings(tmp_path / "other", token="another-token-123"))
+    with ac.ApiClient(url, token, transport=in_process_transport(wrong_app)) as wrong:
+        attempt(lambda: wrong.list_jobs(limit=1, status=None))
+
+    def echo(request: httpx2.Request) -> httpx2.Response:
+        seen = request.headers.get("authorization")
+        path = request.url.path
+        if path == "/401":
+            return httpx2.Response(401, json={"detail": f"seen {seen}"})
+        if path == "/422":
+            return httpx2.Response(422, json={"detail": f"seen {seen}"})
+        if path == "/500":
+            return httpx2.Response(500, json={"detail": f"seen {seen}"})
+        if path == "/302":
+            return httpx2.Response(302, headers={"Location": f"http://x.example.net/{seen}"})
+        return httpx2.Response(200, text=f"not json {seen}")
+
+    with ac.ApiClient(url, token, transport=httpx2.MockTransport(echo)) as stub:
+        for path in ("/401", "/422", "/500", "/302", "/other"):
+            attempt(lambda path=path: stub._call("GET", path, expected=200))  # type: ignore[misc]
+        attempt(lambda: stub.list_jobs(limit=1, status=None))
+    assert any("seen Bearer **********" in m for m in messages)
+
+    def boom(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError(f"boom {CLIENT_TOKEN}", request=request)
+
+    with ac.ApiClient(url, token, transport=httpx2.MockTransport(boom)) as broken:
+        attempt(lambda: broken.list_jobs(limit=1, status=None))
+    assert CLIENT_TOKEN not in log_stream.getvalue()
