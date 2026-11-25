@@ -59,7 +59,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 30 | The PKA marketplace and the receiving skill | 29 | done |
 | 31 | The Shortcut as a file | 28 | todo |
 | 32 | YouTube as a source | 30 | done |
-| 33 | The transcript by job id | 32 | todo |
+| 33 | The transcript by job id | 32 | done |
 | 34 | The CLI as an API client | 33 | todo |
 | 35 | Your own certificate | 34 | todo |
 

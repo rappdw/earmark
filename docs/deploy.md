@@ -550,6 +550,41 @@ the server's). Doctor never sends mail.
 - Read them with the Python reader in the [README quickstart](../README.md#quickstart-fake-backends),
   run with `python3` on the host.
 
+### 8.7 A transcript without the email
+
+`GET /jobs/<job_id>/transcript` serves a job's transcript from the cache, behind the same
+bearer token. `?format=` picks one of three:
+
+- `note` (the default) is the transcript note, rendered by the same code as the mailed
+  attachment. It is that attachment, byte for byte, while the episode's cache is unchanged
+  (the exceptions are under "HTTP API" in [ARCHITECTURE](ARCHITECTURE.md)).
+- `text` is `transcript.txt`.
+- `json` is the segments, with the job's own id and without the ASR model.
+
+From the Mac, or any machine that reaches the API:
+
+```bash
+curl -fsS -OJ -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  "https://earmark.example.com/jobs/<job_id>/transcript"
+curl -fsS -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  "https://earmark.example.com/jobs/<job_id>/transcript?format=text" -o transcript.txt
+```
+
+`-OJ` saves the note under its own file name. On the Spark, inside the container:
+
+```bash
+docker compose exec -T api earmark transcript <job_id> > note.md
+```
+
+Keep `-T`: without it compose allocates a terminal, which turns line endings into CRLF and
+makes the command replace control characters.
+
+The answers:
+
+- 409: the job has no transcript yet, or it failed or was skipped before it had one.
+- 410: the episode's cache was deleted; share it again.
+- A job that failed on `EARMARK_MAX_ATTACHMENT_MB` still has its transcript here.
+
 ## 9. Recipients: EARMARK_ALLOWED_RECIPIENTS
 
 - Every request names one `to`, and earmark never defaults it.

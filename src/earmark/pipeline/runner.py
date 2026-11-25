@@ -33,8 +33,9 @@ from earmark.models import (
 )
 from earmark.pipeline.stages import Backends, OutgoingMail
 from earmark.recipients import RecipientPolicy, mask_address
-from earmark.sources import audio_episode, audio_title, sha256_file
+from earmark.sources import audio_episode, sha256_file
 from earmark.staging import Staging
+from earmark.transcripts import episode_for_job
 from earmark.youtube.links import video_id_from_canonical
 
 logger = logging.getLogger(__name__)
@@ -153,19 +154,10 @@ class Pipeline:
                 )
 
     def load_episode(self, job: Job) -> Episode | None:
-        if job.source == "upload":
-            if job.content_sha256 is None:
-                return None
-            return audio_episode(job, job.content_sha256)
-        if job.episode_key is None:
-            return None
         try:
-            episode = self._artifacts.read_episode(job.episode_key)
+            return episode_for_job(job, self._artifacts)
         except (PermanentError, OSError):
             return None
-        if episode is not None and job.source == "url":
-            return episode.model_copy(update={"title": audio_title(job)})
-        return episode
 
     # -- outcomes ---------------------------------------------------------------------
 

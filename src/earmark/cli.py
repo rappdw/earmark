@@ -3,6 +3,7 @@
 import json
 import logging
 import sqlite3
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -14,7 +15,7 @@ from earmark.config import ConfigError, Settings, load_settings
 from earmark.db import DatabaseSetupError
 from earmark.jobs import LIST_LIMIT_MAX
 from earmark.log import configure_logging
-from earmark.models import JobStatus
+from earmark.models import JobStatus, TranscriptFormat
 
 if TYPE_CHECKING:
     from earmark.api.schemas import JobView
@@ -290,6 +291,53 @@ def jobs_command(
     for job in jobs:
         for line in _job_lines(job):
             typer.echo(line)
+
+
+def terminal_text(data: bytes) -> str:
+    """UTF-8 bytes as text that cannot drive a terminal: every character that is not
+    printable, except newline and tab, becomes '?'. Undecodable bytes become U+FFFD."""
+    text = data.decode("utf-8", errors="replace")
+    return "".join(c if c in "\n\t" or c.isprintable() else "?" for c in text)
+
+
+def _stdout_is_terminal() -> bool:  # a seam for tests
+    return sys.stdout.isatty()
+
+
+@app.command("transcript")
+def transcript_command(
+    job_id: Annotated[str, typer.Argument(help="The job id that POST /transcriptions returned.")],
+    fmt: Annotated[
+        TranscriptFormat,
+        typer.Option("--format", help="note (the mailed note; the default), text or json."),
+    ] = "note",
+) -> None:
+    """Print a job's transcript from the cache, as GET /jobs/{id}/transcript does."""
+    settings = _load_or_exit()
+    configure_logging(settings.log_level, settings.secret_values())
+    from earmark.artifacts import ArtifactStore
+    from earmark.jobs import open_job_store
+    from earmark.transcripts import JOB_NOT_FOUND, TranscriptUnavailable, read_transcript_file
+
+    try:
+        job = open_job_store(settings).get(job_id)
+    except (DatabaseSetupError, sqlite3.Error, OSError) as exc:
+        typer.echo(f"earmark transcript: cannot open the job store: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    if job is None:
+        typer.echo(f"earmark transcript: {JOB_NOT_FOUND}", err=True)
+        raise typer.Exit(code=1)
+    try:
+        found = read_transcript_file(job, ArtifactStore(settings.data_dir), fmt)
+    except TranscriptUnavailable as exc:
+        typer.echo(f"earmark transcript: {exc.detail}", err=True)
+        raise typer.Exit(code=1) from None
+    if _stdout_is_terminal():
+        typer.echo(terminal_text(found.data), nl=False)
+        return
+    sys.stdout.flush()
+    sys.stdout.buffer.write(found.data)
+    sys.stdout.buffer.flush()
 
 
 @app.command("resolve")

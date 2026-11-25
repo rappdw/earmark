@@ -14,6 +14,7 @@ from earmark.errors import PermanentError, SkipEpisode, TransientError
 from earmark.fakes import FakeAudioFetcher, FakeTranscriber, FakeYoutubeSource, make_fake_backends
 from earmark.models import Episode, Job, JobResult, Segment, Transcript, content_key, youtube_key
 from earmark.pipeline.runner import MAX_ERROR_CHARS, describe_error
+from earmark.sources import audio_episode
 from earmark.staging import StagedUpload
 from earmark.transcribe.base import UnusableAudioError
 from earmark.transcribe.faster_whisper import file_key
@@ -695,8 +696,11 @@ def test_direct_url_download_failure_is_reported(tmp_path: Path) -> None:
 
 
 def test_load_episode_per_source(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    staged, upload_job = _enqueue_upload(env, upload_name="memo.m4a")
+    payload = b"ID3" + bytes(64)  # the URL job downloads the same bytes as the upload
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.fetcher = FakeAudioFetcher(fakes.artifacts, payload=payload)
+    env = make_env(tmp_path, fakes=fakes)
+    staged, upload_job = _enqueue_upload(env, payload, upload_name="memo.m4a")
     episode = env.pipeline.load_episode(upload_job)
     assert episode is not None
     assert (episode.key, episode.title) == (content_key(staged.sha256), "memo")
@@ -707,6 +711,14 @@ def test_load_episode_per_source(tmp_path: Path) -> None:
     loaded = env.pipeline.load_episode(url_job)
     assert loaded is not None
     assert loaded.title == "Named"
+    assert url_job.episode_key == content_key(staged.sha256)
+    env.fakes.artifacts.write_episode(audio_episode(upload_job, staged.sha256))  # upload wrote last
+    stored = env.fakes.artifacts.read_episode(content_key(staged.sha256))
+    assert stored is not None
+    assert stored.source == "upload"
+    loaded = env.pipeline.load_episode(url_job)
+    assert loaded is not None
+    assert loaded.source == "url"  # the upload of the same bytes wrote episode.json last
     unresolved = url_job.model_copy(update={"episode_key": None})
     assert env.pipeline.load_episode(unresolved) is None
 

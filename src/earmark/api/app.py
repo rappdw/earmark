@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from earmark import __version__
 from earmark.api.auth import BearerAuthMiddleware, require_api_token
 from earmark.api.routes import build_router
+from earmark.artifacts import ArtifactStore
 from earmark.config import Settings
 from earmark.fetch import MIB
 from earmark.jobs import JobStore, open_job_store
@@ -111,7 +112,13 @@ def create_app(
             "auto_configure": False,
         },
     )
-    app.include_router(build_router(Intake(store, policy, staging), max_upload_bytes=limit))
+    app.include_router(
+        build_router(
+            Intake(store, policy, staging),
+            artifacts=ArtifactStore(settings.data_dir),
+            max_upload_bytes=limit,
+        )
+    )
     app.add_exception_handler(RequestValidationError, _on_validation_error)
     app.add_exception_handler(sqlite3.Error, _on_store_error)
     app.add_middleware(BearerAuthMiddleware, token=token)

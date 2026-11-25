@@ -34,6 +34,7 @@ GUID_YOUTUBE_PREFIX: Final = "youtube:"
 YOUTUBE_ID: Final = re.compile(r"[A-Za-z0-9_-]{11}")
 JobKind = Literal["ingest"]
 JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
+TranscriptFormat = Literal["note", "text", "json"]
 Stage = Literal["resolve", "fetch", "transcribe", "deliver", "notify"]  # "notify" is never set
 DeliveryState = Literal["sending", "sent"]
 Clock = Callable[[], datetime]

@@ -1088,10 +1088,11 @@ def test_readme_http_api_lists_every_route(tmp_path: Path) -> None:
     from fastapi.routing import APIRoute
 
     from earmark.api.routes import build_router
+    from earmark.artifacts import ArtifactStore
 
     store = JobStore(open_database(tmp_path / "earmark.db"))
     intake = Intake(store, RecipientPolicy.from_setting(()), Staging(tmp_path / "data"))
-    router = build_router(intake, max_upload_bytes=1024)
+    router = build_router(intake, artifacts=ArtifactStore(tmp_path / "data"), max_upload_bytes=1024)
     actual = {
         (method, re.sub(r"\{[^}]*\}", "{}", route.path))
         for route in router.routes

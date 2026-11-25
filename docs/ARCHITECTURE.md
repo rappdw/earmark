@@ -302,6 +302,10 @@ src/earmark/
                        standard library only (step 24)
   sources.py           parse_source_url (Apple link, YouTube link or direct URL), display_url, upload_extension,
                        clean_upload_name, audio_title, sha256_file, audio_episode (step 24)
+  transcripts.py       a job's cached transcript as the note, the text or the JSON view:
+                       read_transcript_file, TranscriptFile, TranscriptView,
+                       TranscriptUnavailable, episode_for_job; reads the cache only (the
+                       transcript route and `earmark transcript`; step 33)
   staging.py           Staging: data/uploads/ (UploadWriter) and data/downloads/, release at a
                        terminal state, startup sweeps (step 24)
   sanitize.py          untrusted text to file names and YAML, fit_chars, and the frontmatter
@@ -1319,6 +1323,7 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 |---|---|
 | `POST /transcriptions` | JSON `{url, to, instructions?, title?, timestamp?}` (`TranscriptionRequest`, at most 64 KiB), or `multipart/form-data` with one `file` part plus the text fields `to`, `instructions`, `title` and `timestamp` (the file at most `EARMARK_MAX_UPLOAD_MB`). The answer is 202 `{job_id, status, created}` with `Location: /jobs/{id}`; `created` is `false` when dedupe returned an existing job. 401 bad token. 413 too large. 415 a content type that is neither, or an upload that does not look like audio. 422 an invalid body, a missing, invalid or not-allowed `to`, or a bad URL, show link or YouTube link (not one video, or no valid id), with a message the Shortcut can display. Step 24; it replaced `POST /ingest`. |
 | `GET /jobs/{id}` | The job's `JobView`. 404 if unknown. |
+| `GET /jobs/{id}/transcript` | The job's transcript from the cache (step 33). `?format=note` (the default: the note exactly as the mail code renders it, `text/markdown`, with the attachment's file name in `Content-Disposition`), `text` (`transcript.txt`, `text/plain`) or `json` (`TranscriptView`, `application/json`). 404 unknown job. 409 no transcript yet, or the job failed or was skipped before it had one. 410 the cache is gone. 422 an unknown format. 500 an unreadable cache file. |
 | `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [JobView, …]}`, newest first. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
 
@@ -1382,6 +1387,43 @@ section 5).
 
 It never carries `heartbeat_at`, the lease token, the staged file name, the upload's file
 name, the content hash, the `Message-ID` or `resent`.
+
+**`GET /jobs/{id}/transcript`** (step 33; exact rules in
+`docs/steps/33-transcript-by-job-id.md` sections 4 and 5). `transcripts.read_transcript_file`
+does the work, for the route and for `earmark transcript` alike, so both give the same bytes
+and the same messages.
+
+- **It reads, and does nothing else.** It reads the job row and the files under
+  `episodes/<episode_key>/`. It writes nothing (not `shared.json` either), starts no stage and
+  makes no network request. The handler is sync and runs in the threadpool.
+- **When a job has a transcript:** its status is `done`, or its stage is `deliver` (running,
+  queued for another delivery attempt, or failed while delivering, for example on
+  `EARMARK_MAX_ATTACHMENT_MB`). Otherwise the answer is 409 with a `detail` naming the
+  status (and the stage while it is queued or running). A failed or skipped job that never
+  reached `deliver` is 409 even when another job cached the same episode since.
+- **Formats.** All three bodies are UTF-8. Every 200 carries `Cache-Control: no-store`.
+  - `note`: `mail.note.render_note` on the cached `episode.json`, `shared.json` and
+    `transcript.json`, so it is the mailed note attachment, byte for byte, while that
+    episode's cache is unchanged. For an upload or a URL job the episode is rebuilt with
+    `sources.audio_episode(job, sha256)`, as the runner built it, not taken from
+    `episode.json` (which holds the last job's title). The note is rendered per request and
+    never stored. `Content-Type: text/markdown; charset=utf-8` and
+    `Content-Disposition: attachment; filename="<the attachment's file name>"`.
+  - `text`: the bytes of `transcript.txt`, `text/plain; charset=utf-8`.
+  - `json`: `TranscriptView`, `{job_id, episode_key, language, duration_s, segments: [{start,
+    end, text, speaker}], warnings}`, indented by 2 and ending in a newline, `application/json`.
+    It never carries the ASR model or profile, the guid, `to` or `instructions`.
+- **The cache.** A missing `transcript.json` is 410 for every format; a missing
+  `transcript.txt` is 410 for `text`; a missing `episode.json` (podcast, YouTube, URL) or
+  `shared.json` is 410 for `note`. A file that does not parse is 500, with a `detail` naming
+  the file, and is logged without its content or the validation error.
+- **When the note differs from the mail.** It is rendered from today's cache and mail code.
+  It differs from what was sent when, since then, a later share of the same episode
+  re-resolved it with new metadata, a share carrying an earlier `timestamp` moved
+  `shared.json`'s first share, a new ASR profile re-transcribed it, or a contract revision
+  changed the mail code.
+- **Logs** name the job and the format, and the reason code of a refusal. Never the
+  content, the recipient or the instructions.
 
 ## Configuration
 
@@ -1609,6 +1651,10 @@ and handles text they wrote.
   - `EARMARK_SMTP_PASSWORD` never appears in logs, job errors, pushes, `earmark config` or
     doctor output.
   - The guid appears only inside the attachments: not in the body, the subject or a push.
+- **Leak rules for the transcript route** (step 33), tested in `tests/test_leaks.py`: the
+  note, the text and the JSON view carry neither `to` nor `instructions`, and the route's
+  log lines carry no transcript text, recipient or instructions, nor an error's text. The
+  instructions attachment is never served.
 - **Untrusted text in mail** (step 25).
   - Titles, show names, upload names, URL path segments, feed guids and transcripts reach
     the attachments only, through `mail.note.contract_text` and `yaml_quote`. The one
@@ -2358,6 +2404,16 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
     chosen;
   - migration `0004` rebuilds `jobs`, and an older image then refuses the database;
   - the weekly `slow` job installs the `youtube` extra; the live download stays opt-in.
+- **Settled by step 33** (see `docs/steps/33-transcript-by-job-id.md` section 8):
+  - the note is rendered per request from the cache, not stored, so it can differ from the
+    mailed note after the episode's cache changes (listed under "HTTP API");
+  - the note carries no `job_id`, because adding one is a contract revision; the JSON view
+    carries the job's own `job_id`;
+  - a job has a transcript when it is `done` or its stage is `deliver`, whatever its status;
+  - the JSON view is a public `TranscriptView`, not the cached `Transcript`, so the ASR model
+    and profile stay private and the cache format can change;
+  - `earmark transcript` writes the exact bytes when its output is not a terminal, and only
+    printable characters, newlines and tabs when it is.
 - **Settled by step 28** (see `docs/steps/28-system-scope.md` section 8):
   - the runbook keeps phases 0–10 and appends phase 11 (installing the receiving skill,
     step 30) and phase 12 (the one-episode check), so no existing phase number changes;

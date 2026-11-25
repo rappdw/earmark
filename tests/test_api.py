@@ -25,6 +25,7 @@ from earmark.api.auth import (
 )
 from earmark.api.routes import MAX_JSON_BODY_BYTES, build_router
 from earmark.api.schemas import VIEW_INSTRUCTIONS_CHARS, JobView, job_view
+from earmark.artifacts import ArtifactStore
 from earmark.config import Settings
 from earmark.db import LegacyDatabaseError, open_database
 from earmark.jobs import JobStore
@@ -91,6 +92,7 @@ def _ingest(c: TestClient, **body: Any) -> Any:
         ("POST", "/transcriptions"),
         ("GET", "/jobs"),
         ("GET", f"/jobs/{'a' * 32}"),
+        ("GET", f"/jobs/{'a' * 32}/transcript"),
         ("GET", "/nope"),
         ("GET", "/docs"),
     ],
@@ -721,7 +723,7 @@ def test_store_error_503(settings: Settings, tmp_path: Path) -> None:
 
 def test_routes_are_exactly_the_kept_ones(store: JobStore, tmp_path: Path) -> None:
     intake = Intake(store, RecipientPolicy.from_setting((TO,)), Staging(tmp_path))
-    router = build_router(intake, max_upload_bytes=1024)
+    router = build_router(intake, artifacts=ArtifactStore(tmp_path), max_upload_bytes=1024)
     routes = {
         (route.path, frozenset(route.methods or ()))
         for route in router.routes
@@ -730,10 +732,11 @@ def test_routes_are_exactly_the_kept_ones(store: JobStore, tmp_path: Path) -> No
     assert routes == {
         ("/transcriptions", frozenset({"POST"})),
         ("/jobs/{job_id}", frozenset({"GET"})),
+        ("/jobs/{job_id}/transcript", frozenset({"GET"})),
         ("/jobs", frozenset({"GET"})),
         ("/healthz", frozenset({"GET", "HEAD"})),
     }
-    assert len(router.routes) == 4
+    assert len(router.routes) == 5
 
 
 def test_create_app_refuses_v010_database(settings: Settings, tmp_path: Path) -> None:

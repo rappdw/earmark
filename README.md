@@ -175,13 +175,14 @@ Run them as `uv run earmark <command>`.
 | `worker [--once]` | Run the job worker; `--once` processes at most one job and exits. |
 | `submit <url-or-file> --to <address> [--instructions] [--title]` | Enqueue a transcription, the same way `POST /transcriptions` does. |
 | `jobs [--status] [--limit] [--json]` | List recent jobs, newest first. |
+| `transcript <job_id> [--format]` | Print a job's transcript from the cache: the note as mailed (the default), `text` or `json`. |
 | `resolve <url>` | Resolve an episode URL to its feed, GUID, and audio URL. |
 | `transcribe <file> [--json]` | Transcribe a local audio file and print the result. |
 | `doctor [--online]` | Check the configuration, directories, database, backends, and credentials. |
 | `config` | Show the effective configuration with secrets redacted. |
 | `--version` | Print the version. |
 
-The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs`, and `GET|HEAD /healthz`.
+The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs/{id}/transcript`, `GET /jobs`, and `GET|HEAD /healthz`.
 Everything except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration

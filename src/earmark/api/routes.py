@@ -1,6 +1,7 @@
 """The API's routes."""
 
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Final
@@ -13,12 +14,21 @@ from starlette.requests import ClientDisconnect
 
 from earmark.api.schemas import Health, JobList, JobView, TranscriptionResponse, job_view
 from earmark.api.upload import UploadRejected, log_rejection, receive_upload
+from earmark.artifacts import ArtifactStore
 from earmark.fetch import media_type
 from earmark.jobs import LIST_LIMIT_MAX, Enqueued
-from earmark.models import FORM_FIELDS, JSON_FIELDS, JobStatus, TranscriptionRequest, UploadFields
+from earmark.models import (
+    FORM_FIELDS,
+    JSON_FIELDS,
+    JobStatus,
+    TranscriptFormat,
+    TranscriptionRequest,
+    UploadFields,
+)
 from earmark.recipients import RecipientRefused
 from earmark.resolve.apple import UnsupportedUrlError
 from earmark.submission import Intake
+from earmark.transcripts import JOB_NOT_FOUND, TranscriptUnavailable, read_transcript_file
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +40,8 @@ UNSUPPORTED_TYPE: Final = (
     "send JSON (Content-Type: application/json) or a multipart form "
     "(Content-Type: multipart/form-data)"
 )
+_FILENAME_OK: Final = re.compile(r"[0-9a-z][0-9a-z.-]*\.md")
+_UNAVAILABLE_STATUS: Final = {"not_ready": 409, "gone": 410, "unreadable": 500}
 MISSING_BODY: Final = "request body is missing; send a JSON object with url and to"
 
 
@@ -52,7 +64,7 @@ def _accepted(enqueued: Enqueued) -> JSONResponse:
     )
 
 
-def build_router(intake: Intake, *, max_upload_bytes: int) -> APIRouter:
+def build_router(intake: Intake, *, artifacts: ArtifactStore, max_upload_bytes: int) -> APIRouter:
     router = APIRouter()
     store = intake.store
 
@@ -125,8 +137,36 @@ def build_router(intake: Intake, *, max_upload_bytes: int) -> APIRouter:
     def get_job(job_id: str) -> JobView:
         job = store.get(job_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="job not found")
+            raise HTTPException(status_code=404, detail=JOB_NOT_FOUND)
         return job_view(job)
+
+    @router.get("/jobs/{job_id}/transcript")
+    def get_transcript(
+        job_id: str,
+        fmt: Annotated[TranscriptFormat, Query(alias="format")] = "note",
+    ) -> Response:
+        job = store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=JOB_NOT_FOUND)
+        try:
+            found = read_transcript_file(job, artifacts, fmt)
+        except TranscriptUnavailable as exc:
+            if exc.reason == "unreadable":
+                logger.warning(
+                    "job %s: no transcript as %s: %s: %s", job.id, fmt, exc.reason, exc.detail
+                )
+            else:
+                logger.info("job %s: no transcript as %s: %s", job.id, fmt, exc.reason)
+            raise HTTPException(
+                status_code=_UNAVAILABLE_STATUS[exc.reason], detail=exc.detail
+            ) from None
+        headers = {"Cache-Control": "no-store"}
+        if found.filename is not None:
+            if not _FILENAME_OK.fullmatch(found.filename):
+                raise ValueError("the note's file name is not a plain slug")
+            headers["Content-Disposition"] = f'attachment; filename="{found.filename}"'
+        logger.info("job %s: transcript served as %s", job.id, fmt)
+        return Response(content=found.data, media_type=found.media_type, headers=headers)
 
     @router.get("/jobs")
     def list_jobs(

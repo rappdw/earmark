@@ -15,11 +15,11 @@ from earmark.api.app import create_app
 from earmark.audio import HttpAudioFetcher
 from earmark.config import Settings
 from earmark.errors import PermanentError
-from earmark.fakes import make_fake_backends
+from earmark.fakes import FakeTranscriber, make_fake_backends
 from earmark.fetch import MIB, PermanentFetchError
 from earmark.jobs import NewJob
 from earmark.log import configure_logging
-from earmark.models import Job
+from earmark.models import Job, Segment
 from earmark.notify.ntfy import NtfyClient, NtfyNotifier, NtfyOptions
 from tests.factories import new_podcast_job, new_upload_job, new_url_job, new_youtube_job
 from tests.http_helpers import mock_fetcher
@@ -368,3 +368,77 @@ def test_smtp_password_never_leaks(
         assert SMTP_PASSWORD not in text
         assert "efgh" not in text
     assert "smtp session failed" in log_stream.getvalue()  # the DEBUG log captured the run
+
+
+def _transcript_env(tmp_path: Path) -> PipelineEnv:
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.transcriber = FakeTranscriber(
+        fakes.artifacts, segments=[Segment(start=0, end=5, text="SPOKEN-TOKEN-6e1f and more words")]
+    )
+    return make_env(tmp_path, fakes=fakes)
+
+
+def test_transcript_route_leaks_nothing(tmp_path: Path, log_stream: io.StringIO) -> None:
+    env = _transcript_env(tmp_path)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(create_app(_settings(tmp_path), store=env.jobs), headers=headers) as client:
+        podcast = client.post(
+            "/transcriptions", json={"url": CANON, "to": SECRET_TO, "instructions": INSTRUCTIONS}
+        )
+        upload = client.post(
+            "/transcriptions",
+            files={"file": (FILENAME, b"ID3" + bytes(500), "audio/mp4")},
+            data={"to": SECRET_TO, "instructions": INSTRUCTIONS},
+        )
+        for _ in range(2):
+            done = env.worker.run_once()
+            assert done is not None
+            assert done.status == "done"
+        env.fakes.fetcher.fail_next(PermanentFetchError("audio URL returned 404", host="x"))
+        failing = client.post(
+            "/transcriptions",
+            json={"url": DIRECT_URL, "to": SECRET_TO, "instructions": INSTRUCTIONS},
+        )
+        failed = env.worker.run_once()
+        assert failed is not None
+        assert failed.status == "failed"
+        ids = [r.json()["job_id"] for r in (podcast, upload, failing)]
+        mark = log_stream.tell()
+        bodies: list[tuple[int, str]] = []
+        for job_id in [*ids, "a" * 32]:
+            for fmt in ("note", "text", "json", "xml"):
+                got = client.get(f"/jobs/{job_id}/transcript", params={"format": fmt})
+                bodies.append((got.status_code, got.text))
+        log_stream.seek(mark)
+        text = log_stream.read()
+    assert "transcript served as note" in text
+    for secret in ("SPOKEN-TOKEN", "INSTR-TOKEN", SECRET_TO, MASKED_TO):
+        assert secret not in text
+    for status, body in bodies:
+        assert INSTRUCTIONS not in body
+        assert "INSTR-TOKEN" not in body
+        assert SECRET_TO not in body
+        if status != 200:
+            assert "SPOKEN-TOKEN" not in body
+    assert {s for s, _ in bodies} == {200, 404, 409, 422}
+
+
+def test_unreadable_cache_logs_no_content(tmp_path: Path, log_stream: io.StringIO) -> None:
+    env = _transcript_env(tmp_path)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(create_app(_settings(tmp_path), store=env.jobs), headers=headers) as client:
+        posted = client.post("/transcriptions", json={"url": CANON, "to": SECRET_TO})
+        job = env.worker.run_once()
+        assert job is not None
+        assert job.status == "done"
+        path = env.fakes.artifacts.transcript_json_path(job.episode_key or "")
+        path.write_text('"SPOKEN-TOKEN-6e1f"')
+        mark = log_stream.tell()
+        got = client.get(f"/jobs/{posted.json()['job_id']}/transcript")
+        log_stream.seek(mark)
+        text = log_stream.read()
+    assert got.status_code == 500
+    assert "unreadable" in text
+    for haystack in (text, got.text):
+        for banned in ("SPOKEN-TOKEN", "Traceback", "input_value"):
+            assert banned not in haystack

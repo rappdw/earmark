@@ -976,6 +976,7 @@ def test_cli_commands_are_exactly() -> None:
         "worker",
         "submit",
         "jobs",
+        "transcript",
         "resolve",
         "transcribe",
     }
@@ -1039,3 +1040,107 @@ def test_fresh_database_after_moving_v010_aside(fake_env: Path) -> None:
         assert conn.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
     finally:
         conn.close()
+
+
+# -- transcript -----------------------------------------------------------------------------
+
+
+def _shared_and_run(*extra: str) -> str:
+    job_id = _submit(SHARE, "--instructions", "INSTR-TOKEN", *extra).split()[0]
+    worked = runner.invoke(app, ["worker", "--once"])
+    assert worked.exit_code == 0, worked.stderr
+    return job_id
+
+
+def _episode_dir(root: Path) -> Path:
+    [transcript] = (root / "data").glob("episodes/*/transcript.json")
+    return transcript.parent
+
+
+def test_transcript_command_note_equals_mail(fake_env: Path) -> None:
+    from tests.mail_helpers import parse_mail
+
+    job_id = _shared_and_run()
+    result = runner.invoke(app, ["transcript", job_id])
+    assert result.exit_code == 0, result.stderr
+    mailed = parse_mail((fake_env / "data" / "outbox" / f"{job_id}.eml").read_bytes())
+    assert result.stdout_bytes == mailed.note
+    assert b"INSTR-TOKEN" not in result.stdout_bytes
+
+
+def test_transcript_command_formats(fake_env: Path) -> None:
+    job_id = _shared_and_run()
+    text = runner.invoke(app, ["transcript", job_id, "--format", "text"])
+    assert text.exit_code == 0, text.stderr
+    assert text.stdout_bytes == (_episode_dir(fake_env) / "transcript.txt").read_bytes()
+    as_json = runner.invoke(app, ["transcript", job_id, "--format", "json"])
+    assert as_json.exit_code == 0, as_json.stderr
+    assert json.loads(as_json.stdout_bytes)["job_id"] == job_id
+
+
+@pytest.mark.parametrize("fmt", ["note", "text", "json"])
+def test_transcript_command_matches_api(fake_env: Path, fmt: str) -> None:
+    from fastapi.testclient import TestClient
+    from pydantic import SecretStr
+
+    from earmark.api.app import create_app
+
+    job_id = _shared_and_run()
+    cli = runner.invoke(app, ["transcript", job_id, "--format", fmt])
+    settings = Settings(
+        _env_file=None,
+        api_token=SecretStr("t"),
+        data_dir=fake_env / "data",
+        allowed_recipients=(TO,),
+    )
+    with TestClient(create_app(settings), headers={"Authorization": "Bearer t"}) as client:
+        served = client.get(f"/jobs/{job_id}/transcript", params={"format": fmt})
+    assert (cli.exit_code, served.status_code) == (0, 200)
+    assert cli.stdout_bytes == served.content
+
+
+def test_transcript_command_unknown_job(fake_env: Path) -> None:
+    result = runner.invoke(app, ["transcript", "a" * 32])
+    assert result.exit_code == 1
+    assert result.stderr == "earmark transcript: job not found\n"
+    assert result.stdout == ""
+
+
+def test_transcript_command_not_ready(fake_env: Path) -> None:
+    from earmark.transcripts import NOT_YET
+
+    job_id = _submit(SHARE).split()[0]
+    result = runner.invoke(app, ["transcript", job_id])
+    assert result.exit_code == 1
+    assert result.stderr == f"earmark transcript: {NOT_YET.format(status='queued')}\n"
+    assert result.stdout == ""
+
+
+def test_transcript_command_gone(fake_env: Path) -> None:
+    job_id = _shared_and_run()
+    (_episode_dir(fake_env) / "transcript.json").unlink()
+    result = runner.invoke(app, ["transcript", job_id])
+    assert result.exit_code == 1
+    assert "transcript.json is missing" in result.stderr
+    assert result.stdout == ""
+
+
+def test_transcript_command_bad_format(fake_env: Path) -> None:
+    result = runner.invoke(app, ["transcript", "a" * 32, "--format", "pdf"])
+    assert result.exit_code == 2
+
+
+def test_terminal_text() -> None:
+    from earmark.cli import terminal_text
+
+    assert terminal_text(b"a\x1b[31mb\r\n\tc\xc3\xa9\xff") == "a?[31mb?\n\tcé�"
+
+
+def test_transcript_command_at_a_terminal(fake_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    job_id = _shared_and_run()
+    (_episode_dir(fake_env) / "transcript.txt").write_bytes(b"[00:00:00] hi \x1b[2J there\n")
+    raw = runner.invoke(app, ["transcript", job_id, "--format", "text"])
+    assert raw.stdout_bytes == b"[00:00:00] hi \x1b[2J there\n"
+    monkeypatch.setattr("earmark.cli._stdout_is_terminal", lambda: True)
+    shown = runner.invoke(app, ["transcript", job_id, "--format", "text"])
+    assert shown.stdout == "[00:00:00] hi ?[2J there\n"
