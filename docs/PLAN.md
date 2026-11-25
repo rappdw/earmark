@@ -14,6 +14,9 @@ service" below.
 Shortcut, the service, and the PKA receiving skill, with the two seams between them. See
 "System scope: one repo for the whole system" below.
 
+**Added on 2026-11-25 (step 32).** YouTube as a source, with contract 2, after the first
+real shares from the phone.
+
 ## Status
 
 Update this table when a step passes verification. Each step is one commit titled
@@ -53,6 +56,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 29 | The mail contract as a tested seam | 28 | done |
 | 30 | The PKA marketplace and the receiving skill | 29 | done |
 | 31 | The Shortcut as a file | 28 | todo |
+| 32 | YouTube as a source | 30 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -1406,6 +1410,106 @@ says so.
   be read, otherwise by a runbook check, which the step plan says plainly.
 - The runbook's Shortcut phase installs from the file and ends in a check.
 
+## Step 32: YouTube as a source
+
+**Goal.** A YouTube video shared from the phone is transcribed and mailed like a podcast
+episode, with a stable identity the PKA can de-duplicate on.
+
+**Inputs (operator, 2026-11-25).** The first real shares from the phone included a
+`youtu.be` link. Treated as a direct audio URL (step 24), it failed with "returned
+text/html, not audio", which is correct for today's service. The operator chose:
+
+- YouTube only, not the other sites a downloader supports;
+- **contract 2**, not fitting YouTube into contract 1 as `origin: url`. A `sha256:` of the
+  downloaded audio is not a stable identity for a video, and `youtu.be/<id>` and
+  `youtube.com/watch?v=<id>` would look like different items.
+
+**Build.**
+
+- **Recognising the link.** The API recognises a YouTube video link and keeps only the
+  video id. The planner settles the exact hosts and path forms, at least `youtu.be/<id>`,
+  `www.`, `m.` and bare `youtube.com/watch?v=<id>`, and `/shorts/<id>`. Extra parameters
+  such as `t=`, `si=` and `list=` are dropped. A link with no video id, such as a channel
+  or a bare playlist, is refused with a message saying so. Every other URL keeps step 24's
+  behaviour.
+- **Identity and cache.** The episode key and the cache follow the video id. So two link
+  forms of one video share one cached transcript, and a re-share is a re-share.
+- **Downloading: yt-dlp, audio only, YouTube only.**
+  - It is restricted to the YouTube extractor:
+    - no generic extractor, no playlists;
+    - no cookies, config files or plugins;
+    - no post-processing, because the image has no ffmpeg and the transcriber decodes the
+      stream itself.
+  - Live streams and premieres that haven't aired are refused.
+  - The download size cap applies, and the planner settles whether a duration cap does
+    too.
+  - The planner checks yt-dlp's current requirements for YouTube against its docs. The
+    known one is a JavaScript runtime (Deno) for YouTube's challenges, which the images
+    then need.
+  - The planner decides whether yt-dlp downloads the audio itself, or only extracts the
+    stream URL for `earmark/fetch.py` to download. YouTube throttles plain downloads.
+  - Either way, this is the one exception to "all third-party fetches go through
+    `fetch.py`". It is limited to YouTube's hosts, and stated as a security rule in
+    `docs/ARCHITECTURE.md` and `CLAUDE.md`.
+- **Errors carry retry intent.** These are permanent, with a message saying which:
+  - private, removed, members-only and age-gated videos;
+  - live streams.
+
+  A network failure or a 5xx is transient. An extractor failure that means "yt-dlp is out
+  of date" is permanent, and its message names the remedy.
+- **Metadata.** The title, the channel, the upload date and the duration come from yt-dlp.
+  They are untrusted, and go through `earmark/sanitize.py` like a feed's.
+- **Dependency.**
+  - yt-dlp is locked in `uv.lock` and imported lazily, like the other heavy dependencies.
+    `import earmark` and the default test suite still work without it.
+  - The worker's image gets it, plus whatever runtime it needs.
+  - Updating it is documented: upgrade the package in the lock and rebuild. YouTube breaks
+    yt-dlp from time to time.
+  - `doctor` reports the yt-dlp version and whether its runtime is present.
+- **Contract 2.**
+  - New: `contract/mail-v2.md` and `contract/samples/v2/`. v1's text, its pin and its
+    samples stay unchanged, because v1 mail can still be waiting in an inbox.
+  - v2 is v1 plus `origin: youtube`, with `guid: youtube:<video id>`, and the fields the
+    planner finds a YouTube note needs, such as the channel and the upload date. Where a
+    v1 key's meaning fits, it is reused, not duplicated.
+  - **The planner decides, and puts to the operator if it's a product choice, whether the
+    service sends `contract: 2` for all mail or only for YouTube.** No PKA has the
+    receiving skill yet (runbook phase 11).
+  - v2 is DRAFT until the operator approves the receiving skill after the one-episode
+    check, as v1 is.
+- **The checker and the receiving skill** accept contracts 1 and 2. They are tested
+  against both sample sets. The plugin gets a new version and a `PLUGIN_RELEASES` row.
+- **Docs:**
+  - `docs/shortcut.md` says a YouTube share works through the URL branch, with no change
+    to the Shortcut;
+  - `docs/deploy.md` covers yt-dlp, its runtime, and updating it;
+  - `docs/runbook-spark.md` gains a YouTube check on the Spark;
+  - `docs/ARCHITECTURE.md` and `CLAUDE.md` cover the new source, the exception and
+    contract 2.
+- **Backlog.** YouTube leaves the backlog's "Other sources" item.
+
+**Acceptance.**
+
+- Tests cover the link forms, the refusals and canonicalisation. Two forms of one video
+  give one episode key.
+- The YouTube fetcher is tested with yt-dlp stubbed (recorded metadata, no network) for
+  each of these:
+  - success;
+  - each error class, and its retry intent;
+  - the size cap;
+  - a live stream refused.
+
+  Tests assert the options passed to yt-dlp: YouTube only, and no cookies, config,
+  plugins or playlists.
+- A cached transcript is reused across link forms. A re-share of the same video
+  classifies as `reshare` in the receiver.
+- Every v2 sample passes the checker, and the mail code reproduces it. Every v1 sample
+  still passes. For each new v2 rule, a mutated sample breaking it fails the checker.
+- `make check` passes, including the 3.9 floor for the plugin's scripts.
+- The step plan reports as unverified:
+  - a real download from YouTube, which is a runbook check on the Spark;
+  - the image build with yt-dlp and its runtime.
+
 ## Backlog
 
 Not scheduled. The design leaves room for each.
@@ -1420,5 +1524,5 @@ Not scheduled. The design leaves room for each.
 - **Speaker diarization.** earshot runs pyannote 3.1 on the GPU, and needs `HF_TOKEN`
   with the gated licences accepted. `Segment.speaker` already exists, and the contract
   allows a paragraph per speaker turn.
-- **Other sources:** YouTube, other podcast platforms, and video files.
+- **Other sources:** other podcast platforms, and video files. YouTube is step 32.
 - **An async transcription API for other callers**, such as earshot.
