@@ -14,8 +14,8 @@ service" below.
 Shortcut, the service, and the PKA receiving skill, with the two seams between them. See
 "System scope: one repo for the whole system" below.
 
-**Added on 2026-11-25 (step 32).** YouTube as a source, with contract 2, after the first
-real shares from the phone.
+**Added on 2026-11-25 (steps 32–33).** YouTube as a source, with contract 2, and the
+transcript by job id, after the first real use on the Spark.
 
 ## Status
 
@@ -57,6 +57,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 30 | The PKA marketplace and the receiving skill | 29 | done |
 | 31 | The Shortcut as a file | 28 | todo |
 | 32 | YouTube as a source | 30 | todo |
+| 33 | The transcript by job id | 32 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -1509,6 +1510,57 @@ text/html, not audio", which is correct for today's service. The operator chose:
 - The step plan reports as unverified:
   - a real download from YouTube, which is a runbook check on the Spark;
   - the image build with yt-dlp and its runtime.
+
+## Step 33: The transcript by job id
+
+**Goal.** A client holding the API token can fetch a job's transcript from the API, for
+example from the Mac, without going through the email.
+
+**Inputs (operator, 2026-11-25).** Asked for during the first real use on the Spark. The
+transcript is already cached under `data/episodes/<episode_key>/`, as `transcript.json`
+and `transcript.txt`.
+
+**Build.**
+
+- `GET /jobs/{job_id}/transcript`, behind the same bearer token as the other routes.
+- **Formats,** chosen with a `format` query parameter:
+  - `note`, the default: the transcript note exactly as the mail code renders it for that
+    job, with the same bytes as the email's note attachment. It is `text/markdown`, and
+    its `Content-Disposition` carries the attachment's file name.
+  - `text`: the cached plain transcript, `text/plain`.
+  - `json`: the segments with their timestamps, `application/json`. The planner settles
+    the shape: the cached model, or a public view of it.
+
+  All three are UTF-8. An unknown format is a 422.
+- **States:**
+  - an unknown job id is a 404, the same as `GET /jobs/{id}`;
+  - a job that hasn't reached a transcript yet (queued, or running before `transcribe`
+    finishes) is a 409, saying the status;
+  - a failed job without a transcript is a 409 with its status;
+  - a missing cache, for example deleted by hand, is a 410 saying so.
+
+  The planner checks whether a failed job can still have a transcript (a delivery that
+  failed after transcribing) and serves it if so.
+- **What must not leak:**
+  - the job's `to` and instructions are not in the transcript or the note, and must not be
+    added;
+  - logs say which job and which format, never the content;
+  - the route reads only the cache, and never starts work.
+- The note is rendered on request and not stored, unless the planner finds a reason to
+  store it. Rendering must be deterministic for a job, so the note matches the mailed one.
+- **The CLI:** `earmark transcript <job_id> [--format …]` does the same from inside the
+  container, for the operator on the Spark.
+- **Docs:** the route, in `docs/ARCHITECTURE.md` and the README's API section, with a
+  `curl` example in `docs/deploy.md`.
+
+**Acceptance.**
+
+- Tests cover each format, each state and the token check, and that the `note` format
+  equals the note attachment of the job's message (from the fake mailer) byte for byte.
+- A re-share job (cached transcript, new instructions) serves the same transcript, with
+  its own `job_id` in the note.
+- No test or log line shows the recipient, the instructions or transcript text.
+- `make check` passes.
 
 ## Backlog
 
