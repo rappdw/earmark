@@ -151,6 +151,7 @@ def _settings(tmp_path: Path, **overrides: typing.Any) -> Settings:
         "notify_backend": "fake",
         "mail_backend": "fake",
         "fetch_backend": "http",
+        "youtube_backend": "fake",
     }
     values.update(overrides)
     return Settings(_env_file=None, data_dir=tmp_path / "data", **values)

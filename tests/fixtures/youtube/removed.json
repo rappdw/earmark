@@ -1,0 +1,14 @@
+{
+  "info": {
+    "_type": "video",
+    "id": "aaaaaaaaaaa",
+    "title": "youtube video #aaaaaaaaaaa",
+    "age_limit": 0,
+    "formats": []
+  },
+  "warnings": [
+    "[youtube] This video is unavailable",
+    "No video formats found!",
+    "Requested format is not available"
+  ]
+}

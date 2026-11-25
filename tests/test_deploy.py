@@ -88,7 +88,7 @@ def test_dockerfile_default_extras_exist() -> None:
     [arg] = [line for line in _instructions("ARG") if line.startswith("ARG EXTRAS=")]
     default = arg.split("=", 1)[1].strip('"')
     extras = _pyproject()["project"]["optional-dependencies"]
-    assert default == "transcribe"
+    assert default == "transcribe youtube"
     assert set(default.split()) <= set(extras)
 
 
@@ -221,7 +221,7 @@ def test_compose_shared_data() -> None:
 
 
 def test_compose_builds_transcribe_extra() -> None:
-    assert SERVICES["api"]["build"]["args"]["EXTRAS"] == "${EXTRAS:-transcribe}"
+    assert SERVICES["api"]["build"]["args"]["EXTRAS"] == "${EXTRAS:-transcribe youtube}"
     assert "EXTRAS" not in SERVICES["worker"]["build"]["args"]  # Dockerfile.gpu always has it
 
 

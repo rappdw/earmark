@@ -59,6 +59,7 @@ UNKNOWN_EPISODE: Final = "podcast episode"
 UNKNOWN_UPLOAD: Final = "uploaded audio"
 UPLOAD_LINE: Final = "Uploaded audio"
 UNKNOWN_SHOW: Final = "Apple Podcasts episode"
+YOUTUBE_LINE: Final = "YouTube video"
 _JOINERS: Final = frozenset({"‌", "‍"})
 _DROPPED_CATEGORIES: Final = frozenset({"Cc", "Cf", "Co", "Cn", "Zl", "Zp"})
 
@@ -124,6 +125,13 @@ def _label(job: Job, episode: Episode | None, field: Callable[[str, int], str]) 
         host = field(url_host(job.url or ""), LINE_MAX_BYTES)
         name = field(job.title or "", NAME_MAX_BYTES)
         return f"Audio from {host}", name or f"audio from {host}"
+    if job.source == "youtube":
+        channel = field(episode.show_title, LINE_MAX_BYTES) if episode is not None else ""
+        name = field(episode.title, NAME_MAX_BYTES) if episode is not None else ""
+        return (
+            f"YouTube: {channel}" if channel else YOUTUBE_LINE,
+            name or YOUTUBE_LINE,
+        )
     name = field(episode.title, NAME_MAX_BYTES) if episode is not None else ""
     show = field(episode.show_title, LINE_MAX_BYTES) if episode is not None else ""
     return show or UNKNOWN_SHOW, name or UNKNOWN_EPISODE

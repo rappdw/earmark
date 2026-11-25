@@ -16,15 +16,15 @@ outside this repo.
 | Part | What it is | Runs on | Lives in | Built and run |
 |---|---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link to the service | the operator's iPhone | `docs/shortcut.md`, which says how to build it by hand; `shortcut/earmark.shortcut` from step 31 | Never run on a phone. The file is not built (step 31). |
-| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27 and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
-| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Built in step 30: the `earmark-pka` plugin, its marketplace and the skill, tested on the step 29 samples under CPython 3.9.6 and 3.13. It has never run in a PKA (runbook phase 12). |
+| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27 and 32 (a request may also be a YouTube video link) and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
+| 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Built in step 30 (version 1.1.0 since step 32): the `earmark-pka` plugin, its marketplace and the skill, tested on the contract 1 and contract 2 samples under CPython 3.9.6 and 3.13. It has never run in a PKA (runbook phase 12). |
 
 ### The two seams
 
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`: the request model in code, and "HTTP API" below | the service's API tests (`tests/test_api.py`), and the doc tests that post `docs/shortcut.md`'s JSON example and upload fields to the app; no Shortcut has sent one yet |
-| Mail | service → AMAP → receiving skill | the mail contract, `contract: 1`, in `contract/mail-v1.md` ("The mail contract" below) | the sample emails in `contract/samples/v1/` (step 29), which the service's tests reproduce byte for byte from the real mail code and the checker passes on CPython 3.9.6 and 3.13; the receiving skill's tests (step 30), which run its recognising, checking and de-duplicating over every sample |
+| Mail | service → AMAP → receiving skill | the mail contract: `contract: 2` (step 32), in `contract/mail-v2.md`, which the service sends; and `contract: 1`, in `contract/mail-v1.md`, which the receiving skill still accepts ("The mail contract" below) | the sample emails in `contract/samples/v2/` (step 32), which the service's tests reproduce byte for byte from the real mail code, and `contract/samples/v1/` (step 29, frozen since step 32 and pinned by hash); the checker passes on both on CPython 3.9.6 and 3.13; the receiving skill's tests (step 30), which run its recognising, checking and de-duplicating over every sample |
 
 - The request seam has no folder: its contract is the request model in code plus this
   document.
@@ -32,13 +32,18 @@ outside this repo.
 
 ### The mail seam
 
-`contract/` (step 29) holds the seam: `mail-v1.md` is the `contract: 1` text, `samples/v1/`
-holds ten sample emails, and `README.md` says what the seam is and what its checker cannot
-check. The samples are built by the real `compose_mail` from the fixed inputs in
+`contract/` (step 29) holds the seam: `mail-v1.md` is the `contract: 1` text and `samples/v1/`
+holds its ten sample emails; `mail-v2.md` is the `contract: 2` text (step 32), written as a
+list of changes to contract 1, and `samples/v2/` holds thirteen samples; `README.md` says
+what the seam is and what its checker cannot check. The service sends `contract: 2` for all
+mail. The v2 samples are built by the real `compose_mail` from the fixed inputs in
 `tests/contract_samples.py`; `make samples` regenerates them, and a test fails when the mail
-code's output differs from one by a byte. They are wire format (CRLF), so `.gitattributes`
-keeps git from converting them. A revision is a new `mail-vN.md` with its own `samples/vN/`;
-the v1 files stay.
+code's output differs from one by a byte. The v1 samples can no longer be rebuilt (the mail
+code sends version 2), so they are frozen: a test pins each file's sha256, and `make
+samples` never writes that folder. They are wire format (CRLF), so `.gitattributes` keeps git
+from converting them. A revision is a new `mail-vN.md` with its own `samples/vN/`; the older
+files stay, because mail sent under them can still be waiting in an inbox. The checker and
+the receiver accept both versions.
 
 The contract checker has one copy, in `plugins/earmark-pka/skills/earmark-receive/scripts/`
 (the plugin and the skill around it are step 30's, and the receiver beside it imports it;
@@ -90,7 +95,8 @@ AMAP is outside this repo, and earmark only relies on it.
 ### The receiving skill
 
 The plugin is `plugins/earmark-pka/`, listed by `.claude-plugin/marketplace.json` (marketplace
-`earmark`, plugin `earmark-pka`, version 1.0.0 in its `plugin.json`). It holds exactly six
+`earmark`, plugin `earmark-pka`, version 1.1.0 in its `plugin.json`, which accepts
+`contract: 1` and `contract: 2`). It holds exactly six
 files: `plugin.json`, `skills/earmark-receive/SKILL.md`, the checker's two files, and the
 receiver's two (`receive.py`, a launcher in old syntax, and `earmark_receive.py`). A plugin
 installs only its own folder, so everything the skill runs is in it.
@@ -174,7 +180,9 @@ plugins/earmark-pka/              part 3: the plugin
 contract/                         the mail seam only (step 29)
   README.md                         what the seam is, its versions, where the checker lives
   mail-v1.md                        the contract 1 text
-  samples/v1/                       sample emails
+  mail-v2.md                        the contract 2 text (step 32): YouTube, `type: video`
+  samples/v1/                       sample emails, frozen since step 32
+  samples/v2/                       sample emails the mail code reproduces (step 32)
 shortcut/earmark.shortcut         part 1: the signed export, the folder's only file (step 31)
 src/earmark/                      part 2: the service
 deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment
@@ -192,7 +200,8 @@ docs/                             architecture, plan, runbook, deploy and Shortc
 ## The service
 
 The service (part 2) is a self-hosted transcription and delivery service. A request (step
-24) carries an Apple Podcasts episode link, a direct audio URL, or an uploaded audio file,
+24) carries an Apple Podcasts episode link, a YouTube video link (step 32), a direct audio
+URL, or an uploaded audio file,
 plus a destination address checked against an allowlist, free-form instructions, and
 optionally a title. The worker resolves or downloads the audio and transcribes it, then
 caches the transcript. It emails the transcript note and the instructions to the destination
@@ -223,15 +232,15 @@ backend, not the pipeline.
 
 | Question | Decision | How to change it |
 |---|---|---|
-| Scope | The service transcribes, and delivers the transcript by email (step 25). It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
-| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). Per-job staging files for uploads and direct URLs (`uploads/`, `downloads/`, deleted when the job ends; step 24). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
-| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 1`, drafted by pka-skills, owned by this repo; the text is `contract/mail-v1.md`). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
+| Scope | The service transcribes, and delivers the transcript by email (step 25). Its sources are Apple Podcasts episodes, YouTube videos (step 32), direct audio URLs and uploads. It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
+| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). Per-job staging files for uploads, direct URLs and YouTube audio (`uploads/`, `downloads/`, deleted when the job ends; steps 24, 32), and Deno's small cache (`cache/deno/`, step 32). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
+| Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 2` since step 32, drafted by pka-skills, owned by this repo; the text is `contract/mail-v2.md`, a list of changes to `contract/mail-v1.md`, which the receiving skill still accepts). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
 | Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative for a server elsewhere (`remote`, step 09; see `docs/asr.md`). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so the GPU image (`Dockerfile.gpu`, step 26) builds CTranslate2 from source with CUDA for `sm_121` and swaps it into the venv; the compose worker runs it with `EARMARK_ASR_DEVICE=cuda`. faster-whisper's batched pipeline is optional (`EARMARK_ASR_BATCH_SIZE`). | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_DEVICE`, `EARMARK_ASR_BATCH_SIZE`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge; the Cloudflare token lives only with the proxy. Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
-| Deployment | Two images. The CPU image (`Dockerfile`, extras by build argument, `transcribe` by default) runs `earmark serve`, or anything on a host without a GPU. The GPU image (`Dockerfile.gpu`: `nvidia/cuda` 12.9.1 cuDNN devel and runtime images, uv-managed Python 3.13, CTranslate2 built for `sm_121`) runs `earmark worker` with `gpus: all`. `compose.yaml` has a shared data volume and no vLLM service or `gpu` profile any more. systemd units for the API and the worker (steps 16, 22, 26). | See "Deployment" below and `docs/deploy.md`. |
+| Deployment | Two images. The CPU image (`Dockerfile`, extras by build argument, `transcribe youtube` by default) runs `earmark serve`, or anything on a host without a GPU. The GPU image (`Dockerfile.gpu`: `nvidia/cuda` 12.9.1 cuDNN devel and runtime images, uv-managed Python 3.13, CTranslate2 built for `sm_121`) runs `earmark worker` with `gpus: all`. `compose.yaml` has a shared data volume and no vLLM service or `gpu` profile any more. systemd units for the API and the worker (steps 16, 22, 26). | See "Deployment" below and `docs/deploy.md`. |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), python-multipart's streaming `MultipartParser` for uploads (step 24; Starlette's own form parser spools files to the system temp dir, so it is not used), the stdlib `email`, `smtplib` and `ssl` for delivery (step 25). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
 ## Flow
@@ -249,12 +258,14 @@ Worker ── Pipeline.run(job)
    resolve     apple_podcasts: Apple URL → iTunes Lookup (or the episode page) → RSS → Episode
                upload: the staged file's sha256 → Episode (key = file_key of the bytes)
                url: download (guarded fetch) → data/downloads/<job_id>.<ext> → sha256 → Episode
-   fetch       podcasts only: enclosure → data/episodes/<key>/audio.<ext>
+               youtube: yt-dlp reads the metadata (title, channel, date) → Episode (key = the video id)
+   fetch       podcasts: enclosure → data/episodes/<key>/audio.<ext>
+               youtube: yt-dlp downloads an audio-only stream → data/downloads/<job_id>.<ext>
    transcribe  audio → transcript.json + transcript.txt (skipped when cached with this ASR profile)
    deliver     render the note and instructions (mail contract) → MIME message (inside the
                interruptible window); then, outside it: delivery_state=sending → SMTP →
                delivery_state=sent + done with JobResult(duration_s), in one write
-   finish      delete upload/download staging files; notify via ntfy (never fails the job)
+   finish      delete upload/download/YouTube staging files; notify via ntfy (never fails the job)
 ```
 
 The API handler makes no outbound network request. It validates, streams an upload to disk,
@@ -263,7 +274,7 @@ and enqueues, so the Shortcut gets its 202 as soon as the body has arrived.
 `to`, `instructions` and `title` are stored with the job (step 24), and so is the offset of
 the request's `timestamp` (step 25). `to` and `instructions` are part of the dedupe key.
 After enqueue, only delivery reads `to` and `instructions` (step 25). `title` names uploads
-and direct URLs, and is ignored for podcasts.
+and direct URLs, and is ignored for podcasts and YouTube videos.
 
 ## Module layout
 
@@ -289,7 +300,7 @@ src/earmark/
   submission.py        Intake: recipient check, URL classification, enqueue (API and CLI; step 24)
   recipients.py        normalize_address, mask_address, RecipientPolicy, RecipientRefused;
                        standard library only (step 24)
-  sources.py           parse_source_url (Apple link or direct URL), display_url, upload_extension,
+  sources.py           parse_source_url (Apple link, YouTube link or direct URL), display_url, upload_extension,
                        clean_upload_name, audio_title, sha256_file, audio_episode (step 24)
   staging.py           Staging: data/uploads/ (UploadWriter) and data/downloads/, release at a
                        terminal state, startup sweeps (step 24)
@@ -297,7 +308,10 @@ src/earmark/
                        emitter; standard library only (step 22)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
                        (remote ASR, ntfy)
-  fakes.py             a fake backend for each of the five stages (tests and smoke runs)
+  fakes.py             a fake backend for each of the six stages (tests and smoke runs)
+  youtube/             links.py (link forms, canonical URL, youtube_episode; light),
+                       ytdlp.py (YtDlpYoutubeSource, the `ytdlp` YoutubeSource; imports yt-dlp
+                       only in load_runtime; step 32)
   mail/                note.py (the mail contract: note, instructions file, slug, guid, dates,
                        paragraphs), message.py (compose_mail: the MIME message and the
                        attachment cap), smtp.py (SmtpMailer, the `smtp` Mailer; check_login
@@ -307,7 +321,7 @@ src/earmark/
                        (responses and JobView), upload.py (receive_upload: the streaming
                        multipart reader; step 24)
   pipeline/
-    stages.py          stage Protocols, Backends (the four stage implementations)
+    stages.py          stage Protocols, Backends (the six stage implementations)
     runner.py          Pipeline: runs one claimed job, maps exceptions to job outcomes
     factory.py         composition root: Settings → backends (registries), build_worker
     worker.py          Worker (claim/run loop), Heartbeat thread, SIGTERM/SIGINT handling
@@ -372,7 +386,16 @@ to job text.
 - `Episode`: `key`, `source`, `show_id`, `episode_id`, `guid`, `title`, `show_title`,
   `published_at | None`, `duration_s | None`, `audio_url`, `feed_url | None`, `url`,
   `description`. A validator requires `key == source_key(source, show_id, guid)`.
-  `Source` is `apple_podcasts`, `upload` or `url` (step 24).
+  `Source` is `apple_podcasts`, `upload`, `url` (step 24) or `youtube` (step 32).
+  - **YouTube episodes** (step 32) come from `youtube.links.youtube_episode`. They have
+    `show_id = "youtube"` (synthetic), `episode_id` the 11-character video id,
+    `guid = "youtube:<id>"` and `key = youtube_key(id)`, which is
+    `episode_key("youtube", "youtube", "youtube:<id>")`, through `models.source_key`.
+    `title` and `show_title` (the channel; `""` when unknown) are yt-dlp's, cleaned and capped
+    at 500 characters. `published_at` is the upload time, else YouTube's calendar date with
+    `published_date_only`. `audio_url` is `""` (stream URLs expire and carry the server's
+    address), `feed_url` and `feed_guid` are `None`, `url` is
+    `https://www.youtube.com/watch?v=<id>` and `description` is `""`.
   - **Upload and URL episodes** come from `sources.audio_episode(job, sha256_hex)`. They
     have `show_id = "audio"` (synthetic), `guid = "sha256:<hex of the audio bytes>"`, and
     `key = content_key(hex)`, which is `episode_key("local", "file", hex)`. That is exactly
@@ -423,6 +446,8 @@ to job text.
     - `apple_podcasts`: `url` is the canonical episode URL, so `Episode.url` is canonical
       too.
     - `url`: `url` is the client's direct URL without its fragment.
+    - `youtube` (step 32): `url` is the canonical `https://www.youtube.com/watch?v=<id>`,
+      whatever form the client sent.
     - `upload`: `url` is `None`. `upload_file` is the staged file's name under
       `data/uploads/` (`<32 hex>.<ext>`), `upload_name` the client's cleaned file name, and
       `content_sha256` the hex sha256 of the staged bytes.
@@ -434,7 +459,8 @@ to job text.
 characters, from `models.episode_key`. The Apple show id is used instead of the feed URL
 because feeds move and show ids do not. Upload and URL episodes use
 `content_key(hex) = episode_key("local", "file", hex)` instead (step 24), through
-`models.source_key`. The key names the cache directory, so the same episode shared twice,
+`models.source_key`; YouTube episodes use `youtube_key(id)` (step 32), so every link form of
+one video has one key. The key names the cache directory, so the same episode shared twice,
 or the same bytes sent twice, is transcribed once. Parts are not normalised (the resolver strips
 the GUID); `source` and `show_id` may not contain `:`. Keys are checked with
 `re.fullmatch("[0-9a-f]{20}")` wherever they reach the filesystem.
@@ -460,6 +486,11 @@ class AudioFetcher(Protocol):
     def download(self, url: str, destination: Callable[[str], Path], /) -> Path: ...  # step 24
 
 
+class YoutubeSource(Protocol):  # step 32
+    def resolve(self, video_id: str, /) -> Episode: ...  # PermanentError for a refused video
+    def download(self, video_id: str, destination: Callable[[str], Path], /) -> Path: ...
+
+
 class Transcriber(Protocol):
     def cached(self, episode: Episode, /) -> Transcript | None: ...  # step 24
     def transcribe(self, episode: Episode, audio: Path, /) -> Transcript: ...
@@ -483,14 +514,21 @@ attachment file names.
 - `AudioFetcher.download` fetches a client-supplied direct audio URL to `destination(ext)`
   and returns the path. It always downloads, with no cache. Only the runner calls it, for
   `url` jobs.
+- `YoutubeSource.resolve` reads a video's metadata as an `Episode` and refuses what earmark
+  will not take (live, not yet aired, private, removed, members-only, age-gated) with a
+  `PermanentError` that says which. `download` writes an audio-only stream to
+  `destination(ext)` and reuses the extraction of the `resolve` just before it. It never
+  caches. Only the runner calls them, for `youtube` jobs (step 32). `Backends` has a sixth
+  field, `youtube`.
 - `Transcriber.cached` returns the cached transcript only when it was made with this
   transcriber's ASR profile, and never loads a model.
 - `Resolver.resolve` is called only for `apple_podcasts` jobs, so nothing else reaches it.
 
 Every stage has a fake in `fakes.py` that records each call (`calls`), can be told to
 raise (`fail_next(exc, times)`), and, for the cache-aware stages (fetch, transcribe),
-counts the calls that did real work (`computed`). `FakeAudioFetcher` also counts direct
-downloads (`downloads`), and serves `payloads.get(url, payload)`, so two URLs can serve
+counts the calls that did real work (`computed`). `FakeYoutubeSource` records resolves and
+downloads, counts the downloads (`downloads`) and serves `payloads.get(id, payload)`.
+`FakeAudioFetcher` also counts direct downloads (`downloads`), and serves `payloads.get(url, payload)`, so two URLs can serve
 the same bytes. `FakeMailer` records each `OutgoingMail`. When the factory builds it (with
 `EARMARK_MAIL_BACKEND=fake`), it also writes each message to `data/outbox/<job_id>.eml`
 (mode `0o600`). Its sender is `EARMARK_SMTP_FROM` or the placeholder
@@ -526,8 +564,8 @@ Rules every backend follows:
 
 Step 05; exact signatures in `docs/steps/05-worker.md`.
 
-- **Backends.** `Backends` (in `stages.py`) holds the five stages (resolver, fetcher,
-  transcriber, mailer, notifier); `notifier` is `None` when its backend is `none`. `factory.build_backends` is the
+- **Backends.** `Backends` (in `stages.py`) holds the six stages (resolver, fetcher,
+  youtube, transcriber, mailer, notifier); `notifier` is `None` when its backend is `none`. `factory.build_backends` is the
   only code that constructs backends: one registry per setting maps a backend name to a
   builder, and a name with no builder is a `ConfigError` naming the variable, raised
   before the database is opened. Real backends import their heavy modules inside the
@@ -545,13 +583,17 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
      - `url`: set stage `fetch`, clear this job's old downloads, then
        `fetcher.download(job.url, staging.download_destination(job.id))`, then
        `audio_episode(job, sha256_file(path))`.
+     - `youtube` (step 32): `youtube.resolve(video_id)` with the id from the canonical URL.
+       It runs on every job, so a video that has become private fails a new job even with a
+       cached transcript. A result for another video is permanent.
   2. **Record** it: write `episode.json`, record the episode key on the job, and record the
      share time in `shared.json`. Keep the earliest share time it returns for the note.
   3. **Cache.** If `transcriber.cached(episode)` returns a transcript, skip fetch and
      transcribe.
-  4. **Transcribe.** Otherwise, for a podcast only, `fetch`. Then `transcribe` the
-     podcast's audio, or the staged upload or download in place: it is never moved into
-     `episodes/<key>/`.
+  4. **Transcribe.** Otherwise, for a podcast, `fetch`; for a YouTube video, set stage `fetch`,
+     clear this job's old downloads and `youtube.download(video_id,
+     staging.download_destination(job.id))`. Then `transcribe` the podcast's audio, or the
+     staged upload or download in place: it is never moved into `episodes/<key>/`.
   5. **Check.** Refuse a transcript for another episode (permanent). Copy the transcript's
      warnings to the job.
   6. **Compose** (stage `deliver`, still inside the interruptible window).
@@ -571,10 +613,12 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
      A claimed job already `sent` (only possible by hand) completes without sending.
   8. **Finish:** `staging.release(job)`, then notify.
 - **Retention** (step 24). `Pipeline.finish(job, episode)` releases the staging files of an
-  upload (`uploads/<upload_file>`) or a direct URL (`downloads/<job_id>.*`), then notifies.
+  upload (`uploads/<upload_file>`), a direct URL or a YouTube video (`downloads/<job_id>.*`),
+  then notifies.
   - **When it runs:** for every job that reaches `done`, `failed` or `skipped`, including
     jobs that `requeue_stale` fails.
-  - **What it ignores:** `EARMARK_KEEP_AUDIO` does not keep uploaded or downloaded audio. A
+  - **What it ignores:** `EARMARK_KEEP_AUDIO` does not keep uploaded, downloaded or YouTube
+    audio. A
     requeued retry keeps the staging file. Release errors are logged, never raised.
   - **Podcasts:** their audio follows `CachedTranscriber`'s rules (see "Transcribing").
 - **Outcomes.** `SkipEpisode` → `skipped`; `PermanentError` → `failed`;
@@ -677,6 +721,75 @@ Step 07; exact signatures in `docs/steps/07-resolver.md`.
   root is permanent.
 - **No cache.** Two requests in the window (lookup, feed), three outside it; the
   runner writes `episode.json` afterwards.
+
+### YouTube
+
+Step 32; exact signatures in `docs/steps/32-youtube-source.md`.
+
+- **Links.** `youtube.links` recognises a video in any common form (`youtu.be/<id>`,
+  `youtube.com/watch?v=<id>` on `www`, `m` and `music`, `/shorts/`, `/live/`, `/embed/` and
+  `/v/`, and `youtube-nocookie.com/embed/`), keeps only the 11-character id (`A-Za-z0-9_-`,
+  case kept) and drops every other parameter. `sources.parse_source_url` stores
+  `https://www.youtube.com/watch?v=<id>` with the source `youtube`. A channel, playlist,
+  search or other page, and the playlist and live-page embeds, are refused at the API with
+  422 ("This YouTube link is not a single video. …"); a link with no valid id is refused with
+  "This YouTube link has no valid video id." The API makes no request: a well-formed link to
+  a private or removed video is accepted with 202 and fails in the worker.
+- **One identity.** The episode key, the guid and the dedupe subject come from the video id
+  alone, so every link form of one video is one episode key and one cached transcript. A
+  re-share with new instructions is a new job that skips the download.
+- **yt-dlp downloads the audio itself.** A plain GET of a YouTube stream is throttled to
+  about twice real time (one hour of audio would take half an hour); yt-dlp's chunked ranged
+  downloader with the per-format headers fetched a 10 MB stream in under a second. Doing it
+  in `fetch.py` would be new code that tracks YouTube's behaviour, and still needs yt-dlp to
+  solve the stream URL, so `fetch.py` is not used for media. The address guard is replaced by
+  the narrower rules below; the size cap is kept.
+- **The backend** (`youtube.ytdlp.YtDlpYoutubeSource`, the `ytdlp` backend of
+  `EARMARK_YOUTUBE_BACKEND`). `load_runtime` imports yt-dlp by name (it is optional and
+  untyped), clears yt-dlp's plugin directories, and finds Deno in the interpreter's `bin/`.
+  A missing extra or Deno is a `ConfigError` naming `uv sync --extra youtube`. `resolve`
+  builds a session from fixed options and extracts the metadata once, with
+  `ignore_no_formats_error` so an unplayable video's reason is kept; `download` reuses that
+  extraction on a second session whose output template is the job's staging file.
+- **The options** are exactly: only the `youtube` extractor (`allowed_extractors` and
+  `ie_key`), `noplaylist`, `bestaudio[protocol=https][vcodec=none][audio_channels<=2][abr<=192]`
+  with a fallback to any https audio-only stream, no post-processors and no format fix-up (so
+  no ffmpeg), no cache directory, no environment proxy, no cookies, config files, netrc or
+  extractor arguments, only the venv's Deno as the JavaScript runtime and no remote
+  components, a 30 s socket timeout and 3 retries. A test compares the key set.
+- **Deno.** YouTube's player challenges are solved by `yt-dlp-ejs`, which yt-dlp pins to its
+  own version, in Deno. Deno comes from the `deno` PyPI wheel (the `deno` extra of yt-dlp),
+  so the lock installs it on aarch64 with no system package. It runs the player's JavaScript
+  with no permission flags (no file, network, environment or subprocess access). Around each
+  yt-dlp call earmark sets `DENO_DIR=<data dir>/cache/deno` (unless the operator set it) and
+  `DENO_NO_UPDATE_CHECK=1`, and restores both: under the systemd unit `~/.cache` is
+  read-only.
+- **Refusals.** A video that is live, not yet aired, just ended and still processing,
+  private, members-only, Premium-only, age-restricted, needing a sign-in, removed, or
+  blocked in the server's country fails permanently with a fixed sentence that says which
+  (`REFUSALS` in `ytdlp.py`; no URL, no id, no yt-dlp text). A bot check is permanent too: a
+  retry from the same address rarely clears it and adds requests. YouTube's "try again later"
+  is transient with an hour's delay. Network failures, HTTP 408, 429 and 5xx, a cut-short or
+  empty download and a download over one hour are transient. Anything that means yt-dlp is
+  out of date (an unexpected extractor failure, an exception from inside yt-dlp, HTTP 403, no
+  audio-only stream, no file written) is permanent and points at `docs/deploy.md` section 18.
+  An `OSError` (a full disk) is not mapped: it reaches the runner, which retries it.
+- **The size cap** is `EARMARK_MAX_AUDIO_MB`, applied three ways: the size YouTube declares,
+  before any download request; the bytes counted by a progress hook, which cancels the
+  download; and the file on disk. yt-dlp's own `max_filesize` is not used, because it skips
+  silently. There is no duration cap: the size cap bounds a download (1024 MiB is about 17
+  hours at 128 kbps), and live streams are refused.
+- **Metadata is untrusted.** Title and channel go through `resolve.text.clean_text` (500
+  characters); the date is the upload timestamp when it is a sane number, else the upload
+  calendar date; the duration is a finite non-negative number. Nothing else of yt-dlp's
+  output is kept.
+- **The exception to "all third-party fetches go through `fetch.py`"** (see "Security"):
+  yt-dlp makes its own requests, for YouTube only.
+- **Logging.** `YtDlpLog` sends yt-dlp's debug and info lines to the `yt_dlp` logger at
+  DEBUG and its warnings at WARNING, and keeps the warning texts to classify a refusal.
+  `yt_dlp` is in `QUIET_LOGGERS`, so the DEBUG lines (which carry stream URLs with the
+  server's address) never print. yt-dlp writes `WARNING: Unknown codec …` straight to stderr
+  for some formats; it carries a codec name only.
 
 ### Transcribing
 
@@ -806,19 +919,33 @@ Step 25; exact rules in `docs/steps/25-delivery.md` sections 4 and 5.
     when `published_date_only`. The filename date is the publish date, else the
     first-share date.
   - **The slug.** NFKD, combining marks dropped, ASCII, lower-case, every run of characters
-    outside `[a-z0-9]` becomes `-`. A podcast joins the show and title slugs. The whole slug
-    is cut to 80 characters. When it is empty, the fallback is `podcast-<episode id>` or
-    `audio-<12 hex of the sha256>`.
+    outside `[a-z0-9]` becomes `-`. A podcast joins the show and title slugs, and a video
+    with a channel joins the channel and title slugs (step 32). The whole slug is cut to 80
+    characters. When it is empty, the fallback is `podcast-<episode id>`,
+    `youtube-<video id slug>` or `audio-<12 hex of the sha256>`.
   - **The guid.**
     - Audio: `sha256:<hex>`.
+    - Video (step 32): `youtube:<video id>`.
     - Podcast: `feed:<Episode.feed_guid>` when that is verbatim (cleaning would not change
       it) and at most 300 characters, else `apple:<episode id>`.
     - Apple's `episodeGuid`, which still keys the cache, is not used for the note: it can
       differ from the feed's.
-  - **`source_url`** (`origin: url` only) is `sources.display_url`. It is omitted when the
+  - **`source_url`** (`origin: url`) is `sources.display_url`. It is omitted when the
     URL has a `?`, or when the value is over 300 characters or would be changed by cleaning.
+    For `origin: youtube` (step 32) it is always `https://youtu.be/<video id>`.
+  - **A video note** (step 32, `episode.source == "youtube"`): `type: "video"`,
+    `origin: "youtube"`, `title` (`YouTube video <id>` when YouTube gave none), `channel`
+    when known, `published` (the upload day in the requester's offset, or YouTube's calendar
+    date), `source_url`, `guid`, `tags: ["video"]`. The key order is the podcast's with
+    `channel` after `show`, and a video has neither `show` nor `apple_url`. A podcast note is
+    `type: "podcast"` only for `apple_podcasts` (it used to be anything that was not audio).
+    `CONTRACT` is 2 in both files of every message, so a podcast or audio note differs from
+    its contract 1 form only in that line; its `transcript_sha256` covers the body, so a
+    note filed from a version 1 message and a re-share that arrives as version 2 classify
+    as a re-share.
   - **`language`** is kept only when it looks like BCP 47 (`[a-z]{2,3}(-[A-Za-z0-9]{2,8})*`).
-  - **The body.** `# <show> — <title>` (podcast) or `# <title>`, then `## Transcript`, then
+  - **The body.** `# <show> — <title>` (podcast), `# <channel> — <title>` (a video with a
+    channel) or `# <title>`, then `## Transcript`, then
     paragraphs. A new paragraph starts on a speaker change, once the current one spans
     30 s, or when the next segment would take it past 60 s. A longer single segment stands
     alone and is never split. Each paragraph starts with `[hh:mm:ss]` of its first segment.
@@ -891,18 +1018,21 @@ Step 25; exact rules in `docs/steps/25-delivery.md` sections 4 and 5.
     They never carry the server's reply text, which echoes addresses: errors made from
     smtplib exceptions are raised `from None`.
 
-#### The mail contract (`contract: 1`)
+#### The mail contract (`contract: 2`)
 
 - **Provenance.** Drafted by pka-skills on 2026-11-23. Owned by this repo since 2026-11-24
   (the operator's decision; pka-skills confirmed that `contract: 1` stands as drafted). Since
   step 29 its one source of truth is `contract/mail-v1.md`, moved there unchanged from this
-  document and from `docs/PLAN.md` "Re-scope", which link to it.
-- Status: **DRAFT**. It becomes final once the operator approves the PKA's receiving
-  procedure, which is now the receiving skill (step 30). A revision comes with a contract
-  version bump, because mail sent under one version can still be waiting in an inbox when
-  the next one ships. Step 25 built to this text.
+  document and from `docs/PLAN.md` "Re-scope", which link to it. Step 32 (2026-11-25) added
+  `contract/mail-v2.md` for YouTube, as a list of changes to contract 1; the service sends
+  `contract: 2` for all mail (the operator's decision), and the receiving skill accepts both.
+- Status: **DRAFT**, both versions. A version becomes final once the operator approves the
+  PKA's receiving procedure, which is now the receiving skill (step 30). A revision comes
+  with a contract version bump, because mail sent under one version can still be waiting in
+  an inbox when the next one ships. Step 25 built to version 1, and step 32 to version 2.
 
-The text: [contract/mail-v1.md](../contract/mail-v1.md). A test pins it by hash.
+The texts: [contract/mail-v1.md](../contract/mail-v1.md) and
+[contract/mail-v2.md](../contract/mail-v2.md). A test pins each by hash.
 
 ### Notifying
 
@@ -927,6 +1057,9 @@ wording in `docs/steps/25-delivery.md` section 5.8.
       `uploaded audio`, then `Uploaded audio`;
     - direct URL: the request's title, else `audio from <host>`, then `Audio from <host>`.
       A URL job's episode title is never used, because it can come from the URL path.
+    - YouTube (step 32): the video's title (`YouTube video` when unknown), then
+      `YouTube: <channel>` (`YouTube video` when the channel is unknown). No video id and no
+      URL.
   - The rest of the message:
     - Done (sent) adds `To: <masked recipient>`, `Duration: HH:MM:SS`, `Resent after an
       interruption.` when the job's `resent` is set, and the warning count with the first
@@ -969,8 +1102,12 @@ Step 15; exact checks in `docs/steps/15-notify-doctor.md` sections 5.5–5.7.
     counts, read without migrating. A missing file is never created. A database from before
     step 22, or another application's file, is `FAIL` with the refusal message of "Database
     identity".
-  - Each selected backend (resolver, fetch, asr), built through the same factory registry
-    as the worker. That imports its extra and runs the CUDA check.
+  - Each selected backend (resolver, fetch, youtube, asr), built through the same factory
+    registry as the worker. That imports its extra and runs the CUDA check.
+  - `youtube` (step 32), after `fetch`: `warn` for `fake`; for `ytdlp`, `FAIL` naming
+    `uv sync --extra youtube` when yt-dlp or its Deno is missing, otherwise `ok` with
+    `yt-dlp <v>, yt-dlp-ejs <v>, deno <v>` (`unknown` for a version that cannot be read). It
+    makes no request and starts no process.
   - For `faster_whisper` only: `asr libraries` (step 19): the installed `faster-whisper`
     and `av` versions, read from package metadata (`importlib.metadata`, through
     `Probes.installed`), checked against `transcribe.compat.KNOWN_INCOMPATIBLE`. It
@@ -1050,7 +1187,8 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
   `title`, the URL or the staged upload's name, file name and sha256, and `shared_at`.
 - **Dedupe** (step 24).
   - **The key** is `sha256(json [kind, source, subject, to, instructions])`, where the
-    subject is the canonical Apple URL, the direct URL, or `sha256:<hex>` for an upload.
+    subject is the canonical Apple URL, the canonical YouTube URL (step 32, so two forms of
+    one video are one request), the direct URL, or `sha256:<hex>` for an upload.
     `title` and `shared_at` are not part of it.
   - **A repeat** returns the existing job (`Enqueued.created` is `False`) while it is
     `queued` or `running`, or while it is `done` and its `updated_at` is less than
@@ -1083,7 +1221,8 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
   `CHECK (kind IN ('ingest'))`, `jobs_active_dedupe`, `jobs_by_status`). Migrations stay
   append-only.
 - Step 24 appended `0002_requests` (schema version 2). It adds these columns:
-  - `source` (`NOT NULL DEFAULT 'apple_podcasts'`, `CHECK` in the three sources);
+  - `source` (`NOT NULL DEFAULT 'apple_podcasts'`, `CHECK` in the three sources; step 32's
+    rebuild allows a fourth, `youtube`);
   - `recipient`, which is the `Job.to` field (`TO` is an SQL keyword);
   - `instructions` (`NOT NULL DEFAULT ''`);
   - `title`, `upload_file`, `upload_name` and `content_sha256`.
@@ -1091,13 +1230,20 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
   It copies `prompt` into `instructions`, drops `prompt`, and adds
   `jobs_by_dedupe (dedupe_key, status, updated_at)`. Rows from before it keep `recipient`
   NULL and their status.
-- Step 25 appended `0003_delivery`, so `SCHEMA_VERSION` is 3. It adds these columns:
+- Step 25 appended `0003_delivery` (schema version 3). It adds these columns:
   - `utc_offset_min` (`INTEGER`, `CHECK` in ±1439);
   - `delivery_state` (`CHECK IN ('sending', 'sent')`);
   - `message_id` and `sent_at`;
   - `resent` (`INTEGER NOT NULL DEFAULT 0`, `CHECK IN (0, 1)`).
 
   Earlier rows get `NULL` and `0`.
+- Step 32 appended `0004_youtube`, so `SCHEMA_VERSION` is 4. SQLite cannot alter a `CHECK`,
+  so it rebuilds `jobs` with `source` allowing `youtube`: it creates `jobs_0004` with the
+  same 30 columns in the same order, copies every row by an explicit column list, drops
+  `jobs`, renames the new table, and recreates the three indexes, all inside the
+  migration's `BEGIN IMMEDIATE`. Rows, the application id and the partial unique index are
+  kept. An image from before step 32 then refuses the database as newer than it supports
+  (`docs/deploy.md` section 15 says to back it up first).
 - The lineage is marked by `PRAGMA application_id = 0x45524D4B` (`b"ERMK"`), stamped in
   the same transaction that creates `jobs`.
 - `identity_error(path, application_id, user_version)` decides:
@@ -1126,7 +1272,7 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
-  earmark.db                    jobs (application id ERMK, schema 3); WAL mode
+  earmark.db                    jobs (application id ERMK, schema 4); WAL mode
   outbox/<job_id>.eml           only with EARMARK_MAIL_BACKEND=fake: the message the fake
                                 mailer "sent" (0o600; step 25)
   uploads/                      staging.Staging, owned by the API (mode 0o700; step 24)
@@ -1134,9 +1280,12 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
     <upload_id>.<ext>           a received upload (0o600); deleted when its job ends, or by the
                                 API's startup sweep when no queued or running job names it
   downloads/                    staging.Staging, owned by the worker (step 24)
-    <job_id>.<ext>              a direct URL's audio for one job; deleted when the job ends
+    <job_id>.<ext>              a direct URL's or YouTube video's audio for one job; deleted when
+                                the job ends
     .<job_id>.<ext>.<random>.part  download in progress; swept at worker startup unless the
                                 job is running
+  cache/deno/                   Deno's analysis cache for yt-dlp (DENO_DIR; step 32); Deno creates
+                                it, and it holds nothing that matters
   episodes/<episode_key>/       paths owned by artifacts.ArtifactStore
     episode.json                written by the runner after resolve
     shared.json                 ShareRecord: first share time, kept by the runner (earliest wins)
@@ -1168,7 +1317,7 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 
 | Route | Purpose |
 |---|---|
-| `POST /transcriptions` | JSON `{url, to, instructions?, title?, timestamp?}` (`TranscriptionRequest`, at most 64 KiB), or `multipart/form-data` with one `file` part plus the text fields `to`, `instructions`, `title` and `timestamp` (the file at most `EARMARK_MAX_UPLOAD_MB`). The answer is 202 `{job_id, status, created}` with `Location: /jobs/{id}`; `created` is `false` when dedupe returned an existing job. 401 bad token. 413 too large. 415 a content type that is neither, or an upload that does not look like audio. 422 an invalid body, a missing, invalid or not-allowed `to`, or a bad URL or show link, with a message the Shortcut can display. Step 24; it replaced `POST /ingest`. |
+| `POST /transcriptions` | JSON `{url, to, instructions?, title?, timestamp?}` (`TranscriptionRequest`, at most 64 KiB), or `multipart/form-data` with one `file` part plus the text fields `to`, `instructions`, `title` and `timestamp` (the file at most `EARMARK_MAX_UPLOAD_MB`). The answer is 202 `{job_id, status, created}` with `Location: /jobs/{id}`; `created` is `false` when dedupe returned an existing job. 401 bad token. 413 too large. 415 a content type that is neither, or an upload that does not look like audio. 422 an invalid body, a missing, invalid or not-allowed `to`, or a bad URL, show link or YouTube link (not one video, or no valid id), with a message the Shortcut can display. Step 24; it replaced `POST /ingest`. |
 | `GET /jobs/{id}` | The job's `JobView`. 404 if unknown. |
 | `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [JobView, …]}`, newest first. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
@@ -1200,6 +1349,12 @@ section 5).
 - **URLs.** An Apple Podcasts link (`podcasts.apple.com`, `itunes.apple.com`) is
   canonicalised as before, with the same messages for malformed links, show links and
   non-episodes.
+  - A YouTube link (step 32; `youtu.be`, `youtube.com` and its subdomains,
+    `youtube-nocookie.com`; with or without a scheme) is reduced to its 11-character video id
+    and stored as `https://www.youtube.com/watch?v=<id>` with the source `youtube`. A link that
+    is not one video is refused: "This YouTube link is not a single video. Share a video, not
+    a channel, playlist or search." A link with no valid id: "This YouTube link has no valid
+    video id." Credentials and a port are refused like Apple's.
   - Any other `http://` or `https://` URL is a direct audio URL, stored without its
     fragment.
   - Other `*.apple.com` hosts are refused as not an episode, and URLs with credentials are
@@ -1215,7 +1370,8 @@ section 5).
 **`JobView`** (step 24) is the only job shape the API and `earmark jobs` return. It has:
 
 - `id`, `status`, `stage`, `source`;
-- `url`: the canonical Apple URL whole; for a direct URL, scheme, host, port and path only;
+- `url`: the canonical Apple or YouTube URL whole; for a direct URL, scheme, host, port and
+  path only;
   for an upload, `null`;
 - `to`, in full;
 - `instructions`, cut to 200 characters (199 and `…`);
@@ -1242,6 +1398,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `DATA_DIR` | `./data` | Database and episode cache |
 | `RESOLVER_BACKEND` | `apple` | `apple`, `fake` |
 | `FETCH_BACKEND` | `http` | `http`, `fake` |
+| `YOUTUBE_BACKEND` | `ytdlp` | `ytdlp` (needs the `youtube` extra; a worker without it refuses to start, naming it), `fake` (step 32) |
 | `ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, `fake` |
 | `MAIL_BACKEND` | `smtp` | `smtp`, `fake` (step 25). `smtp` without its required settings is a startup `ConfigError`; `fake` sends nothing and writes `data/outbox/<job_id>.eml` |
 | `NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, `none`. `ntfy` without `NTFY_URL` sends nothing (the worker still starts) |
@@ -1252,7 +1409,7 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `ASR_TIMEOUT_SECONDS` | `10800` | How long the remote backend waits for the server's answer (read and write timeout) |
 | `KEEP_AUDIO` | `false` | Keep audio after transcription |
 | `NTFY_URL`, `NTFY_TOKEN` | unset | ntfy topic URL and optional access token (both secret; step 15). URL: http(s), a host, optional path prefix, ending in the topic (`[-_A-Za-z0-9]{1,64}`), such as `https://ntfy.sh/my-earmark-topic` or `http://ntfy.tailnet-name.ts.net/earmark`; no credentials, query, or fragment. On public ntfy.sh the topic name is the only protection unless the topic is reserved, so pick a long random one. Token: printable ASCII without spaces (`tk_…`), sent as a bearer token |
-| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_AUDIO_MB` also caps direct-URL downloads; `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
+| `MAX_AUDIO_MB`, `MAX_FEED_MB`, `ALLOW_PRIVATE_FETCH` | `1024`, `20`, `false` | Fetch limits in MiB (× 1024 × 1024); `MAX_AUDIO_MB` also caps direct-URL and YouTube downloads; `MAX_FEED_MB` caps the lookup, the episode page, and the feed. `ALLOW_PRIVATE_FETCH` turns off the address check only |
 | `ALLOWED_RECIPIENTS` | unset (every request refused) | Comma-separated exact addresses, or `all` (any address; a written acceptance of risk, warned about at `serve` startup and by doctor). Matching is exact on the local part and case-insensitive on the domain. Cannot mix `all` with addresses. Shown masked by `earmark config` (step 24) |
 | `MAX_UPLOAD_MB` | `1024` | Upload size cap in MiB, for `POST /transcriptions` and `earmark submit FILE` (step 24) |
 | `DEDUPE_WINDOW_S` | `600` | Seconds a `done` job is returned for an identical request (same source, `to` and `instructions`); `0` dedupes active jobs only (step 24) |
@@ -1283,8 +1440,9 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
     by digest. The Python tag follows `.python-version`; the uv minor follows the
     `uv_build` bound.
   - Dependencies: `uv sync --locked --no-dev` plus the extras in the build argument
-    `EXTRAS` (default `transcribe`), with the project installed non-editable into
-    `/app/.venv`.
+    `EXTRAS` (default `transcribe youtube`, step 32), with the project installed non-editable
+    into `/app/.venv`. The `youtube` extra brings yt-dlp and a Deno wheel, about 45 MB, so a
+    CPU worker handles YouTube links too.
   - User: `earmark`, with UID and GID from build arguments (default 1000, 0 refused).
     `/data` is owned by it.
   - Environment: `EARMARK_HOST=0.0.0.0`, `EARMARK_DATA_DIR=/data`,
@@ -1306,8 +1464,8 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   - Python: uv installs CPython 3.13.18, the CPU image's version, into `/opt/python`, which
     the runtime copies. It has the headers the bindings need; Ubuntu 24.04's own Python is
     3.12 and is not used.
-  - The venv: `uv sync --locked --no-dev --no-editable --extra transcribe` into
-    `/app/.venv`, as in the CPU image.
+  - The venv: `uv sync --locked --no-dev --no-editable --extra transcribe --extra youtube`
+    into `/app/.venv`, as in the CPU image.
   - CTranslate2: the tag `CT2_VERSION` (a global build argument, default `v` plus the
     locked version, `v4.9.0`) is cloned and built with the recipe's flags and
     `-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"` (default `121`). It is installed under
@@ -1324,7 +1482,9 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   - Build-time check, in the runtime stage, with no GPU: `ctranslate2` and `faster_whisper`
     import (with `BatchedInferencePipeline`), `ctranslate2.__version__` equals
     `CT2_VERSION`, `ctranslate2.__file__` is under `/app/.venv/`, and the loaded
-    `libctranslate2` is the one in `/opt/ctranslate2/lib/`, not a wheel's bundled copy.
+    `libctranslate2` is the one in `/opt/ctranslate2/lib/`, not a wheel's bundled copy. A
+    second runtime-stage `RUN` (step 32) runs the venv's `deno --version` and imports
+    `yt_dlp` and `yt_dlp_ejs`, with no uv and no network.
   - `v4.6.0`, earshot's proven tag, is the fallback (`--build-arg CT2_VERSION=v4.6.0`). Its
     CMake ignores `CMAKE_CUDA_ARCHITECTURES` and, with no GPU at build time, builds the
     common architectures up to `8.6+PTX`, so the GB10 JIT-compiles the PTX.
@@ -1333,7 +1493,7 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
     `docs/deploy.md` section 7 checks it.
 - **Compose.**
   - `api` (`serve`) runs the CPU image `earmark:local` (built with
-    `EXTRAS: ${EXTRAS:-transcribe}`). `worker` (`worker`) runs the GPU image `earmark:gpu`
+    `EXTRAS: ${EXTRAS:-transcribe youtube}`). `worker` (`worker`) runs the GPU image `earmark:gpu`
     (`dockerfile: Dockerfile.gpu`) with `gpus: all`, which needs an NVIDIA GPU, the NVIDIA
     Container Toolkit and Compose 2.30 or later. Both share the named volume `data` at
     `/data` and get `APP_UID`/`APP_GID` as build arguments.
@@ -1397,6 +1557,10 @@ and handles text they wrote.
   never the client's string, so re-shares dedupe and no client-controlled URL reaches the
   resolver. The resolver accepts only Apple Podcasts episode links, and the runner calls it
   only for them.
+- **Requests: YouTube links** (step 32). A link on a YouTube host is reduced to its
+  11-character video id, validated against `[A-Za-z0-9_-]{11}`, and stored as the canonical
+  `https://www.youtube.com/watch?v=<id>`. Only that id reaches yt-dlp, as a URL earmark
+  builds; never the client's string. A link that is not one video is refused at the API.
 - **Requests: direct URLs.** Any other client URL is a direct audio URL. The guarded fetch
   (`fetch.py`, below) is its only path, as `AudioFetcher.download` in the worker. So it
   gets http(s) only, no credentials (also refused at the API), the private-address guard
@@ -1458,7 +1622,8 @@ and handles text they wrote.
   - The envelope has exactly one recipient, the validated `to`. Delivery checks it against
     the allowlist again before sending.
 - **Outbound fetches.** Feed and enclosure URLs come from podcast publishers. Every such
-  fetch goes through `fetch.py`:
+  fetch goes through `fetch.py`, with one exception, YouTube (step 32), which is described
+  after this list. The rules of `fetch.py`:
   - http and https only, checked on the first URL and on every redirect target; URLs
     with credentials are refused. At most 20 redirects.
   - Addresses are checked when a connection opens, inside a custom httpcore2
@@ -1478,10 +1643,27 @@ and handles text they wrote.
   - No proxies from the environment, no cookies kept between fetches, and a generic
     `User-Agent: earmark/<version>`. URL paths and queries (which can carry session
     ids) are not logged or put in job errors.
+- **The exception: yt-dlp** (step 32). yt-dlp makes its own requests, for YouTube only,
+  because its chunked, ranged downloader and per-format headers are what YouTube serves at
+  full speed (see "YouTube").
+  - yt-dlp is given one URL, built by earmark from a validated id. Only the `youtube`
+    extractor is loaded: no generic extractor, no playlists, no plugins, no config files, no
+    cookies kept (a new session per call, an in-memory jar), no environment proxies and no
+    remote components (`yt-dlp-ejs` comes from the lock, not from npm or GitHub).
+  - Before anything is downloaded the chosen stream must be `https` on a `googlevideo.com`
+    host. yt-dlp follows that host's redirects itself.
+  - yt-dlp's requests to YouTube's hosts do not pass the private-address guard,
+    `EARMARK_ALLOW_PRIVATE_FETCH` or `MAX_FEED_MB`: a resolver that points those names at a
+    private address is not caught. The size cap (`EARMARK_MAX_AUDIO_MB`) and the no-proxy rule
+    are kept.
+  - YouTube's player JavaScript runs in Deno with no permissions: no file, network,
+    environment or subprocess access.
+  - Job errors and pushes carry only fixed sentences (no URL, no id, no yt-dlp text). A YouTube
+    job is logged by its video id; pushes carry the title and channel only.
 - **Third-party logging** (step 20). Every log record goes through earmark's one handler
   (`log.configure_logging`), which applies three rules on top of secret redaction:
   - *Wire loggers are gated at the handler.* Records below WARNING from `httpx`,
-    `httpcore`, `httpx2`, `httpcore2`, `urllib3`, and `huggingface_hub` (and their
+    `httpcore`, `httpx2`, `httpcore2`, `urllib3`, `huggingface_hub` and `yt_dlp` (and their
     children) are dropped by a handler filter, and the loggers' levels are also set to
     WARNING or above. These loggers print request URLs and redirect `Location` headers
     (relative paths a URL pattern cannot recognise). The filter is what holds: libraries
@@ -1511,7 +1693,9 @@ and handles text they wrote.
     no `httpx`). It never imports `huggingface_hub` itself.
 
   `runner.describe_error` applies `scrub_urls` to the text of non-earmark exceptions, so
-  job errors and warnings follow the same rule.
+  job errors and warnings follow the same rule. One line escapes the handler: yt-dlp's
+  `parse_codecs` writes `WARNING: Unknown codec …` straight to stderr for some formats (step
+  32); it carries a codec name and no URL.
 - **XML.** Feeds are parsed only by `resolve/rss.py`, with `defusedxml.ElementTree`
   (entity declarations and external references refused, so no expansion bombs and no
   external entities; a DOCTYPE alone is allowed and never fetched). The stdlib parser
@@ -1626,6 +1810,13 @@ replaces it, so `-m network` runs only network tests. Opt-in markers:
   through `httpx.MockTransport` and `httpx`/`httpcore` against `tests/uds_http.py`, with
   sockets blocked, and checks that no URL path or query reaches earmark's log output; the
   default suite does the same for `httpx2`/`httpcore2` and uvicorn.
+  `tests/test_ytdlp_real.py` (step 32) is `slow` too: it loads the real yt-dlp offline, with
+  sockets blocked (the options construct a real session loading one extractor, the real
+  error classes map as designed, Deno runs). It needs the `youtube` extra and fails without
+  it; the weekly job installs both extras. `tests/test_youtube_live.py` is `network` and
+  skipped unless `YOUTUBE_TEST=1`: it downloads one 19-second public video from YouTube, so
+  CI never runs it (GitHub's runners get bot checks) and the operator runs it from the
+  Spark.
 - `gpu`: needs CUDA; it does not get sockets back.
 - `smtp` (step 25): `tests/test_smtp_live.py` logs in to a real SMTP server and sends one
   message, to `SMTP_TEST_TO`, from the `SMTP_TEST_*` settings. Those are separate names
@@ -1647,22 +1838,31 @@ tested through `doctor.Probes`: injected transports, an injected `GuardedFetcher
 missing extras simulated with `sys.modules` stubs. `tests/legacy_db.py` builds the
 v0.1.0-shaped database for the refusal tests.
 
+YouTube tests (step 32): `tests/test_youtube_links.py` covers the link forms, the refusals and
+the one identity of a video; `tests/test_ytdlp.py` runs the backend on `tests/ytdlp_fakes.py`
+(stand-in yt-dlp classes and a scripted session) with metadata recorded in
+`tests/fixtures/youtube/`, and asserts the exact options passed to yt-dlp; `import
+earmark.pipeline.factory` loads no yt-dlp.
+
 Receiving skill tests (step 30): `tests/test_plugin.py` checks both manifests against the
 documented fields, that the plugin holds exactly its six files, the release pin
 (`PLUGIN_RELEASES`), and the statements `SKILL.md` must make (the exception, the preflight
 first, no mail read by the skill, no version control, the outcomes). `tests/test_receiver.py`
 runs the receiver as a subprocess under CPython 3.13 and 3.9.6 against a fake `pka-tools`:
-every step 29 sample classifies `new`, and the resend, re-share, re-transcription and their
+every sample of both contract versions classifies `new`, a re-share across versions is a
+re-share, and the resend, re-share, re-transcription and their
 out-of-order arrival, a lost record, a moved or deleted note and an ambiguous one each give
 the documented outcome; the write commands are checked for exact bytes, refused destinations,
 and touching only the note. `tests/test_checker_floor.py` covers both scripts. Whether a PKA
 follows `SKILL.md` is not tested; it is runbook phase 12.
 
-Contract tests (step 29): `tests/test_contract_samples.py` proves the mail code reproduces
-each sample byte for byte, and the sample properties, the resend and the placeholders-only
+Contract tests (steps 29, 32): `tests/test_contract_samples.py` proves the mail code reproduces
+each v2 sample byte for byte, and that each v1 file still has the sha256 it had when the mail
+code last built it, and the sample properties, the resend and the placeholders-only
 rule. `tests/test_mail_checker.py` runs the checker as a subprocess, as a PKA would, under
 every interpreter in `MAIL_CHECKER_PYTHONS` (CPython 3.9.6 and 3.8 under `make check`): every
-sample passes in `message` and `files` mode, a mutation per rule fails that rule, and the exit
+sample of both versions passes in `message` and `files` mode, a mutation per rule fails that
+rule (a rule that only contract 2 has, such as the video's `source_url`, included), and the exit
 codes 0, 1, 2 and 64 and the output are checked. `tests/test_checker_floor.py` proves the
 checker exists once, imports only the standard library, writes no bytecode, and that the
 gate rejects 3.10+ code (ruff at `py39` and the pinned mypy on probe files).
@@ -1797,8 +1997,8 @@ run the container. There are exactly three workflows
 - `network.yml` ("Live tests") runs every Monday at 05:23 UTC and on `workflow_dispatch`,
   with `contents: read` and no secrets, in two jobs: `network` (step 07) runs `uv run
   --locked pytest -m network -v -rs` with the same pinned actions and setup as `ci.yml`;
-  `slow` (step 08) runs `uv sync --locked --extra transcribe` and `uv run --locked --extra
-  transcribe pytest -m slow -v -rs`, with setup-uv's `cache-suffix: slow` and a pinned
+  `slow` (step 08) runs `uv sync --locked --extra transcribe --extra youtube` and `uv run --locked --extra
+  transcribe --extra youtube pytest -m slow -v -rs`, with setup-uv's `cache-suffix: slow` and a pinned
   `actions/cache` step for `~/.cache/earmark-tests` (the Whisper model and the clip).
   GitHub runs `schedule` and `workflow_dispatch` only for workflow files on the default
   branch, so it starts once the file is on `main`.
@@ -1950,6 +2150,14 @@ Step planners should check these against current documentation instead of assumi
     `read_attachment` giving a `path:` (inbox-lab-vol 0.1). A pka-tools release could change
     `post-route`'s behaviour without the receiver knowing; 1.8.0 is the minimum and 1.11.0
     was the version read.
+11. **YouTube changes break yt-dlp.** They do so every few weeks (step 32); the remedy is an
+    upgrade, `docs/deploy.md` section 18.2. Dependabot proposes yt-dlp updates weekly, and the
+    weekly `slow` job runs the real library offline. YouTube is moving formats to SABR-only
+    streaming for some clients (yt-dlp warned of skipped `web_embedded` https formats on an
+    age-gated video), which may one day leave no https audio stream: the job then fails with
+    "no audio-only stream". Datacenter addresses get bot checks, so CI never downloads from
+    YouTube; the Spark's own line is what matters, and runbook phase 4 checks it. The address
+    guard does not cover yt-dlp ("Security").
 
 ## Re-scope decisions (2026-11-23)
 
@@ -2129,6 +2337,27 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
     word `third-party`;
   - step 28's planned-names test keys the plugin aliases on the files step 30 creates;
   - lint gains the `FA` rules, and `.gitattributes` keeps the CRLF samples unconverted.
+- **Settled by step 32** (see `docs/steps/32-youtube-source.md` section 8):
+  - the service sends `contract: 2` for all mail, not only for YouTube (the operator's
+    decision of 2026-11-25); the v1 text, its pin and its samples stay frozen;
+  - yt-dlp downloads the audio itself, which is the one exception to "every third-party fetch
+    goes through `fetch.py`", narrowed as in "Security";
+  - a new stage, `YoutubeSource`, with its own setting and registry, because the resolver takes
+    only Apple Podcasts links and its backend needs an extra;
+  - a YouTube note is `type: video` with a `channel` key (the operator's decision), not a
+    podcast with a `show`;
+  - private, members-only, Premium, age-restricted and removed videos are refused, since earmark
+    never signs in; a bot check fails the job and is not retried; there is no duration cap
+    (the operator's decision);
+  - the canonical form is `https://www.youtube.com/watch?v=<id>` in the job and
+    `https://youtu.be/<id>` in the note;
+  - the `youtube` extra is on by default in both images, and a worker without it refuses to
+    start (the operator's decision);
+  - the dependency is `yt-dlp[default,deno]`: `default` pins the matching `yt-dlp-ejs`, and
+    `deno` is a locked aarch64 wheel with no system package; Node, QuickJS and Bun were not
+    chosen;
+  - migration `0004` rebuilds `jobs`, and an older image then refuses the database;
+  - the weekly `slow` job installs the `youtube` extra; the live download stays opt-in.
 - **Settled by step 28** (see `docs/steps/28-system-scope.md` section 8):
   - the runbook keeps phases 0–10 and appends phase 11 (installing the receiving skill,
     step 30) and phase 12 (the one-episode check), so no existing phase number changes;
@@ -2141,8 +2370,9 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
 ## Not planned
 
 `docs/PLAN.md` "Backlog" lists what the design leaves room for: a send-rate cap, re-shares
-as a reference only, an "analysis done" push, speaker diarization, other sources, and an
-async transcription API for other callers. None is designed here.
+as a reference only, an "analysis done" push, speaker diarization, other sources (other
+podcast platforms and video files; YouTube is built, step 32), and an async transcription API
+for other callers. None is designed here.
 
 ## History: removed in step 22
 

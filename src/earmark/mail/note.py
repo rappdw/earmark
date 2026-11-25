@@ -1,4 +1,4 @@
-"""Render the transcript note and the instructions file to the mail contract (``contract: 1``).
+"""Render the transcript note and the instructions file to the mail contract (``contract: 2``).
 
 Standard library, ``earmark.models``, ``earmark.sanitize`` and the light parts of
 ``earmark.sources`` only. Everything that came from a feed or a caller is cleaned here
@@ -16,6 +16,7 @@ from typing import Final
 from earmark.models import (
     AUDIO_SOURCES,
     GUID_SHA256_PREFIX,
+    GUID_YOUTUBE_PREFIX,
     Episode,
     Job,
     Segment,
@@ -25,8 +26,9 @@ from earmark.models import (
 )
 from earmark.sanitize import YamlValue, clean_unicode, emit_frontmatter, fit_chars
 from earmark.sources import display_url
+from earmark.youtube.links import short_youtube_url
 
-CONTRACT: Final = 1
+CONTRACT: Final = 2
 MAX_TEXT_CHARS: Final = 300  # feed- or caller-supplied strings
 MAX_TITLE_CHARS: Final = 200
 MAX_SLUG_CHARS: Final = 80
@@ -86,8 +88,9 @@ def slugify(text: str) -> str:
 
 
 def note_guid(episode: Episode) -> str:
-    """``sha256:<hex>`` for audio; for a podcast ``feed:<guid>`` verbatim, else ``apple:<id>``."""
-    if episode.source in AUDIO_SOURCES:
+    """``sha256:<hex>`` for audio, ``youtube:<id>`` for a video; for a podcast
+    ``feed:<guid>`` verbatim, else ``apple:<id>``."""
+    if episode.source in AUDIO_SOURCES or episode.source == "youtube":
         return episode.guid
     if episode.feed_guid is not None:
         candidate = "feed:" + episode.feed_guid
@@ -148,6 +151,7 @@ def _publish_date(episode: Episode, tz: timezone) -> date | None:
 
 
 def _slug(episode: Episode, show: str | None, title: str) -> str:
+    """The slug of the file name; ``show`` is the show of a podcast or the channel of a video."""
     if show is not None:
         slug = "-".join(p for p in (slugify(show), slugify(title)) if p)
     else:
@@ -155,7 +159,10 @@ def _slug(episode: Episode, show: str | None, title: str) -> str:
     slug = slug[:MAX_SLUG_CHARS].rstrip("-")
     if slug:
         return slug
-    if show is not None:
+    if episode.source == "youtube":
+        suffix = slugify(episode.episode_id)
+        fallback = f"youtube-{suffix}" if suffix else "youtube"
+    elif show is not None:
         suffix = slugify(episode.episode_id)
         fallback = f"podcast-{suffix}" if suffix else "podcast"
     else:
@@ -164,7 +171,9 @@ def _slug(episode: Episode, show: str | None, title: str) -> str:
     return fallback[:MAX_SLUG_CHARS].rstrip("-")
 
 
-def _source_url(job: Job) -> str | None:
+def _source_url(job: Job, episode: Episode) -> str | None:
+    if episode.source == "youtube":
+        return short_youtube_url(episode.episode_id)
     if job.source != "url" or job.url is None or "?" in job.url:
         return None
     value = display_url(job.url)
@@ -190,10 +199,17 @@ def render_note(
 ) -> RenderedNote:
     """The note and the instructions file for one finished transcription."""
     tz = requester_tz(job)
-    podcast = episode.source not in AUDIO_SOURCES
+    podcast = episode.source == "apple_podcasts"
+    video = episode.source == "youtube"
     title = contract_text(episode.title, MAX_TITLE_CHARS)
-    show: str | None = None
-    if podcast:
+    show: str | None = None  # the podcast's show
+    channel: str | None = None
+    if video:
+        title = title or contract_text(
+            f"YouTube video {episode.guid.removeprefix(GUID_YOUTUBE_PREFIX)}", MAX_TITLE_CHARS
+        )
+        channel = contract_text(episode.show_title, MAX_TEXT_CHARS) or None
+    elif podcast:
         title = title or contract_text(f"Episode {episode.episode_id}", MAX_TITLE_CHARS)
         show = contract_text(episode.show_title, MAX_TEXT_CHARS) or contract_text(
             f"Show {episode.show_id}", MAX_TEXT_CHARS
@@ -203,12 +219,13 @@ def render_note(
 
     published = _publish_date(episode, tz)
     file_date = published or first_shared_at.astimezone(tz).date()
-    stem = f"{file_date.isoformat()}-{_slug(episode, show, title)}"
+    stem = f"{file_date.isoformat()}-{_slug(episode, show or channel, title)}"
     note_name = f"{stem}.md"
     guid = note_guid(episode)
 
     paragraphs = transcript_paragraphs(transcript.segments)
-    heading = title if show is None else f"{show} — {title}"
+    lead = show or channel
+    heading = title if lead is None else f"{lead} — {title}"
     body = f"# {heading}\n\n## Transcript\n\n" + "\n\n".join(paragraphs)
     if paragraphs:
         body += "\n"
@@ -217,7 +234,7 @@ def render_note(
     apple_url: str | None = None
     if podcast and job.url is not None and contract_text(job.url, MAX_TEXT_CHARS) == job.url:
         apple_url = job.url
-    kind = "podcast" if podcast else "audio"
+    kind = "podcast" if podcast else "video" if video else "audio"
     note = _file(
         [
             ("type", kind),
@@ -226,12 +243,13 @@ def render_note(
             ("origin", job.source),
             ("title", title),
             ("show", show),
+            ("channel", channel),
             ("date", file_date),
             ("published", published),
             ("duration", format_hms(transcript.duration_s)),
             ("language", _language(transcript)),
             ("apple_url", apple_url),
-            ("source_url", _source_url(job)),
+            ("source_url", _source_url(job, episode)),
             ("guid", guid),
             ("shared_at", first_shared_at.astimezone(tz)),
             ("transcript_sha256", sha256),

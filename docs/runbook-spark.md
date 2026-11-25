@@ -158,7 +158,8 @@ docker compose run --rm worker doctor --online
 - step 2 prints `4.9.0`, a path under `/app/.venv/`, `1` and a list with `float16`;
 - `no uv`;
 - doctor shows `asr cuda ok "1 CUDA device, float16 supported"`, `recipients ok 1
-  allowed`, and `mail warn` (the fake). It exits 0;
+  allowed`, `youtube ok "yt-dlp …, yt-dlp-ejs …, deno …"` (the three versions), and `mail
+  warn` (the fake). It exits 0;
 - step 4 logs `loaded Whisper model 'large-v3' in … s on cuda (float16)` and prints the JFK
   text;
 - `doctor --online` shows the Apple lookup ok.
@@ -201,6 +202,22 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/jobs
 docker compose cp api:/data/outbox ./outbox
 ```
 
+A third and a fourth request check YouTube (section 18 of the deploy guide): "Me at the zoo"
+is 19 seconds of speech. The second link is the same video in another form, with other
+instructions, so it must reuse the transcript:
+
+```bash
+for url in 'https://youtu.be/jNQXAC9IVRw?si=example' \
+           'https://www.youtube.com/watch?v=jNQXAC9IVRw&t=5'; do
+  curl -s http://127.0.0.1:8787/transcriptions \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"url\": \"$url\", \"to\": \"you@example.org\", \"instructions\": \"$url\"}"
+  sleep 60
+done
+docker compose logs --tail 40 worker
+docker compose exec worker ls /data/downloads
+```
+
 Then read the messages with the Python reader in the
 [README quickstart](../README.md#quickstart-fake-backends), over `./outbox/*.eml`, with
 `python3`.
@@ -213,6 +230,11 @@ Then read the messages with the Python reader in the
 - the podcast note has `origin: "apple_podcasts"`, a `feed:` or `apple:` guid, and real
   text in `[hh:mm:ss]` paragraphs;
 - the upload note has `origin: "upload"`, a `sha256:` guid and the JFK text;
+- both YouTube jobs are `done`; the worker log shows one transcription and then `transcript
+  for <key> is cached`; the notes have `type: "video"`, `contract: 2`, `origin: "youtube"`,
+  `guid: "youtube:jNQXAC9IVRw"`, `channel: "jawed"`, `published: 2005-04-24` and the zoo
+  text; `/data/downloads` is empty. A bot check or an "out of date" failure is the finding
+  to bring back (deploy section 18);
 - `shared_at` carries the Spark's offset.
 
 ## Phase 5: Email: the sending mailbox and a real delivery

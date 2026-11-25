@@ -417,8 +417,8 @@ def test_no_workflow_runs_smtp_marker() -> None:
 # --- slow job (step 08) --------------------------------------------------------------------
 
 SLOW_COMMANDS = [
-    "uv sync --locked --extra transcribe",
-    "uv run --locked --extra transcribe pytest -m slow -v -rs",
+    "uv sync --locked --extra transcribe --extra youtube",
+    "uv run --locked --extra transcribe --extra youtube pytest -m slow -v -rs",
 ]
 CACHE_ACTION = "actions/cache"
 CACHE_PIN = "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
@@ -561,12 +561,14 @@ def test_container_workflow_checks_gpu_dockerfile() -> None:
     )
 
 
-def test_container_workflow_cpu_build_unchanged() -> None:
+def test_container_workflow_cpu_build() -> None:
     by_name = {s["name"]: s["run"] for s in _steps(_only_job(_container())) if "run" in s}
     assert by_name["Build the image"] == "docker build --tag earmark:ci ."
     assert by_name["Check the image"] == (
         "docker run --rm earmark:ci --version\n"
         'docker run --rm --entrypoint python earmark:ci -c "import ctranslate2, faster_whisper"\n'
+        "docker run --rm --entrypoint deno earmark:ci --version\n"
+        'docker run --rm --entrypoint python earmark:ci -c "import yt_dlp, yt_dlp_ejs"\n'
         'test "$(docker run --rm --entrypoint id earmark:ci -u)" = 1000\n'
         'test "$(docker run --rm --entrypoint printenv earmark:ci HF_HUB_DISABLE_TELEMETRY)" = 1\n'
         "docker image ls earmark:ci\n"

@@ -274,6 +274,55 @@ def test_bad_urls_422(client: TestClient, store: JobStore, url: str, problem: Ur
     assert store.list_recent() == []
 
 
+YT = "jNQXAC9IVRw"
+YT_CANON = f"https://www.youtube.com/watch?v={YT}"
+
+
+def test_youtube_link_enqueues_canonical(client: TestClient, store: JobStore) -> None:
+    r = client.post("/transcriptions", json={"url": f"https://youtu.be/{YT}?si=tracking", "to": TO})
+    assert r.status_code == 202
+    job = store.get(r.json()["job_id"])
+    assert job is not None
+    assert (job.source, job.url, job.status) == ("youtube", YT_CANON, "queued")
+    view = client.get(f"/jobs/{job.id}").json()
+    assert (view["source"], view["url"]) == ("youtube", YT_CANON)
+
+
+@pytest.mark.parametrize(
+    ("url", "problem"),
+    [
+        ("https://www.youtube.com/@example", "youtube_not_video"),
+        ("https://www.youtube.com/playlist?list=PLx", "youtube_not_video"),
+        ("https://www.youtube.com/results?search_query=x", "youtube_not_video"),
+        ("https://youtu.be/short", "youtube_bad_id"),
+        ("https://www.youtube.com/watch?v=", "youtube_bad_id"),
+    ],
+)
+def test_youtube_refusals_are_422(
+    client: TestClient, store: JobStore, url: str, problem: UrlProblem
+) -> None:
+    r = client.post("/transcriptions", json={"url": url, "to": TO})
+    assert r.status_code == 422
+    assert r.json()["detail"] == MESSAGES[problem]
+    assert MESSAGES["youtube_not_video"] == (
+        "This YouTube link is not a single video. Share a video, not a channel, playlist or search."
+    )
+    assert MESSAGES["youtube_bad_id"] == "This YouTube link has no valid video id."
+    assert store.list_recent() == []
+
+
+def test_youtube_forms_dedupe(client: TestClient, store: JobStore) -> None:
+    first = client.post(
+        "/transcriptions", json={"url": f"https://youtu.be/{YT}?si=x", "to": TO}
+    ).json()
+    second = client.post(
+        "/transcriptions", json={"url": f"https://www.youtube.com/shorts/{YT}", "to": TO}
+    )
+    assert second.status_code == 202
+    assert second.json() == {**first, "created": False}
+    assert len(store.list_recent()) == 1
+
+
 def test_ingest_dedupe_hit_returns_existing_job(client: TestClient, store: JobStore) -> None:
     first = _ingest(client).json()
     second = client.post(

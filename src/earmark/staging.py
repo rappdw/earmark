@@ -191,7 +191,7 @@ class Staging:
         try:
             if job.source == "upload" and job.upload_file is not None:
                 self.remove_upload(job.upload_file)
-            elif job.source == "url":
+            elif job.source in ("url", "youtube"):
                 self.clear_download(job.id)
         except (OSError, ValueError) as exc:
             logger.warning(

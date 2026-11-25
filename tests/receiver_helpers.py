@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from tests.checker_helpers import Interpreter, Parts, run_receiver, split
-from tests.contract_samples import SAMPLES_DIR
+from tests.contract_samples import sample_path
 
 FAKE_PKA_TOOLS: Final = '#!/bin/sh\nprintf \'{\\n  "version": "%s"\\n}\\n\' "{version}"\n'
 
@@ -58,7 +58,9 @@ def attachment_args(
 
 
 def sample_bytes(name: str) -> bytes:
-    return (SAMPLES_DIR / f"{name}.eml").read_bytes()
+    """A sample's bytes: ``name`` is ``<sample>`` (v2), ``v1/<sample>`` or ``v2/<sample>``."""
+    version, _, bare = name.rpartition("/")
+    return sample_path(version or "v2", bare).read_bytes()
 
 
 def sample_args(name: str, directory: Path) -> list[str]:

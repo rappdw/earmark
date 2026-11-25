@@ -131,6 +131,72 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             """,
         ),
     ),
+    Migration(
+        "0004_youtube",
+        (
+            # SQLite cannot alter a CHECK, so the table is rebuilt with the new source.
+            """
+            CREATE TABLE jobs_0004 (
+                seq INTEGER PRIMARY KEY,
+                id TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL CHECK (kind IN ('ingest')),
+                status TEXT NOT NULL
+                    CHECK (status IN ('queued', 'running', 'done', 'failed', 'skipped')),
+                stage TEXT,
+                url TEXT,
+                episode_key TEXT,
+                dedupe_key TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                run_after TEXT NOT NULL,
+                error TEXT,
+                warnings TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(warnings)),
+                result TEXT,
+                shared_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                heartbeat_at TEXT,
+                lease_token TEXT,
+                source TEXT NOT NULL DEFAULT 'apple_podcasts'
+                    CHECK (source IN ('apple_podcasts', 'upload', 'url', 'youtube')),
+                recipient TEXT,
+                instructions TEXT NOT NULL DEFAULT '',
+                title TEXT,
+                upload_file TEXT,
+                upload_name TEXT,
+                content_sha256 TEXT,
+                utc_offset_min INTEGER CHECK (utc_offset_min BETWEEN -1439 AND 1439),
+                delivery_state TEXT CHECK (delivery_state IN ('sending', 'sent')),
+                message_id TEXT,
+                sent_at TEXT,
+                resent INTEGER NOT NULL DEFAULT 0 CHECK (resent IN (0, 1))
+            ) STRICT
+            """,
+            """
+            INSERT INTO jobs_0004 (
+                seq, id, kind, status, stage, url, episode_key, dedupe_key, attempts,
+                run_after, error, warnings, result, shared_at, created_at, updated_at,
+                heartbeat_at, lease_token, source, recipient, instructions, title, upload_file,
+                upload_name, content_sha256, utc_offset_min, delivery_state, message_id,
+                sent_at, resent
+            )
+            SELECT
+                seq, id, kind, status, stage, url, episode_key, dedupe_key, attempts,
+                run_after, error, warnings, result, shared_at, created_at, updated_at,
+                heartbeat_at, lease_token, source, recipient, instructions, title, upload_file,
+                upload_name, content_sha256, utc_offset_min, delivery_state, message_id,
+                sent_at, resent
+            FROM jobs
+            """,
+            "DROP TABLE jobs",
+            "ALTER TABLE jobs_0004 RENAME TO jobs",
+            """
+            CREATE UNIQUE INDEX jobs_active_dedupe ON jobs (dedupe_key)
+                WHERE status IN ('queued', 'running')
+            """,
+            "CREATE INDEX jobs_by_status ON jobs (status, created_at, seq)",
+            "CREATE INDEX jobs_by_dedupe ON jobs (dedupe_key, status, updated_at)",
+        ),
+    ),
 )
 SCHEMA_VERSION: Final = len(MIGRATIONS)
 

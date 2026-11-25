@@ -57,7 +57,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 29 | The mail contract as a tested seam | 28 | done |
 | 30 | The PKA marketplace and the receiving skill | 29 | done |
 | 31 | The Shortcut as a file | 28 | todo |
-| 32 | YouTube as a source | 30 | todo |
+| 32 | YouTube as a source | 30 | done |
 | 33 | The transcript by job id | 32 | todo |
 | 34 | The CLI as an API client | 33 | todo |
 
@@ -672,7 +672,9 @@ and filing, each with its own context. earmark's job is:
 **The mail contract (pka-skills, `contract: 1`, 2026-11-23).** Status: **DRAFT**. It
 becomes final once the operator approves the PKA's receiving procedure. A revision would
 come with a contract version bump. Step 25 builds to this text. The text is in
-`contract/mail-v1.md`, moved there unchanged in step 29.
+`contract/mail-v1.md`, moved there unchanged in step 29. Step 32 added `contract: 2`
+(`contract/mail-v2.md`) for YouTube, and the service sends it for all mail. The v1 text and
+samples stay frozen.
 
 **Inputs from the other agents (2026-11-23).**
 
@@ -1121,7 +1123,7 @@ largely independent parts, and the two seams where they meet:
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`, in `docs/ARCHITECTURE.md` | the service's API tests, and the Shortcut doc tests checking the Shortcut's requests against the request model |
-| Mail | service → (AMAP) → receiving skill | the mail contract, `contract: 1` | sample emails in `contract/` that both sides test against (steps 29, 30) |
+| Mail | service → (AMAP) → receiving skill | the mail contract, `contract: 2` (`contract/mail-v2.md`) since step 32; `contract: 1` still accepted | sample emails in `contract/` that both sides test against (steps 29, 30, 32) |
 
 **How mail reaches a PKA.** AMAP is outside this repo, and earmark only relies on it:
 

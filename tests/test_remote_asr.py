@@ -818,6 +818,7 @@ def test_factory_builds_remote(tmp_path: Path) -> None:
         tmp_path,
         resolver_backend="fake",
         fetch_backend="fake",
+        youtube_backend="fake",
         notify_backend="fake",
         mail_backend="fake",
         asr_api_key="k-1",
@@ -856,6 +857,7 @@ def test_missing_base_url_is_config_error(tmp_path: Path) -> None:
         asr_base_url=None,
         resolver_backend="fake",
         fetch_backend="fake",
+        youtube_backend="fake",
         notify_backend="fake",
         mail_backend="fake",
     )

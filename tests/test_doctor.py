@@ -44,6 +44,7 @@ NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory 
 FAKES: dict[str, Any] = {
     "resolver_backend": "fake",
     "fetch_backend": "fake",
+    "youtube_backend": "fake",
     "asr_backend": "fake",
     "notify_backend": "none",
     "mail_backend": "fake",
@@ -1018,6 +1019,7 @@ def test_doctor_check_names_in_order(tmp_path: Path) -> None:
         "database",
         "resolver",
         "fetch",
+        "youtube",
         "asr",
         "mail",
         "notify",
@@ -1177,3 +1179,43 @@ def test_online_smtp_skipped_when_offline_mail_failed(tmp_path: Path) -> None:
 
 def test_online_smtp_not_listed_for_the_fake_backend(tmp_path: Path) -> None:
     assert "smtp" not in check(make_settings(tmp_path), online=True)
+
+
+# -- YouTube ----------------------------------------------------------------------------------
+
+
+def test_youtube_fake_warns(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path), "youtube")
+    assert result.status == "warn"
+    assert "fake YouTube source" in result.detail
+
+
+def test_youtube_ok_versions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from earmark.youtube import ytdlp
+    from tests.ytdlp_fakes import fake_runtime
+
+    fake = fake_runtime(tmp_path)
+    monkeypatch.setattr(ytdlp, "load_runtime", lambda: fake.runtime)
+    result = status(make_settings(tmp_path, youtube_backend="ytdlp"), "youtube")
+    assert result.status == "ok"
+    assert result.detail == "yt-dlp 2026.11.23, yt-dlp-ejs 0.8.0, deno 2.9.8"
+    assert not fake.sessions  # no request, no process
+
+
+def test_youtube_unknown_versions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from earmark.youtube import ytdlp
+    from tests.ytdlp_fakes import fake_runtime
+
+    runtime = replace(fake_runtime(tmp_path).runtime, ejs_version=None, deno_version=None)
+    monkeypatch.setattr(ytdlp, "load_runtime", lambda: runtime)
+    result = status(make_settings(tmp_path, youtube_backend="ytdlp"), "youtube")
+    assert result.detail == "yt-dlp 2026.11.23, yt-dlp-ejs unknown, deno unknown"
+
+
+def test_youtube_missing_extra_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "yt_dlp", None)
+    result = status(make_settings(tmp_path, youtube_backend="ytdlp"), "youtube")
+    assert result.status == "fail"
+    assert "uv sync --extra youtube" in result.detail

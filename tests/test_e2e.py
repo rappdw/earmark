@@ -169,3 +169,39 @@ def test_run_once_empty_queue(tmp_path: Path) -> None:
     assert env.worker.run_once() is None
     assert env.fakes.resolver.call_count == 0
     assert env.fakes.notifier.call_count == 0
+
+
+def test_youtube_two_link_forms_one_transcript(
+    client: TestClient, env: PipelineEnv, tmp_path: Path
+) -> None:
+    first = client.post(
+        "/transcriptions",
+        json={"url": "https://youtu.be/jNQXAC9IVRw?si=x", "to": TO, "instructions": "one"},
+    )
+    second = client.post(
+        "/transcriptions",
+        json={
+            "url": "https://www.youtube.com/shorts/jNQXAC9IVRw",
+            "to": TO,
+            "instructions": "two",
+        },
+    )
+    assert (first.status_code, second.status_code) == (202, 202)
+    one = _finish(client, env, first.json()["job_id"])
+    two = _finish(client, env, second.json()["job_id"])
+    assert (one.source, two.source) == ("youtube", "youtube")
+    assert one.episode_key == two.episode_key is not None
+    assert env.fakes.transcriber.computed == 1
+    assert env.fakes.youtube.downloads == 1
+    first_mail, second_mail = (parse_mail(m.data) for m in env.fakes.mailer.calls)
+    one_front = assert_note_hash_verifies(first_mail.note)
+    two_front = assert_note_hash_verifies(second_mail.note)
+    assert one_front["guid"] == two_front["guid"] == "youtube:jNQXAC9IVRw"
+    assert one_front["transcript_sha256"] == two_front["transcript_sha256"]
+    assert one_front["type"] == "video"
+    assert one_front["contract"] == 2
+    assert first_mail.instructions.endswith(b"one")
+    assert second_mail.instructions.endswith(b"two")
+    assert not (tmp_path / "data" / "downloads").exists() or not any(
+        (tmp_path / "data" / "downloads").iterdir()
+    )

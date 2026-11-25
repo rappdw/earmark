@@ -98,6 +98,11 @@ Variations:
 
 - Use **Show Notification** instead of **Show Result** for a quieter result.
 - Add an **Ask for Input** for a `title` on uploads. Podcasts ignore `title`.
+- **YouTube.** Share a video from the YouTube app or from Safari. The link goes through the
+  same URL branch (actions 8 to 11) with no change to the Shortcut: the server recognises
+  `youtu.be/…`, `youtube.com/watch?v=…`, Shorts and the other video forms, keeps only the
+  video id, and downloads the audio itself. A channel, a playlist or a search is refused
+  (section 4).
 
 The token is stored inside the Shortcut. Do not share the Shortcut with anyone; if you
 do, change `EARMARK_API_TOKEN` and the Shortcut.
@@ -180,6 +185,8 @@ The API's message is shown as is, in `detail`.
 | 422 | `That is not a valid link. Share an episode from Apple Podcasts.` | The shared text is not a URL. |
 | 422 | `This links to a whole show. Share a single episode instead.` | The link has no episode (`?i=`). |
 | 422 | `This Apple link is not a podcast episode.` | An Apple link of another kind. |
+| 422 | `This YouTube link is not a single video. Share a video, not a channel, playlist or search.` | The YouTube link is a channel, a playlist, a search or another page. |
+| 422 | `This YouTube link has no valid video id.` | The YouTube link has no video id, or one that is not 11 characters. |
 | 422 | `to must be one email address` | The `to` is not a single address. |
 | 422 | `to is not an allowed recipient (EARMARK_ALLOWED_RECIPIENTS)` | The address is not on the server's allowlist. |
 | 422 | `no recipients are allowed yet: set EARMARK_ALLOWED_RECIPIENTS on the server` | The server's allowlist is empty. |
@@ -210,7 +217,8 @@ email has gone. If nothing works, run `earmark doctor` on the server.
 **A new question.** Share the same item again with new instructions. That is a new job with
 a new job id and the same transcript, which is not transcribed again. The PKA keeps one note
 and runs the new instructions. A direct audio URL is downloaded again each time, but not
-transcribed again.
+transcribed again. A YouTube video is downloaded again only when it must be transcribed
+again; every link form of one video is the same video.
 
 ## 6. What the share sheet sends (unverified)
 

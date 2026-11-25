@@ -350,7 +350,7 @@ def test_fresh_database_identity(tmp_path: Path) -> None:
     path = tmp_path / "earmark.db"
     db = open_database(path)
     assert db.identity() == (APPLICATION_ID, SCHEMA_VERSION)
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     with db.connect() as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert names == {"jobs"}
@@ -433,7 +433,7 @@ def test_migration_0003_adds_delivery_columns(tmp_path: Path) -> None:
     finally:
         conn.close()
     db = open_database(path)
-    assert db.schema_version() == SCHEMA_VERSION == 3
+    assert db.schema_version() == SCHEMA_VERSION == 4
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM jobs").fetchone()
         for bad in (
@@ -484,3 +484,95 @@ def test_source_check_constraint(tmp_path: Path) -> None:
             """,
             ("c" * 32, stamp, stamp, stamp, stamp),
         )
+
+
+def _insert_row(conn: sqlite3.Connection, job_id: str, source: str, **extra: object) -> None:
+    stamp = "2026-01-01T12:00:00.000000+00:00"
+    columns = {
+        "id": job_id,
+        "kind": "ingest",
+        "status": "done",
+        "url": URL,
+        "recipient": "you@example.org",
+        "instructions": "q",
+        "dedupe_key": "k-" + job_id,
+        "attempts": 1,
+        "run_after": stamp,
+        "warnings": '["w"]',
+        "shared_at": stamp,
+        "created_at": stamp,
+        "updated_at": stamp,
+        "source": source,
+        **extra,
+    }
+    names = ", ".join(columns)
+    marks = ", ".join("?" for _ in columns)
+    conn.execute(f"INSERT INTO jobs ({names}) VALUES ({marks})", list(columns.values()))  # noqa: S608
+
+
+def test_migration_0004_keeps_rows(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    open_database(path, migrations=MIGRATIONS[:3])
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        _insert_row(conn, "a" * 32, "apple_podcasts")
+        _insert_row(
+            conn,
+            "b" * 32,
+            "upload",
+            url=None,
+            upload_file="1" * 32 + ".m4a",
+            upload_name="n.m4a",
+            content_sha256="2" * 64,
+        )
+        _insert_row(
+            conn,
+            "c" * 32,
+            "url",
+            utc_offset_min=-480,
+            delivery_state="sending",
+            message_id="<m@example.org>",
+            title="t",
+        )
+        conn.row_factory = sqlite3.Row
+        before = [dict(r) for r in conn.execute("SELECT * FROM jobs ORDER BY seq")]
+    finally:
+        conn.close()
+    db = open_database(path)
+    assert db.schema_version() == 4
+    with db.connect() as conn:
+        after = [dict(r) for r in conn.execute("SELECT * FROM jobs ORDER BY seq")]
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert after == before
+    assert [r["delivery_state"] for r in after] == [None, None, "sending"]
+    assert {"jobs_active_dedupe", "jobs_by_status", "jobs_by_dedupe"} <= indexes
+    assert db.identity() == (APPLICATION_ID, 4)
+
+
+def test_migration_0004_accepts_youtube_only(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    with db.connect() as conn:
+        _insert_row(conn, "d" * 32, "youtube", status="queued")
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_row(conn, "e" * 32, "vimeo")
+
+
+def test_migration_0004_keeps_active_dedupe(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    open_database(path, migrations=MIGRATIONS[:3])
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        _insert_row(conn, "a" * 32, "apple_podcasts", status="queued", dedupe_key="same")
+    finally:
+        conn.close()
+    db = open_database(path)
+    with db.connect() as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_row(conn, "b" * 32, "youtube", status="queued", dedupe_key="same")
+        _insert_row(conn, "c" * 32, "youtube", status="done", dedupe_key="same")
+
+
+def test_schema_version_is_4() -> None:
+    assert SCHEMA_VERSION == 4
+    assert MIGRATIONS[-1].name == "0004_youtube"

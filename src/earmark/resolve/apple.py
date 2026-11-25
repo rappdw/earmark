@@ -12,7 +12,15 @@ from earmark.models import MAX_URL_CHARS, EpisodeRef
 APPLE_HOSTS: Final = frozenset({"podcasts.apple.com", "itunes.apple.com"})
 DEFAULT_COUNTRY: Final = "us"
 
-UrlProblem = Literal["malformed", "unsupported_host", "show_link", "not_episode", "credentials"]
+UrlProblem = Literal[
+    "malformed",
+    "unsupported_host",
+    "show_link",
+    "not_episode",
+    "credentials",
+    "youtube_not_video",
+    "youtube_bad_id",
+]
 
 MESSAGES: Final[Mapping[UrlProblem, str]] = MappingProxyType(
     {
@@ -21,6 +29,11 @@ MESSAGES: Final[Mapping[UrlProblem, str]] = MappingProxyType(
         "show_link": "This links to a whole show. Share a single episode instead.",
         "not_episode": "This Apple link is not a podcast episode.",
         "credentials": "Links with a user name or password are not supported.",
+        "youtube_not_video": (
+            "This YouTube link is not a single video. "
+            "Share a video, not a channel, playlist or search."
+        ),
+        "youtube_bad_id": "This YouTube link has no valid video id.",
     }
 )
 

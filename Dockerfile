@@ -11,8 +11,8 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv
 WORKDIR /src
-# Optional extras, space-separated: "transcribe" (default) or "".
-ARG EXTRAS="transcribe"
+# Optional extras, space-separated: "transcribe youtube" (default), one of them, or "".
+ARG EXTRAS="transcribe youtube"
 COPY pyproject.toml uv.lock .python-version README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project \

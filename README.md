@@ -5,8 +5,8 @@ filed by the operator's personal knowledge assistants (PKAs). This repository ho
 whole system, in three parts (below).
 
 Most of this README is about part 2, the service: a self-hosted transcription and delivery
-service. An iOS Shortcut, curl or `earmark submit` sends an Apple Podcasts episode link, a direct audio URL or an audio file, plus a
-destination address and instructions. A worker transcribes it with faster-whisper, on the
+service. An iOS Shortcut, curl or `earmark submit` sends an Apple Podcasts episode link, a YouTube video link, a direct audio URL or an audio
+file, plus a destination address and instructions. A worker transcribes it with faster-whisper, on the
 DGX Spark's GPU in the GPU image. The transcript note and the instructions are emailed to
 that address as two Markdown attachments, and an ntfy push follows. Python 3.13.
 
@@ -26,7 +26,7 @@ that address as two Markdown attachments, and an ntfy push follows. Python 3.13.
   in a PKA. Its contract checker (step 29) and its receiver are tested under Python 3.9.
 
 The two seams are the request (`POST /transcriptions`) and the mail contract
-(`contract: 1`). AMAP, outside this repository, delivers the mail to each PKA. The service
+(`contract: 2`, with `contract: 1` still accepted by the receiving skill). AMAP, outside this repository, delivers the mail to each PKA. The service
 files nothing; the PKA files, through the receiving skill. The parts, the seams, the
 definition of done and the repo layout are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#system-three-parts-and-two-seams).
@@ -42,9 +42,11 @@ Every stage is a protocol with a real backend and a fake, chosen by configuratio
 
 - **resolve**: the `apple` resolver turns the Apple link into the show's feed and the
   episode's audio URL (iTunes lookup, then the RSS feed). A direct audio URL or an upload
-  needs no lookup. Fake: `fake`.
+  needs no lookup. A YouTube link is read by yt-dlp (title, channel, date). Fake: `fake`.
 - **fetch**: the `http` fetcher downloads the audio through a guarded client (scheme
-  check, private-address block, size cap). Fake: `fake`.
+  check, private-address block, size cap). Fake: `fake`. A YouTube video's audio is
+  downloaded by the `ytdlp` backend (`EARMARK_YOUTUBE_BACKEND`, the `youtube` extra); fake:
+  `fake`.
 - **transcribe**: `faster_whisper` in the worker, or `remote`, an OpenAI-compatible speech
   server ([docs/asr.md](docs/asr.md)). Fake: `fake`.
 - **deliver**: the `smtp` mailer sends the transcript note and the instructions through
@@ -79,8 +81,8 @@ demo=$(mktemp -d)
 export EARMARK_API_TOKEN=demo-token
 export EARMARK_ALLOWED_RECIPIENTS=you@example.org
 export EARMARK_DATA_DIR="$demo/data"
-export EARMARK_RESOLVER_BACKEND=fake EARMARK_FETCH_BACKEND=fake EARMARK_ASR_BACKEND=fake \
-  EARMARK_MAIL_BACKEND=fake EARMARK_NOTIFY_BACKEND=fake
+export EARMARK_RESOLVER_BACKEND=fake EARMARK_FETCH_BACKEND=fake EARMARK_YOUTUBE_BACKEND=fake \
+  EARMARK_ASR_BACKEND=fake EARMARK_MAIL_BACKEND=fake EARMARK_NOTIFY_BACKEND=fake
 uv run earmark doctor
 
 uv run earmark serve &
@@ -143,7 +145,8 @@ resolver never fetches the Apple URL, and the fake transcriber accepts any bytes
 one needs audio). `kill %1` stops the server, and `wait` lets it finish shutting down.
 Everything lives in a temporary directory, so nothing is left in the repository.
 
-**Real backends.** `uv sync --extra transcribe` installs local faster-whisper. Set
+**Real backends.** `uv sync --extra transcribe --extra youtube` installs local faster-whisper
+and yt-dlp with its Deno runtime ([docs/deploy.md](docs/deploy.md) section 18). Set
 `EARMARK_ALLOWED_RECIPIENTS` and the `EARMARK_SMTP_*` settings
 ([docs/deploy.md](docs/deploy.md) section 8). On the Spark, use compose with the GPU image
 (section 7). [docs/deploy.md](docs/deploy.md) also covers systemd and how the phone
@@ -210,6 +213,7 @@ Copy `.env.example` to start.
 |---|---|---|
 | `EARMARK_RESOLVER_BACKEND` | `apple` | `apple` or `fake`. |
 | `EARMARK_FETCH_BACKEND` | `http` | `http` or `fake`. |
+| `EARMARK_YOUTUBE_BACKEND` | `ytdlp` | `ytdlp` (needs the `youtube` extra) or `fake`. |
 | `EARMARK_ASR_BACKEND` | `faster_whisper` | `faster_whisper`, `remote`, or `fake`. |
 | `EARMARK_MAIL_BACKEND` | `smtp` | `smtp` or `fake`. The fake sends nothing and writes `data/outbox/<job id>.eml`. |
 | `EARMARK_NOTIFY_BACKEND` | `ntfy` | `ntfy`, `fake`, or `none`. |

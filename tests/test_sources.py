@@ -90,6 +90,41 @@ def test_parse_source_url_refusals(text: str, problem: UrlProblem) -> None:
     assert "pw" not in info.value.message
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://youtu.be/jNQXAC9IVRw?si=abc",
+        "youtu.be/jNQXAC9IVRw",
+        "http://www.youtube.com/watch?v=jNQXAC9IVRw&t=5s",
+        "https://m.youtube.com/shorts/jNQXAC9IVRw",
+    ],
+)
+def test_parse_source_url_youtube(text: str) -> None:
+    assert parse_source_url(text) == SourceUrl(
+        "youtube", "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (APPLE, SourceUrl("apple_podcasts", APPLE)),
+        ("https://audio.example.net/a.mp3", SourceUrl("url", "https://audio.example.net/a.mp3")),
+        ("https://vimeo.com/1", SourceUrl("url", "https://vimeo.com/1")),
+        (
+            "https://notyoutube.com/watch?v=jNQXAC9IVRw",
+            SourceUrl("url", "https://notyoutube.com/watch?v=jNQXAC9IVRw"),
+        ),
+        (
+            "https://example.org/youtube.com/watch?v=jNQXAC9IVRw",
+            SourceUrl("url", "https://example.org/youtube.com/watch?v=jNQXAC9IVRw"),
+        ),
+    ],
+)
+def test_non_youtube_urls_unchanged(text: str, expected: SourceUrl) -> None:
+    assert parse_source_url(text) == expected
+
+
 def test_credentials_message() -> None:
     assert MESSAGES["credentials"] == "Links with a user name or password are not supported."
 

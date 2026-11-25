@@ -184,3 +184,21 @@ def test_logging_is_masked_and_host_only(rig: Rig, caplog: pytest.LogCaptureFixt
     joined = "\n".join(texts)
     for secret in ("SECRET-INSTRUCTIONS", "PATH-TOKEN", "sig=Q", "TITLE-TOKEN", "you@", "other@"):
         assert secret not in joined
+
+
+def test_youtube_enqueue_log_names_the_id(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG, logger="earmark.submission"):
+        first = rig.url("https://youtu.be/jNQXAC9IVRw?si=TRACKING&t=30", instructions="SECRET")
+        again = rig.url("https://www.youtube.com/shorts/jNQXAC9IVRw")
+    assert first.job.source == "youtube"
+    assert first.job.url == "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    assert (first.created, again.created) == (True, True)  # other instructions: a new request
+    assert first.job.episode_key is None  # the key is set by the worker, not at intake
+    texts = [r.getMessage() for r in caplog.records]
+    assert len(texts) == 2
+    assert "YouTube video jNQXAC9IVRw" in texts[0]
+    for text in texts:
+        assert "http" not in text
+        assert "TRACKING" not in text
+        assert "SECRET" not in text
+        assert "you@" not in text

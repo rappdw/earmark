@@ -25,10 +25,13 @@ from pydantic_core import PydanticCustomError
 from earmark.recipients import MAX_ADDRESS_CHARS as MAX_ADDRESS_CHARS
 from earmark.recipients import normalize_address
 
-Source = Literal["apple_podcasts", "upload", "url"]
+Source = Literal["apple_podcasts", "upload", "url", "youtube"]
 AUDIO_SOURCES: Final[frozenset[Source]] = frozenset({"upload", "url"})
 AUDIO_SHOW_ID: Final = "audio"  # the synthetic show id of upload and url episodes
 GUID_SHA256_PREFIX: Final = "sha256:"
+YOUTUBE_SHOW_ID: Final = "youtube"  # the synthetic show id of a YouTube episode
+GUID_YOUTUBE_PREFIX: Final = "youtube:"
+YOUTUBE_ID: Final = re.compile(r"[A-Za-z0-9_-]{11}")
 JobKind = Literal["ingest"]
 JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
 Stage = Literal["resolve", "fetch", "transcribe", "deliver", "notify"]  # "notify" is never set
@@ -86,8 +89,20 @@ def content_key(sha256_hex: str) -> str:
 _SHA256_GUID: Final = re.compile("sha256:[0-9a-f]{64}")
 
 
+def youtube_key(video_id: str) -> str:
+    """``episode_key("youtube", "youtube", "youtube:" + video_id)``; ValueError if not an id."""
+    if YOUTUBE_ID.fullmatch(video_id) is None:
+        raise ValueError("not a YouTube video id")
+    return episode_key("youtube", YOUTUBE_SHOW_ID, GUID_YOUTUBE_PREFIX + video_id)
+
+
 def source_key(source: Source, show_id: str, guid: str) -> str:
-    """``content_key`` for upload and url (guid ``sha256:`` + 64 hex), else ``episode_key``."""
+    """``content_key`` for upload and url (guid ``sha256:`` + 64 hex), ``youtube_key`` for
+    youtube (guid ``youtube:`` + the video id), else ``episode_key``."""
+    if source == "youtube":
+        if show_id != YOUTUBE_SHOW_ID or not guid.startswith(GUID_YOUTUBE_PREFIX):
+            raise ValueError("a youtube episode needs show_id 'youtube' and a youtube: guid")
+        return youtube_key(guid[len(GUID_YOUTUBE_PREFIX) :])
     if source in AUDIO_SOURCES:
         if show_id != AUDIO_SHOW_ID or _SHA256_GUID.fullmatch(guid) is None:
             raise ValueError("an upload or url episode needs show_id 'audio' and a sha256 guid")

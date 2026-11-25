@@ -65,7 +65,7 @@ jobs:
         with:
           path: ~/.cache/earmark-tests
           key: slow-assets-${{ hashFiles('tests/slow_assets.py') }}
-      - name: Install dependencies with the transcribe extra
-        run: uv sync --locked --extra transcribe
+      - name: Install dependencies with the transcribe and youtube extras
+        run: uv sync --locked --extra transcribe --extra youtube
       - name: Slow tests
-        run: uv run --locked --extra transcribe pytest -m slow -v -rs
+        run: uv run --locked --extra transcribe --extra youtube pytest -m slow -v -rs

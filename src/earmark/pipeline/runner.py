@@ -29,11 +29,13 @@ from earmark.models import (
     Transcript,
     scrub_surrogates,
     utc_now,
+    youtube_key,
 )
 from earmark.pipeline.stages import Backends, OutgoingMail
 from earmark.recipients import RecipientPolicy, mask_address
 from earmark.sources import audio_episode, audio_title, sha256_file
 from earmark.staging import Staging
+from earmark.youtube.links import video_id_from_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -218,13 +220,22 @@ class Pipeline:
             if sha256_file(audio) != job.content_sha256:
                 raise PermanentError("the uploaded audio changed after it was received")
             episode = audio_episode(job, job.content_sha256)
-        else:
+        elif job.source == "youtube":
+            if job.url is None:
+                raise PermanentError("ingest job without a url")
+            video_id = video_id_from_canonical(job.url)
+            episode = b.youtube.resolve(video_id)
+            if episode.source != "youtube" or episode.key != youtube_key(video_id):
+                raise PermanentError("the YouTube source returned another video")
+        elif job.source == "url":
             if job.url is None:
                 raise PermanentError("ingest job without a url")
             jobs.set_stage(claim, "fetch")
             staging.clear_download(job.id)
             audio = b.fetcher.download(job.url, staging.download_destination(job.id))
             episode = audio_episode(job, sha256_file(audio))
+        else:
+            raise PermanentError("unknown source")
         state.episode = episode
         self._artifacts.write_episode(episode)
         jobs.set_episode_key(claim, episode.key)
@@ -234,7 +245,14 @@ class Pipeline:
         if transcript is None:
             if audio is None:
                 jobs.set_stage(claim, "fetch")
-                audio = b.fetcher.fetch(episode)
+                if job.source == "youtube":
+                    staging.clear_download(job.id)
+                    audio = b.youtube.download(
+                        video_id_from_canonical(job.url or ""),
+                        staging.download_destination(job.id),
+                    )
+                else:
+                    audio = b.fetcher.fetch(episode)
             jobs.set_stage(claim, "transcribe")
             transcript = b.transcriber.transcribe(episode, audio)
         else:

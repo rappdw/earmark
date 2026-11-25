@@ -9,9 +9,18 @@ from earmark.fakes import (
     FakeNotifier,
     FakeResolver,
     FakeTranscriber,
+    FakeYoutubeSource,
 )
 from earmark.mail.smtp import SmtpMailer
-from earmark.pipeline.stages import AudioFetcher, Mailer, Notifier, Resolver, Transcriber
+from earmark.pipeline.stages import (
+    AudioFetcher,
+    Mailer,
+    Notifier,
+    Resolver,
+    Transcriber,
+    YoutubeSource,
+)
+from earmark.youtube.ytdlp import YtDlpYoutubeSource
 from tests.factories import make_job
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +50,17 @@ def test_mailers_satisfy_the_protocol(tmp_path: Path) -> None:
     real_class: type[Mailer] = SmtpMailer
     assert fake.sender
     assert real_class is SmtpMailer
+
+
+def test_youtube_sources_satisfy_the_protocol(tmp_path: Path) -> None:
+    # Checked by mypy: both assignments fail the type check unless the classes fit `YoutubeSource`.
+    fake: YoutubeSource = FakeYoutubeSource()
+    real_class: type[YoutubeSource] = YtDlpYoutubeSource
+    episode = fake.resolve("jNQXAC9IVRw")
+    path = fake.download("jNQXAC9IVRw", lambda ext: tmp_path / f"v.{ext}")
+    assert episode.source == "youtube"
+    assert path.read_bytes() == b"fake youtube audio\n"
+    assert real_class is YtDlpYoutubeSource
 
 
 SNIPPET = """\

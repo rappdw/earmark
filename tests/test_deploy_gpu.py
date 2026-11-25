@@ -164,7 +164,7 @@ def test_gpu_venv_from_lock() -> None:
     syncs = [r for r in RUNS if "uv sync" in r]
     assert len(syncs) == 2
     for sync in syncs:
-        for flag in ("--locked", "--no-dev", "--extra transcribe"):
+        for flag in ("--locked", "--no-dev", "--extra transcribe", "--extra youtube"):
             assert flag in sync, (flag, sync)
     assert "--no-editable" in syncs[-1]
     assert "UV_PROJECT_ENVIRONMENT=/app/.venv" in " ".join(instructions(TEXT, "ENV")).split()
@@ -194,7 +194,9 @@ def test_gpu_no_uv_after_swap() -> None:
 def test_gpu_build_time_check() -> None:
     copies = [i for i, line in enumerate(RUNTIME) if line.startswith("COPY --from=build")]
     assert len(copies) == 3
-    [check] = [line for line in RUNTIME if "/app/.venv/bin/python -c" in line]
+    [check] = [
+        line for line in RUNTIME if "/app/.venv/bin/python -c" in line and "ctranslate2" in line
+    ]
     assert RUNTIME.index(check) > max(copies)
     assert RUNTIME.index(check) < RUNTIME.index(next(x for x in RUNTIME if x.startswith("USER")))
     for needle in (
@@ -207,6 +209,17 @@ def test_gpu_build_time_check() -> None:
     ):
         assert needle in check, needle
     assert check.rstrip().endswith('"$CT2_VERSION"')
+
+
+def test_gpu_youtube_build_time_check() -> None:
+    """The runtime stage runs the venv's Deno and imports yt-dlp: no network, no uv."""
+    copies = [i for i, line in enumerate(RUNTIME) if line.startswith("COPY --from=build")]
+    [check] = [line for line in RUNTIME if "/app/.venv/bin/deno --version" in line]
+    assert check.startswith("RUN ")
+    assert "import yt_dlp, yt_dlp_ejs" in check
+    assert RUNTIME.index(check) > max(copies)
+    assert RUNTIME.index(check) < RUNTIME.index(next(x for x in RUNTIME if x.startswith("USER")))
+    assert not _uv_words(check)
 
 
 def test_gpu_runtime_has_no_uv() -> None:

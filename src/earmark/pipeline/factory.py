@@ -19,6 +19,7 @@ from earmark.fakes import (
     FakeNotifier,
     FakeResolver,
     FakeTranscriber,
+    FakeYoutubeSource,
 )
 from earmark.jobs import JobStore, open_job_store
 from earmark.models import Clock, utc_now
@@ -30,6 +31,7 @@ from earmark.pipeline.stages import (
     Notifier,
     Resolver,
     Transcriber,
+    YoutubeSource,
 )
 from earmark.pipeline.worker import Worker, heartbeat_interval
 from earmark.staging import Staging
@@ -57,6 +59,12 @@ def _apple_resolver(ctx: BuildContext) -> Resolver:
     from earmark.resolve.resolver import build_apple_resolver
 
     return build_apple_resolver(ctx.settings)
+
+
+def _ytdlp_source(ctx: BuildContext) -> YoutubeSource:
+    from earmark.youtube.ytdlp import build_ytdlp_source
+
+    return build_ytdlp_source(ctx.settings)
 
 
 def _faster_whisper_transcriber(ctx: BuildContext) -> Transcriber:
@@ -90,6 +98,10 @@ RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
 FETCHERS: Final[Mapping[str, Builder[AudioFetcher]]] = {
     "fake": lambda ctx: FakeAudioFetcher(ctx.artifacts),
     "http": _http_fetcher,
+}
+YOUTUBE_SOURCES: Final[Mapping[str, Builder[YoutubeSource]]] = {
+    "fake": lambda ctx: FakeYoutubeSource(),
+    "ytdlp": _ytdlp_source,
 }
 TRANSCRIBERS: Final[Mapping[str, Builder[Transcriber]]] = {
     "fake": lambda ctx: FakeTranscriber(ctx.artifacts),
@@ -128,6 +140,7 @@ def build_backends(
     problems: list[str] = []
     resolver = _lookup(RESOLVERS, "resolver_backend", settings.resolver_backend, problems)
     fetcher = _lookup(FETCHERS, "fetch_backend", settings.fetch_backend, problems)
+    youtube = _lookup(YOUTUBE_SOURCES, "youtube_backend", settings.youtube_backend, problems)
     transcriber = _lookup(TRANSCRIBERS, "asr_backend", settings.asr_backend, problems)
     mailer = _lookup(MAILERS, "mail_backend", settings.mail_backend, problems)
     notifier = _lookup(NOTIFIERS, "notify_backend", settings.notify_backend, problems)
@@ -135,6 +148,7 @@ def build_backends(
         problems
         or resolver is None
         or fetcher is None
+        or youtube is None
         or transcriber is None
         or mailer is None
         or notifier is None
@@ -144,6 +158,7 @@ def build_backends(
     return Backends(
         resolver=resolver(ctx),
         fetcher=fetcher(ctx),
+        youtube=youtube(ctx),
         transcriber=transcriber(ctx),
         mailer=mailer(ctx),
         notifier=notifier(ctx),
@@ -180,9 +195,10 @@ def build_worker(
         recipient_policy=settings.recipient_policy(),
     )
     logger.info(
-        "backends: resolver=%s fetch=%s asr=%s mail=%s notify=%s",
+        "backends: resolver=%s fetch=%s youtube=%s asr=%s mail=%s notify=%s",
         settings.resolver_backend,
         settings.fetch_backend,
+        settings.youtube_backend,
         settings.asr_backend,
         settings.mail_backend,
         settings.notify_backend,

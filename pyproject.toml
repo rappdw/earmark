@@ -24,6 +24,11 @@ transcribe = [
   "av>=18.1,<19",
 ]
 
+# yt-dlp reads a YouTube video's metadata and downloads its audio. "default" pins the matching
+# yt-dlp-ejs (YouTube's challenge scripts); "deno" brings the JavaScript runtime they need as a
+# PyPI wheel, with no system package. See docs/ARCHITECTURE.md "YouTube".
+youtube = ["yt-dlp[default,deno]>=2026.11.23"]
+
 [project.scripts]
 earmark = "earmark.cli:app"
 

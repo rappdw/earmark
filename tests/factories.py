@@ -105,6 +105,16 @@ def new_url_job(
     return NewJob(source="url", url=url, to=to, instructions=instructions, title=title)
 
 
+YOUTUBE_ID = "jNQXAC9IVRw"
+YOUTUBE_URL = f"https://www.youtube.com/watch?v={YOUTUBE_ID}"
+
+
+def new_youtube_job(
+    url: str = YOUTUBE_URL, to: str = TO, *, instructions: str = "", title: str | None = None
+) -> NewJob:
+    return NewJob(source="youtube", url=url, to=to, instructions=instructions, title=title)
+
+
 def new_upload_job(
     sha256: str = SHA,
     to: str = TO,

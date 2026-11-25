@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from earmark.staging import UPLOADS_DIR, Staging
-from tests.factories import new_upload_job, new_url_job
+from tests.factories import new_upload_job, new_url_job, new_youtube_job
 from tests.pipeline_env import make_env
 
 UPLOAD_NAME = re.compile(r"[0-9a-f]{32}\.mp3")
@@ -243,3 +243,15 @@ def test_release_never_raises(
     monkeypatch.undo()
     assert staged.path.exists()
     assert os.access(staged.path, os.R_OK)
+
+
+def test_release_clears_youtube_downloads(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    staging = env.staging
+    video = env.jobs.enqueue(new_youtube_job()).job
+    staging.download_destination(video.id)("webm").write_bytes(b"download")
+    (staging.downloads_dir / f".{video.id}.webm.part").write_bytes(b"partial")
+    other = staging.downloads_dir / f"{'9' * 32}.webm"
+    other.write_bytes(b"someone else's")
+    staging.release(video)
+    assert [p.name for p in staging.downloads_dir.iterdir()] == [other.name]

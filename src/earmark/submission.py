@@ -12,6 +12,7 @@ from earmark.models import TranscriptionRequest, UploadFields
 from earmark.recipients import RecipientPolicy, mask_address
 from earmark.sources import parse_source_url, url_host
 from earmark.staging import StagedUpload, Staging
+from earmark.youtube.links import video_id_from_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,8 @@ class Intake:
         )
         if parsed.source == "apple_podcasts":
             subject = parsed.url
+        elif parsed.source == "youtube":
+            subject = f"YouTube video {video_id_from_canonical(parsed.url)}"
         else:
             subject = f"audio URL on {url_host(parsed.url)}"
         self._log(enqueued, subject, request.to, request.instructions)

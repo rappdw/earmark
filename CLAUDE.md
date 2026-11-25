@@ -10,12 +10,12 @@ own context.
   marketplace: `plugins/earmark-pka/` (built in step 30, never run in a PKA; its contract checker is step 29).
 
 The two seams are the request (`POST /transcriptions`) and the mail contract
-(`contract: 1`). AMAP, outside this repo, carries the mail from the service to each PKA.
+(`contract: 2` since step 32; the receiving skill still accepts `contract: 1`). AMAP, outside this repo, carries the mail from the service to each PKA.
 `docs/ARCHITECTURE.md` "System" has the parts, the seams, the definition of done and the
 repo layout. The service files nothing; the PKA files, through the receiving skill.
 
-The service today (after step 27): a request is an Apple Podcasts episode link, a direct
-audio URL, or an uploaded file, with a destination address and instructions. The worker
+The service today (after step 32): a request is an Apple Podcasts episode link, a YouTube
+video link, a direct audio URL, or an uploaded file, with a destination address and instructions. The worker
 resolves or downloads the audio, transcribes it, caches the transcript, emails the
 transcript note and the instructions to the destination as two Markdown attachments, and
 sends an ntfy push. On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26),
@@ -47,7 +47,7 @@ green, `main` is fast-forwarded to that commit. Do not push otherwise without be
 ## Commands
 
 ```bash
-uv sync                      # install (add --extra transcribe for local Whisper)
+uv sync                      # install (add --extra transcribe for local Whisper, --extra youtube for yt-dlp)
 make check                   # the gate: ruff check + ruff format --check + mypy + pytest
 make samples                 # regenerate contract/samples/v1/ from the mail code
 claude plugin validate --strict .   # the manifests (by hand; not in CI)
@@ -86,8 +86,8 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   suite. Use recorded fixtures, stubs on unix sockets, and the fakes; put anything live
   behind a marker.
 - **Heavy dependencies are optional extras, imported lazily** (faster-whisper and
-  CTranslate2, the `transcribe` extra). `import earmark` and the default test suite must
-  work without them.
+  CTranslate2, the `transcribe` extra; yt-dlp, `yt-dlp-ejs` and Deno, the `youtube` extra,
+  step 32). `import earmark` and the default test suite must work without them.
 - **Errors carry retry intent.** Raise `TransientError` (retry with backoff),
   `PermanentError` (fail now), or `SkipEpisode` (e.g. subscriber-only episode, no public
   feed). The worker treats anything else as transient.
@@ -95,8 +95,11 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   are client-supplied URLs, uploads, their file names, titles, and instructions. All
   third-party fetches go through `earmark/fetch.py` (scheme check, private-address block,
   size cap); it is also the only path to a direct audio URL, and the resolver takes only
-  Apple Podcasts episode links. Anything that becomes a file name or YAML goes through
-  `earmark/sanitize.py`.
+  Apple Podcasts episode links. The one exception is YouTube (step 32): yt-dlp makes its own
+  requests, for YouTube only, given a URL earmark builds from a validated video id, with no
+  cookies, plugins, config or proxies, and with a stream check and the size cap; the
+  private-address guard does not cover it (`docs/ARCHITECTURE.md` "Security"). Anything that
+  becomes a file name or YAML goes through `earmark/sanitize.py`.
 - **Never log or print a secret**: the API token, the ASR key, the ntfy URL and token,
   and from step 25 the SMTP password. `Settings` holds them as `SecretStr`.
 - **Recipients and instructions must not leak** (step 24). Instructions never appear in
@@ -106,9 +109,12 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   `EARMARK_ALLOWED_RECIPIENTS`. Unset refuses every request. `all` is the operator's
   written acceptance of a risk, warned about at startup and by doctor. earmark never
   defaults the recipient or the sender.
-- **Mail follows the contract exactly** (step 25): `contract: 1`, drafted by pka-skills
-  and owned by this repo, still a draft. The text is `contract/mail-v1.md` (step 29), pinned
-  by a hash test. A change to a key, file name, format, or rule is a contract revision with
+- **Mail follows the contract exactly** (step 25): `contract: 2` since step 32 (contract 1
+  is still accepted by the receiving skill), drafted by pka-skills and owned by this repo,
+  still a draft. The texts are `contract/mail-v2.md` (a list of changes to
+  `contract/mail-v1.md`; step 32) and `contract/mail-v1.md` (step 29), each pinned by a hash
+  test. `contract/samples/v2/` is built by the mail code, and `contract/samples/v1/` is frozen
+  (pinned by hash, never regenerated). A change to a key, file name, format, or rule is a contract revision with
   a version bump: a new `contract/mail-vN.md` and `contract/samples/vN/`, with
   `docs/PLAN.md` and `docs/ARCHITECTURE.md` updated together, never a quiet edit. Delivery
   is at-least-once: a resend keeps its `Message-ID` and `job_id`.

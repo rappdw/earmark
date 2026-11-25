@@ -11,18 +11,21 @@ from pydantic import SecretStr
 
 from earmark.config import REDACTED, Settings
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import FakeAudioFetcher, FakeTranscriber, make_fake_backends
-from earmark.models import Episode, Job, JobResult, Segment, Transcript, content_key
+from earmark.fakes import FakeAudioFetcher, FakeTranscriber, FakeYoutubeSource, make_fake_backends
+from earmark.models import Episode, Job, JobResult, Segment, Transcript, content_key, youtube_key
 from earmark.pipeline.runner import MAX_ERROR_CHARS, describe_error
 from earmark.staging import StagedUpload
 from earmark.transcribe.base import UnusableAudioError
 from earmark.transcribe.faster_whisper import file_key
+from earmark.youtube.links import youtube_episode
 from tests.factories import (
     T0,
+    YOUTUBE_ID,
     make_transcript,
     new_podcast_job,
     new_upload_job,
     new_url_job,
+    new_youtube_job,
 )
 from tests.pipeline_env import (
     CANON,
@@ -706,3 +709,119 @@ def test_load_episode_per_source(tmp_path: Path) -> None:
     assert loaded.title == "Named"
     unresolved = url_job.model_copy(update={"episode_key": None})
     assert env.pipeline.load_episode(unresolved) is None
+
+
+# -- YouTube ------------------------------------------------------------------------------
+
+
+def test_youtube_job_runs(tmp_path: Path) -> None:
+    env = make_env(tmp_path, store_type=CountingJobStore)
+    env.jobs.enqueue(new_youtube_job(instructions="Summarise."))
+    job = _run(env)
+    assert job.status == "done"
+    assert counting_store(env).stages == ["resolve", "fetch", "transcribe", "deliver"]
+    assert job.episode_key == youtube_key(YOUTUBE_ID)
+    assert env.fakes.youtube.call_count == 2  # resolve, then download
+    assert env.fakes.youtube.downloads == 1
+    assert env.fakes.resolver.call_count == 0
+    assert env.fakes.fetcher.call_count == 0
+    episode = env.fakes.artifacts.read_episode(youtube_key(YOUTUBE_ID))
+    assert episode is not None
+    assert (episode.source, episode.guid) == ("youtube", f"youtube:{YOUTUBE_ID}")
+    assert env.fakes.transcriber.computed == 1
+    (mail,) = env.fakes.mailer.calls
+    assert b'type: "video"' in _decoded_note(mail.data)
+    assert b'origin: "youtube"' in _decoded_note(mail.data)
+    assert _downloads(env) == []
+
+
+def _decoded_note(data: bytes) -> bytes:
+    import email
+    import email.policy
+
+    message = email.message_from_bytes(data, policy=email.policy.default)
+    parts = [
+        p
+        for p in message.iter_attachments()
+        if not (p.get_filename() or "").endswith(".instructions.md")
+    ]
+    payload = parts[0].get_payload(decode=True)
+    assert isinstance(payload, bytes)
+    return payload
+
+
+def test_youtube_cache_reused(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    env.jobs.enqueue(new_youtube_job(instructions="one"))
+    first = _run(env)
+    env.jobs.enqueue(new_youtube_job(instructions="two"))
+    second = _run(env)
+    assert (first.status, second.status) == ("done", "done")
+    assert first.episode_key == second.episode_key
+    assert env.fakes.youtube.downloads == 1
+    assert env.fakes.transcriber.computed == 1
+    assert len(env.fakes.mailer.calls) == 2
+
+
+def test_youtube_cached_skips_download(tmp_path: Path) -> None:
+    env = make_env(tmp_path, store_type=CountingJobStore)
+    env.jobs.enqueue(new_youtube_job(instructions="one"))
+    _run(env)
+    counting_store(env).stages.clear()
+    env.jobs.enqueue(new_youtube_job(instructions="two"))
+    _run(env)
+    assert counting_store(env).stages == ["resolve", "deliver"]
+    assert env.fakes.youtube.downloads == 1
+
+
+def test_youtube_episode_mismatch(tmp_path: Path) -> None:
+    other = youtube_episode(
+        "ex_ample-02",
+        title="Wrong",
+        channel="",
+        published_at=None,
+        published_date_only=False,
+        duration_s=None,
+    )
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.youtube = FakeYoutubeSource(episodes={YOUTUBE_ID: other})
+    env = make_env(tmp_path, fakes=fakes)
+    env.jobs.enqueue(new_youtube_job())
+    job = _run(env)
+    assert job.status == "failed"
+    assert job.error == "the YouTube source returned another video"
+    assert fakes.youtube.downloads == 0
+    assert not fakes.mailer.calls
+
+
+def test_youtube_refusal_fails_job(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    env.fakes.youtube.fail_next(PermanentError("This YouTube video is private."))
+    env.jobs.enqueue(new_youtube_job())
+    job = _run(env)
+    assert (job.status, job.error) == ("failed", "This YouTube video is private.")
+    assert len(env.fakes.notifier.calls) == 1
+    assert env.fakes.notifier.calls[0].job.status == "failed"
+    assert _downloads(env) == []
+    assert not env.fakes.mailer.calls
+
+
+def test_youtube_download_kept_while_retrying(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    env.fakes.transcriber.fail_next(TransientError("asr busy"))
+    env.jobs.enqueue(new_youtube_job())
+    assert _run(env).status == "queued"
+    assert len(_downloads(env)) == 1
+    env.clock.advance(60)
+    assert _run(env).status == "done"
+    assert _downloads(env) == []
+    assert env.fakes.youtube.downloads == 2  # the retry downloads again
+
+
+def test_load_episode_for_youtube(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    env.jobs.enqueue(new_youtube_job())
+    job = _run(env)
+    loaded = env.pipeline.load_episode(job)
+    assert loaded is not None
+    assert loaded.key == youtube_key(YOUTUBE_ID)

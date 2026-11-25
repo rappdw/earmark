@@ -53,13 +53,17 @@ PLANS = [
     "docs/steps/28-system-scope.md",
     "docs/steps/29-mail-contract-seam.md",
     "docs/steps/30-pka-receiving-skill.md",
+    "docs/steps/32-youtube-source.md",
 ]
 CONTRACT_DOCS = [
     "contract/README.md",
     "contract/mail-v1.md",
     "contract/samples/v1/README.md",
+    "contract/mail-v2.md",
+    "contract/samples/v2/README.md",
 ]
 CONTRACT_V1_SHA256 = "7361f3d0fb20fa3edb0c5b98529c0c998532ba035f53ac8392fb47aea9dcd82d"
+CONTRACT_V2_SHA256 = "210d64fb6c872b231a08702490dcd3877aeed980adf2e61cb1f335cc0d4a7f94"
 ARCH = "docs/ARCHITECTURE.md"
 DOCS = [
     "README.md",
@@ -158,7 +162,7 @@ def test_quickstart_block_present() -> None:
 def test_quickstart_uses_fake_backends() -> None:
     script = _quickstart()
     fields = [n for n in Settings.model_fields if n.endswith("_backend")]
-    assert len(fields) == 5
+    assert len(fields) == 6
     for name in fields:
         assert re.search(rf"\b{env_var(name)}=fake\b", script), name
 
@@ -428,6 +432,12 @@ ERROR_ROWS = [
     (422, "That is not a valid link. Share an episode from Apple Podcasts."),
     (422, "This links to a whole show. Share a single episode instead."),
     (422, "This Apple link is not a podcast episode."),
+    (
+        422,
+        "This YouTube link is not a single video. "
+        "Share a video, not a channel, playlist or search.",
+    ),
+    (422, "This YouTube link has no valid video id."),
     (422, "to must be one email address"),
     (422, "to is not an allowed recipient (EARMARK_ALLOWED_RECIPIENTS)"),
     (422, "no recipients are allowed yet: set EARMARK_ALLOWED_RECIPIENTS on the server"),
@@ -480,6 +490,8 @@ def _error_triggers(tmp_path: Path) -> list[tuple[int, dict[str, Any]]]:
         (_episode("hello"), "application/json", {}),
         (_episode(show), "application/json", {}),
         (_episode("https://www.apple.com/podcasts/"), "application/json", {}),
+        (_episode("https://www.youtube.com/@example"), "application/json", {}),
+        (_episode("https://youtu.be/short"), "application/json", {}),
         (_json(url=good, to="not an address"), "application/json", {}),
         (_json(url=good, to="stranger@example.com"), "application/json", {}),
         (_episode(good), "application/json", {"settings_overrides": {"allowed_recipients": ()}}),
@@ -1149,8 +1161,11 @@ def test_architecture_system_seams() -> None:
     assert [r[0] for r in rows] == ["Request", "Mail"]
     request, mail = rows
     assert "POST /transcriptions" in request[2]
+    assert "contract: 2" in mail[2]
     assert "contract: 1" in mail[2]
     assert "contract/samples/v1/" in mail[3]
+    assert "contract/samples/v2/" in mail[3]
+    assert "32" in step_numbers(mail[3])
     assert "29" in step_numbers(mail[3])
 
 
@@ -1198,7 +1213,9 @@ def test_architecture_repo_layout_matches_repo() -> None:
         "plugins/earmark-pka/skills/earmark-receive/SKILL.md",
         "plugins/earmark-pka/skills/earmark-receive/scripts/",
         "contract/mail-v1.md",
+        "contract/mail-v2.md",
         "contract/samples/v1/",
+        "contract/samples/v2/",
         "shortcut/earmark.shortcut",
         "src/earmark/",
         "compose.yaml",
@@ -1233,7 +1250,7 @@ def test_architecture_repo_layout_covers_top_level() -> None:
 def test_architecture_mail_contract_provenance() -> None:
     text = read_doc(ARCH)
     headings = [ln for ln in text.splitlines() if ln.startswith("#### The mail contract")]
-    assert headings == ["#### The mail contract (`contract: 1`)"]
+    assert headings == ["#### The mail contract (`contract: 2`)"]
     preamble = section(text, "#### The mail contract")
     flat = _flat(preamble).lower()
     for needle in (
@@ -1242,10 +1259,11 @@ def test_architecture_mail_contract_provenance() -> None:
         "2026-11-24",
         "owned by this repo",
         "contract/mail-v1.md",
+        "contract/mail-v2.md",
         "**draft**",
     ):
         assert needle in flat, needle
-    assert {"29", "30"} <= step_numbers(preamble)
+    assert {"29", "30", "32"} <= step_numbers(preamble)
 
 
 def test_architecture_parts_say_what_is_unbuilt() -> None:
@@ -1369,24 +1387,50 @@ def test_contract_v1_text_is_pinned() -> None:
     assert digest == CONTRACT_V1_SHA256
 
 
-def test_contract_text_exists_once() -> None:
-    lines = {ln.strip() for ln in _contract_block().splitlines() if len(ln.strip()) >= 40}
-    assert len(lines) >= 40
-    contract = ROOT / "contract" / "mail-v1.md"
+def _contract_v2_block() -> str:
+    text = read_doc("contract/mail-v2.md")
+    return between_markers(text, "contract-v2").strip("\n") + "\n"
+
+
+def test_contract_v2_text_is_pinned() -> None:
+    digest = hashlib.sha256(_contract_v2_block().encode("utf-8")).hexdigest()
+    assert digest == CONTRACT_V2_SHA256
+
+
+def _assert_text_exists_once(block: str, owner: Path, exempt: tuple[Path, ...] = ()) -> None:
+    lines = {ln.strip() for ln in block.splitlines() if len(ln.strip()) >= 40}
+    assert lines
     for directory, names, files in os.walk(ROOT):
         names[:] = [n for n in names if n not in {".git", ".venv"}]
         for name in files:
             path = Path(directory) / name
-            if path.suffix != ".md" or path == contract:
+            if path.suffix != ".md" or path == owner or path in exempt:
                 continue
             text = path.read_text(encoding="utf-8")
             hits = [ln for ln in lines if ln in text]
             assert not hits, (str(path.relative_to(ROOT)), hits[:2])
 
 
+def test_contract_text_exists_once() -> None:
+    assert len(_contract_block().splitlines()) >= 40
+    _assert_text_exists_once(_contract_block(), ROOT / "contract" / "mail-v1.md")
+
+
+def test_contract_v2_text_exists_once() -> None:
+    # The step plan that specified the text is the one exception.
+    exempt = (ROOT / "docs" / "steps" / "32-youtube-source.md",)
+    _assert_text_exists_once(_contract_v2_block(), ROOT / "contract" / "mail-v2.md", exempt)
+
+
+def test_contract_v2_repeats_nothing_of_v1() -> None:
+    v1 = {ln.strip() for ln in _contract_block().splitlines() if len(ln.strip()) >= 40}
+    assert not [ln for ln in _contract_v2_block().splitlines() if ln.strip() in v1]
+
+
 def test_plan_and_architecture_point_to_contract() -> None:
     for doc in ("docs/PLAN.md", ARCH):
         assert "contract/mail-v1.md" in read_doc(doc), doc
+        assert "contract/mail-v2.md" in read_doc(doc), doc
     mail = section(read_doc(ARCH), "#### The mail contract")
     assert "- **Both files**" not in mail
 
@@ -1397,7 +1441,9 @@ def test_contract_readme() -> None:
         "plugins/earmark-pka/skills/earmark-receive/scripts/check_mail.py",
         "python3 -I",
         "mail-v1.md",
+        "mail-v2.md",
         "samples/v1/",
+        "samples/v2/",
         "DRAFT",
         "make samples",
         "3.9",
@@ -1413,6 +1459,35 @@ def test_contract_still_draft() -> None:
     versions = section(read_doc("contract/README.md"), "## Versions")
     assert "DRAFT" in versions
     assert "Status: **DRAFT**" in read_doc("contract/mail-v1.md")
+    assert "Status: **DRAFT**" in read_doc("contract/mail-v2.md")
+    assert versions.count("DRAFT") >= 2
+
+
+def test_deploy_doc_youtube() -> None:
+    deploy = read_doc("docs/deploy.md")
+    text = section(deploy, "## 18. YouTube")
+    for needle in (
+        "uv lock --upgrade-package yt-dlp",
+        "--upgrade-package yt-dlp-ejs",
+        "--upgrade-package deno",
+        "EARMARK_YOUTUBE_BACKEND",
+        "docker compose build",
+        "docker compose run --rm worker doctor",
+        "Dependabot",
+    ):
+        assert needle in text, needle
+    for heading in ("### 18.1 ", "### 18.2 ", "### 18.3 "):
+        assert heading in text, heading
+    runbook = section(read_doc("docs/runbook-spark.md"), "## Phase 4: ")
+    for needle in (
+        "https://youtu.be/jNQXAC9IVRw?si=example",
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw&t=5",
+        "youtube:jNQXAC9IVRw",
+        'origin: "youtube"',
+    ):
+        assert needle in runbook, needle
+    phase3 = section(read_doc("docs/runbook-spark.md"), "## Phase 3: ")
+    assert "youtube ok" in phase3
 
 
 @pytest.mark.parametrize("doc", CONTRACT_DOCS)

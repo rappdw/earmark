@@ -259,6 +259,7 @@ SHOW_LINK = "https://podcasts.apple.com/us/podcast/x/id1200361736"
 BACKEND_VARS = (
     "RESOLVER_BACKEND",
     "FETCH_BACKEND",
+    "YOUTUBE_BACKEND",
     "ASR_BACKEND",
     "MAIL_BACKEND",
     "NOTIFY_BACKEND",
@@ -900,7 +901,7 @@ def test_doctor_failure_exit_1(doctor_env: Path, monkeypatch: pytest.MonkeyPatch
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1
     assert "FAIL  api token" in result.stdout
-    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 4 warnings"
+    assert result.stdout.splitlines()[-1] == "doctor: 1 check failed, 5 warnings"
 
 
 def test_doctor_bad_settings_exit_2_no_echo(

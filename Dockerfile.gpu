@@ -30,10 +30,10 @@ RUN uv python install 3.13.18
 WORKDIR /src
 COPY pyproject.toml uv.lock .python-version README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-install-project --extra transcribe
+    uv sync --locked --no-dev --no-install-project --extra transcribe --extra youtube
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-editable --extra transcribe
+    uv sync --locked --no-dev --no-editable --extra transcribe --extra youtube
 ARG CT2_VERSION
 ARG CUDA_ARCH
 # The swap is the last uv command in this file: a later `uv sync` or `uv run` would put the
@@ -75,6 +75,10 @@ COPY --from=build /app/.venv /app/.venv
 RUN echo /opt/ctranslate2/lib > /etc/ld.so.conf.d/ctranslate2.conf \
  && ldconfig \
  && /app/.venv/bin/python -c "import sys, ctranslate2, faster_whisper; from faster_whisper import BatchedInferencePipeline; want = sys.argv[1].removeprefix('v'); assert ctranslate2.__version__ == want, (ctranslate2.__version__, want); assert ctranslate2.__file__.startswith('/app/.venv/'), ctranslate2.__file__; libs = {line.split()[-1] for line in open('/proc/self/maps') if 'libctranslate2' in line}; assert libs and all(p.startswith('/opt/ctranslate2/lib/') for p in libs), libs; print('ctranslate2', ctranslate2.__version__, sorted(libs))" "$CT2_VERSION"
+# Build-time check of the YouTube extra: its Deno runtime (a PyPI wheel, in the venv's bin) runs
+# and yt-dlp and its challenge scripts import. Nothing here touches the network.
+RUN /app/.venv/bin/deno --version \
+ && /app/.venv/bin/python -c "import yt_dlp, yt_dlp_ejs"
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     EARMARK_HOST=0.0.0.0 \

@@ -33,6 +33,7 @@ from earmark.models import (
     format_hms,
     is_episode_key,
     source_key,
+    youtube_key,
 )
 from tests.factories import PST, SHA, T0, TO, make_episode, make_job, make_transcript
 
@@ -263,10 +264,10 @@ def test_job_kind_requirements() -> None:
 
 
 def test_source_values() -> None:
-    assert typing.get_args(Source) == ("apple_podcasts", "upload", "url")
+    assert typing.get_args(Source) == ("apple_podcasts", "upload", "url", "youtube")
 
 
-@pytest.mark.parametrize("source", ["apple_podcasts", "upload", "url"])
+@pytest.mark.parametrize("source", ["apple_podcasts", "upload", "url", "youtube"])
 def test_job_source_requirements(source: Source) -> None:
     good = _audio_job(source) if source != "apple_podcasts" else _minimal_job()
     data: dict[str, Any] = good.model_dump(mode="json")
@@ -524,3 +525,62 @@ def test_old_episode_json_loads_with_defaults() -> None:
     old = Episode.model_validate(data)
     assert (old.feed_guid, old.published_date_only) == (None, False)
     assert old.key == make_episode().key
+
+
+def test_youtube_key_and_source_key() -> None:
+    key = youtube_key("jNQXAC9IVRw")
+    assert key == episode_key("youtube", "youtube", "youtube:jNQXAC9IVRw")
+    assert source_key("youtube", "youtube", "youtube:jNQXAC9IVRw") == key
+    assert youtube_key("ex_ample-02") != key
+    for bad in ("short", "twelve_chars", "has.a.dot.1", ""):
+        with pytest.raises(ValueError, match="video id"):
+            youtube_key(bad)
+    with pytest.raises(ValueError, match="show_id"):
+        source_key("youtube", "audio", "youtube:jNQXAC9IVRw")
+    with pytest.raises(ValueError, match="video id"):
+        source_key("youtube", "youtube", "youtube:short")
+    with pytest.raises(ValueError, match="youtube: guid"):
+        source_key("youtube", "youtube", "sha256:" + "0" * 64)
+
+
+def test_youtube_episode_validates() -> None:
+    from earmark.youtube.links import youtube_episode
+
+    episode = youtube_episode(
+        "jNQXAC9IVRw",
+        title="Me at the zoo",
+        channel="jawed",
+        published_at=T0,
+        published_date_only=False,
+        duration_s=19.0,
+    )
+    assert episode.key == youtube_key("jNQXAC9IVRw")
+    assert (episode.source, episode.show_id, episode.episode_id) == (
+        "youtube",
+        "youtube",
+        "jNQXAC9IVRw",
+    )
+    assert episode.guid == "youtube:jNQXAC9IVRw"
+    assert (episode.audio_url, episode.feed_url, episode.description) == ("", None, "")
+    assert episode.url == "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    with pytest.raises(ValidationError, match="key does not match"):
+        Episode.model_validate(episode.model_dump() | {"guid": "youtube:ex_ample-02"})
+    with pytest.raises(ValueError, match="video id"):
+        youtube_episode(
+            "bad",
+            title="",
+            channel="",
+            published_at=None,
+            published_date_only=False,
+            duration_s=None,
+        )
+
+
+def test_youtube_job_requires_url() -> None:
+    data = _minimal_job().model_dump(mode="json") | {
+        "source": "youtube",
+        "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+    }
+    assert Job.model_validate(data).source == "youtube"
+    with pytest.raises(ValidationError, match="requires url"):
+        Job.model_validate(data | {"url": None})

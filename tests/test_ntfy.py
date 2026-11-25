@@ -144,6 +144,43 @@ def test_compose_unknown_episode() -> None:
     assert job.url not in result.message
 
 
+def test_youtube_labels() -> None:
+    from earmark.youtube.links import youtube_episode
+
+    episode = youtube_episode(
+        "jNQXAC9IVRw",
+        title="Me at the zoo",
+        channel="jawed",
+        published_at=None,
+        published_date_only=False,
+        duration_s=19.0,
+    )
+    job = _job("done", source="youtube", url="https://www.youtube.com/watch?v=jNQXAC9IVRw")
+    result = compose(job, episode, secrets=(TOKEN, TOPIC_URL))
+    assert result is not None
+    assert result.title == "Sent: Me at the zoo"
+    assert result.message.splitlines()[0] == "YouTube: jawed"
+    bare = youtube_episode(
+        "jNQXAC9IVRw",
+        title="",
+        channel="",
+        published_at=None,
+        published_date_only=False,
+        duration_s=None,
+    )
+    result = compose(job, bare, secrets=())
+    assert result is not None
+    assert result.title == "Sent: YouTube video"
+    assert result.message.splitlines()[0] == "YouTube video"
+    before = compose(_job("failed", source="youtube", url=job.url, stage="resolve"), None)
+    assert before is not None
+    assert before.title == "Failed: YouTube video"
+    assert before.message.splitlines()[0] == "YouTube video"
+    for text in (result.title, result.message, before.title, before.message):
+        assert "jNQXAC9IVRw" not in text
+        assert "://" not in text
+
+
 @pytest.mark.parametrize("status", ["queued", "running"])
 def test_compose_non_terminal_is_none(status: str) -> None:
     assert compose(_job(status), make_episode()) is None

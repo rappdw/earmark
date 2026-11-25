@@ -17,6 +17,7 @@ def test_defaults() -> None:
     assert s.data_dir == Path("./data")
     assert s.resolver_backend == "apple"
     assert s.fetch_backend == "http"
+    assert s.youtube_backend == "ytdlp"
     assert s.asr_backend == "faster_whisper"
     assert s.notify_backend == "ntfy"
     assert (s.asr_model, s.asr_device, s.asr_compute_type) == ("large-v3", "auto", "auto")
@@ -165,6 +166,7 @@ def test_all_backends_accept_fake(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "RESOLVER_BACKEND",
         "FETCH_BACKEND",
+        "YOUTUBE_BACKEND",
         "ASR_BACKEND",
         "NOTIFY_BACKEND",
         "MAIL_BACKEND",
@@ -172,7 +174,7 @@ def test_all_backends_accept_fake(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(f"EARMARK_{name}", "fake")
     s = load_settings(env_file=None)
     assert s.resolver_backend == s.fetch_backend == s.asr_backend == s.notify_backend == "fake"
-    assert s.mail_backend == "fake"
+    assert s.mail_backend == s.youtube_backend == "fake"
 
 
 def test_log_level_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -343,6 +345,7 @@ def test_settings_fields_are_exactly() -> None:
         "data_dir",
         "resolver_backend",
         "fetch_backend",
+        "youtube_backend",
         "asr_backend",
         "notify_backend",
         "mail_backend",

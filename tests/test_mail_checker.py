@@ -30,50 +30,62 @@ from tests.checker_helpers import (
     split,
     write_parts,
 )
-from tests.contract_samples import SAMPLES, SAMPLES_DIR
+from tests.contract_samples import ALL_SAMPLES, SAMPLES, SAMPLES_DIR, sample_path
 
 FLOOR = floor_interpreters()
 PYTHONS = pytest.mark.parametrize("python", FLOOR, ids=lambda i: i.id)
 SAMPLE_NAMES = list(SAMPLES)
+ALL = pytest.mark.parametrize(("version", "name"), ALL_SAMPLES)
 
 
-def _sample(name: str) -> bytes:
-    return (SAMPLES_DIR / f"{name}.eml").read_bytes()
+def _sample(name: str, version: str = "v2") -> bytes:
+    return sample_path(version, name).read_bytes()
 
 
 # --- 6.2: every sample passes ---------------------------------------------------------
 
 
 @PYTHONS
-@pytest.mark.parametrize("name", SAMPLE_NAMES)
-def test_samples_pass_message_mode(python: Interpreter, name: str) -> None:
-    result = run_checker(python, "message", "--json", str(SAMPLES_DIR / f"{name}.eml"))
+@ALL
+def test_samples_pass_message_mode(python: Interpreter, version: str, name: str) -> None:
+    result = run_checker(python, "message", "--json", str(sample_path(version, name)))
     assert result.returncode == 0, result.stdout + result.stderr
     document = report(result)
     assert document["ok"] is True
     assert document["failures"] == []
     assert document["skipped"] == []
-    parts = split(_sample(name))
+    parts = split(_sample(name, version))
+    assert document["contract"] == int(version[1:])
     summary = document["summary"]
     assert summary["note"] == parts.note_name
     assert summary["instructions"] == parts.instructions_name
     assert summary["guid"] == front_value(parts.note, "guid").strip('"')
     assert summary["job_id"] == front_value(parts.instructions, "job_id").strip('"')
     assert summary["transcript_sha256"] == front_value(parts.note, "transcript_sha256").strip('"')
-    assert summary["type"] in {"podcast", "audio"}
+    assert summary["type"] in {"podcast", "audio", "video"}
     assert summary["message_id"] == dict(parts.headers)["Message-ID"]
 
 
 @PYTHONS
-@pytest.mark.parametrize("name", SAMPLE_NAMES)
-def test_samples_pass_files_mode(python: Interpreter, name: str, tmp_path: Path) -> None:
-    args = write_parts(split(_sample(name)), tmp_path)
+@ALL
+def test_samples_pass_files_mode(
+    python: Interpreter, version: str, name: str, tmp_path: Path
+) -> None:
+    args = write_parts(split(_sample(name, version)), tmp_path)
     result = run_checker(python, "files", "--json", *args)
     assert result.returncode == 0, result.stdout + result.stderr
     document = report(result)
     assert document["ok"] is True
     assert document["skipped"] == ["message.defects", "message.structure"]
     assert document["summary"]["message_id"] is None
+    assert document["contract"] == int(version[1:])
+
+
+def test_text_output_names_the_contract(tmp_path: Path) -> None:
+    for version, name in (("v1", "podcast-feed"), ("v2", "youtube")):
+        result = run_checker(interpreters()[0], "message", str(sample_path(version, name)))
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.splitlines()[0] == f"OK: earmark mail, contract {version[1:]}"
 
 
 @pytest.mark.parametrize("name", SAMPLE_NAMES)
@@ -181,6 +193,16 @@ def _long_show(n: int) -> Mutate:
     return _note("show", 'show: "' + "s" * n + '"')
 
 
+def _both_contracts(line: str) -> Mutate:
+    return lambda p, raw: rebuild(
+        dataclasses.replace(
+            p,
+            note=set_front(p.note, "contract", line),
+            instructions=set_front(p.instructions, "contract", line),
+        )
+    )
+
+
 def _first_job_id(p: Parts) -> str:
     return front_value(p.instructions, "job_id").strip('"')
 
@@ -192,6 +214,7 @@ class Case:
     base: str
     mutate: Mutate
     files: bool = False
+    version: str = "v2"
 
     @property
     def id(self) -> str:
@@ -204,6 +227,7 @@ def _upper_hash(note: bytes) -> bytes:
 
 
 F = "podcast-feed"
+Y = "youtube"
 CASES: list[Case] = [
     Case("message.defects", "base64", F, lambda p, raw: b64_corrupt(raw)),
     Case(
@@ -266,9 +290,16 @@ CASES: list[Case] = [
     Case("string.length", "title", F, _long_title(201)),
     Case("string.length", "show", F, _long_show(301)),
     Case("note.keys", "extra", F, _note("summary", 'summary: "x"')),
+    Case("note.keys", "channel-v1", F, _note("channel", 'channel: "x"'), version="v1"),
     Case("note.required", "duration", F, _note("duration", None)),
     Case("note.required", "show", F, _note("show", None)),
+    Case("note.required", "video-source-url", Y, _note("source_url", None)),
     Case("note.omitted", "audio-show", "upload", _note("show", 'show: "x"')),
+    Case("note.omitted", "podcast-channel", F, _note("channel", 'channel: "x"')),
+    Case("note.omitted", "video-show", Y, _note("show", 'show: "x"')),
+    Case(
+        "note.omitted", "video-apple-url", Y, _note("apple_url", 'apple_url: "https://x.example/a"')
+    ),
     Case(
         "note.omitted",
         "audio-source-url",
@@ -285,11 +316,12 @@ CASES: list[Case] = [
     Case("note.types", "date", F, _note("date", 'date: "2026-11-20"')),
     Case("note.types", "no-offset", F, _note("shared_at", "shared_at: 2026-11-22T10:00:00")),
     Case("note.types", "tags", F, _note("tags", 'tags: "podcast"')),
-    Case("note.type", "video", F, _note("type", 'type: "video"')),
-    Case("note.contract", "two", F, _note("contract", "contract: 2")),
+    Case("note.type", "video-in-v1", F, _note("type", 'type: "video"'), version="v1"),
+    Case("note.contract", "three", "youtube", _both_contracts("contract: 3")),
     Case("note.source", "other", F, _note("source", 'source: "other"')),
     Case("note.origin", "upload", F, _note("origin", 'origin: "upload"')),
     Case("note.origin", "youtube", F, _note("origin", 'origin: "youtube"')),
+    Case("note.origin", "url-video", Y, _note("origin", 'origin: "url"')),
     Case("note.date", "other-day", F, _note("date", "date: 2026-11-21")),
     Case(
         "note.filename-date",
@@ -320,7 +352,22 @@ CASES: list[Case] = [
     Case("note.guid", "podcast-scheme", F, _guid("podcast:1")),
     Case("note.guid", "apple-letters", F, _guid("apple:abc")),
     Case("note.guid", "audio-feed", "upload", _guid("feed:x")),
+    Case("note.guid", "video-short", Y, _guid("youtube:short")),
+    Case("note.guid", "video-sha256", Y, _guid("sha256:" + "ab" * 32)),
+    Case("note.guid", "podcast-youtube", F, _guid("youtube:exampleVid1")),
     Case("note.guid", "audio-uppercase", "upload", _guid("sha256:" + "AB" * 32)),
+    Case(
+        "note.source-url-youtube",
+        "other-id",
+        Y,
+        _note("source_url", 'source_url: "https://youtu.be/exampleVid2"'),
+    ),
+    Case(
+        "note.source-url-youtube",
+        "watch-path",
+        Y,
+        _note("source_url", 'source_url: "https://www.youtube.com/watch"'),
+    ),
     Case("note.sha256-form", "uppercase", F, lambda p, raw: rebuild(p.with_note(_upper_hash))),
     Case(
         "note.hash",
@@ -336,6 +383,14 @@ CASES: list[Case] = [
         F,
         _body_edit("# The Example Show — The Example Topic", "# The Example Topic"),
     ),
+    Case(
+        "note.heading",
+        "video-no-channel",
+        Y,
+        _body_edit("# The Example Channel — An Example Talk", "# An Example Talk"),
+    ),
+    Case("note.tags", "video-podcast", Y, _note("tags", 'tags:\n  - "podcast"')),
+    Case("string.length", "channel", Y, _note("channel", 'channel: "' + "c" * 301 + '"')),
     Case("note.paragraphs", "no-marker", F, _body_edit("[00:00:50] ", "")),
     Case("note.paragraphs", "extra-newline", F, _body_edit("\n\n[00:00:35]", "\n\n\n[00:00:35]")),
     Case("instructions.keys", "missing", F, _instr("job_id", None)),
@@ -348,7 +403,7 @@ CASES: list[Case] = [
         _instr("shared_at", 'shared_at: "2026-11-22T18:00:00+00:00"'),
     ),
     Case("instructions.type", "note", F, _instr("type", 'type: "earmark-note"')),
-    Case("instructions.contract", "two", F, _instr("contract", "contract: 2")),
+    Case("instructions.contract", "one", Y, _instr("contract", "contract: 1")),
     Case("instructions.for", "other", F, _instr("for", 'for: "2026-11-20-other.md"')),
     Case("instructions.guid", "other", F, _instr("guid", 'guid: "feed:other"')),
     Case("subject.prefix", "colon", F, _subject("earmark: x"), files=True),
@@ -404,7 +459,7 @@ def test_case_ids_are_unique() -> None:
 @PYTHONS
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
 def test_mutation_fails(python: Interpreter, case: Case, tmp_path: Path) -> None:
-    raw = _sample(case.base)
+    raw = _sample(case.base, case.version)
     mutated = case.mutate(split(raw), raw)
     path = tmp_path / "mutated.eml"
     path.write_bytes(mutated)

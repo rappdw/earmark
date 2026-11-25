@@ -37,6 +37,19 @@ class AudioFetcher(Protocol):
         ...
 
 
+class YoutubeSource(Protocol):
+    def resolve(self, video_id: str, /) -> Episode:
+        """The video's metadata as an Episode. Raises PermanentError for a video earmark
+        refuses (live, not yet aired, private, removed, members-only, age-gated), and
+        Transient/PermanentError as fetching does."""
+        ...
+
+    def download(self, video_id: str, destination: Callable[[str], Path], /) -> Path:
+        """Download an audio-only stream to destination(ext) and return the path. Reuses
+        the extraction of the resolve just before it. Never caches."""
+        ...
+
+
 class Transcriber(Protocol):
     def cached(self, episode: Episode, /) -> Transcript | None:
         """The cached transcript if one exists for this transcriber's profile.
@@ -92,10 +105,11 @@ class Mailer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Backends:
-    """The five stage implementations the runner drives."""
+    """The six stage implementations the runner drives."""
 
     resolver: Resolver
     fetcher: AudioFetcher
+    youtube: YoutubeSource
     transcriber: Transcriber
     mailer: Mailer
     notifier: Notifier | None  # None when EARMARK_NOTIFY_BACKEND=none

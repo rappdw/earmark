@@ -1,4 +1,4 @@
-"""The transcript note and the instructions file, to the mail contract (``contract: 1``)."""
+"""The transcript note and the instructions file, to the mail contract (``contract: 2``)."""
 
 import hashlib
 import re
@@ -80,7 +80,7 @@ def test_podcast_note_exact() -> None:
     expected = (
         "---\n"
         'type: "podcast"\n'
-        "contract: 1\n"
+        "contract: 2\n"
         'source: "earmark"\n'
         'origin: "apple_podcasts"\n'
         'title: "Épisode 1: «Tests»"\n'
@@ -116,7 +116,7 @@ def test_audio_url_note_exact() -> None:
     assert rendered.note.data.decode() == (
         "---\n"
         'type: "audio"\n'
-        "contract: 1\n"
+        "contract: 2\n"
         'source: "earmark"\n'
         'origin: "url"\n'
         'title: "Board meeting"\n'
@@ -143,7 +143,7 @@ def test_upload_note_exact() -> None:
     assert rendered.note.data.decode() == (
         "---\n"
         'type: "audio"\n'
-        "contract: 1\n"
+        "contract: 2\n"
         'source: "earmark"\n'
         'origin: "upload"\n'
         'title: "clip"\n'
@@ -169,7 +169,7 @@ def test_instructions_file_exact() -> None:
     assert rendered.instructions.data.decode() == (
         "---\n"
         'type: "earmark-instructions"\n'
-        "contract: 1\n"
+        "contract: 2\n"
         'for: "2026-01-02-le-podcast-episode-1-tests.md"\n'
         'guid: "feed:urn:example:guid-1"\n'
         f'job_id: "{DELIVERY_JOB_ID}"\n'
@@ -280,7 +280,7 @@ def test_key_order_and_scalar_types() -> None:
         "type", "contract", "source", "origin", "title", "show", "date", "published",
         "duration", "language", "apple_url", "guid", "shared_at", "transcript_sha256", "tags",
     ]  # fmt: skip
-    assert front["contract"] == 1
+    assert front["contract"] == 2
     assert type(front["contract"]) is int
     assert type(front["date"]) is date
     assert type(front["published"]) is date
@@ -695,3 +695,101 @@ def test_transcript_sha256_is_over_the_body_bytes() -> None:
     head, _, body = note.partition(b"\n---\n")
     assert _front(note)["transcript_sha256"] == hashlib.sha256(body).hexdigest()
     assert head.startswith(b"---\n")
+
+
+# -- video notes (contract 2) -----------------------------------------------------------
+
+
+def _video(
+    *,
+    title: str = "An Example Talk",
+    channel: str = "The Example Channel",
+    video_id: str = "exampleVid1",
+) -> tuple[bytes, bytes, str, str]:
+    """(note, instructions, note file name, guid) for a YouTube job at +02:00."""
+    from earmark.youtube.links import canonical_youtube_url, youtube_episode
+
+    job = make_delivery_job(
+        source="youtube",
+        url=canonical_youtube_url(video_id),
+        instructions="Summarise it.",
+        utc_offset_min=120,
+    )
+    episode = youtube_episode(
+        video_id,
+        title=title,
+        channel=channel,
+        published_at=datetime(2026, 11, 21, 15, 0, tzinfo=UTC),
+        published_date_only=False,
+        duration_s=125.0,
+    )
+    rendered = render_note(
+        job, episode, make_transcript_with(SEGMENTS, episode=episode), first_shared_at=T0
+    )
+    return rendered.note.data, rendered.instructions.data, rendered.note.filename, rendered.guid
+
+
+def test_video_note_fields() -> None:
+    note, instructions, name, guid = _video()
+    front = _front(note)
+    assert list(front) == [
+        "type", "contract", "source", "origin", "title", "channel", "date", "published",
+        "duration", "language", "source_url", "guid", "shared_at", "transcript_sha256", "tags",
+    ]  # fmt: skip
+    assert front["type"] == "video"
+    assert front["contract"] == 2
+    assert front["origin"] == "youtube"
+    assert front["channel"] == "The Example Channel"
+    assert front["source_url"] == "https://youtu.be/exampleVid1"
+    assert front["guid"] == guid == "youtube:exampleVid1"
+    assert front["tags"] == ["video"]
+    assert "show" not in front
+    assert "apple_url" not in front
+    assert name == "2026-11-21-the-example-channel-an-example-talk.md"
+    assert (
+        note.decode()
+        .split("\n---\n", 1)[1]
+        .startswith("# The Example Channel — An Example Talk\n\n## Transcript\n\n")
+    )
+    assert 'guid: "youtube:exampleVid1"' in instructions.decode()
+
+
+def test_video_note_no_channel() -> None:
+    note, _, name, _ = _video(channel="")
+    front = _front(note)
+    assert "channel" not in front
+    assert name == "2026-11-21-an-example-talk.md"
+    assert note.decode().split("\n---\n", 1)[1].startswith("# An Example Talk\n\n## Transcript")
+
+
+def test_video_slug_fallback() -> None:
+    note, _, name, _ = _video(title="", channel="", video_id="ex_ample-02")
+    assert _front(note)["title"] == "YouTube video ex_ample-02"
+    assert name == "2026-11-21-youtube-video-ex-ample-02.md"
+    _, _, name2, _ = _video(title="日本語", channel="", video_id="ex_ample-02")
+    assert name2 == "2026-11-21-youtube-ex-ample-02.md"
+
+
+def test_every_note_is_contract_2() -> None:
+    podcast, _ = _podcast()
+    assert _front(podcast)["contract"] == 2
+    job, episode = make_audio_job()
+    rendered = render_note(
+        job, episode, make_transcript_with(SEGMENTS, episode=episode), first_shared_at=T0
+    )
+    assert _front(rendered.note.data)["contract"] == 2
+    assert _front(rendered.instructions.data)["contract"] == 2
+    assert _front(_video()[1])["contract"] == 2
+
+
+def test_podcast_is_apple_only() -> None:
+    job, episode = make_audio_job(source="url")
+    front = _front(
+        render_note(
+            job, episode, make_transcript_with(SEGMENTS, episode=episode), first_shared_at=T0
+        ).note.data
+    )
+    assert front["type"] == "audio"
+    assert "show" not in front
+    assert "channel" not in front
+    assert note_guid(episode).startswith("sha256:")

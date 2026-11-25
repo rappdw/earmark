@@ -108,6 +108,9 @@ the Repo Map (its `## Repo Map` section). Choose the folder from the Repo Map, o
 instructions when they name one. Never choose a project workspace unless the instructions or
 the owner name it. Show the proposal and wait for the owner, unless the level is hands-off.
 
+The note's `type` is `podcast`, `audio`, or `video` (a YouTube video, with its `channel`). A
+video is filed like the others, by the Repo Map.
+
 If `previously_filed` is set, say that the earlier note is gone and ask the owner, in every
 mode.
 

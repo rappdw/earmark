@@ -31,6 +31,7 @@ from tests.factories import (
     new_podcast_job,
     new_upload_job,
     new_url_job,
+    new_youtube_job,
 )
 
 URL = "https://podcasts.apple.com/us/podcast/x/id1?i=2"
@@ -424,6 +425,18 @@ def test_dedupe_distinguishes_source_and_subject(store: JobStore) -> None:
     assert len(ids) == 4
     again = store.enqueue(new_upload_job("a" * 64, upload_file="f" * 32 + ".mp3"))
     assert not again.created
+
+
+def test_youtube_dedupe_subject(store: JobStore) -> None:
+    canonical = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    first = store.enqueue(new_youtube_job(canonical, instructions="x"))
+    again = store.enqueue(new_youtube_job(canonical, instructions="x"))
+    assert (first.created, again.created) == (True, False)
+    assert again.job.id == first.job.id
+    assert first.job.source == "youtube"
+    assert store.enqueue(new_youtube_job(canonical, instructions="y")).created
+    assert store.enqueue(new_youtube_job(canonical, to="b@example.org", instructions="x")).created
+    assert store.enqueue(new_url_job(canonical, instructions="x")).created  # another source
 
 
 def test_enqueue_rejects_inconsistent_jobs(store: JobStore) -> None:

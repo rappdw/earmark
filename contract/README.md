@@ -10,18 +10,22 @@ Shortcut to the service, has no folder here.
 
 | Version | Text | Samples | Status |
 |---|---|---|---|
-| `1` | `mail-v1.md` | `samples/v1/` | `DRAFT` |
+| `1` | `mail-v1.md` | `samples/v1/` (frozen) | `DRAFT`, still accepted |
+| `2` | `mail-v2.md` | `samples/v2/` | `DRAFT`, what the service sends |
 
-A revision is a new text and a new samples folder, `mail-v2.md` and `samples/v2/`. The old
-files stay, because mail sent under v1 can still be waiting in an inbox. `docs/PLAN.md` and
-`docs/ARCHITECTURE.md` are updated in the same commit. A test pins the v1 text by hash, so
-an edit to it cannot pass quietly.
+Version 2 (step 32) adds YouTube: `type: video`, `origin: youtube` and the `channel` key. It
+is written as a list of changes to version 1. The service sends `contract: 2` for all mail,
+and the receiving skill and the checker accept both versions. A revision is a new text and a
+new samples folder. The old files stay, because mail sent under an earlier version can
+still be waiting in an inbox. `docs/PLAN.md` and `docs/ARCHITECTURE.md` are updated in the
+same commit. A test pins each text by hash, so an edit to one cannot pass quietly, and the v1
+samples are frozen: they are pinned by hash, because the mail code no longer builds them.
 
 ## The checker
 
 `plugins/earmark-pka/skills/earmark-receive/scripts/check_mail.py` is the only copy (a test
 enforces it), and the plugin and skill around it are step 30's, and its receiver imports it. It reads the standard
-library only, needs Python 3.9 or newer, and is run as `python3 -I`:
+library only, needs Python 3.9 or newer, and is run as `python3 -I`, and checks contract 1 and contract 2:
 
 ```text
 python3 -I check_mail.py message [--json] PATH
@@ -49,5 +53,6 @@ unreadable file) and 64 (a usage error).
 
 ## Samples
 
-`samples/v1/README.md` says what each sample shows. `make samples` regenerates them from
-`tests/contract_samples.py`; review the diff before committing.
+`samples/v2/README.md` and `samples/v1/README.md` say what each sample shows. `make samples`
+regenerates the v2 samples from `tests/contract_samples.py`; review the diff before
+committing. The v1 samples are never regenerated.

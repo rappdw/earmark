@@ -41,6 +41,8 @@ jobs:
         run: |
           docker run --rm earmark:ci --version
           docker run --rm --entrypoint python earmark:ci -c "import ctranslate2, faster_whisper"
+          docker run --rm --entrypoint deno earmark:ci --version
+          docker run --rm --entrypoint python earmark:ci -c "import yt_dlp, yt_dlp_ejs"
           test "$(docker run --rm --entrypoint id earmark:ci -u)" = 1000
           test "$(docker run --rm --entrypoint printenv earmark:ci HF_HUB_DISABLE_TELEMETRY)" = 1
           docker image ls earmark:ci

@@ -1,0 +1,14 @@
+{
+  "info": {
+    "_type": "video",
+    "id": "yZIXLfi8CZQ",
+    "title": "youtube video #yZIXLfi8CZQ",
+    "age_limit": 0,
+    "formats": []
+  },
+  "warnings": [
+    "[youtube] Private video. If the owner of this video has granted you access, please sign in. Use --cookies-from-browser or --cookies for the authentication.",
+    "No video formats found!",
+    "Requested format is not available"
+  ]
+}

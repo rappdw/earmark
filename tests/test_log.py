@@ -151,6 +151,8 @@ def test_logger_name_predicates() -> None:
     assert is_quiet_logger("httpx")
     assert is_quiet_logger("huggingface_hub.utils._http")
     assert is_quiet_logger("httpx2")
+    assert is_quiet_logger("yt_dlp")
+    assert "yt_dlp" in QUIET_LOGGERS
     assert not is_quiet_logger("httpxy")
     assert not is_quiet_logger("uvicorn.access")
 

@@ -15,6 +15,7 @@ from earmark.fakes import (
     FakeNotifier,
     FakeResolver,
     FakeTranscriber,
+    FakeYoutubeSource,
 )
 from earmark.pipeline import factory
 from tests.factories import TO, new_podcast_job
@@ -24,6 +25,7 @@ SHARE = "https://podcasts.apple.com/us/podcast/x/id1200361736?i=1000802907981&uo
 FIELDS: dict[str, tuple[typing.Any, typing.Mapping[str, object]]] = {
     "resolver_backend": (config.ResolverBackend, factory.RESOLVERS),
     "fetch_backend": (config.FetchBackend, factory.FETCHERS),
+    "youtube_backend": (config.YoutubeBackend, factory.YOUTUBE_SOURCES),
     "asr_backend": (config.AsrBackend, factory.TRANSCRIBERS),
     "mail_backend": (config.MailBackend, factory.MAILERS),
     "notify_backend": (config.NotifyBackend, factory.NOTIFIERS),
@@ -82,6 +84,7 @@ def test_all_fake_builds_fakes(tmp_path: Path) -> None:
     b = factory.build_backends(_fake_settings(tmp_path), artifacts)
     assert isinstance(b.resolver, FakeResolver)
     assert isinstance(b.fetcher, FakeAudioFetcher)
+    assert isinstance(b.youtube, FakeYoutubeSource)
     assert isinstance(b.transcriber, FakeTranscriber)
     assert isinstance(b.mailer, FakeMailer)
     assert isinstance(b.notifier, FakeNotifier)
@@ -122,7 +125,7 @@ def test_pipeline_modules_import_light() -> None:
         "import sys\n"
         "import earmark.pipeline.runner, earmark.pipeline.worker, earmark.pipeline.factory\n"
         "heavy = {'fastapi', 'starlette', 'uvicorn', 'httpx2', 'faster_whisper', 'onnxruntime',\n"
-        "         'numpy'}\n"
+        "         'numpy', 'yt_dlp', 'yt_dlp_ejs'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in heavy))\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
@@ -281,7 +284,10 @@ def test_fake_mailer_writes_outbox(tmp_path: Path) -> None:
 def test_build_worker_logs_mail_backend(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("INFO", logger="earmark.pipeline.factory"):
         factory.build_worker(_fake_settings(tmp_path))
-    assert "backends: resolver=fake fetch=fake asr=fake mail=fake notify=fake" in caplog.text
+    assert (
+        "backends: resolver=fake fetch=fake youtube=fake asr=fake mail=fake notify=fake"
+        in caplog.text
+    )
 
 
 def test_build_worker_passes_recipient_policy(tmp_path: Path) -> None:
@@ -323,3 +329,29 @@ def test_factory_does_not_import_smtp_module() -> None:
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert proc.stdout.strip() == "[]"
+
+
+def test_youtube_registry_and_missing_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert set(factory.YOUTUBE_SOURCES) == {"fake", "ytdlp"}
+    monkeypatch.setitem(sys.modules, "yt_dlp", None)
+    with pytest.raises(ConfigError, match="uv sync --extra youtube"):
+        factory.build_backends(
+            _fake_settings(tmp_path, youtube_backend="ytdlp"), ArtifactStore(tmp_path / "data")
+        )
+
+
+def test_ytdlp_backend_builds_from_a_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from earmark.youtube import ytdlp
+    from tests.ytdlp_fakes import fake_runtime
+
+    fake = fake_runtime(tmp_path)
+    monkeypatch.setattr(ytdlp, "load_runtime", lambda: fake.runtime)
+    b = factory.build_backends(
+        _fake_settings(tmp_path, youtube_backend="ytdlp"), ArtifactStore(tmp_path / "data")
+    )
+    assert isinstance(b.youtube, ytdlp.YtDlpYoutubeSource)
+    assert not fake.sessions

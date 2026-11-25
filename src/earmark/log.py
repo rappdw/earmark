@@ -35,6 +35,7 @@ QUIET_LOGGERS: Final = (
     "httpcore2",
     "urllib3",
     "huggingface_hub",
+    "yt_dlp",
 )
 LIBRARY_HANDLER_LOGGERS: Final = ("huggingface_hub",)
 OWN_LOGGER: Final = "earmark"

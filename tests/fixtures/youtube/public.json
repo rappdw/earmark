@@ -1,0 +1,51 @@
+{
+  "_type": "video",
+  "id": "jNQXAC9IVRw",
+  "title": "Me at the zoo",
+  "channel": "jawed",
+  "uploader": "jawed",
+  "upload_date": "20050424",
+  "timestamp": 1114313512,
+  "duration": 19,
+  "live_status": "not_live",
+  "was_live": false,
+  "is_live": false,
+  "availability": "public",
+  "age_limit": 0,
+  "extractor_key": "Youtube",
+  "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+  "format_id": "251",
+  "ext": "webm",
+  "protocol": "https",
+  "acodec": "opus",
+  "vcodec": "none",
+  "filesize": 252182,
+  "filesize_approx": 252180,
+  "url": "https://rr1---sn-placeholder.googlevideo.com/videoplayback?expire=0&id=placeholder",
+  "formats": [
+    {
+      "format_id": "139",
+      "ext": "m4a",
+      "acodec": "mp4a.40.5",
+      "vcodec": "none",
+      "protocol": "https",
+      "filesize": 117526
+    },
+    {
+      "format_id": "140",
+      "ext": "m4a",
+      "acodec": "mp4a.40.2",
+      "vcodec": "none",
+      "protocol": "https",
+      "filesize": 309288
+    },
+    {
+      "format_id": "251",
+      "ext": "webm",
+      "acodec": "opus",
+      "vcodec": "none",
+      "protocol": "https",
+      "filesize": 252182
+    }
+  ]
+}

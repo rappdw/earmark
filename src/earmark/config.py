@@ -13,6 +13,7 @@ from earmark.recipients import ALL, RecipientPolicy, normalize_address
 
 ResolverBackend = Literal["apple", "fake"]
 FetchBackend = Literal["http", "fake"]
+YoutubeBackend = Literal["ytdlp", "fake"]
 AsrBackend = Literal["faster_whisper", "remote", "fake"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
 MailBackend = Literal["smtp", "fake"]
@@ -75,6 +76,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(Path("./data"), description="Working data (jobs DB, episode cache).")
     resolver_backend: ResolverBackend = Field("apple", description="Episode URL resolver.")
     fetch_backend: FetchBackend = Field("http", description="Audio/feed fetcher.")
+    youtube_backend: YoutubeBackend = Field("ytdlp", description="YouTube source.")
     asr_backend: AsrBackend = Field("faster_whisper", description="Transcription backend.")
     notify_backend: NotifyBackend = Field("ntfy", description="Notifier.")
     mail_backend: MailBackend = Field("smtp", description="Mail sender.")

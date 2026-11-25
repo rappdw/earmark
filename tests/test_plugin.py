@@ -23,6 +23,7 @@ SKILL: Final = SKILL_DIR / "SKILL.md"
 # plugin, the checker included, needs a new version in plugin.json and a new row here.
 PLUGIN_RELEASES: Final[dict[str, str]] = {
     "1.0.0": "f0e31e5d2baadb7baed8c3253077796fb4250642df069fa8e07e687e5789329b",
+    "1.1.0": "43dbd67a38a7f3c273808b9c4d364812222f2513af247cbb0b56eef2298d3bea",
 }
 
 # The documented fields (code.claude.com, "Marketplace reference" and "Plugin manifest reference",

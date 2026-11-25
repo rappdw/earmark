@@ -23,6 +23,7 @@ from earmark.models import (
 )
 from earmark.resolve.apple import APPLE_HOSTS, UnsupportedUrlError, parse_apple_url
 from earmark.sanitize import clean_unicode
+from earmark.youtube.links import canonical_youtube_url, is_youtube_host, video_id_of
 
 HASH_CHUNK: Final = 1024 * 1024
 MAX_UPLOAD_NAME_CHARS: Final = 255
@@ -34,8 +35,8 @@ _JOINERS: Final = frozenset({"‌", "‍"})
 
 @dataclass(frozen=True, slots=True)
 class SourceUrl:
-    source: Literal["apple_podcasts", "url"]
-    url: str  # apple: canonical episode URL; url: the URL without its fragment
+    source: Literal["apple_podcasts", "url", "youtube"]
+    url: str  # apple, youtube: the canonical URL; url: the URL without its fragment
 
 
 def parse_source_url(text: str, /) -> SourceUrl:
@@ -44,13 +45,15 @@ def parse_source_url(text: str, /) -> SourceUrl:
     if not text or len(text) > MAX_URL_CHARS or any(c <= " " or c == "\x7f" for c in text):
         raise UnsupportedUrlError("malformed")
     if "://" not in text:
-        # Only an Apple link may leave out the scheme.
+        # Only an Apple or YouTube link may leave out the scheme.
         try:
             host = (urlsplit("https://" + text).hostname or "").rstrip(".")
         except ValueError:
             raise UnsupportedUrlError("malformed") from None
         if host in APPLE_HOSTS:
             return SourceUrl("apple_podcasts", parse_apple_url(text).url)
+        if is_youtube_host(host):
+            return _parse_youtube("https://" + text)
         raise UnsupportedUrlError("malformed")
     try:
         parts = urlsplit(text)
@@ -66,9 +69,25 @@ def parse_source_url(text: str, /) -> SourceUrl:
         return SourceUrl("apple_podcasts", parse_apple_url(text).url)
     if host == "apple.com" or host.endswith(".apple.com"):
         raise UnsupportedUrlError("not_episode")
+    if is_youtube_host(host):
+        return _parse_youtube(text)
     if "@" in parts.netloc:
         raise UnsupportedUrlError("credentials")
     return SourceUrl("url", parts._replace(fragment="").geturl())
+
+
+def _parse_youtube(text: str, /) -> SourceUrl:
+    """A link on a YouTube host: one video, as its canonical URL, or ``UnsupportedUrlError``."""
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        raise UnsupportedUrlError("malformed") from None
+    if "@" in parts.netloc:
+        raise UnsupportedUrlError("credentials")
+    if port is not None:
+        raise UnsupportedUrlError("malformed")
+    return SourceUrl("youtube", canonical_youtube_url(video_id_of(parts)))
 
 
 def display_url(url: str, /) -> str:

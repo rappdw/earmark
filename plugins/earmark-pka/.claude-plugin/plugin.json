@@ -1,6 +1,6 @@
 {
   "name": "earmark-pka",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Checks and files the earmark transcript emails that AMAP delivers to a PKA",
   "author": {
     "name": "rappdw",

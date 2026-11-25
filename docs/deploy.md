@@ -15,6 +15,9 @@ through this guide in order, with a check after each phase.
   linux/arm64), not run-tested. CI builds it and runs only `earmark --version`, an import
   of the extras, and a user-id check inside it. The API and worker have never run in a
   container, because the build sandbox has no Docker.
+- YouTube downloads are not tested here. The tests run yt-dlp stubbed, and the weekly `slow`
+  job runs the real library offline. A real download needs YouTube's answer to your server's
+  address, so only runbook phase 4 checks one (section 18).
 - The GPU image is untested: CI only runs `docker build --check` on `Dockerfile.gpu`, and it
   has never been built or run. The Spark smoke test in section 7 is the only real check.
 - The systemd units are examples, reviewed but never run.
@@ -104,7 +107,7 @@ in `.env`, which compose also reads.
 | `API_BIND` | `127.0.0.1:8787` | Host address and port the API is published on. Leave it at the default. |
 | `APP_UID` | `1000` | User id both images run as; the data volume belongs to it. |
 | `APP_GID` | `1000` | Group id both images run as. |
-| `EXTRAS` | `transcribe` | Optional extras in the CPU image (`api`). `serve` needs none, but a CPU-only worker (7.2) needs `transcribe`. |
+| `EXTRAS` | `transcribe youtube` | Optional extras in the CPU image (`api`). `serve` needs none, but a CPU-only worker (7.2) needs `transcribe`, and YouTube links (section 18) need `youtube`. |
 | `HF_HUB_DISABLE_TELEMETRY` | `1` | Hugging Face telemetry in the containers; `0` turns it back on (section 17). Read by Hugging Face's libraries, not by earmark. |
 
 Things to know:
@@ -145,8 +148,12 @@ checks the API), and contain no `.env` file; compose passes the settings in.
 
    ```bash
    sudo -u earmark env UV_PYTHON_INSTALL_DIR=/srv/earmark/.python \
-     uv sync --locked --no-dev --extra transcribe
+     uv sync --locked --no-dev --extra transcribe --extra youtube
    ```
+
+   The `youtube` extra brings yt-dlp and the Deno runtime it needs (section 18). A worker
+   without it refuses to start, naming the extra: add it, or set
+   `EARMARK_YOUTUBE_BACKEND=fake` to run without YouTube.
 
 3. Create `/srv/earmark/.env` (mode 0600, owned by `earmark`) with the settings from
    section 4, and `EARMARK_HOST=127.0.0.1` and `EARMARK_DATA_DIR=/srv/earmark/data`.
@@ -384,8 +391,8 @@ services:
       EARMARK_ASR_COMPUTE_TYPE: int8
 ```
 
-The worker then uses the CPU image (set `EXTRAS` to include `transcribe`, which is the
-default) and `int8` on the CPU. Use a smaller `EARMARK_ASR_MODEL` on a CPU, such as `small`
+The worker then uses the CPU image (set `EXTRAS` to include `transcribe` and `youtube`,
+which is the default) and `int8` on the CPU. Use a smaller `EARMARK_ASR_MODEL` on a CPU, such as `small`
 or `distil-large-v3`. Without the override, a worker with `EARMARK_ASR_DEVICE=cuda` and no
 GPU refuses to start.
 
@@ -688,6 +695,11 @@ grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PA
 - **Upgrade** with `git pull`, `docker compose build` (the GPU image rebuilds CTranslate2,
   so it takes long), and `docker compose up -d`. Migrations run on start. After a rebuild,
   repeat smoke steps 2 and 4 (section 7.3).
+- **The database moves to schema 4** the first time this version starts (the `youtube`
+  source). An older image then refuses the database as newer than it supports, so back up
+  `earmark.db` (and its `-wal` and `-shm` files, with earmark stopped) before upgrading. A
+  native install that skips `--extra youtube` on upgrade must add it, or set
+  `EARMARK_YOUTUBE_BACKEND=fake`: the worker refuses to start without the extra.
 
 ## 16. Troubleshooting
 
@@ -713,6 +725,9 @@ grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PA
 | a PKA got the same message twice | Delivery is at-least-once; the PKA's dedupe drops it. |
 | doctor or startup: `was created by earmark 0.1.0` | Section 14. |
 | the worker exits "sees no CUDA device" | Section 7.4. |
+| the worker exits naming the `youtube` extra | The extra is not installed: section 5, or `EARMARK_YOUTUBE_BACKEND=fake`. |
+| a YouTube job failed: "out of date", "no audio-only stream" or "HTTP 403" | yt-dlp needs an upgrade: section 18.2. |
+| a YouTube job failed: "prove it is not a bot" | YouTube checks the server's address; earmark does not sign in. Share the link again later (section 18.1). |
 | "refused non-public address" | A resolver answered a tracker with `0.0.0.0` (section 11). |
 | "You are sending unauthenticated requests to the HF Hub" in the worker log | Informational, shown once per process on a model download. Public models need no token, and earmark never reads one; `huggingface_hub` uses `HF_TOKEN` if you set it in the service environment. |
 
@@ -743,3 +758,69 @@ Whisper model), do not get the unit's environment. Prefix them with
 container). hf_xet prunes them at 250 MB or 14 days. They hold hosts and request ids but no
 URL paths. Earmark leaves them there. `HF_XET_LOG_DEST` (a directory ending in `/`, or a
 file) moves them, and an empty value is ignored.
+
+## 18. YouTube
+
+A YouTube video link is a request like a podcast link (step 32). The worker has yt-dlp read
+the video's title, channel and date, download an audio-only stream, and transcribe it; the
+note is `type: video` (`contract: 2`).
+
+### 18.1 What it needs, and what it refuses
+
+- **The `youtube` extra** of the project, locked in `uv.lock` and installed by both images
+  and by the native `uv sync` (sections 4 and 5): yt-dlp, `yt-dlp-ejs` (the scripts that
+  solve YouTube's player challenges, pinned by yt-dlp to its own version), and Deno, the
+  JavaScript runtime those scripts run in, as a PyPI wheel. Nothing is installed from `apt`
+  or fetched at run time. The player's JavaScript runs in Deno with no file, network,
+  environment or process permission.
+- **No ffmpeg, no cookies, no sign-in.** earmark picks an audio-only stream and sends the file
+  to the transcriber as it is.
+- `EARMARK_YOUTUBE_BACKEND` is `ytdlp` (the default) or `fake`. `earmark doctor` shows the
+  three versions and fails when the extra or Deno is missing. It makes no request.
+- Deno keeps a small cache under `<data dir>/cache/deno/`. Downloads sit in
+  `<data dir>/downloads/` while a job runs and are deleted when it ends. The size cap is
+  `EARMARK_MAX_AUDIO_MB`; there is no duration cap.
+- **Refused, with the reason in the failure and the push:** a live stream or a premiere that
+  has not aired, a recording YouTube is still processing, private, removed, members-only and
+  Premium videos, age-restricted videos, and videos that are not available in the server's
+  country. A bot check fails the job and is not retried: earmark does not sign in to YouTube,
+  and retrying from the same address adds requests. YouTube's "try again later" is retried
+  after an hour.
+- A link to a channel, a playlist or a search is refused at once with a 422.
+
+### 18.2 Updating yt-dlp
+
+YouTube changes break yt-dlp every few weeks. When a job fails with "out of date", "no
+audio-only stream" or "HTTP 403", upgrade it and rebuild:
+
+```bash
+uv lock --upgrade-package yt-dlp --upgrade-package yt-dlp-ejs --upgrade-package deno
+make check
+git commit -am "Upgrade yt-dlp"
+# on the Spark:
+git pull
+docker compose build
+docker compose up -d
+docker compose run --rm worker doctor
+```
+
+Upgrade the three together: yt-dlp pins the `yt-dlp-ejs` it needs. Dependabot proposes the
+update weekly (its seven-day cooldown applies; run the lock command by hand when a failure
+cannot wait). The weekly `slow` job runs the real library offline, so a broken upgrade shows
+there, but only a share on the Spark proves a download.
+
+### 18.3 What earmark fetches from YouTube
+
+yt-dlp makes its own requests, so this is the one exception to "every third-party fetch goes
+through `fetch.py`":
+
+- yt-dlp gets one URL, `https://www.youtube.com/watch?v=<id>`, built by earmark from the
+  video id; never the string the client sent. Only the `youtube` extractor is loaded: no
+  generic extractor, no playlists, no plugins, no config files, no cookies kept, no
+  environment proxies, no remote components.
+- The stream must be `https` on a `googlevideo.com` host before anything is downloaded.
+- yt-dlp's requests to YouTube's hosts do not pass the private-address guard or
+  `EARMARK_ALLOW_PRIVATE_FETCH`. A resolver that points those names at a private address is
+  not caught. The size cap is kept.
+- Logs and pushes name the video by its id and title, never a URL; yt-dlp's debug output
+  never prints.

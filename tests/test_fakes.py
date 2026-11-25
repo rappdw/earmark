@@ -6,6 +6,7 @@ import pytest
 
 from earmark.errors import PermanentError, TransientError
 from earmark.fakes import (
+    FAKE_NOW,
     FAKE_SENDER,
     DownloadCall,
     FakeAudioFetcher,
@@ -14,12 +15,15 @@ from earmark.fakes import (
     FakeNotifier,
     FakeResolver,
     FakeTranscriber,
+    FakeYoutubeSource,
     FetchCall,
     ResolveCall,
     TranscribeCall,
+    YoutubeDownloadCall,
+    YoutubeResolveCall,
     make_fake_backends,
 )
-from earmark.models import Episode, Transcript
+from earmark.models import Episode, Transcript, youtube_key
 from earmark.pipeline.stages import OutgoingMail
 from tests.factories import make_episode, make_job
 
@@ -297,3 +301,39 @@ def test_fake_resolver_sets_feed_guid() -> None:
     episode = FakeResolver().resolve(URL)
     assert episode.feed_guid == episode.guid
     assert episode.published_date_only is False
+
+
+def test_fake_youtube_source(tmp_path: Path) -> None:
+    source = FakeYoutubeSource(payload=b"default", payloads={"ex_ample-02": b"special"})
+    episode = source.resolve("jNQXAC9IVRw")
+    assert episode.key == youtube_key("jNQXAC9IVRw")
+    assert (episode.title, episode.show_title) == ("Fake video jNQXAC9IVRw", "Fake Channel")
+    assert (episode.published_at, episode.duration_s) == (FAKE_NOW, 600.0)
+    assert source.resolve("jNQXAC9IVRw") == episode  # deterministic
+    first = source.download("jNQXAC9IVRw", lambda ext: tmp_path / f"one.{ext}")
+    second = source.download("ex_ample-02", lambda ext: tmp_path / f"two.{ext}")
+    assert (first.name, first.read_bytes(), second.read_bytes()) == (
+        "one.webm",
+        b"default",
+        b"special",
+    )
+    assert source.downloads == 2
+    assert source.calls == [
+        YoutubeResolveCall("jNQXAC9IVRw"),
+        YoutubeResolveCall("jNQXAC9IVRw"),
+        YoutubeDownloadCall("jNQXAC9IVRw"),
+        YoutubeDownloadCall("ex_ample-02"),
+    ]
+    source.fail_next(PermanentError("gone"))
+    with pytest.raises(PermanentError, match="gone"):
+        source.download("jNQXAC9IVRw", lambda ext: tmp_path / f"three.{ext}")
+    assert source.downloads == 2
+    assert not (tmp_path / "three.webm").exists()
+    custom = FakeYoutubeSource(episodes={"jNQXAC9IVRw": episode.model_copy(update={"title": "T"})})
+    assert custom.resolve("jNQXAC9IVRw").title == "T"
+
+
+def test_fake_backends_carry_a_youtube_source(tmp_path: Path) -> None:
+    fb = make_fake_backends(tmp_path)
+    assert isinstance(fb.youtube, FakeYoutubeSource)
+    assert fb.backends().youtube is fb.youtube

@@ -21,7 +21,7 @@ from earmark.jobs import NewJob
 from earmark.log import configure_logging
 from earmark.models import Job
 from earmark.notify.ntfy import NtfyClient, NtfyNotifier, NtfyOptions
-from tests.factories import new_podcast_job, new_upload_job, new_url_job
+from tests.factories import new_podcast_job, new_upload_job, new_url_job, new_youtube_job
 from tests.http_helpers import mock_fetcher
 from tests.ntfy_stub import PUBLISHED, TOPIC_URL, json_reply
 from tests.pipeline_env import CANON, PipelineEnv, make_env
@@ -37,6 +37,8 @@ OTHER_TO = "you@example.org"
 DIRECT_URL = "https://audio.example.net/private/PATH-TOKEN-91d2.mp3?sig=QUERY-TOKEN-a77b"
 FILENAME = "FILE-TOKEN-3b8f.m4a"
 TITLE = "TITLE-TOKEN-0d4e"
+YOUTUBE_ID = "jNQXAC9IVRw"
+YOUTUBE_URL = f"https://www.youtube.com/watch?v={YOUTUBE_ID}"
 URL_TOKENS = ("PATH-TOKEN", "QUERY-TOKEN", "/private/", "?sig=")
 
 
@@ -174,6 +176,8 @@ def _enqueue_source(env: PipelineEnv, source: str) -> Job:
         new = new_podcast_job(CANON, to=SECRET_TO, instructions=INSTRUCTIONS, title=TITLE)
     elif source == "url":
         new = new_url_job(DIRECT_URL, to=SECRET_TO, instructions=INSTRUCTIONS, title=TITLE)
+    elif source == "youtube":
+        new = new_youtube_job(YOUTUBE_URL, to=SECRET_TO, instructions=INSTRUCTIONS, title=TITLE)
     else:
         with env.staging.begin_upload("m4a") as writer:
             writer.write(b"ID3" + bytes(200))
@@ -206,7 +210,7 @@ def _push_for(tmp_path: Path, source: str, status: str) -> str:
 
 
 @pytest.mark.parametrize("status", ["done", "failed"])
-@pytest.mark.parametrize("source", ["podcast", "upload", "url"])
+@pytest.mark.parametrize("source", ["podcast", "upload", "url", "youtube"])
 def test_push_has_no_instructions_url_path_or_address(
     tmp_path: Path, source: str, status: str
 ) -> None:
@@ -220,7 +224,7 @@ def test_push_has_no_instructions_url_path_or_address(
         assert "audio.example.net" in text
 
 
-@pytest.mark.parametrize("source", ["podcast", "upload", "url"])
+@pytest.mark.parametrize("source", ["podcast", "upload", "url", "youtube"])
 def test_push_carries_no_instructions(tmp_path: Path, source: str) -> None:
     assert "INSTR-TOKEN" not in _push_for(tmp_path, source, "done")
 
@@ -233,6 +237,42 @@ def test_direct_url_host_only_in_push(tmp_path: Path, status: str) -> None:
         assert token not in text
     if status == "done":
         assert "https://" not in text
+
+
+def test_youtube_job_leaks_nothing(tmp_path: Path, log_stream: io.StringIO) -> None:
+    """Logs and the push: no instructions, a masked address, no URL, no guid."""
+    notifier, bodies = _ntfy_with_capture()
+    fakes = make_fake_backends(tmp_path / "data")
+    env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), notifier=notifier))
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(create_app(_settings(tmp_path), store=env.jobs), headers=headers) as client:
+        posted = client.post(
+            "/transcriptions",
+            json={
+                "url": f"https://youtu.be/{YOUTUBE_ID}?si=SI-TOKEN-4e2a&t=9",
+                "to": SECRET_TO,
+                "instructions": INSTRUCTIONS,
+                "title": TITLE,
+            },
+        )
+        assert posted.status_code == 202
+    ran = env.worker.run_once()
+    assert ran is not None
+    assert ran.status == "done"
+    logs = log_stream.getvalue()
+    assert f"YouTube video {YOUTUBE_ID}" in logs
+    assert MASKED_TO in logs
+    [body] = bodies
+    push = body.decode()
+    for text in (logs, push):
+        assert "INSTR-TOKEN" not in text
+        assert "summarise the budget" not in text
+        assert "zelda.secret" not in text
+        assert "SI-TOKEN" not in text
+        assert "watch?v=" not in text
+        assert "youtu.be" not in text
+        assert "youtube:" not in text  # the guid
+    assert "https://" not in push
 
 
 def test_failed_push_scrubs_urls_from_the_reason(tmp_path: Path) -> None:
@@ -257,6 +297,7 @@ def _smtp_settings(tmp_path: Path, **overrides: object) -> Settings:
         "smtp_from": "earmark@example.org",
         "resolver_backend": "fake",
         "fetch_backend": "fake",
+        "youtube_backend": "fake",
         "asr_backend": "fake",
         "notify_backend": "fake",
         "api_token": SecretStr(TOKEN),

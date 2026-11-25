@@ -1,0 +1,30 @@
+{
+  "info": {
+    "_type": "video",
+    "id": "HtVdAasjOgU",
+    "title": "The Witcher 3: Wild Hunt - The Sword Of Destiny Trailer",
+    "channel": "The Witcher",
+    "live_status": "not_live",
+    "availability": "needs_auth",
+    "age_limit": 18,
+    "formats": [
+      {
+        "format_id": "137",
+        "ext": "mp4",
+        "acodec": "none",
+        "vcodec": "avc1.640028",
+        "protocol": "https"
+      },
+      {
+        "format_id": "248",
+        "ext": "webm",
+        "acodec": "none",
+        "vcodec": "vp9",
+        "protocol": "https"
+      }
+    ]
+  },
+  "warnings": [
+    "Requested format is not available"
+  ]
+}

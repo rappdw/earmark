@@ -16,6 +16,7 @@ from earmark.errors import PermanentError
 from earmark.models import Clock, Episode, Job, Segment, Transcript, episode_key
 from earmark.pipeline.stages import Backends, OutgoingMail
 from earmark.transcribe.base import asr_profile
+from earmark.youtube.links import youtube_episode
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
 FAKE_SENDER: Final = "earmark@example.org"  # the fake sends nothing; never used by smtp
@@ -63,6 +64,16 @@ class FetchCall:
 @dataclass(frozen=True)
 class DownloadCall:
     url: str
+
+
+@dataclass(frozen=True)
+class YoutubeResolveCall:
+    video_id: str
+
+
+@dataclass(frozen=True)
+class YoutubeDownloadCall:
+    video_id: str
 
 
 @dataclass(frozen=True)
@@ -135,6 +146,40 @@ class FakeAudioFetcher(FakeStage[FetchCall | DownloadCall]):
         path = self._artifacts.audio_path(episode.key, "mp3")
         atomic_write_bytes(path, self._payload)
         self.computed += 1
+        return path
+
+
+class FakeYoutubeSource(FakeStage[YoutubeResolveCall | YoutubeDownloadCall]):
+    def __init__(
+        self,
+        payload: bytes = b"fake youtube audio\n",
+        payloads: Mapping[str, bytes] | None = None,
+        episodes: Mapping[str, Episode] | None = None,
+    ) -> None:
+        super().__init__()
+        self._payload = payload
+        self._payloads = dict(payloads or {})
+        self._episodes = dict(episodes or {})
+        self.downloads = 0
+
+    def resolve(self, video_id: str) -> Episode:
+        self._enter(YoutubeResolveCall(video_id))
+        if video_id in self._episodes:
+            return self._episodes[video_id]
+        return youtube_episode(
+            video_id,
+            title=f"Fake video {video_id}",
+            channel="Fake Channel",
+            published_at=FAKE_NOW,
+            published_date_only=False,
+            duration_s=600.0,
+        )
+
+    def download(self, video_id: str, destination: Callable[[str], Path]) -> Path:
+        self._enter(YoutubeDownloadCall(video_id))
+        path = destination("webm")
+        atomic_write_bytes(path, self._payloads.get(video_id, self._payload))
+        self.downloads += 1
         return path
 
 
@@ -219,6 +264,7 @@ class FakeBackends:
     artifacts: ArtifactStore
     resolver: FakeResolver
     fetcher: FakeAudioFetcher
+    youtube: FakeYoutubeSource
     transcriber: FakeTranscriber
     mailer: FakeMailer
     notifier: FakeNotifier
@@ -227,6 +273,7 @@ class FakeBackends:
         return Backends(
             resolver=self.resolver,
             fetcher=self.fetcher,
+            youtube=self.youtube,
             transcriber=self.transcriber,
             mailer=self.mailer,
             notifier=self.notifier,
@@ -239,6 +286,7 @@ def make_fake_backends(data_dir: Path) -> FakeBackends:
         artifacts=artifacts,
         resolver=FakeResolver(),
         fetcher=FakeAudioFetcher(artifacts),
+        youtube=FakeYoutubeSource(),
         transcriber=FakeTranscriber(artifacts),
         mailer=FakeMailer(),
         notifier=FakeNotifier(),

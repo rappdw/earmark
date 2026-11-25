@@ -1,4 +1,6 @@
-"""The earmark mail contract (``contract: 1``) as a checker: standard library only, Python 3.9.
+"""The earmark mail contract (``contract: 1`` and ``2``) as a checker.
+
+Standard library only, Python 3.9.
 
 ``check_mail.py`` is the launcher; this module holds the rules. It reads a whole message
 (``message``), or the parts a PKA's inbox tools give it (``files``), and reports every
@@ -27,7 +29,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Final, NoReturn
 
-CONTRACT: Final = 1
+CONTRACTS: Final = (1, 2)
+CONTRACT: Final = 2  # the newest
 EXIT_OK, EXIT_FAILED, EXIT_PREREQUISITE, EXIT_USAGE = 0, 1, 2, 64
 CHECKER_NAME: Final = "earmark-mail-contract"
 
@@ -63,15 +66,24 @@ def _rules() -> tuple[Rule, ...]:
         ("note.required", "attachments", "every key the note's type requires is present"),
         ("note.omitted", "attachments", "keys the note's type or origin omits are absent"),
         ("note.types", "attachments", "each note key has its table type"),
-        ("note.type", "attachments", "type is podcast or audio"),
-        ("note.contract", "attachments", "contract is 1"),
+        ("note.type", "attachments", "type is podcast or audio, or video from contract 2"),
+        ("note.contract", "attachments", "contract is 1 or 2"),
         ("note.source", "attachments", "source is earmark"),
-        ("note.origin", "attachments", "origin is apple_podcasts, upload or url, matching type"),
+        (
+            "note.origin",
+            "attachments",
+            "origin is apple_podcasts, upload or url, or youtube from contract 2, matching type",
+        ),
         ("note.date", "attachments", "date equals the filename's date"),
         ("note.filename-date", "attachments", "date is the publish date, else the shared_at date"),
         ("note.duration", "attachments", "duration is hh:mm:ss"),
         ("note.language", "attachments", "language is a BCP 47 tag"),
         ("note.source-url", "attachments", "source_url has no userinfo, query or fragment"),
+        (
+            "note.source-url-youtube",
+            "attachments",
+            "a video's source_url is https://youtu.be/ and its guid's video id",
+        ),
         ("note.guid", "attachments", "guid has the form the note's type allows"),
         ("note.sha256-form", "attachments", "transcript_sha256 is 64 lower-case hex digits"),
         ("note.hash", "attachments", "transcript_sha256 is the sha256 of the body as sent"),
@@ -89,7 +101,7 @@ def _rules() -> tuple[Rule, ...]:
         ),
         ("instructions.types", "attachments", "each instructions key has its type"),
         ("instructions.type", "attachments", "type is earmark-instructions"),
-        ("instructions.contract", "attachments", "contract is 1"),
+        ("instructions.contract", "attachments", "contract is the note's (1 or 2)"),
         ("instructions.for", "attachments", "for is the note's filename"),
         ("instructions.guid", "attachments", "guid equals the note's guid"),
         ("subject.prefix", "subject", "the subject starts with [earmark] "),
@@ -134,6 +146,7 @@ class Report:
     failures: tuple[Failure, ...]
     skipped: tuple[str, ...]  # rule ids not run because an input was not given
     summary: dict[str, str | None]
+    contract: int | None = None  # the note's contract version, None when unknown
 
 
 # ---------------------------------------------------------------------------------------
@@ -368,7 +381,7 @@ def _split_fence(text: str) -> tuple[list[str], str] | None:
 # ---------------------------------------------------------------------------------------
 # The rules
 
-_NOTE_TYPES = {
+_NOTE_TYPES_V1 = {
     "type": "string",
     "contract": "int",
     "source": "string",
@@ -386,6 +399,10 @@ _NOTE_TYPES = {
     "transcript_sha256": "string",
     "tags": "list",
 }
+_NOTE_TYPES_V2 = {**_NOTE_TYPES_V1, "channel": "string"}
+_KIND_ORIGINS_V1 = {"podcast": ("apple_podcasts",), "audio": ("upload", "url")}
+_KIND_ORIGINS_V2 = {**_KIND_ORIGINS_V1, "video": ("youtube",)}
+_VIDEO_GUID = re.compile(r"youtube:([A-Za-z0-9_-]{11})")
 _NOTE_REQUIRED = (
     "type",
     "contract",
@@ -547,37 +564,59 @@ def _check_types(ctx: _Ctx, file: _File, table: dict[str, str], rule: str) -> bo
     return ok
 
 
+def _note_version(note: _File) -> int | None:
+    value = note.scalar("contract", "int")
+    for version in CONTRACTS:
+        if value == str(version):
+            return version
+    return None
+
+
 def _check_note(ctx: _Ctx, note: _File) -> None:
     if note.fields is None:
         return
     fields = note.fields
+    # A note whose version is unknown (only note.contract reports that) gets the newest tables.
+    v1 = _note_version(note) == 1
+    table = _NOTE_TYPES_V1 if v1 else _NOTE_TYPES_V2
+    kind_origins = _KIND_ORIGINS_V1 if v1 else _KIND_ORIGINS_V2
     for key in fields:
-        if key not in _NOTE_TYPES:
+        if key not in table:
             ctx.fail("note.keys", "note", "a key is not in the contract: " + key[:40])
     kind = note.string("type")
-    for key in _NOTE_REQUIRED + (("show",) if kind == "podcast" else ()):
+    required: tuple[str, ...] = _NOTE_REQUIRED
+    if kind == "podcast":
+        required = (*required, "show")
+    if kind == "video" and not v1:
+        required = (*required, "source_url")
+    for key in required:
         if key not in fields:
             ctx.fail("note.required", "note", "a required key is missing: " + key)
     origin = note.string("origin")
-    if kind == "audio":
-        for key in ("show", "apple_url"):
-            if key in fields:
-                ctx.fail("note.omitted", "note", "audio omits this key: " + key)
-    if "source_url" in fields and origin != "url":
-        ctx.fail("note.omitted", "note", "source_url belongs to origin url only")
+    omitted = {
+        "audio": ("show", "apple_url") if v1 else ("show", "apple_url", "channel"),
+        "podcast": () if v1 else ("channel",),
+        "video": ("show", "apple_url"),
+    }
+    for key in omitted.get(kind or "", ()):
+        if key in fields:
+            ctx.fail("note.omitted", "note", (kind or "") + " omits this key: " + key)
+    source_url_origins = ("url",) if v1 else ("url", "youtube")
+    if "source_url" in fields and origin not in source_url_origins:
+        ctx.fail("note.omitted", "note", "source_url belongs to origin url or youtube only")
     if kind == "podcast" and "source_url" in fields and origin == "url":
         ctx.fail("note.omitted", "note", "a podcast omits source_url")
-    _check_types(ctx, note, _NOTE_TYPES, "note.types")
-    if kind is not None and kind not in ("podcast", "audio"):
-        ctx.fail("note.type", "note", "type is neither podcast nor audio")
-    if note.scalar("contract", "int") not in (None, "1"):
-        ctx.fail("note.contract", "note", "contract is not 1")
+    _check_types(ctx, note, table, "note.types")
+    if kind is not None and kind not in kind_origins:
+        ctx.fail("note.type", "note", "type is not valid for this contract")
+    if note.scalar("contract", "int") not in (None, "1", "2"):
+        ctx.fail("note.contract", "note", "contract is not 1 or 2")
     source = note.string("source")
     if source is not None and source != "earmark":
         ctx.fail("note.source", "note", "source is not earmark")
     if origin is not None:
-        wrong = origin not in ("apple_podcasts", "upload", "url")
-        if kind in ("podcast", "audio") and (origin == "apple_podcasts") != (kind == "podcast"):
+        wrong = origin not in {o for origins in kind_origins.values() for o in origins}
+        if kind in kind_origins and origin not in kind_origins[kind]:
             wrong = True
         if wrong:
             ctx.fail("note.origin", "note", "origin is not valid for this type")
@@ -603,15 +642,32 @@ def _check_note(ctx: _Ctx, note: _File) -> None:
         if userinfo or "?" in source_url or "#" in source_url:
             ctx.fail("note.source-url", "note", "source_url has userinfo, a query or a fragment")
     guid = note.string("guid")
-    if guid is not None and kind in ("podcast", "audio"):
+    video_id = None
+    if guid is not None and kind in kind_origins:
         if kind == "podcast":
             good = (guid.startswith("feed:") and len(guid) > 5) or bool(
                 re.fullmatch(r"apple:[0-9]+", guid)
             )
-        else:
+        elif kind == "audio":
             good = bool(re.fullmatch(r"sha256:[0-9a-f]{64}", guid))
+        else:
+            match = _VIDEO_GUID.fullmatch(guid)
+            good = match is not None
+            video_id = match.group(1) if match else None
         if not good:
             ctx.fail("note.guid", "note", "guid does not have the form this type allows")
+    expected_url = None if video_id is None else "https://youtu.be/" + video_id
+    if (
+        origin == "youtube"
+        and source_url is not None
+        and expected_url is not None
+        and source_url != expected_url
+    ):
+        ctx.fail(
+            "note.source-url-youtube",
+            "note",
+            "source_url is not https://youtu.be/ and the guid's video id",
+        )
     digest = note.string("transcript_sha256")
     if digest is not None:
         if not _SHA256.fullmatch(digest):
@@ -627,6 +683,7 @@ def _check_note(ctx: _Ctx, note: _File) -> None:
 def _check_body(ctx: _Ctx, note: _File, kind: str | None) -> None:
     title = note.string("title")
     show = note.string("show")
+    channel = note.string("channel")
     body = note.body
     if body is None or title is None:
         return
@@ -634,6 +691,8 @@ def _check_body(ctx: _Ctx, note: _File, kind: str | None) -> None:
         if show is None:
             return
         head = "# " + show + " — " + title + "\n\n## Transcript\n\n"
+    elif kind == "video" and channel is not None:
+        head = "# " + channel + " — " + title + "\n\n## Transcript\n\n"
     else:
         head = "# " + title + "\n\n## Transcript\n\n"
     if not body.startswith(head):
@@ -656,8 +715,12 @@ def _check_instructions(ctx: _Ctx, instr: _File, note: _File | None) -> None:
     kind = instr.string("type")
     if kind is not None and kind != "earmark-instructions":
         ctx.fail("instructions.type", "instructions", "type is not earmark-instructions")
-    if instr.scalar("contract", "int") not in (None, "1"):
-        ctx.fail("instructions.contract", "instructions", "contract is not 1")
+    found = instr.scalar("contract", "int")
+    known = _note_version(note) if note is not None else None
+    if found is not None and (
+        found not in ("1", "2") or (known is not None and found != str(known))
+    ):
+        ctx.fail("instructions.contract", "instructions", "contract is not the note's (1 or 2)")
     if note is None:
         return
     target = instr.string("for")
@@ -813,7 +876,8 @@ def check(mail: Mail) -> Report:
         _check_instructions(ctx, instr, note)
     _check_text(ctx, mail, note, instr)
     failures = tuple(ctx.failures)
-    return Report(failures, _skipped(mail), _summary(mail, failures, note, instr))
+    version = _note_version(note) if note is not None else None
+    return Report(failures, _skipped(mail), _summary(mail, failures, note, instr), version)
 
 
 # ---------------------------------------------------------------------------------------
@@ -828,7 +892,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = _Parser(prog="check_mail.py", description="Check an earmark mail, contract 1.")
+    parser = _Parser(prog="check_mail.py", description="Check an earmark mail, contract 1 or 2.")
     sub = parser.add_subparsers(dest="command", required=True)
     message = sub.add_parser("message", help="check a whole RFC 5322 message")
     message.add_argument("--json", action="store_true", help="print one JSON object")
@@ -879,7 +943,7 @@ def _print_report(report: Report, as_json: bool) -> None:
     if as_json:
         document: dict[str, Any] = {
             "checker": CHECKER_NAME,
-            "contract": CONTRACT,
+            "contract": report.contract,
             "ok": not report.failures,
             "failures": [
                 {"rule": f.rule, "file": f.file, "message": f.message} for f in report.failures
@@ -895,7 +959,10 @@ def _print_report(report: Report, as_json: bool) -> None:
     if report.failures:
         _write("FAILED: " + str(len(report.failures)) + " check(s)")
     else:
-        _write("OK: earmark mail, contract " + str(CONTRACT))
+        _write(
+            "OK: earmark mail, contract "
+            + ("?" if report.contract is None else str(report.contract))
+        )
     if report.skipped:
         _write("not checked (input not given): " + ", ".join(report.skipped))
 

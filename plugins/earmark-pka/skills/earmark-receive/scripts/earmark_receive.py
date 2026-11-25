@@ -433,7 +433,7 @@ def _classify(ws: Path, inp: _Input) -> _Verdict:
     reasons, found = _recognise(inp)
     if found is None:
         return _Verdict("not-earmark", {"outcome": "not-earmark", "reasons": reasons})
-    if found.contract != 1:
+    if found.contract not in contract.CONTRACTS:
         return _Verdict(
             "unknown-contract", {"outcome": "unknown-contract", "contract": found.contract}
         )
@@ -444,7 +444,7 @@ def _classify(ws: Path, inp: _Input) -> _Verdict:
         mail = contract.Mail(attachments, inp.subject, inp.body, None, None)
     report = contract.check(mail)
     base: dict[str, Any] = {
-        "contract": 1,
+        "contract": found.contract,
         "failures": sorted({f.rule for f in report.failures}),
         "skipped": sorted(report.skipped),
     }

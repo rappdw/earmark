@@ -28,7 +28,7 @@ from tests.checker_helpers import (
     set_front,
     split,
 )
-from tests.contract_samples import SAMPLES
+from tests.contract_samples import ALL_SAMPLES, SAMPLES
 from tests.receiver_helpers import (
     attachment_args,
     receive,
@@ -42,6 +42,7 @@ from tests.receiver_helpers import (
 FLOOR = floor_interpreters()
 PYTHONS = pytest.mark.parametrize("python", FLOOR, ids=lambda i: i.id)
 SAMPLE_NAMES = list(SAMPLES)
+ALL_NAMES = [f"{version}/{name}" for version, name in ALL_SAMPLES]
 NOTE = "2026-11-20-the-example-show-the-example-topic.md"
 FILED = f"podcasts/{NOTE}"
 SKIPPED = ["attachment.media-type", "message.defects", "message.structure"]
@@ -98,7 +99,7 @@ def _expected(name: str) -> dict[str, str]:
 
 
 @PYTHONS
-@pytest.mark.parametrize("name", SAMPLE_NAMES)
+@pytest.mark.parametrize("name", ALL_NAMES)
 def test_every_sample_classifies_new(python: Interpreter, tmp_path: Path, name: str) -> None:
     env = Env(python, tmp_path)
     code, doc = env.run("classify", name)
@@ -113,7 +114,7 @@ def test_every_sample_classifies_new(python: Interpreter, tmp_path: Path, name: 
 
 
 @PYTHONS
-@pytest.mark.parametrize("name", SAMPLE_NAMES)
+@pytest.mark.parametrize("name", ALL_NAMES)
 def test_every_sample_classifies_new_eml(python: Interpreter, tmp_path: Path, name: str) -> None:
     ws = workspace(tmp_path)
     eml = tmp_path / "m.eml"
@@ -128,8 +129,15 @@ def test_every_sample_classifies_new_eml(python: Interpreter, tmp_path: Path, na
 
 @PYTHONS
 def test_empty_instructions_flag(python: Interpreter, tmp_path: Path) -> None:
-    flags = {n: Env(python, tmp_path / n).classify(n)["instructions_empty"] for n in SAMPLE_NAMES}
-    assert {n for n, empty in flags.items() if empty} == {"empty-instructions"}
+    flags = {
+        n: Env(python, tmp_path / n.replace("/", "-")).classify(n)["instructions_empty"]
+        for n in ALL_NAMES
+    }
+    assert {n for n, empty in flags.items() if empty} == {
+        "v1/empty-instructions",
+        "v2/empty-instructions",
+        "v2/youtube-no-channel",
+    }
 
 
 def _drop_second(args: list[str]) -> list[str]:
@@ -218,12 +226,12 @@ def test_not_earmark(python: Interpreter, tmp_path: Path, case: str) -> None:
 def test_unknown_contract(python: Interpreter, tmp_path: Path) -> None:
     env = Env(python, tmp_path)
     parts = split(sample_bytes("podcast-feed"))
-    parts = parts.with_note(lambda b: set_front(b, "contract", "contract: 2"))
-    parts = parts.with_instructions(lambda b: set_front(b, "contract", "contract: 2"))
+    parts = parts.with_note(lambda b: set_front(b, "contract", "contract: 3"))
+    parts = parts.with_instructions(lambda b: set_front(b, "contract", "contract: 3"))
     code, doc = receive(python, "classify", env.ws, *env.parts_args(parts))
     assert code == 1
     assert doc["outcome"] == "unknown-contract"
-    assert doc["contract"] == 2
+    assert doc["contract"] == 3
 
 
 def _swap_body(old: str, new: str) -> Callable[[Parts], Parts]:
@@ -475,9 +483,37 @@ def test_other_samples_are_independent(python: Interpreter, tmp_path: Path) -> N
         if n not in {"podcast-feed", "podcast-feed.resend", "podcast-feed.reshare"}
         and n not in {"podcast-feed.retranscription", "empty-instructions"}
     ]
-    assert len(others) == 5
+    assert len(others) == 8
     for name in others:
         assert env.classify(name)["outcome"] == "new", name
+
+
+@PYTHONS
+def test_youtube_reshare(python: Interpreter, tmp_path: Path) -> None:
+    env = Env(python, tmp_path)
+    doc = env.file("v2/youtube")
+    path = doc["path"]
+    assert path.endswith("2026-11-21-the-example-channel-an-example-talk.md")
+    again = env.classify("v2/youtube.reshare")
+    assert (again["outcome"], again["path"]) == ("reshare", path)
+    assert again["guid"] == "youtube:exampleVid1"
+
+
+@PYTHONS
+def test_reshare_across_contract_versions(python: Interpreter, tmp_path: Path) -> None:
+    env = Env(python, tmp_path)
+    env.file("v1/podcast-feed")
+    doc = env.classify("v2/podcast-feed.reshare")
+    assert (doc["outcome"], doc["path"]) == ("reshare", FILED)
+    assert doc["contract"] == 2
+
+
+@PYTHONS
+def test_v2_retranscription(python: Interpreter, tmp_path: Path) -> None:
+    env = Env(python, tmp_path)
+    env.file("v2/podcast-feed")
+    doc = env.classify("v2/podcast-feed.retranscription")
+    assert (doc["outcome"], doc["rewrite_body"]) == ("retranscription", True)
 
 
 @PYTHONS

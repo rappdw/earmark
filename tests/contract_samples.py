@@ -1,4 +1,7 @@
-"""The sample emails of ``contract/samples/v1/``, built by the real mail code.
+"""The sample emails of ``contract/samples/v2/``, built by the real mail code.
+
+The v1 samples (``contract/samples/v1/``) are frozen since step 32: the mail code now sends
+``contract: 2``, so it can no longer rebuild them, and ``V1_SHA256`` pins their bytes.
 
 Every input is written out here, with no ``tests/factories.py`` defaults, so a factory change
 cannot move a sample. ``python -m tests.contract_samples`` (``make samples``) rewrites the
@@ -15,9 +18,38 @@ from typing import Final
 from earmark.mail.message import DEFAULT_MAX_ATTACHMENT_BYTES, compose_mail
 from earmark.models import Episode, Job, Segment, Source, Transcript, episode_key
 from earmark.sources import audio_episode
+from earmark.youtube.links import youtube_episode
 
 ROOT: Final = Path(__file__).resolve().parents[1]
-SAMPLES_DIR: Final = ROOT / "contract" / "samples" / "v1"
+SAMPLES_DIR: Final = ROOT / "contract" / "samples" / "v2"
+V1_DIR: Final = ROOT / "contract" / "samples" / "v1"
+V1_NAMES: Final = (
+    "podcast-feed",
+    "podcast-feed.resend",
+    "podcast-feed.reshare",
+    "podcast-feed.retranscription",
+    "podcast-apple",
+    "upload",
+    "direct-url",
+    "direct-url-query",
+    "empty-instructions",
+    "hostile-title",
+)
+# sha256 of each v1 file as committed before step 32 (they are never regenerated).
+V1_SHA256: Final[dict[str, str]] = {
+    "direct-url-query": "5861eaf427fcd0e66c21ffcc2ee1f5fc6c6cba810287a745588c4f595de73367",
+    "direct-url": "97de796c1152cc2dede6e00b9997f99d4f1659ece0532235a5e33aaa7e97570f",
+    "empty-instructions": "1cadcf40222ef4ae567833f81a217c4b1bdc6a6101ca2d9d7deae86971ba278f",
+    "hostile-title": "c9b28d6ce505d3ae1d5b60498ccaafc9c4eeb46f5aa2c96cc0f49d4a739fe1d8",
+    "podcast-apple": "d8d2d054973d3693e0af6d7d6552b64f761b56665c45743e962119844d7d19bf",
+    "podcast-feed": "969514d03626c88532982478f2bcea55946ede0441cdf94f004fa795b352b0d0",
+    "podcast-feed.resend": "b9834c56719c43ced8115a95758470affa0b92a2e5fadcfd92152899332e1c90",
+    "podcast-feed.reshare": "e72b12ee770a4a376879127c79c1db6397d00f1fa0c0b2f0cdb1a06eb347f479",
+    "podcast-feed.retranscription": (
+        "20a4e8be3923de439ebeb0f6b12f5f8c7ac5d5958a68902369a0d19e9c399f98"
+    ),
+    "upload": "78f62e57b631d850aa24b75b783be889174e6edb87ce64257eb3987f538111e3",
+}
 SENDER: Final = "earmark@example.org"
 PERSONAL: Final = "pka-personal@example.net"
 WORK: Final = "pka-work@example.net"
@@ -294,6 +326,45 @@ def _build_samples() -> dict[str, SampleInputs]:
         _FIRST_SHARED,
         _FIRST_DATE,
     )
+    youtube_episode_ = youtube_episode(
+        "exampleVid1",
+        title="An Example Talk",
+        channel="The Example Channel",
+        published_at=datetime(2026, 11, 21, 15, 0, tzinfo=UTC),
+        published_date_only=False,
+        duration_s=125.0,
+    )
+    youtube_transcript = _transcript(youtube_episode_, _FEED_SEGMENTS, language="en")
+    youtube_url = "https://www.youtube.com/watch?v=exampleVid1"
+    youtube_job = _job(
+        11,
+        source="youtube",
+        url=youtube_url,
+        instructions="Summarise the talk in three bullets.\nFile it under learning.",
+        utc_offset_min=120,
+    )
+    youtube_reshare_job = _job(
+        12,
+        source="youtube",
+        url=youtube_url,
+        instructions="Compare it with the earlier talk.",
+        shared_at=_LATER_SHARED,
+        utc_offset_min=120,
+    )
+    quiet_episode = youtube_episode(
+        "ex_ample-02",
+        title="Untitled Upload Example",
+        channel="",
+        published_at=datetime(2026, 11, 19, tzinfo=UTC),
+        published_date_only=True,
+        duration_s=95.0,
+    )
+    quiet_job = _job(
+        13,
+        source="youtube",
+        url="https://www.youtube.com/watch?v=ex_ample-02",
+        instructions="",
+    )
     return {
         "podcast-feed": base,
         "podcast-feed.resend": resend,
@@ -305,6 +376,23 @@ def _build_samples() -> dict[str, SampleInputs]:
         "direct-url-query": _audio_inputs(8, query_job),
         "empty-instructions": empty,
         "hostile-title": hostile,
+        "youtube": SampleInputs(
+            youtube_job, youtube_episode_, youtube_transcript, _FIRST_SHARED, _FIRST_DATE
+        ),
+        "youtube.reshare": SampleInputs(
+            youtube_reshare_job,
+            youtube_episode_,
+            youtube_transcript,
+            _FIRST_SHARED,
+            _LATER_SHARED + timedelta(minutes=5),
+        ),
+        "youtube-no-channel": SampleInputs(
+            quiet_job,
+            quiet_episode,
+            _transcript(quiet_episode, _AUDIO_SEGMENTS, language=None),
+            _FIRST_SHARED,
+            _FIRST_DATE,
+        ),
     }
 
 
@@ -324,6 +412,30 @@ def build(name: str) -> bytes:
         max_attachment_bytes=DEFAULT_MAX_ATTACHMENT_BYTES,
     )
     return mail.data
+
+
+ALL_SAMPLES: Final[list[tuple[str, str]]] = [("v1", name) for name in V1_NAMES] + [
+    ("v2", name) for name in SAMPLES
+]
+
+
+def sample_path(version: str, name: str) -> Path:
+    """The ``.eml`` of a sample: ``version`` is ``v1`` or ``v2``."""
+    directory = {"v1": V1_DIR, "v2": SAMPLES_DIR}[version]
+    return directory / f"{name}.eml"
+
+
+def v1_drift() -> list[str]:
+    """The v1 files that are missing, changed or extra (the set is exactly ``V1_NAMES``)."""
+    found: list[str] = []
+    for name, expected in V1_SHA256.items():
+        path = V1_DIR / f"{name}.eml"
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            found.append(name)
+    found.extend(
+        f"{path.stem} (unexpected)" for path in V1_DIR.glob("*.eml") if path.stem not in V1_SHA256
+    )
+    return found
 
 
 def drifted(directory: Path = SAMPLES_DIR) -> list[str]:
@@ -353,7 +465,10 @@ def main(argv: list[str] | None = None) -> int:
         names = drifted()
         for name in names:
             sys.stdout.write(f"differs from the mail code: {name}.eml\n")
-        return 1 if names else 0
+        frozen = v1_drift()
+        for name in frozen:
+            sys.stdout.write(f"v1 sample changed or missing: {name}.eml\n")
+        return 1 if names or frozen else 0
     if args:
         sys.stderr.write("usage: python -m tests.contract_samples [--check]\n")
         return 64

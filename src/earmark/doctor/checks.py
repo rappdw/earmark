@@ -92,6 +92,7 @@ class OfflineChecks:
         ]
         results.append(guarded("resolver", self.resolver))
         results.append(guarded("fetch", self.fetch))
+        results.append(guarded("youtube", self.youtube))
         asr = guarded("asr", self.asr)
         results.append(asr)
         if s.asr_backend == "faster_whisper" and asr.status == "ok":
@@ -251,6 +252,30 @@ class OfflineChecks:
                 "EARMARK_ALLOW_PRIVATE_FETCH=true: the private-address guard is off",
             )
         return CheckResult("fetch", "ok", "http, private addresses are refused")
+
+    def youtube(self) -> CheckResult:
+        from earmark.pipeline.factory import YOUTUBE_SOURCES
+
+        name = self.settings.youtube_backend
+        if name == "fake":
+            return CheckResult("youtube", "warn", "fake YouTube source (for tests)")
+        try:
+            built = YOUTUBE_SOURCES[name](self._context())
+        except ConfigError as exc:
+            return CheckResult("youtube", "fail", config_text(exc))
+        close_quietly(built)
+        runtime = getattr(built, "runtime", None)
+
+        def version(value: object) -> str:
+            return value if isinstance(value, str) and value else "unknown"
+
+        return CheckResult(
+            "youtube",
+            "ok",
+            f"yt-dlp {version(getattr(runtime, 'version', None))}, "
+            f"yt-dlp-ejs {version(getattr(runtime, 'ejs_version', None))}, "
+            f"deno {version(getattr(runtime, 'deno_version', None))}",
+        )
 
     def asr(self) -> CheckResult:
         from earmark.pipeline.factory import TRANSCRIBERS
