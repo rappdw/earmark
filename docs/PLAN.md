@@ -14,8 +14,9 @@ service" below.
 Shortcut, the service, and the PKA receiving skill, with the two seams between them. See
 "System scope: one repo for the whole system" below.
 
-**Added on 2026-11-25 (steps 32–33).** YouTube as a source, with contract 2, and the
-transcript by job id, after the first real use on the Spark.
+**Added on 2026-11-25 (steps 32–34).** YouTube as a source, with contract 2; the
+transcript by job id; and the CLI as an API client. All three come from the first real use
+on the Spark.
 
 ## Status
 
@@ -58,6 +59,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 31 | The Shortcut as a file | 28 | todo |
 | 32 | YouTube as a source | 30 | todo |
 | 33 | The transcript by job id | 32 | todo |
+| 34 | The CLI as an API client | 33 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -1560,6 +1562,72 @@ and `transcript.txt`.
 - A re-share job (cached transcript, new instructions) serves the same transcript, with
   its own `job_id` in the note.
 - No test or log line shows the recipient, the instructions or transcript text.
+- `make check` passes.
+
+## Step 34: The CLI as an API client
+
+**Goal.** `earmark jobs`, `submit` and `transcript` show the running service's data,
+whether they are run on the Spark's host or on the Mac. A command never answers from an
+empty database it just created.
+
+**Inputs (operator, 2026-11-25).** Run on the Spark's host, in a venv, `earmark jobs`
+printed "no jobs" while the API listed four. The host CLI read `.env`'s
+`EARMARK_DATA_DIR=./data`, a new empty database, while the service's data is in the
+Docker volume at `/data`.
+
+The operator first suggested detecting the running containers. The operator agreed
+instead to an explicit client mode, because detection has three problems:
+
+- it needs Docker access;
+- it changes answers silently when the containers are down;
+- it doesn't help on the Mac.
+
+**Build.**
+
+- **Client mode.**
+  - When `EARMARK_API_URL` is set, these commands call the API with `EARMARK_API_TOKEN`
+    instead of opening the database:
+    - `jobs`, and a single job;
+    - `submit`, a link or a local file uploaded as `POST /transcriptions` does;
+    - `transcript` (step 33).
+  - Their output matches the local mode's.
+  - `doctor`, `config`, `transcribe`, `resolve`, `serve` and `worker` stay local.
+    `doctor` reports whether client mode is set and, with `--online`, whether the API
+    answers `/healthz`.
+- **Where it is set.** `EARMARK_API_URL` belongs in the operator's shell, not in `.env`,
+  because Compose passes `.env` into the containers. The docs say so. The planner decides
+  whether the containers should refuse it or ignore it.
+- **The token and the transport.**
+  - The token is sent only over HTTPS, or over plain HTTP to a loopback address. Any
+    other `http://` URL is refused, with a message.
+  - Certificates are verified, with no option to turn that off.
+  - The token never appears in output, logs or errors.
+  - Errors from the API (401, 404, 409, 422) are shown as the API's `detail`, with a
+    non-zero exit code.
+- **No empty database by accident.**
+  - A read-only command (`jobs`, a single job, `transcript`) never creates the data
+    directory or the database. If either is missing, the command says so, names
+    `EARMARK_DATA_DIR`, suggests `EARMARK_API_URL` or `docker compose exec api earmark …`,
+    and exits non-zero.
+  - `serve`, `worker` and `submit` in local mode still create them as today.
+- **Wording.** `submit --instructions` says the instructions go to the PKA with the
+  transcript. It no longer says "for the analysis".
+- **Docs:**
+  - `docs/deploy.md` gets a CLI section covering the containers, client mode on the
+    Spark's host (`http://127.0.0.1:8787`) and client mode on the Mac (the HTTPS name);
+  - the README's command list is updated.
+
+**Acceptance.**
+
+- Tests run each client-mode command against the real API app in-process, or on a stub
+  over a unix socket. There is no network. The tests cover:
+  - success;
+  - 401, 404, 409 and 422;
+  - the plain-HTTP refusal for non-loopback hosts.
+
+  Local-mode and client-mode output are the same for the same jobs.
+- A test fails if the token appears in any output or log line.
+- `jobs` with a missing database creates nothing and exits non-zero with the message.
 - `make check` passes.
 
 ## Backlog
