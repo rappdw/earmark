@@ -16,7 +16,8 @@ Shortcut, the service, and the PKA receiving skill, with the two seams between t
 
 **Added on 2026-11-25 (steps 32–34).** YouTube as a source, with contract 2; the
 transcript by job id; and the CLI as an API client. All three come from the first real use
-on the Spark.
+on the Spark. Step 35, added the same day, documents the certificate route the operator took
+there.
 
 ## Status
 
@@ -60,6 +61,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 32 | YouTube as a source | 30 | done |
 | 33 | The transcript by job id | 32 | todo |
 | 34 | The CLI as an API client | 33 | todo |
+| 35 | Your own certificate | 34 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -1561,8 +1563,9 @@ and `transcript.txt`.
 
 - Tests cover each format, each state and the token check, and that the `note` format
   equals the note attachment of the job's message (from the fake mailer) byte for byte.
-- A re-share job (cached transcript, new instructions) serves the same transcript, with
-  its own `job_id` in the note.
+- A re-share job (cached transcript, new instructions) serves the same transcript. Its
+  `json` format carries its own `job_id`. The note stays byte-identical to the mailed one,
+  which under contract 2 has no `job_id` (operator, 2026-11-25: keep contract 2).
 - No test or log line shows the recipient, the instructions or transcript text.
 - `make check` passes.
 
@@ -1630,6 +1633,55 @@ instead to an explicit client mode, because detection has three problems:
   Local-mode and client-mode output are the same for the same jobs.
 - A test fails if the token appears in any output or log line.
 - `jobs` with a missing database creates nothing and exits non-zero with the message.
+- `make check` passes.
+
+## Step 35: Your own certificate
+
+**Goal.** The deploy docs and the runbook cover serving the API with a certificate the
+operator already has, on a port other than 443 if something else holds it, as well as the
+Let's Encrypt DNS-01 route they describe today.
+
+**Inputs (operator, 2026-11-25).** In runbook phase 7 on the Spark, the operator used a
+commercial wildcard certificate instead of a Cloudflare token, with stock Caddy from the
+distribution's packages, and served the API on another port because another project's
+proxy held 443. `deploy/caddy/install-cert.sh` was written for that during the session and
+used for real once; it is untracked until this step. Renewal is manual: rerun the script.
+
+**Build.**
+
+- **The script,** `deploy/caddy/install-cert.sh`, committed. It runs on the Mac (bash 3.2,
+  LibreSSL):
+  - it checks locally that the chain parses, the key matches the first certificate, the
+    chain has the intermediates, and the certificate has not expired, and warns within 30
+    days of expiry;
+  - it copies both files over ssh into a private temporary directory, installs them as
+    `/etc/caddy/certs/fullchain.pem` (root:caddy 0644) and `privkey.pem` (root:caddy 0640),
+    validates the Caddyfile and reloads Caddy if it is running;
+  - `--dry-run` does the local checks only. It never prints the key.
+
+  The planner reviews it and may fix it, keeping that behaviour.
+- **An example Caddyfile** for this route, `deploy/caddy/Caddyfile.own-cert`: a `tls`
+  line with the two installed paths, a `bind` to the LAN address, and a port in the site
+  address, with a comment saying when to change it. Placeholders only.
+- **Docs:**
+  - `docs/deploy.md` §6.1 gains a subsection, "With a certificate you already have": the
+    chain must include the intermediates (iOS rejects a bare leaf), stock Caddy is enough
+    (no DNS module, no token), installing and renewing with the script, and choosing
+    another port when 443 is taken, which then appears in the Shortcut's URL and every
+    `curl`;
+  - runbook phase 7 offers this as the alternative to the Cloudflare token, with its own
+    checks, and phases 7 and 9 say to include the port if one was chosen;
+  - `docs/ARCHITECTURE.md`'s repo layout lists the two new files.
+- No service code changes.
+
+**Acceptance.**
+
+- The docs tests cover the new subsection and the runbook alternative, and the existing
+  placeholder scan covers the new files: no real domain, address or key material.
+- A test runs the script's local checks against certificates generated in the test (a
+  matching chain passes `--dry-run`; a bare leaf, a mismatched key and an expired
+  certificate each fail with their message), with no ssh and no network.
+- The repo layout test passes with the new files listed.
 - `make check` passes.
 
 ## Backlog
