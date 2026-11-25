@@ -6,7 +6,8 @@ This runbook takes the setup in the order of the choices already made:
 2. The GPU smoke test, then a real transcription into the fake outbox.
 3. A sending mailbox, and a real delivery to your own address.
 4. The PKA recipients.
-5. A DNS-only Cloudflare name, served by Caddy on the LAN and reached over WireGuard.
+5. A DNS-only Cloudflare name, served by Caddy on the LAN with a Let's Encrypt certificate
+   or one you already have, and reached over WireGuard.
 6. ntfy notifications, then the iOS Shortcut.
 7. The receiving skill on each PKA (step 30, built and never run in a PKA), then one episode
    through the whole system.
@@ -31,8 +32,9 @@ Fill these in once. The commands below use the placeholders on the left.
 |---|---|---|
 | `spark` | The Spark's hostname. | |
 | `192.168.1.10` | The Spark's LAN address. A DHCP reservation keeps it fixed. | |
-| `earmark.example.com` | The API's name, in your Cloudflare zone. | |
-| `example.com` | That Cloudflare zone. | |
+| `earmark.example.com` | The API's name, in your DNS zone. | |
+| `example.com` | That DNS zone (in Cloudflare for phase 7's route A). | |
+| `8443` | The HTTPS port, only if something else on the Spark holds 443 (phase 7). | |
 | `example.org` | Your mail domain. | |
 | `earmark@example.org` | The sending mailbox. | |
 | `smtp.example.org` | The provider's submission host. | |
@@ -308,50 +310,94 @@ Filing is not checked here: it needs the receiving skill (phases 11 and 12).
 ## Phase 7: Reaching the API from the phone and the Mac
 
 The API stays on `127.0.0.1:8787`. Caddy serves it over HTTPS on the LAN address, and a
-DNS-only Cloudflare record points the name at that private address
+DNS-only record points the name at that private address
 ([deploy.md section 6.1](deploy.md#61-a-private-dns-name-wireguard-and-caddy-primary)).
+The certificate comes one of two ways: **route A**, Let's Encrypt with a Cloudflare token
+(step 3), or **route B**, a certificate you already have, such as a commercial wildcard
+(step 4, [deploy.md section 6.1.8](deploy.md#618-with-a-certificate-you-already-have)).
+Do one of them.
 
-1. **DNS record.** In Cloudflare, add an `A` record `earmark.example.com` →
-   `192.168.1.10`, with proxy status **DNS only (grey cloud)**. It publishes your internal
-   address, which is a minor leak.
-2. **Cloudflare token.** Create an API token with **Zone → DNS → Edit** and
-   **Zone → Zone → Read**, and limit it to the one zone. Edit alone fails.
-3. **Caddy with the Cloudflare module.** Build or download it, then confirm the module is
-   there:
+1. **DNS record.** In Cloudflare (or the DNS provider of your zone, for route B), add an
+   `A` record `earmark.example.com` → `192.168.1.10`. In Cloudflare, set proxy status **DNS
+   only (grey cloud)**. The record publishes your internal address, which is a minor leak.
+2. **The port.** On the Spark, `sudo ss -ltnp 'sport = :443'` shows whether something
+   already listens on 443. If another program holds it (another project's proxy, say),
+   use another port, such as 8443, in the Caddyfile's site address
+   (`earmark.example.com:8443`). From then on, add it to every URL: in the checks below
+   (`https://earmark.example.com:8443/healthz`), in the Shortcut (phase 9), and in
+   `EARMARK_API_URL` on the Mac. Neither example Caddyfile uses port 80.
+3. **Route A: Let's Encrypt with a Cloudflare token.**
+   - Create an API token with **Zone → DNS → Edit** and **Zone → Zone → Read**, and limit
+     it to the one zone. Edit alone fails.
+   - Build or download Caddy with the Cloudflare module, then confirm the module is there:
 
-   ```bash
-   xcaddy build v2.11.9 --with github.com/caddy-dns/cloudflare@v0.2.4
-   ./caddy list-modules | grep dns.providers.cloudflare
-   ```
+     ```bash
+     xcaddy build v2.11.9 --with github.com/caddy-dns/cloudflare@v0.2.4
+     ./caddy list-modules | grep dns.providers.cloudflare
+     ```
 
-   Install it as `/usr/bin/caddy` behind Caddy's own systemd unit (6.1.3).
-4. **Config and token.**
+     Install it as `/usr/bin/caddy` behind Caddy's own systemd unit (6.1.3).
+   - Config and token:
 
-   ```bash
-   sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile   # then edit the name and bind
-   sudo install -m 600 /dev/null /etc/caddy/cloudflare.env
-   sudoedit /etc/caddy/cloudflare.env                    # CF_API_TOKEN=<token>
-   sudo systemctl edit caddy        # [Service] EnvironmentFile=/etc/caddy/cloudflare.env
-   sudo caddy validate --config /etc/caddy/Caddyfile
-   sudo systemctl restart caddy && journalctl -u caddy -f   # wait for the certificate
-   ```
+     ```bash
+     sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile   # then edit the name and bind
+     sudo install -m 600 /dev/null /etc/caddy/cloudflare.env
+     sudoedit /etc/caddy/cloudflare.env                    # CF_API_TOKEN=<token>
+     sudo systemctl edit caddy        # [Service] EnvironmentFile=/etc/caddy/cloudflare.env
+     sudo caddy validate --config /etc/caddy/Caddyfile
+     sudo systemctl restart caddy && journalctl -u caddy -f   # wait for the certificate
+     ```
 
+4. **Route B: a certificate you already have.** Stock Caddy, no token, and no module.
+   - On the Spark, install Caddy from the distribution's packages and put the example in
+     place:
+
+     ```bash
+     sudo apt install caddy
+     sudo cp deploy/caddy/Caddyfile.own-cert /etc/caddy/Caddyfile   # then edit the name, bind and port
+     ```
+
+   - On the Mac, from a checkout, check the files, then install them (sudo asks for your
+     password on the Spark):
+
+     ```bash
+     deploy/caddy/install-cert.sh --dry-run spark ~/ssl/example.com.fullchain.pem ~/ssl/example.com.key
+     deploy/caddy/install-cert.sh spark ~/ssl/example.com.fullchain.pem ~/ssl/example.com.key
+     ```
+
+     If Caddy was not running, start it: `sudo systemctl start caddy`.
+   - Write down the expiry date the script printed. Renewal is manual: before that date, run
+     the same line with the new files.
 5. **WireGuard on the phone and the Mac.** Add the Spark to the existing tunnel:
    `AllowedIPs = 192.168.1.10/32` (a split tunnel), `DNS =` unset. Turn on on-demand
    activation for cellular and for Wi-Fi other than the home SSIDs.
 
 **Check:**
 
+- Add your port to each URL below if you chose one in step 2.
 - `dig +short earmark.example.com @1.1.1.1` prints `192.168.1.10`.
 - `dig earmark.example.com` through your home resolver gives the same answer. If it
   doesn't, DNS-rebinding protection is dropping it. Allow-list the domain (6.1.6), for
   example `rebind-domain-ok=/example.com/` for dnsmasq or Pi-hole.
-- From the Mac at home, `curl https://earmark.example.com/healthz` prints
-  `{"status":"ok"}` with a valid certificate.
+- On the Spark, `sudo ss -ltnp | grep caddy` shows `192.168.1.10:443` (or your port), and
+  never `0.0.0.0` or `*`.
+- Route A: `journalctl -u caddy` shows the certificate obtained for `earmark.example.com`.
+- Route B:
+  - the install printed `chain: 2 certificates, in order; key matches` (or more
+    certificates), then `Caddyfile valid` and `caddy reloaded`;
+  - `sudo ls -l /etc/caddy/certs` shows `privkey.pem` as `-rw-r-----` `root caddy`;
+  - from the Mac,
+    `openssl s_client -connect earmark.example.com:8443 -servername earmark.example.com -showcerts </dev/null 2>/dev/null | grep -c 'BEGIN CERTIFICATE'`
+    prints 2 or more: the server sends the intermediates;
+  - the same `openssl s_client` without `-showcerts`, piped to
+    `openssl x509 -noout -serial -enddate`, shows the serial and date the script printed.
+- From the Mac at home, `curl https://earmark.example.com/healthz` (route B on port 8443:
+  `curl https://earmark.example.com:8443/healthz`) prints `{"status":"ok"}` with a valid
+  certificate.
 - On the phone, on cellular with Wi-Fi off, Safari opens
-  `https://earmark.example.com/healthz`.
+  `https://earmark.example.com/healthz`, with your port if you chose one.
 - An upload through the proxy from the Mac: the phase 4 upload `curl`, pointed at
-  `https://earmark.example.com/transcriptions`, answers 202. See
+  `https://earmark.example.com/transcriptions` (with your port), answers 202. See
   [deploy.md section 6.3](deploy.md#63-uploads-through-the-proxy).
 
 ## Phase 8: Notifications (ntfy)
@@ -376,9 +422,13 @@ DNS-only Cloudflare record points the name at that private address
 Build it from [docs/shortcut.md](shortcut.md) section 2. First capture the share sheet
 (shortcut.md section 6), for a podcast link and for a file. Then share an episode and
 choose Personal, and share a voice memo or an audio file from Files and choose Work.
+The Shortcut's URL is `https://earmark.example.com/transcriptions`, or with the port from
+phase 7 if you chose one: `https://earmark.example.com:8443/transcriptions`.
 
 **Check:**
 
+- the Shortcut's URL has the port from phase 7, if you chose one, and Safari on the phone
+  opens that host and port's `/healthz`;
 - the Shortcut shows a `job_id` each time;
 - the pushes arrive;
 - each PKA gets its message;

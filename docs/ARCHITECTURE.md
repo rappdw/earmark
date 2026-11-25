@@ -185,7 +185,12 @@ contract/                         the mail seam only (step 29)
   samples/v2/                       sample emails the mail code reproduces (step 32)
 shortcut/earmark.shortcut         part 1: the signed export, the folder's only file (step 31)
 src/earmark/                      part 2: the service
-deploy/, Dockerfile, Dockerfile.gpu, compose.yaml   part 2: deployment
+deploy/                           part 2: deployment
+  caddy/Caddyfile                   the example reverse proxy, Let's Encrypt through DNS-01
+  caddy/Caddyfile.own-cert          the same with a certificate you already have (step 35)
+  caddy/install-cert.sh             installs that certificate on the server, from the Mac (step 35)
+  systemd/                          the units for a native install
+Dockerfile, Dockerfile.gpu, compose.yaml   part 2: the images and the services
 tests/                            every part's tests, one gate
 tools/py39/                       the pinned mypy that checks the checker against Python 3.9 (step 29)
 docs/                             architecture, plan, runbook, deploy and Shortcut docs
@@ -239,7 +244,7 @@ backend, not the pipeline.
 | Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative for a server elsewhere (`remote`, step 09; see `docs/asr.md`). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so the GPU image (`Dockerfile.gpu`, step 26) builds CTranslate2 from source with CUDA for `sm_121` and swaps it into the venv; the compose worker runs it with `EARMARK_ASR_DEVICE=cuda`. faster-whisper's batched pipeline is optional (`EARMARK_ASR_BATCH_SIZE`). | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_DEVICE`, `EARMARK_ASR_BATCH_SIZE`, `EARMARK_ASR_BASE_URL`. |
-| Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge; the Cloudflare token lives only with the proxy. Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
+| Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge (the Cloudflare token lives only with the proxy). Or the operator's own certificate, installed by `deploy/caddy/install-cert.sh`, with stock Caddy, on another port if 443 is taken (step 35). Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
 | Deployment | Two images. The CPU image (`Dockerfile`, extras by build argument, `transcribe youtube` by default) runs `earmark serve`, or anything on a host without a GPU. The GPU image (`Dockerfile.gpu`: `nvidia/cuda` 12.9.1 cuDNN devel and runtime images, uv-managed Python 3.13, CTranslate2 built for `sm_121`) runs `earmark worker` with `gpus: all`. `compose.yaml` has a shared data volume and no vLLM service or `gpu` profile any more. systemd units for the API and the worker (steps 16, 22, 26). | See "Deployment" below and `docs/deploy.md`. |
 | Language and tooling | Python 3.13 (`requires-python = ">=3.13,<3.14"`, chosen in step 01 from wheel availability on aarch64), uv with the `uv_build` backend, FastAPI, pydantic, httpx2 (the maintained successor of httpx, imported as `httpx2`) with its httpcore2 for the guarded network backend (step 06), typer, stdlib `sqlite3`, defusedxml for RSS (step 07), python-multipart's streaming `MultipartParser` for uploads (step 24; Starlette's own form parser spools files to the system temp dir, so it is not used), the stdlib `email`, `smtplib` and `ssl` for delivery (step 25). PyYAML is a dev dependency only: tests parse the workflows and `compose.yaml` with it (step 22). Sync code throughout the worker. | Widen `requires-python` once every heavy extra ships wheels for the new version on linux/aarch64; `uv lock` enforces this through `tool.uv.required-environments`. |
 
@@ -356,6 +361,8 @@ Dockerfile, .dockerignore, compose.yaml    the CPU image and the services (step 
 Dockerfile.gpu         the GPU image: CTranslate2 built with CUDA, swapped into the venv (step 26)
 deploy/systemd/        earmark-api.service and earmark-worker.service (step 16)
 deploy/caddy/Caddyfile the example reverse proxy (step 16)
+deploy/caddy/Caddyfile.own-cert, install-cert.sh   the own-certificate example and its
+                       installer, run from the Mac (step 35)
 ```
 
 ## Domain models
@@ -1611,6 +1618,21 @@ Step 16; exact files in `docs/steps/16-deploy-shortcut.md` section 4, operator g
   - it sets `resolvers 1.1.1.1`;
   - it forwards to `127.0.0.1:8787`.
 
+  `deploy/caddy/Caddyfile.own-cert` (step 35) is the same proxy with a certificate the
+  operator already has: `tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem`,
+  stock Caddy, `auto_https disable_redirects`, and a port in the site address
+  (`earmark.example.com:8443`) for a host where another proxy holds 443.
+  `deploy/caddy/install-cert.sh` runs on the Mac (bash 3.2, LibreSSL) and does three things:
+
+  - it checks the chain and key locally: every certificate parses, the key matches, the
+    intermediates are in order, there is a SAN, the certificate has not expired, and it
+    warns within 30 days;
+  - it copies them over ssh into a remote `mktemp -d` that a trap removes;
+  - it installs them with sudo as root:caddy 0644 and 0640, validates the Caddyfile, and
+    reloads Caddy.
+
+  Renewal is rerunning it; the packaged unit's `caddy reload --force` reads replaced files.
+
   The token is never in earmark's `.env`, which compose exports into earmark's
   containers. Nothing binds the API to a non-loopback host address by default;
   `EARMARK_HOST=0.0.0.0` exists only inside the container.
@@ -2209,8 +2231,10 @@ Step planners should check these against current documentation instead of assumi
    builds the CPU image on linux/arm64 and runs one-off commands in it (`container.yml`),
    but no service has ever run in a container. The GPU image (step 26) has never been
    built: CI only lints it with `docker build --check`. The reachability setup has not been run either: WireGuard, the DNS-only record,
-   resolvers' DNS rebinding protection, and Caddy's DNS-01 issuance. Only the example
-   Caddyfile was checked, with `caddy validate`. What the iOS share sheet hands a Shortcut
+   resolvers' DNS rebinding protection, and Caddy's DNS-01 issuance. The example
+   Caddyfiles were checked with `caddy validate`; the own-certificate route (step 35) has run
+   once on the operator's Spark, and its script is tested only with ssh, sudo and Caddy
+   stubbed. What the iOS share sheet hands a Shortcut
    is also unverified (no iPhone);
    `docs/shortcut.md` says how to capture it into `tests/fixtures/share_sheet.json`.
    The Shortcut itself has never run (step 27): its action names come from Apple's
@@ -2471,6 +2495,13 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
     and profile stay private and the cache format can change;
   - `earmark transcript` writes the exact bytes when its output is not a terminal, and only
     printable characters, newlines and tabs when it is.
+- **Settled by step 35** (see `docs/steps/35-own-certificate.md` section 8):
+  - a certificate the operator already has is an alternative to DNS-01, not a
+    replacement; both examples stay;
+  - `deploy/caddy/install-cert.sh` is the only installer, and it runs from the Mac;
+    renewal is rerunning it, by hand;
+  - the script refuses a chain that holds a key, is out of order, or lacks a SAN, and it
+    warns rather than restarts when the unit's reload lacks `--force`.
 - **Settled by step 34** (see `docs/steps/34-cli-api-client.md` section 8):
   - client mode is explicit (`EARMARK_API_URL`), not detected from running containers;
   - the containers ignore `EARMARK_API_URL` rather than refuse it: compose blanks it, and

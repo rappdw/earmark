@@ -1,0 +1,17 @@
+# Example: TLS for earmark on the LAN interface only, with a certificate you already
+# have (a commercial wildcard, say). Stock Caddy is enough: no DNS module, no API token.
+# deploy/caddy/install-cert.sh installs the two files below; see docs/deploy.md 6.1.8.
+{
+	# No port 80: nothing redirects to HTTPS, and another proxy may hold port 80.
+	auto_https disable_redirects
+}
+
+# :8443 because another proxy on this host already listens on 443. If nothing else uses
+# 443, drop ":8443" (Caddy then serves 443), and leave the port out of every URL.
+earmark.example.com:8443 {
+	# The LAN (or WireGuard) address the DNS record points to. Never 0.0.0.0.
+	bind 192.168.1.10
+	# The full chain (the server's certificate, then each intermediate), then the key.
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+	reverse_proxy 127.0.0.1:8787
+}

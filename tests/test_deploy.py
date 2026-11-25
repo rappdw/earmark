@@ -406,6 +406,35 @@ def test_caddyfile_example() -> None:
     assert "127.0.0.1:8787" in compose_bind
 
 
+def test_caddyfile_own_cert_example() -> None:
+    text = (ROOT / "deploy" / "caddy" / "Caddyfile.own-cert").read_text()
+    cert_dir = re.search(
+        r"^CERT_DIR=(\S+)$", (ROOT / "deploy" / "caddy" / "install-cert.sh").read_text(), re.M
+    )
+    assert cert_dir
+    lines = text.splitlines()
+    code = [x.strip() for x in lines if x.strip() and not x.strip().startswith("#")]
+    site_blocks = [x for x in lines if x.endswith(" {") and not x.startswith("\t")]
+    assert len(site_blocks) == 1
+    address = re.fullmatch(r"earmark\.example\.com:(\d+) \{", site_blocks[0])
+    assert address
+    assert 1024 <= int(address[1]) <= 65535
+    assert int(address[1]) != 8787
+    [bind] = [x.split()[1] for x in code if x.startswith("bind ")]
+    parsed = ipaddress.ip_address(bind)
+    assert parsed.version == 4
+    assert parsed.is_private
+    assert str(parsed) != "0.0.0.0"  # noqa: S104 - checking the example never binds everything
+    assert f"tls {cert_dir[1]}/fullchain.pem {cert_dir[1]}/privkey.pem" in code
+    assert "reverse_proxy 127.0.0.1:8787" in code
+    assert "auto_https disable_redirects" in code
+    assert not any(x.startswith("dns ") for x in code)
+    assert "{env." not in text
+    assert "CF_" not in text
+    assert any(x.startswith("#") and "443" in x for x in (y.strip() for y in lines))
+    assert "http://" not in text.replace("https://", "")
+
+
 def test_proxy_token_stays_out_of_earmark() -> None:
     files = [
         ROOT / ".env.example",

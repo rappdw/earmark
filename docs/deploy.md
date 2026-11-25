@@ -28,9 +28,12 @@ through this guide in order, with a check after each phase.
 - The Shortcut has never run on a phone.
 - The reachability setup is not verified by the earmark build. That covers the DNS-only
   Cloudflare record, the WireGuard split tunnel, Caddy with the DNS-01 challenge,
-  Tailscale Serve, and ntfy self-hosting, all described from their documentation. Only the
-  example `deploy/caddy/Caddyfile` was checked, with `caddy validate` and `caddy fmt`,
-  using a Caddy build that has the Cloudflare module.
+  Tailscale Serve, and ntfy self-hosting, all described from their documentation. The
+  example `deploy/caddy/Caddyfile` was checked with `caddy validate` and `caddy fmt`,
+  using a Caddy build that has the Cloudflare module. `deploy/caddy/Caddyfile.own-cert` was
+  checked the same way with Caddy 2.6.2 and 2.11.9, and `deploy/caddy/install-cert.sh`'s
+  checks are tested against generated certificates, with ssh, sudo and Caddy stubbed. The
+  own-certificate route (6.1.8) has run once, on the operator's Spark.
 
 ## 2. Overview
 
@@ -48,6 +51,8 @@ iPhone / Mac ──(home Wi-Fi, or WireGuard split tunnel)──► 192.168.1.10
 Cloudflare DNS: earmark.example.com A 192.168.1.10 (DNS only, never proxied)
 worker ──(SMTP submission, TLS)──► smtp.example.org ──► each PKA's address ──(AMAP)──► the PKA
 ```
+
+With a certificate you already have, Caddy may listen on another port, such as 8443 (6.1.8).
 
 - AMAP, outside this repo, applies the sender allowlist and DMARC, and hands the mail to the
   PKA (section 8.5).
@@ -220,6 +225,9 @@ supported setups. Neither is verified by the earmark build.
 
 Caddy needs one short site block, and it issues and renews the certificate by itself.
 
+With a certificate you already have, stock Caddy is enough and the build steps below do not
+apply: see 6.1.8 for the Caddyfile and the install.
+
 The stock Caddy build lacks the Cloudflare DNS module, so you need a build that has it
 (`github.com/caddy-dns/cloudflare`):
 
@@ -248,6 +256,8 @@ route to `http://127.0.0.1:8787`), but it needs more configuration.
 
 #### 6.1.4 The certificate: Let's Encrypt with DNS-01
 
+This is the Let's Encrypt route. With a certificate you already have, skip it: see 6.1.8.
+
 - Create a Cloudflare API token with **Zone → DNS → Edit** and **Zone → Zone → Read**,
   and set Zone Resources to the one zone. Both Caddy's module and Traefik need the zone
   read to find the zone, so `Zone:DNS:Edit` alone is not enough.
@@ -268,10 +278,11 @@ The proxy is documented and shipped as an example file, not as a compose service
 
 - Compose's `env_file: .env` exports every line into the earmark containers. A Cloudflare
   token in the same file would land in the API and worker environments.
-- The proxy is host infrastructure. It owns port 443 on the LAN address and often fronts
+- The proxy is host infrastructure. It owns port 443 on the LAN address, or another port if something else holds 443 (6.1.8), and often fronts
   other services. In Docker it would need `network_mode: host`, which removes most of the
   isolation a compose service brings.
-- A stock image is not enough, because the Cloudflare module needs a custom build.
+- For the Let's Encrypt route a stock image is not enough, because the Cloudflare module
+  needs a custom build.
 - One proxy setup then serves both the compose and the systemd install.
 
 The cost is one more thing to install by hand, which this section walks through.
@@ -308,9 +319,61 @@ A local DNS override for the name is an alternative. Caddy then still needs
 - From the Mac at home, then on cellular with the tunnel on:
   `curl https://earmark.example.com/healthz` prints `{"status":"ok"}`, with a valid
   certificate.
+  If Caddy listens on another port (6.1.8), add it to every URL here, for example
+  `https://earmark.example.com:8443/healthz`.
 - From a host outside both, the name resolves but the connection fails. That is correct.
 - The Shortcut URL is `https://earmark.example.com/transcriptions`
   ([docs/shortcut.md](shortcut.md)).
+
+#### 6.1.8 With a certificate you already have
+
+If you already have a certificate for the name, such as a commercial wildcard for
+`*.example.com`, Caddy can serve it instead of getting one from Let's Encrypt. The DNS record
+(6.1.1), WireGuard (6.1.2) and the rebinding note (6.1.6) stay the same; 6.1.4 does not
+apply.
+
+- **Stock Caddy is enough.** No DNS module, no custom build and no Cloudflare token: the
+  distribution's package (`sudo apt install caddy`) or Caddy's own package both work.
+- **The chain must include the intermediates.** The file Caddy serves is the server's
+  certificate followed by each intermediate, in that order. iOS rejects a bare leaf, and
+  clients such as `curl` never fetch a missing intermediate. Your CA's download usually
+  has a "full chain" or "bundle" file; otherwise append the CA's intermediate file to the
+  certificate.
+- **The Caddyfile** is [`deploy/caddy/Caddyfile.own-cert`](../deploy/caddy/Caddyfile.own-cert).
+  Copy it to `/etc/caddy/Caddyfile` and change the name, the `bind` address and the port. Its
+  `tls` line names the two installed files.
+- **Install the certificate with the script**, from a checkout on the Mac (`spark` is the
+  Spark's ssh host):
+
+  ```bash
+  deploy/caddy/install-cert.sh --dry-run spark ~/ssl/example.com.fullchain.pem ~/ssl/example.com.key
+  deploy/caddy/install-cert.sh spark ~/ssl/example.com.fullchain.pem ~/ssl/example.com.key
+  ```
+
+  [`deploy/caddy/install-cert.sh`](../deploy/caddy/install-cert.sh) checks locally that every
+  certificate parses, that the key matches the first one, that the chain has the intermediates
+  in order, and that the certificate has a Subject Alternative Name and has not expired. It
+  warns within 30 days of expiry. `--dry-run` stops there. Otherwise it copies both files over
+  ssh into a private temporary directory on the server, installs them as
+  `/etc/caddy/certs/fullchain.pem` (root:caddy 0644) and `/etc/caddy/certs/privkey.pem`
+  (root:caddy 0640), removes the copies, validates `/etc/caddy/Caddyfile`, and reloads Caddy
+  if it is running. sudo on the server asks for your password. The script never prints the
+  key. It needs bash and openssl (the Mac's own are fine), and an unencrypted key.
+- **Renewal is manual.** Nothing renews this certificate. Before the date the script prints,
+  get the new files from your CA and run the script again: it replaces both files and
+  reloads Caddy. The packaged unit reloads with `caddy reload --force`, which reads the new
+  files. A reload without `--force` keeps the old certificate, and the script warns if the
+  unit's reload lacks it.
+- **When 443 is taken.** If another proxy on the host already listens on 443 (check with
+  `sudo ss -ltnp 'sport = :443'`), give Caddy another port in the site address, such as
+  `earmark.example.com:8443`, as the example does. Every URL then carries the port:
+  - the Shortcut's, `https://earmark.example.com:8443/transcriptions`;
+  - every `curl` in these docs and in the runbook;
+  - `EARMARK_API_URL` on the Mac (section 19.4).
+
+  The example keeps `auto_https disable_redirects`, so Caddy needs no port 80, which the
+  other proxy may hold as well. If the host runs a firewall, allow the port from the LAN
+  and the WireGuard subnet only.
 
 ### 6.2 Tailscale Serve (the shorter alternative)
 
@@ -328,8 +391,8 @@ The Shortcut uploads audio files, which can be large. From Caddy's documentation
 (2026-11-23; none of it was run here):
 
 - Caddy's defaults set no body size limit and no timeout for reading the request body or
-  writing the response, and its reverse proxy streams the request body to earmark. The
-  example Caddyfile adds nothing that limits uploads.
+  writing the response, and its reverse proxy streams the request body to earmark. Neither
+  example Caddyfile adds anything that limits uploads.
 - The limit is `EARMARK_MAX_UPLOAD_MB` (default 1024 MiB). earmark answers 413 above it.
 - The API answers only after the whole file has arrived, so a large voice memo on
   cellular takes as long as the upload does. How long the Shortcut waits is not

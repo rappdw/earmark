@@ -54,6 +54,7 @@ PLANS = [
     "docs/steps/29-mail-contract-seam.md",
     "docs/steps/30-pka-receiving-skill.md",
     "docs/steps/32-youtube-source.md",
+    "docs/steps/35-own-certificate.md",
 ]
 CONTRACT_DOCS = [
     "contract/README.md",
@@ -1220,6 +1221,8 @@ def test_architecture_repo_layout_matches_repo() -> None:
         "shortcut/earmark.shortcut",
         "src/earmark/",
         "compose.yaml",
+        "deploy/caddy/Caddyfile.own-cert",
+        "deploy/caddy/install-cert.sh",
     }
     assert brief <= paths, sorted(brief - paths)
 
@@ -1510,3 +1513,146 @@ def test_deploy_doc_cli_section() -> None:
         "not in .env",
     ):
         assert needle in flat, needle
+
+
+# --- step 35: your own certificate --------------------------------------------------------
+
+OWN_CERT_CADDYFILE = "deploy/caddy/Caddyfile.own-cert"
+INSTALL_CERT = "deploy/caddy/install-cert.sh"
+EXAMPLE_HOST = re.compile(
+    r"\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|app|cloud|me|co|uk|de|ai)\b", re.IGNORECASE
+)
+EXAMPLE_DOMAINS = ("example.com", "example.org", "example.net")
+
+
+def _assert_example_hosts(text: str, label: str) -> None:
+    for match in EXAMPLE_HOST.finditer(text):
+        host = match[0].lower()
+        ok = host == "github.com" or any(
+            host == d or host.endswith("." + d) for d in EXAMPLE_DOMAINS
+        )
+        assert ok, (label, match[0])
+
+
+def _assert_no_key_material(text: str, label: str) -> None:
+    assert "-----BEGIN" not in text, label
+    assert re.search(r"[A-Za-z0-9+/]{64,}", text) is None, label
+
+
+def _deploy_files() -> list[str]:
+    root = ROOT / "deploy"
+    return sorted(str(p.relative_to(ROOT)) for p in root.rglob("*") if p.is_file())
+
+
+@pytest.mark.parametrize("path", _deploy_files())
+def test_deploy_files_use_placeholders_only(path: str) -> None:
+    text = read_doc(path)
+    _assert_placeholders(text, path)
+    _assert_example_hosts(text, path)
+    _assert_no_key_material(text, path)
+
+
+def test_deploy_file_scan_catches_real_names() -> None:
+    for text in ("earmark.realhost.org", "tls /x/real.example.co"):
+        with pytest.raises(AssertionError):
+            _assert_example_hosts(text, "probe")
+    with pytest.raises(AssertionError):
+        _assert_no_key_material("-----BEGIN PRIVATE KEY-----", "probe")
+    with pytest.raises(AssertionError):
+        _assert_no_key_material("A" * 64, "probe")
+    _assert_example_hosts("earmark.example.com github.com a.example.org", "probe")
+
+
+def test_deploy_doc_own_certificate() -> None:
+    text = read_doc("docs/deploy.md")
+    own = section(text, "#### 6.1.8 ")
+    assert own.startswith("#### 6.1.8 With a certificate you already have")
+    for needle in (
+        "intermediates",
+        "iOS rejects a bare leaf",
+        "Stock Caddy",
+        "no Cloudflare token",
+        "install-cert.sh --dry-run",
+        "Caddyfile.own-cert",
+        "run the script again",
+        "--force",
+        "443",
+        "https://earmark.example.com:8443/transcriptions",
+        "curl",
+        "EARMARK_API_URL",
+        "disable_redirects",
+        "root:caddy 0640",
+        "root:caddy 0644",
+    ):
+        assert needle in _flat(own).replace("`", ""), needle
+    for heading in ("#### 6.1.3 ", "#### 6.1.4 "):
+        assert "6.1.8" in section(text, heading), heading
+
+
+def test_runbook_phase_7_offers_own_certificate() -> None:
+    body, _, check = _phase(7).partition("**Check:**")
+    for needle in (
+        "route A",
+        "route B",
+        "deploy.md#618-with-a-certificate-you-already-have",
+        "Caddyfile.own-cert",
+        "install-cert.sh --dry-run",
+        "sudo apt install caddy",
+        "ss -ltnp",
+        "cloudflare.env",
+    ):
+        assert needle in body, needle
+    for needle in (
+        "Route A:",
+        "Route B:",
+        "s_client",
+        "-showcerts",
+        "BEGIN CERTIFICATE",
+        "-serial",
+        "privkey.pem",
+        "-rw-r-----",
+        "@1.1.1.1",
+        "in order; key matches",
+    ):
+        assert needle in check, needle
+
+
+def test_runbook_and_docs_name_the_port() -> None:
+    caddyfile = read_doc(OWN_CERT_CADDYFILE)
+    [port] = re.findall(r"^earmark\.example\.com:(\d+) \{$", caddyfile, re.MULTILINE)
+    assert port == "8443"
+    assert f"https://earmark.example.com:{port}/healthz" in _phase(7)
+    assert f"https://earmark.example.com:{port}/transcriptions" in _phase(9)
+    own = section(read_doc("docs/deploy.md"), "#### 6.1.8 ")
+    assert f"https://earmark.example.com:{port}/transcriptions" in own
+    assert f"https://earmark.example.com:{port}" in read_doc("docs/shortcut.md")
+
+
+def test_install_cert_usage_matches_docs() -> None:
+    usage = "deploy/caddy/install-cert.sh [--dry-run] <ssh-host> <fullchain.pem> <private.key>"
+    assert f"#   {usage}\n" in read_doc(INSTALL_CERT)
+    lines = [
+        line.strip()
+        for doc in DOCS
+        for fence in fences(read_doc(doc))
+        if fence.info.split()[:1] == ["bash"]
+        for line in fence.body.splitlines()
+        if INSTALL_CERT in line
+    ]
+    assert len(lines) >= 4
+    for line in lines:
+        words = shlex.split(line)
+        assert words[0] == INSTALL_CERT, line
+        operands = words[1:]
+        if operands[:1] == ["--dry-run"]:
+            operands = operands[1:]
+        assert len(operands) == 3, line
+        assert not any(o.startswith("-") for o in operands), line
+
+
+def test_architecture_names_own_certificate() -> None:
+    arch = read_doc(ARCH)
+    [row] = [x for x in arch.splitlines() if x.startswith("| Reachability |")]
+    assert "install-cert.sh" in row
+    assert "step 35" in row
+    assert "Settled by step 35" in arch

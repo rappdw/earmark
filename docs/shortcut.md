@@ -26,7 +26,8 @@ You need four things:
   section 6: a private DNS name with a WireGuard tunnel, or Tailscale Serve. Check it first
   with Safari on the phone: open `https://earmark.example.com/healthz`. It should show
   `{"status":"ok"}`. The examples below use `earmark.example.com`; replace it with your
-  name.
+  name. If the proxy listens on a port other than 443, include it:
+  `https://earmark.example.com:8443` ([docs/deploy.md](deploy.md) section 6.1.8).
 - **The token**, the value of `EARMARK_API_TOKEN` on the server.
 - **The two destination addresses**, both on the server's allowlist ([docs/deploy.md](deploy.md)
   section 9): `pka-personal@example.net` and `pka-work@example.net`.

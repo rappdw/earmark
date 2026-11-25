@@ -61,7 +61,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 32 | YouTube as a source | 30 | done |
 | 33 | The transcript by job id | 32 | done |
 | 34 | The CLI as an API client | 33 | done |
-| 35 | Your own certificate | 34 | todo |
+| 35 | Your own certificate | 34 | done |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
