@@ -19,6 +19,11 @@ transcript by job id; and the CLI as an API client. All three come from the firs
 on the Spark. Step 35, added the same day, documents the certificate route the operator took
 there.
 
+**Added on 2026-11-28 (step 36).** A versioned API for programs, asked for by earshot (the
+operator's meeting transcriber) to replace its own transcription container on the Spark.
+A job submitted there is transcribed and kept for its client, and nothing about it leaves
+the Spark.
+
 ## Status
 
 Update this table when a step passes verification. Each step is one commit titled
@@ -62,6 +67,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 33 | The transcript by job id | 32 | done |
 | 34 | The CLI as an API client | 33 | done |
 | 35 | Your own certificate | 34 | done |
+| 36 | Transcription without delivery: the /v1 API | 35 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -1682,6 +1688,91 @@ used for real once; it is untracked until this step. Renewal is manual: rerun th
   matching chain passes `--dry-run`; a bare leaf, a mismatched key and an expired
   certificate each fail with their message), with no ssh and no network.
 - The repo layout test passes with the new files listed.
+- `make check` passes.
+
+## Step 36: Transcription without delivery: the /v1 API
+
+**Goal.** A program on the operator's hardware can send audio to the Spark, have it
+transcribed, and fetch the transcript by job id, without an email, a push, or anything else
+leaving the Spark.
+
+**Inputs (operator, 2026-11-28, through earshot).** The operator's words: "introduce a new
+api that doesn't take an email address, but runs the transcription. it should return the job
+id that can be queried and then a get transcription api as well that takes that job id."
+earshot is the first client. It sends one job per channel, so two per meeting, each a
+2–4 hour mono FLAC, through an SSH tunnel to `127.0.0.1:8787`. Meeting titles, names and
+transcripts are sensitive: they must not reach SMTP, ntfy or the logs. earshot is a public
+repo and codes against `/v1` as a contract.
+
+**Build.**
+
+- **`POST /v1/transcriptions`**, multipart only, behind the same bearer token.
+  - Fields: `file` (required), `initial_prompt` (optional; a cap the planner sets, a few
+    hundred characters), `language` (optional; a Whisper language code, otherwise
+    auto-detect). Any other field, `to` and `title` included, is a 422.
+  - It returns 202 with `{"job_id", "status"}`.
+  - Uploads only. There is no URL and no resolve stage.
+- **A delivery-free job.** The job records that it has no delivery.
+  - The worker runs fetch and transcribe and then marks it `done`. There is no deliver
+    stage and no notify stage, so no mail and no ntfy push, on success, on failure, or on
+    a skip.
+  - The recipient allowlist does not apply, because nothing is sent. The bearer token is
+    the gate. `docs/ARCHITECTURE.md` "Security" and `CLAUDE.md` say so.
+  - Nothing about the job is logged beyond its id, sizes, timings, status and error
+    class: no file name, no title, no `initial_prompt`, no transcript text. The upload's
+    file name is not stored as a title.
+- **`GET /v1/jobs/{id}`**: a narrow, stable view for `/v1`, not the internal `JobView`: id,
+  status (queued, running, done, failed, skipped), stage, error, `created_at`,
+  `updated_at`, and the language and duration once known. It is served for delivery-free
+  jobs; the planner decides whether other jobs are visible under `/v1` and how.
+- **`GET /v1/jobs/{id}/transcript`**: the json format of step 33,
+  `{job_id, language, duration_s, segments: [{start, end, text}], warnings}`. A `text`
+  format may also be offered. The 404, 409 and 410 states are step 33's.
+- **`DELETE /v1/jobs/{id}`**: purges what earmark holds for that job: the cached transcript
+  and its files, any kept audio, the staged upload, and the job's `initial_prompt`. It
+  leaves a job row that says it was purged, so a later fetch is a 410, not a 404. Purging a
+  queued or running job is refused with a 409; cancelling is out of scope. There is no
+  delete-after-fetch flag: a fetch that is lost in transit must be repeatable.
+- **The cache and decode options.** The transcript cache today holds one transcript per
+  episode key and reuses it only when the ASR profile matches. With a per-request
+  `initial_prompt` and `language`, the same audio can be transcribed two ways. The planner
+  settles the keying, so that a job always serves the transcript made with its own
+  options, a re-sent identical request reuses the cache, and a purge removes only what
+  belongs to the purged job, or says plainly what else it removes.
+- **Long jobs.** A 4-hour file runs for tens of minutes on the GPU. The planner checks
+  that the heartbeat keeps the lease (900 s) alive through a long transcription, and fixes
+  it if not.
+- **`/v1` is a contract.** Its text is `contract/api-v1.md`, pinned by a hash test like the
+  mail contract, with an example of each response. Additive changes are allowed; a
+  breaking change is `/v2`. The existing unversioned routes stay as they are.
+- **Docs:** `docs/ARCHITECTURE.md` (the System section gains the API seam and its client,
+  HTTP API, Security, Data layout), `CLAUDE.md`, the README, and `docs/deploy.md` (reaching
+  the API over an SSH tunnel; the upload cap; that 16 kHz mono is enough, since Whisper
+  resamples to 16 kHz, which keeps a 4-hour file well under the cap).
+
+**Research.** Whether faster-whisper's `transcribe`, and its batched pipeline if
+`ASR_BATCH_SIZE` is set, take `initial_prompt` and `language` in the installed version,
+and what each does to the ASR profile.
+
+**Out of scope.** Word timestamps, word and language probabilities, cancelling a job,
+other decode options (beam size, VAD, compute type, model), URL sources under `/v1`, and
+turning batching on by default; that last one is the operator's setting
+(`EARMARK_ASR_BATCH_SIZE`).
+
+**Acceptance.**
+
+- A `/v1` job runs end to end on the fakes and never reaches the mailer or the notifier,
+  on success, failure, and skip. A test fails if either is called.
+- `to`, `title`, unknown fields, a missing file, an over-long `initial_prompt` and a bad
+  `language` are each a 422 with a short message. A missing or wrong token is a 401.
+- No log line carries the upload's file name, the `initial_prompt` or transcript text; a
+  test feeds marked values through submit, run, fetch and purge and searches the logs.
+- Two jobs of the same audio with different `initial_prompt` values each serve their own
+  transcript, and an identical re-send reuses the cache without transcribing again.
+- `DELETE` removes the job's files and prompt, a fetch afterwards is a 410, and a queued or
+  running job is refused. A test shows what remains on disk.
+- The responses match the examples in `contract/api-v1.md`, and the contract's hash is
+  pinned.
 - `make check` passes.
 
 ## Backlog
