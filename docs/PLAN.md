@@ -1790,7 +1790,8 @@ turning batching on by default; that last one is the operator's setting
 instructions to the Spark, have a local language model summarise it, and fetch the result
 by job id, with nothing leaving the Spark.
 
-**Inputs (operator, 2026-11-28, through earshot).** earshot becomes a thin front end:
+**Inputs (operator, 2026-11-28, through earshot; confirmed by the operator directly the
+same day, including the partial reversal of the re-scope).** earshot becomes a thin front end:
 capture and meeting logic only, with no model work on the Mac. Transcription moves to
 step 36, and summarisation moves here. earshot sends its own merged Markdown transcript
 (speaker labels, `[HH:MM:SS]` stamps, cleaned of channel bleed), not a reference to a `/v1`
