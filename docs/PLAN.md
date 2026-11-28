@@ -22,7 +22,10 @@ there.
 **Added on 2026-11-28 (step 36).** A versioned API for programs, asked for by earshot (the
 operator's meeting transcriber) to replace its own transcription container on the Spark.
 A job submitted there is transcribed and kept for its client, and nothing about it leaves
-the Spark.
+the Spark. Step 37, added the same day, adds summaries on a local model to that API: earshot
+becomes a thin front end, and all model work moves to the Spark. It partly reverses the
+re-scope of 2026-11-23, which removed analysis, but only under `/v1` and only on a local
+model.
 
 ## Status
 
@@ -68,6 +71,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 34 | The CLI as an API client | 33 | done |
 | 35 | Your own certificate | 34 | done |
 | 36 | Transcription without delivery: the /v1 API | 35 | todo |
+| 37 | Summaries on a local model: /v1/summaries | 36 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -1778,6 +1782,99 @@ turning batching on by default; that last one is the operator's setting
   running job is refused. A test shows what remains on disk.
 - The responses match the examples in `contract/api-v1.md`, and the contract's hash is
   pinned.
+- `make check` passes.
+
+## Step 37: Summaries on a local model: /v1/summaries
+
+**Goal.** A program on the operator's hardware can send a transcript and its own
+instructions to the Spark, have a local language model summarise it, and fetch the result
+by job id, with nothing leaving the Spark.
+
+**Inputs (operator, 2026-11-28, through earshot).** earshot becomes a thin front end:
+capture and meeting logic only, with no model work on the Mac. Transcription moves to
+step 36, and summarisation moves here. earshot sends its own merged Markdown transcript
+(speaker labels, `[HH:MM:SS]` stamps, cleaned of channel bleed), not a reference to a `/v1`
+job, because it merges two channel jobs and edits the result first. It owns its notes
+format and sends it as the instructions. Meetings run 2–4 hours: 30–60 thousand words.
+
+**This is not the old analysis stage.** Step 22 removed analysis, the vault, entities and
+search; they stay removed. This step brings back only what a local summary needs. It may
+recover code from the `v0.1.0-full-pipeline` tag (the OpenAI-compatible client of step 11,
+`docs/steps/11-local-llm-map-reduce.md`, whose findings on vLLM, llama.cpp and Ollama are
+the starting point), but nothing else from it. There is no Claude or other cloud backend
+under `/v1`, and none is added.
+
+**Build.**
+
+- **`POST /v1/summaries`**, JSON, behind the bearer token: `transcript` (string,
+  required) and `instructions` (string, required; used as the system prompt). Any other
+  field is a 422. It returns 202 with `{"job_id", "status"}`. Both inputs have a size cap,
+  stated in the contract.
+- **The backend.** An OpenAI-compatible chat completions server that the operator runs on
+  the Spark (Ollama, llama.cpp's `llama-server` or vLLM), named by settings such as
+  `EARMARK_LLM_BASE_URL` and `EARMARK_LLM_MODEL`, with an output token limit and a timeout.
+  Unset, `/v1/summaries` is a 503 that says so, and doctor reports it.
+  - **Local only.** The base URL must name a loopback or private-network address; anything
+    else is refused when settings load. The planner decides how a host name is handled.
+  - The request goes through earmark's own client with the same care as the remote ASR
+    backend: no proxies from the environment, no redirects, bounded response size.
+- **No silent truncation.** The input must fit the model's context with room for the
+  output.
+  - At submit, an input over the operator's configured cap is a 422 that states the cap.
+    The submit handler still makes no outbound request.
+  - In the worker, the planner finds a reliable way to know the input fitted, for each
+    server type, and fails the job permanently with a clear message when it did not. This
+    matters most for Ollama, whose context comes from its own settings, not the request,
+    and which can drop the start of a long prompt silently. Doctor reports the server's
+    context window where the server exposes it.
+  - Map-reduce over chunks is out of scope; the contract states the maximum input instead.
+- **A summary job.** It runs one model call and is `done` with its output stored next to
+  it. There is no deliver or notify stage: no mail, no ntfy push, on success or failure.
+  Logs carry the job id, sizes, timings, token counts and the error class, never the
+  transcript, instructions or output.
+- **`GET /v1/jobs/{id}`** gains a `kind` field (`transcription` or `summary`), additively.
+  Step 36's view otherwise applies. For a summary job, the language and duration fields
+  are absent or null, as the planner decides and the contract states.
+- **`GET /v1/jobs/{id}/summary`**: `{job_id, model, text, warnings}`, with `text` the
+  model's Markdown as returned. 404, 409 and 410 as for transcripts. The model's output is
+  untrusted text; earmark serves it as data and does not interpret it.
+- **`DELETE /v1/jobs/{id}`** purges a summary job's transcript, instructions and output,
+  with step 36's tombstone.
+- **Long generations.** The lease and the client timeout cover a long generation on a
+  4-hour input; the planner checks the heartbeat as step 36 does.
+- **The contract.** `contract/api-v1.md` gains the summary routes and the input caps,
+  additively, with examples; its hash pin is updated as a recorded, additive revision.
+- **Docs:** `docs/ARCHITECTURE.md` (the re-scope record, System, HTTP API, Security, the
+  module layout), `CLAUDE.md` ("The service today" and the rules), the README, and
+  `docs/deploy.md`: running a local model server on the Spark next to the GPU worker, and
+  setting its context window (Ollama's in particular) to fit 4-hour meetings, with the
+  memory this costs on the Spark.
+
+**Research.** Re-check step 11's findings against current releases: how each server
+reports its context window and the prompt's token count, and what each does with a prompt
+that is too long. Check whether the Spark's unified memory can hold large-v3 and a useful
+model at once, or whether the docs must say to unload one.
+
+**Out of scope.** Map-reduce chunking, per-request `max_tokens` or `temperature`, a
+summary that references a `/v1` transcription job, structured (JSON) output, any cloud
+model, and running the model server from earmark's compose file unless the planner finds
+it the simpler path for the operator.
+
+**Acceptance.**
+
+- A summary job runs end to end against a fake OpenAI-compatible server on a unix socket,
+  never reaches the mailer or the notifier, and serves the model's text byte for byte.
+- An input over the cap is a 422 stating the cap; a test shows the handler makes no
+  outbound request. An over-context input in the worker fails the job with the stated
+  message, for each server's way of reporting it, and never stores a summary of part of
+  the input.
+- A base URL that is not loopback or private is refused at settings load.
+- No log line carries the transcript, instructions or output; a test feeds marked values
+  through submit, run, fetch and purge and searches the logs.
+- `kind` is correct for both job types, and the summary route on a transcription job, and
+  the transcript route on a summary job, each give a clear error.
+- `DELETE` purges a summary job as it does a transcription job.
+- `contract/api-v1.md` covers the new routes and caps, and the step-36 examples still hold.
 - `make check` passes.
 
 ## Backlog
