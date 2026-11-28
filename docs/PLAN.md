@@ -1758,7 +1758,8 @@ repo and codes against `/v1` as a contract.
 `ASR_BATCH_SIZE` is set, take `initial_prompt` and `language` in the installed version,
 and what each does to the ASR profile.
 
-**Out of scope.** Word timestamps, word and language probabilities, cancelling a job,
+**Out of scope.** Word timestamps (operator, 2026-11-28: not for now; when a client
+needs them they are an additive, opt-in `/v1` field), word and language probabilities, cancelling a job,
 other decode options (beam size, VAD, compute type, model), URL sources under `/v1`, and
 turning batching on by default; that last one is the operator's setting
 (`EARMARK_ASR_BATCH_SIZE`).
