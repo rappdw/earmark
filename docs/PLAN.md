@@ -1707,9 +1707,13 @@ repo and codes against `/v1` as a contract.
 **Build.**
 
 - **`POST /v1/transcriptions`**, multipart only, behind the same bearer token.
-  - Fields: `file` (required), `initial_prompt` (optional; a cap the planner sets, a few
-    hundred characters), `language` (optional; a Whisper language code, otherwise
-    auto-detect). Any other field, `to` and `title` included, is a 422.
+  - Fields: `file` (required), `initial_prompt` (optional), `language` (optional; a
+    Whisper language code, otherwise auto-detect).
+  - The `initial_prompt` cap matches Whisper's own window, not less: faster-whisper keeps
+    about the last 223 tokens of a prompt, roughly 800–1000 characters of English names and
+    jargon. The planner checks that in the installed version and sets the cap (about 1000
+    characters, or a token count), and `contract/api-v1.md` states it exactly, so a client
+    can trim to it. Any other field, `to` and `title` included, is a 422.
   - It returns 202 with `{"job_id", "status"}`.
   - Uploads only. There is no URL and no resolve stage.
 - **A delivery-free job.** The job records that it has no delivery.
