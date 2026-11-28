@@ -2,13 +2,17 @@
 
 import logging
 import re
+import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Final
+
+from pydantic import ValidationError
 
 from earmark.artifacts import ArtifactStore
 from earmark.errors import (
@@ -26,6 +30,8 @@ from earmark.models import (
     Episode,
     Job,
     JobResult,
+    SummaryInput,
+    SummaryRecord,
     Transcript,
     scrub_surrogates,
     utc_now,
@@ -35,6 +41,13 @@ from earmark.pipeline.stages import Backends, OutgoingMail
 from earmark.recipients import RecipientPolicy, mask_address
 from earmark.sources import audio_episode, sha256_file
 from earmark.staging import Staging
+from earmark.summarize.base import (
+    INPUT_CHANGED,
+    INPUT_MISSING,
+    INPUT_UNREADABLE,
+    NOT_CONFIGURED,
+    check_result,
+)
 from earmark.transcripts import episode_for_job
 from earmark.youtube.links import video_id_from_canonical
 
@@ -105,19 +118,24 @@ class Pipeline:
         job = claim.job
         state = _RunState()
         try:
+            result: JobResult | None = None  # None for a summary job
+            outgoing: tuple[OutgoingMail, JobResult] | None = None
             with interruptible():
-                transcript = self._stage_work(claim, state)
-                result = JobResult(duration_s=transcript.duration_s, language=transcript.language)
-                if job.delivery == "none":
-                    mail = None
+                if job.kind == "summary":
+                    self._summarize(claim)
                 else:
-                    self._jobs.set_stage(claim, "deliver")
-                    mail = self._compose(job, state, transcript)
+                    transcript = self._stage_work(claim, state)
+                    result = JobResult(
+                        duration_s=transcript.duration_s, language=transcript.language
+                    )
+                    if job.delivery != "none":
+                        self._jobs.set_stage(claim, "deliver")
+                        outgoing = (self._compose(job, state, transcript), result)
             # Delivery runs outside the interruptible window: a SIGTERM waits for it.
-            if mail is None:
+            if outgoing is None:
                 done = self._jobs.complete(claim, result)
             else:
-                done = self._deliver(claim, mail, result)
+                done = self._deliver(claim, *outgoing)
         except LeaseLostError:
             logger.warning("lost the lease on job %s; abandoning it", job.id)
             return None
@@ -267,6 +285,58 @@ class Pipeline:
             raise PermanentError("transcriber returned a transcript for another episode")
         self._warn(job.id, transcript.warnings)
         return transcript
+
+    def _summarize(self, claim: Claim) -> None:
+        """One model call on the staged input; the summary is written only if it is whole."""
+        job = claim.job
+        self._jobs.set_stage(claim, "summarize")
+        summarizer = self._b.summarizer
+        if summarizer is None:
+            raise PermanentError(NOT_CONFIGURED)
+        if job.upload_file is None or job.content_sha256 is None:
+            raise PermanentError(INPUT_MISSING)
+        path = self._staging.upload_path(job.upload_file)
+        if not path.is_file():
+            raise PermanentError(INPUT_MISSING)
+        raw = path.read_bytes()
+        if sha256(raw).hexdigest() != job.content_sha256:
+            raise PermanentError(INPUT_CHANGED)
+        try:
+            request = SummaryInput.model_validate_json(raw)
+        except (ValidationError, UnicodeDecodeError):
+            raise PermanentError(INPUT_UNREADABLE) from None
+        started = time.monotonic()
+        result = summarizer.summarize(request)
+        elapsed = time.monotonic() - started
+        check_result(result, max_output_tokens=summarizer.max_output_tokens)
+        self._artifacts.write_summary(
+            SummaryRecord(
+                job_id=job.id,
+                backend=summarizer.backend,
+                model=result.model,
+                text=result.text,
+                warnings=result.warnings,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                context_tokens=result.context_tokens,
+                created_at=self._clock(),
+            )
+        )
+        self._warn(job.id, result.warnings)
+        prompt = "?" if result.prompt_tokens is None else result.prompt_tokens
+        completion = "?" if result.completion_tokens is None else result.completion_tokens
+        logger.info(
+            "job %s: summary of %d transcript and %d instructions characters by %s model %s: "
+            "%s prompt tokens, %s output tokens, %.1f s",
+            job.id,
+            len(request.transcript),
+            len(request.instructions),
+            summarizer.backend,
+            result.model,
+            prompt,
+            completion,
+            elapsed,
+        )
 
     # -- delivery ---------------------------------------------------------------------
 

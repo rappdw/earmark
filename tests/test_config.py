@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -89,7 +90,7 @@ def test_secret_fields_are_secretstr() -> None:
     }
     for n in names:
         assert Settings.model_fields[n].annotation == SecretStr | None, n
-    assert names == {"api_token", "asr_api_key", "ntfy_token", "smtp_password"}
+    assert names == {"api_token", "asr_api_key", "llm_api_key", "ntfy_token", "smtp_password"}
 
 
 _SECRETS = {
@@ -381,6 +382,14 @@ def test_settings_fields_are_exactly() -> None:
         "smtp_from",
         "smtp_timeout_s",
         "max_attachment_mb",
+        "llm_backend",
+        "llm_base_url",
+        "llm_model",
+        "llm_api_key",
+        "llm_context_tokens",
+        "llm_max_output_tokens",
+        "llm_timeout_seconds",
+        "llm_max_transcript_chars",
         "log_level",
     )
 
@@ -646,3 +655,251 @@ def test_api_url_empty_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_is_loopback_ip(host: str, loopback: bool) -> None:
     assert cfg.is_loopback_ip(host) is loopback
+
+
+# -- EARMARK_LLM_* (step 37) ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        "http://127.0.0.1:11434",
+        "http://127.8.9.10",
+        "http://[::1]:8000",
+        "http://10.0.0.5",
+        "http://172.16.0.1",
+        "http://172.31.255.254",
+        "http://192.168.1.10:8080",
+        "http://[fd00::1]",
+        "http://localhost:11434",
+        "http://ollama:11434",
+        "http://llm",
+        "http://host.docker.internal:11434",
+        "http://spark.local",
+        "http://box.lan",
+        "http://gpu.home.arpa",
+        "http://app.localhost:8080",
+        "https://ollama/",
+        "HTTP://Ollama:11434/",
+        "http://[::ffff:127.0.0.1]:8000",
+    ],
+)
+def test_llm_base_url_accepted(given: str) -> None:
+    stored = Settings(_env_file=None, llm_base_url=given).llm_base_url
+    assert stored is not None
+    assert not stored.endswith("/")
+    assert stored.split("://")[0] in ("http", "https")
+    assert stored.split("://", 1)[1].lower() == given.split("://", 1)[1].rstrip("/").lower()
+
+
+@pytest.mark.parametrize(
+    ("given", "message"),
+    [
+        ("http://8.8.8.8", cfg.LLM_URL_NOT_LOCAL),
+        ("http://1.1.1.1:11434", cfg.LLM_URL_NOT_LOCAL),
+        ("http://172.32.0.1", cfg.LLM_URL_NOT_LOCAL),
+        ("http://172.15.255.255", cfg.LLM_URL_NOT_LOCAL),
+        ("http://100.64.0.1", cfg.LLM_URL_NOT_LOCAL),
+        ("http://169.254.169.254", cfg.LLM_URL_NOT_LOCAL),
+        ("http://[fe80::1]", cfg.LLM_URL_NOT_LOCAL),
+        ("http://0.0.0.0:11434", cfg.LLM_URL_NOT_LOCAL),
+        ("http://[::ffff:8.8.8.8]", cfg.LLM_URL_NOT_LOCAL),
+        ("http://api.example.com", cfg.LLM_URL_NOT_LOCAL),
+        ("http://ollama.com", cfg.LLM_URL_NOT_LOCAL),
+        ("http://-bad", cfg.LLM_URL_NOT_LOCAL),
+        ("http://my.internal.example.org", cfg.LLM_URL_NOT_LOCAL),
+        ("https://llm.example.org/v1", cfg.LLM_URL_PATH),
+        ("http://127.0.0.1/v1", cfg.LLM_URL_PATH),
+        ("http://user:pw@127.0.0.1", cfg.LLM_URL_CREDENTIALS),
+        ("http://127.0.0.1?x=1", cfg.LLM_URL_QUERY),
+        ("http://127.0.0.1/#frag", cfg.LLM_URL_QUERY),
+        ("ftp://127.0.0.1", cfg.LLM_URL_SHAPE),
+        ("http://", cfg.LLM_URL_SHAPE),
+        ("127.0.0.1:11434", cfg.LLM_URL_SHAPE),
+        ("http://127.0.0.1:99999", cfg.LLM_URL_SHAPE),
+    ],
+)
+def test_llm_base_url_refused(monkeypatch: pytest.MonkeyPatch, given: str, message: str) -> None:
+    monkeypatch.setenv("EARMARK_LLM_BASE_URL", given)
+    with pytest.raises(ConfigError) as caught:
+        load_settings(env_file=None)
+    assert caught.value.errors == [f"EARMARK_LLM_BASE_URL: Value error, {message}"]
+    shown = str(caught.value).replace(message, "")
+    for piece in re.findall(r"[A-Za-z0-9.-]{4,}", given.split("//")[-1]):
+        assert piece not in shown, piece  # the input never reaches the message
+
+
+def test_llm_base_url_empty_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EARMARK_LLM_BASE_URL", "")
+    assert load_settings(env_file=None).llm_base_url is None
+    assert Settings(_env_file=None, llm_base_url="  ").llm_base_url is None
+
+
+def test_is_local_ip() -> None:
+    import ipaddress
+
+    def local(text: str) -> bool:
+        return cfg.is_local_ip(ipaddress.ip_address(text))
+
+    for yes in (
+        "127.0.0.1",
+        "127.255.255.255",
+        "10.255.255.255",
+        "172.16.0.0",
+        "172.31.255.255",
+        "192.168.0.1",
+        "::1",
+        "fc00::1",
+        "fdff:ffff::1",
+        "::ffff:10.0.0.1",
+        "::ffff:127.0.0.1",
+    ):
+        assert local(yes), yes
+    for no in (
+        "0.0.0.0",  # noqa: S104  # an address to refuse, not a bind
+        "8.8.8.8",
+        "172.15.255.255",
+        "172.32.0.0",
+        "100.64.0.1",
+        "100.127.255.255",
+        "169.254.1.1",
+        "192.169.0.1",
+        "::",
+        "fe80::1",
+        "ff02::1",
+        "2001:db8::1",
+        "::ffff:8.8.8.8",
+        "::ffff:169.254.169.254",
+        "fbff::1",
+    ):
+        assert not local(no), no
+
+
+def test_is_local_host_name() -> None:
+    for yes in (
+        "localhost",
+        "LOCALHOST",
+        "localhost.",
+        "a.localhost",
+        "ollama",
+        "llm-1",
+        "a.internal",
+        "host.docker.internal",
+        "b.a.local",
+        "x.lan",
+        "x.home.arpa",
+    ):
+        assert cfg.is_local_host_name(yes), yes
+    for no in (
+        "",
+        "example.com",
+        "a.b",
+        "internal.com",
+        "x.lan.example.org",
+        "-a",
+        "a-",
+        "a_b",
+        "a" * 64,
+        "127.0.0.1",
+        "::1",
+        "a..internal",
+        ".internal",
+    ):
+        assert not cfg.is_local_host_name(no), no
+
+
+def test_llm_settings_defaults() -> None:
+    s = Settings(_env_file=None)
+    assert (s.llm_backend, s.llm_base_url, s.llm_model, s.llm_api_key) == ("none", None, None, None)
+    assert s.llm_context_tokens is None
+    assert (s.llm_max_output_tokens, s.llm_timeout_seconds, s.llm_max_transcript_chars) == (
+        8192,
+        3600.0,
+        400_000,
+    )
+
+
+def test_llm_backend_is_lower_cased_and_checked(monkeypatch: pytest.MonkeyPatch) -> None:
+    spaced: dict[str, Any] = {"llm_backend": " Ollama "}
+    assert Settings(_env_file=None, **spaced).llm_backend == "ollama"
+    monkeypatch.setenv("EARMARK_LLM_PROVIDER", "anthropic")  # step 11's setting turns nothing on
+    assert load_settings(env_file=None).llm_backend == "none"
+    monkeypatch.setenv("EARMARK_LLM_BACKEND", "openai")
+    with pytest.raises(ConfigError) as caught:
+        load_settings(env_file=None)
+    assert caught.value.errors[0].startswith("EARMARK_LLM_BACKEND: ")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("llm_context_tokens", 8191),
+        ("llm_max_output_tokens", 255),
+        ("llm_max_output_tokens", 131_073),
+        ("llm_timeout_seconds", 0),
+        ("llm_max_transcript_chars", 999),
+        ("llm_max_transcript_chars", 10_000_001),
+    ],
+)
+def test_llm_numeric_bounds(field: str, value: float) -> None:
+    bad: dict[str, Any] = {field: value}
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **bad)
+    edge: dict[str, Any] = {
+        "llm_context_tokens": 8192,
+        "llm_max_output_tokens": 256,
+        "llm_timeout_seconds": 0.5,
+        "llm_max_transcript_chars": 1000,
+    }
+    good: dict[str, Any] = {field: edge[field]}
+    Settings(_env_file=None, **good)
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("gpt-oss:120b", "gpt-oss:120b"),
+        ("openai/gpt-oss-120b", "openai/gpt-oss-120b"),
+        ("  llama3.3:70b-instruct-q4_K_M ", "llama3.3:70b-instruct-q4_K_M"),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_llm_model_accepted(given: str, expected: str | None) -> None:
+    assert Settings(_env_file=None, llm_model=given).llm_model == expected
+
+
+@pytest.mark.parametrize("given", ["two words", "tab\tname", "new\nline", "x" * 201, "bell\x07"])
+def test_llm_model_refused(given: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, llm_model=given)
+
+
+def test_llm_api_key_is_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = Settings(_env_file=None, llm_api_key=SecretStr("  sentinel-llm-key  "))
+    assert s.llm_api_key is not None
+    assert s.llm_api_key.get_secret_value() == "sentinel-llm-key"
+    assert "sentinel-llm-key" in s.secret_values()
+    assert "sentinel-llm-key" not in repr(s)
+    assert ("EARMARK_LLM_API_KEY", "**********") in s.redacted_items()
+    assert Settings(_env_file=None, llm_api_key=SecretStr("  ")).llm_api_key is None
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, llm_api_key=SecretStr("two words"))
+
+
+def test_earmark_config_redacts_the_llm_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from typer.testing import CliRunner
+
+    from earmark.cli import app
+
+    monkeypatch.setenv("EARMARK_LLM_API_KEY", "sentinel-llm-key-9f")
+    result = CliRunner().invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "sentinel-llm-key-9f" not in result.output
+    assert "EARMARK_LLM_API_KEY=**********" in result.output.replace(" ", "")
+
+
+def test_env_example_has_the_llm_section() -> None:
+    text = (ROOT / ".env.example").read_text()
+    assert "EARMARK_LLM_BACKEND=none" in text
+    assert "EARMARK_LLM_MAX_TRANSCRIPT_CHARS=400000" in text

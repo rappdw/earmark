@@ -350,7 +350,7 @@ def test_fresh_database_identity(tmp_path: Path) -> None:
     path = tmp_path / "earmark.db"
     db = open_database(path)
     assert db.identity() == (APPLICATION_ID, SCHEMA_VERSION)
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     with db.connect() as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert names == {"jobs"}
@@ -573,9 +573,10 @@ def test_migration_0004_keeps_active_dedupe(tmp_path: Path) -> None:
         _insert_row(conn, "c" * 32, "youtube", status="done", dedupe_key="same")
 
 
-def test_schema_version_is_5() -> None:
-    assert SCHEMA_VERSION == 5
-    assert MIGRATIONS[-1].name == "0005_v1"
+def test_schema_version_is_6() -> None:
+    assert SCHEMA_VERSION == 6
+    assert MIGRATIONS[-1].name == "0006_summaries"
+    assert MIGRATIONS[-2].name == "0005_v1"
 
 
 # -- step 36 ------------------------------------------------------------------------------------
@@ -597,8 +598,8 @@ def test_migration_0005_keeps_rows(tmp_path: Path) -> None:
         )
     finally:
         conn.close()
-    db = open_database(path)
-    assert db.schema_version() == SCHEMA_VERSION == 5
+    db = open_database(path, migrations=MIGRATIONS[:5])
+    assert db.schema_version() == 5
     with db.connect() as conn:
         rows = conn.execute("SELECT * FROM jobs ORDER BY seq").fetchall()
         assert [r["delivery"] for r in rows] == ["mail", "mail"]
@@ -658,3 +659,108 @@ def test_checkpoint_busy_returns_false(tmp_path: Path) -> None:
         assert db.checkpoint() is False
     finally:
         reader.close()
+
+
+# -- step 37 ------------------------------------------------------------------------------------
+
+_V5_COLUMNS = (
+    "seq, id, kind, status, stage, url, episode_key, dedupe_key, attempts, run_after, error, "
+    "warnings, result, shared_at, created_at, updated_at, heartbeat_at, lease_token, source, "
+    "recipient, instructions, title, upload_file, upload_name, content_sha256, utc_offset_min, "
+    "delivery_state, message_id, sent_at, resent, delivery, initial_prompt, language, purged_at"
+)
+
+
+_V5_SELECT = f"SELECT {_V5_COLUMNS} FROM jobs"  # noqa: S608  # constant columns
+_V5_SELECT_ORDERED = _V5_SELECT + " ORDER BY seq"
+
+
+def _v5_database(path: Path) -> None:
+    open_database(path, migrations=MIGRATIONS[:5])
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        _insert_row(conn, "a" * 32, "apple_podcasts", stage="deliver", error="e")
+        _insert_row(
+            conn,
+            "b" * 32,
+            "upload",
+            url=None,
+            recipient=None,
+            instructions="",
+            upload_file="1" * 32 + ".m4a",
+            content_sha256="2" * 64,
+            delivery="none",
+            initial_prompt="names",
+            language="en",
+            status="queued",
+            dedupe_key="live-key",
+        )
+        _insert_row(
+            conn,
+            "c" * 32,
+            "upload",
+            url=None,
+            recipient=None,
+            instructions="",
+            upload_file="3" * 32 + ".m4a",
+            content_sha256="4" * 64,
+            delivery="none",
+            purged_at="2026-01-02T00:00:00.000000+00:00",
+            dedupe_key="purged:" + "c" * 32,
+        )
+    finally:
+        conn.close()
+
+
+def test_migration_0006_keeps_rows(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    _v5_database(path)
+    before = sqlite3.connect(path, autocommit=True)
+    try:
+        rows_before = [tuple(r) for r in before.execute(_V5_SELECT)]
+    finally:
+        before.close()
+    assert len(rows_before) == 3
+    db = open_database(path)
+    assert db.schema_version() == SCHEMA_VERSION == 6
+    with db.connect() as conn:
+        rows_after = [tuple(r) for r in conn.execute(_V5_SELECT_ORDERED)]
+        assert rows_after == rows_before
+        names = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)")]
+        assert names == [c.strip() for c in _V5_COLUMNS.split(",")]
+        _insert_row(
+            conn,
+            "d" * 32,
+            "upload",
+            kind="summary",
+            url=None,
+            recipient=None,
+            instructions="",
+            upload_file="5" * 32 + ".json",
+            content_sha256="6" * 64,
+            delivery="none",
+        )
+        assert conn.execute("SELECT kind FROM jobs WHERE id = ?", ("d" * 32,)).fetchone()[0] == (
+            "summary"
+        )
+    assert db.identity() == (APPLICATION_ID, 6)
+
+
+def test_migration_0006_keeps_active_dedupe(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    _v5_database(path)
+    db = open_database(path)
+    with db.connect() as conn:
+        indexes = {r["name"] for r in conn.execute("PRAGMA index_list(jobs)")}
+        assert {"jobs_active_dedupe", "jobs_by_status", "jobs_by_dedupe"} <= indexes
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_row(conn, "e" * 32, "apple_podcasts", status="queued", dedupe_key="live-key")
+        _insert_row(conn, "f" * 32, "apple_podcasts", status="done", dedupe_key="live-key")
+
+
+def test_migration_0006_rejects_other_kinds(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    with db.connect() as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_row(conn, "a" * 32, "apple_podcasts", kind="analysis")
+        _insert_row(conn, "b" * 32, "apple_podcasts", kind="ingest")

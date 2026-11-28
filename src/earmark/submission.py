@@ -8,7 +8,13 @@ import logging
 from dataclasses import dataclass
 
 from earmark.jobs import Enqueued, JobStore, NewJob
-from earmark.models import TranscriptionRequest, UploadFields, V1UploadFields
+from earmark.models import (
+    SummaryFields,
+    TranscriptionRequest,
+    UploadFields,
+    V1UploadFields,
+    summary_input_bytes,
+)
 from earmark.recipients import RecipientPolicy, mask_address
 from earmark.sources import parse_source_url, url_host
 from earmark.staging import StagedUpload, Staging
@@ -101,6 +107,37 @@ class Intake:
             "enqueued job %s: upload of %d bytes, no delivery (created=%s)",
             enqueued.job.id,
             staged.size,
+            enqueued.created,
+        )
+        return enqueued
+
+    def submit_summary(self, fields: SummaryFields, /) -> Enqueued:
+        """Stage the input and enqueue a summary job. Deletes the staged file when this
+        raises or finds an existing job. No recipient check: nothing is sent."""
+        staged = self.staging.stage_document(summary_input_bytes(fields), "json")
+        try:
+            enqueued = self.store.enqueue(
+                NewJob(
+                    kind="summary",
+                    source="upload",
+                    to=None,
+                    upload_file=staged.name,
+                    upload_name=None,
+                    content_sha256=staged.sha256,
+                    delivery="none",
+                )
+            )
+        except BaseException:
+            self.staging.release_staged(staged)
+            raise
+        if not enqueued.created:
+            self.staging.release_staged(staged)
+        logger.info(
+            "enqueued job %s: summary of %d transcript and %d instructions characters, "
+            "no delivery (created=%s)",
+            enqueued.job.id,
+            len(fields.transcript),
+            len(fields.instructions),
             enqueued.created,
         )
         return enqueued

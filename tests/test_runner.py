@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta
@@ -11,13 +12,21 @@ from pydantic import SecretStr
 
 from earmark.config import REDACTED, Settings
 from earmark.errors import PermanentError, SkipEpisode, TransientError
-from earmark.fakes import FakeAudioFetcher, FakeTranscriber, FakeYoutubeSource, make_fake_backends
+from earmark.fakes import (
+    FakeAudioFetcher,
+    FakeSummarizer,
+    FakeTranscriber,
+    FakeYoutubeSource,
+    make_fake_backends,
+)
 from earmark.models import (
     DecodeOptions,
     Episode,
     Job,
     JobResult,
     Segment,
+    SummaryInput,
+    SummaryResult,
     Transcript,
     content_key,
     youtube_key,
@@ -46,6 +55,7 @@ from tests.pipeline_env import (
     counting_store,
     make_env,
 )
+from tests.summary_env import stage_summary_job
 
 
 def _run(env: PipelineEnv) -> Job:
@@ -890,3 +900,220 @@ def test_v1_job_runs_only_the_transcribe_stages(tmp_path: Path) -> None:
     assert not (tmp_path / "data" / "episodes").exists()  # no episode.json, no shared.json
     assert env.fakes.mailer.calls == []
     assert env.fakes.notifier.calls == []
+
+
+# -- summary jobs (step 37) -----------------------------------------------------------------
+
+
+def _summary_env(tmp_path: Path, **kwargs: Any) -> PipelineEnv:
+    return make_env(tmp_path, **kwargs)
+
+
+def _stage_raw_summary_job(env: PipelineEnv, data: bytes) -> Job:
+    from earmark.jobs import NewJob
+
+    staged = env.staging.stage_document(data, "json")
+    return env.jobs.enqueue(
+        NewJob(
+            kind="summary",
+            source="upload",
+            to=None,
+            upload_file=staged.name,
+            content_sha256=staged.sha256,
+            delivery="none",
+        )
+    ).job
+
+
+def test_summary_job_runs_through_the_summarizer(tmp_path: Path) -> None:
+    env = _summary_env(tmp_path)
+    queued = stage_summary_job(env.jobs, env.staging, transcript="x" * 50)
+    done = _run(env)
+    assert (done.id, done.status, done.stage, done.result) == (queued.id, "done", "summarize", None)
+    assert done.episode_key is None
+    record = env.fakes.artifacts.read_summary(done.id)
+    assert record is not None
+    assert record.text == "Summary of 50 characters.\n"
+    assert (record.backend, record.model) == ("fake", "fake-llm")
+    assert record.created_at == env.clock.now
+    assert env.fakes.summarizer.call_count == 1
+    for untouched in (
+        env.fakes.resolver,
+        env.fakes.fetcher,
+        env.fakes.youtube,
+        env.fakes.transcriber,
+        env.fakes.mailer,
+        env.fakes.notifier,
+    ):
+        assert untouched.call_count == 0
+    assert not env.staging.upload_path(queued.upload_file or "").exists()
+
+
+def test_summary_warnings_and_counts_are_stored(tmp_path: Path) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+
+    class WarningSummarizer:
+        backend = "fake"
+        model = "m"
+        max_output_tokens = 8192
+
+        def summarize(self, request: SummaryInput, /) -> SummaryResult:
+            return SummaryResult(
+                text="t",
+                model="m",
+                finish_reason="stop",
+                prompt_tokens=11,
+                completion_tokens=2,
+                context_tokens=8192,
+                warnings=("the server did not report token counts",),
+            )
+
+    env = make_env(
+        tmp_path, fakes=fakes, backends=replace(fakes.backends(), summarizer=WarningSummarizer())
+    )
+    stage_summary_job(env.jobs, env.staging)
+    done = _run(env)
+    assert done.warnings == ("the server did not report token counts",)
+    record = env.fakes.artifacts.read_summary(done.id)
+    assert record is not None
+    assert (record.prompt_tokens, record.completion_tokens, record.context_tokens) == (11, 2, 8192)
+    assert record.warnings == done.warnings
+
+
+def test_summary_not_configured_on_worker(tmp_path: Path) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+    env = make_env(tmp_path, fakes=fakes, backends=replace(fakes.backends(), summarizer=None))
+    queued = stage_summary_job(env.jobs, env.staging)
+    job = _run(env)
+    assert (job.status, job.error) == (
+        "failed",
+        "summaries are not configured on the worker (EARMARK_LLM_BACKEND is none)",
+    )
+    assert job.attempts == 1  # permanent: not retried
+    assert not env.staging.upload_path(queued.upload_file or "").exists()
+    assert not env.fakes.artifacts.has_summary(job.id)
+
+
+def test_summary_input_missing(tmp_path: Path) -> None:
+    env = _summary_env(tmp_path)
+    queued = stage_summary_job(env.jobs, env.staging)
+    env.staging.upload_path(queued.upload_file or "").unlink()
+    job = _run(env)
+    assert (job.status, job.error) == ("failed", "the summary's input is missing; send it again")
+    assert env.fakes.summarizer.call_count == 0
+
+
+def test_summary_input_changed(tmp_path: Path) -> None:
+    env = _summary_env(tmp_path)
+    queued = stage_summary_job(env.jobs, env.staging)
+    path = env.staging.upload_path(queued.upload_file or "")
+    path.write_bytes(path.read_bytes().replace(b"Alice", b"Mallory"))
+    job = _run(env)
+    assert (job.status, job.error) == (
+        "failed",
+        "the summary's input changed after it was received",
+    )
+    assert env.fakes.summarizer.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b'{"transcript": "SECRET-TEXT", "instructions": "SECRET-INSTR", "extra": 1}',
+        b'{"transcript": 5, "instructions": "SECRET-INSTR"}',
+        b'["SECRET-TEXT"]',
+        b"not json SECRET-TEXT",
+        b"\xff\xfe SECRET-TEXT",
+    ],
+)
+def test_summary_input_unreadable(tmp_path: Path, data: bytes) -> None:
+    env = _summary_env(tmp_path)
+    _stage_raw_summary_job(env, data)
+    job = _run(env)
+    assert (job.status, job.error) == ("failed", "the summary's input is unreadable; send it again")
+    assert "SECRET" not in repr(job)
+    assert env.fakes.summarizer.call_count == 0
+
+
+def test_summary_check_result_applies_to_fake(tmp_path: Path) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.summarizer = FakeSummarizer(finish_reason="length", completion_tokens=8192)
+    env = make_env(tmp_path, fakes=fakes)
+    stage_summary_job(env.jobs, env.staging)
+    job = _run(env)
+    assert job.status == "failed"
+    assert (job.error or "").startswith("the summary was cut off")
+    assert not fakes.artifacts.has_summary(job.id)
+    assert job.attempts == 1
+
+
+@pytest.mark.parametrize("text", ["", "  \n"])
+def test_summary_empty_text_is_not_stored(tmp_path: Path, text: str) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.summarizer = FakeSummarizer(text=text)
+    env = make_env(tmp_path, fakes=fakes)
+    stage_summary_job(env.jobs, env.staging)
+    job = _run(env)
+    assert (job.status, job.error) == (
+        "failed",
+        "the model returned no summary text (finish reason: stop); nothing was kept",
+    )
+    assert not fakes.artifacts.has_summary(job.id)
+
+
+def test_summary_transient_failure_retries_and_overwrites(tmp_path: Path) -> None:
+    env = _summary_env(tmp_path)
+    queued = stage_summary_job(env.jobs, env.staging)
+    env.fakes.summarizer.fail_next(TransientError("later"))
+    first = _run(env)
+    assert (first.status, first.attempts) == ("queued", 1)
+    assert env.staging.upload_path(queued.upload_file or "").is_file()
+    env.clock.advance(61)
+    second = _run(env)
+    assert (second.status, second.attempts) == ("done", 2)
+    assert env.fakes.artifacts.has_summary(second.id)
+
+
+def test_summary_unexpected_error_does_not_echo_the_input(tmp_path: Path) -> None:
+    env = _summary_env(tmp_path, max_attempts=1)
+    stage_summary_job(env.jobs, env.staging, transcript="TRANSCRIPT-MARK")
+    env.fakes.summarizer.fail_next(RuntimeError("boom"))
+    job = _run(env)
+    assert job.status == "failed"
+    assert "TRANSCRIPT-MARK" not in (job.error or "")
+
+
+def test_summary_done_log_line(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fakes = make_fake_backends(tmp_path / "data")
+    fakes.summarizer = FakeSummarizer(model="example-model", prompt_tokens=120, completion_tokens=7)
+    env = make_env(tmp_path, fakes=fakes)
+    stage_summary_job(env.jobs, env.staging, transcript="t" * 30, instructions="i" * 12)
+    with caplog.at_level(logging.INFO, logger="earmark.pipeline.runner"):
+        done = _run(env)
+    [line] = [r.getMessage() for r in caplog.records if "summary of" in r.getMessage()]
+    assert re.fullmatch(
+        rf"job {done.id}: summary of 30 transcript and 12 instructions characters by fake "
+        r"model example-model: 120 prompt tokens, 7 output tokens, \d+\.\d s",
+        line,
+    )
+
+
+def test_summary_done_log_line_unknown_counts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    env = _summary_env(tmp_path)
+    stage_summary_job(env.jobs, env.staging)
+    with caplog.at_level(logging.INFO, logger="earmark.pipeline.runner"):
+        _run(env)
+    [line] = [r.getMessage() for r in caplog.records if "summary of" in r.getMessage()]
+    assert ": ? prompt tokens, ? output tokens, " in line
+
+
+def test_summary_logs_carry_no_input_text(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    env = _summary_env(tmp_path)
+    stage_summary_job(
+        env.jobs, env.staging, transcript="MARKTRANSCRIPT words", instructions="MARKINSTR"
+    )
+    with caplog.at_level(logging.DEBUG):
+        _run(env)
+    assert "MARK" not in caplog.text

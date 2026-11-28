@@ -117,6 +117,7 @@ def v1_env(
     allowed_recipients: tuple[str, ...] = (),
     segments: Sequence[Segment] | None = None,
     backends_hook: Callable[[Backends], Backends] | None = None,
+    settings_overrides: dict[str, Any] | None = None,
     **env_kwargs: Any,
 ) -> Iterator[V1Env]:
     fakes = fakes or make_fake_backends(tmp_path / "data")
@@ -141,6 +142,7 @@ def v1_env(
         api_token=SecretStr(TOKEN),
         data_dir=tmp_path / "data",
         allowed_recipients=allowed_recipients,
+        **(settings_overrides or {}),
     )
     app = create_app(settings, store=env.jobs, max_upload_bytes=max_upload_bytes)
     with TestClient(app, headers=AUTH) as client:

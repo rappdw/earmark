@@ -15,11 +15,14 @@ API for programs such as earshot (`contract/api-v1.md`, step 36). AMAP, outside 
 `docs/ARCHITECTURE.md` "System" has the parts, the seams, the definition of done and the
 repo layout. The service files nothing; the PKA files, through the receiving skill.
 
-The service today (after step 36): a request is an Apple Podcasts episode link, a YouTube
+The service today (after step 37a): a request is an Apple Podcasts episode link, a YouTube
 video link, a direct audio URL, or an uploaded file, with a destination address and instructions. The worker
 resolves or downloads the audio, transcribes it, caches the transcript, emails the
 transcript note and the instructions to the destination as two Markdown attachments, and
-sends an ntfy push. On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26),
+sends an ntfy push. A `/v1` summary request (step 37) sends a transcript and instructions to a
+local model server on the Spark and keeps the result for its client; no cloud model, no mail,
+no push. Step 37a builds the summary jobs on a fake summarizer; the Ollama, llama-server and
+vLLM clients are step 37b, so until then only `EARMARK_LLM_BACKEND=fake` runs. On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26),
 which builds CTranslate2 with CUDA. A `/v1` upload is transcribed and kept for its client,
 with no mail and no push.
 
@@ -102,13 +105,14 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   cookies, plugins, config or proxies, and with a stream check and the size cap; the
   private-address guard does not cover it (`docs/ARCHITECTURE.md` "Security"). Anything that
   becomes a file name or YAML goes through `earmark/sanitize.py`.
-- **Never log or print a secret**: the API token, the ASR key, the ntfy URL and token,
-  and from step 25 the SMTP password. `Settings` holds them as `SecretStr`.
+- **Never log or print a secret**: the API token, the ASR key, the LLM key
+  (`EARMARK_LLM_API_KEY`), the ntfy URL and token, and from step 25 the SMTP password. `Settings` holds them as `SecretStr`.
 - **Recipients and instructions must not leak** (step 24). Instructions never appear in
   logs or pushes. An address appears in logs and pushes only masked (`j…@example.org`).
   A direct URL appears in logs and pushes host-only. For a `/v1` job (step 36) no log line
   carries the upload's file name (never stored), the `initial_prompt` or transcript text;
-  logs carry ids, sizes, timings, status and errors.
+  logs carry ids, sizes, timings, status and errors. A summary job's (step 37) transcript,
+  instructions and output never appear in a log or in `job.error`.
 - **The recipient allowlist is the gate** (step 24). Every `to` is checked against
   `EARMARK_ALLOWED_RECIPIENTS`. Unset refuses every request. `all` is the operator's
   written acceptance of a risk, warned about at startup and by doctor. earmark never
@@ -151,8 +155,17 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   command runs after the swap, and none at runtime: `uv sync` and `uv run` reinstall the
   locked CPU wheel. No `pip install` anywhere. `get_cuda_device_count() >= 1` does not
   prove the build; a transcription on the Spark does.
+- **Summaries are local only** (step 37). `EARMARK_LLM_BASE_URL` must name a loopback or
+  private address or a local name, checked at load and again at every connect. There is no
+  cloud backend, and none is added without the operator. No silent truncation: a summary is
+  stored only when the server provably read the whole input and the model stopped on its
+  own. Ollama is called only through `/api/chat` with `truncate: false` and `shift: false`,
+  version 0.40.17 or later. The model server's error text is never copied into a job, a log
+  or a response.
 - **Removed code stays removed.** What step 22 deleted is recoverable from the
-  `v0.1.0-full-pipeline` tag. Bring nothing back without a plan step.
+  `v0.1.0-full-pipeline` tag. Bring nothing back without a plan step. Summaries under `/v1`
+  (step 37) are not the old analysis stage: the analyzer, the vault, entities and search stay
+  removed.
 
 ## Environment
 

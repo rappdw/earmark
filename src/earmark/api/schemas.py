@@ -10,10 +10,13 @@ from earmark.models import (
     EpisodeKey,
     Job,
     JobId,
+    JobKind,
     JobResult,
     JobStatus,
     Source,
     Stage,
+    V1Kind,
+    v1_kind,
 )
 from earmark.sources import display_url
 
@@ -34,6 +37,7 @@ class JobView(ApiModel):
     """What the API (and ``earmark jobs``) shows of a job. Never the raw ``Job``."""
 
     id: JobId
+    kind: JobKind
     status: JobStatus
     stage: Stage | None
     source: Source
@@ -70,6 +74,7 @@ def job_view(job: Job) -> JobView:
         url = job.url
     return JobView(
         id=job.id,
+        kind=job.kind,
         status=job.status,
         stage=job.stage,
         source=job.source,
@@ -100,6 +105,7 @@ class V1JobView(ApiModel):
     """What /v1 shows of a delivery-free job."""
 
     job_id: JobId
+    kind: V1Kind
     status: JobStatus
     stage: Stage | None
     error: str | None  # scrub_urls(job.error)
@@ -114,6 +120,7 @@ def v1_job_view(job: Job) -> V1JobView:
     result = job.result
     return V1JobView(
         job_id=job.id,
+        kind=v1_kind(job),
         status=job.status,
         stage=job.stage,
         error=None if job.error is None else scrub_urls(job.error),

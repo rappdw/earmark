@@ -16,11 +16,14 @@ from earmark.errors import PermanentError
 from earmark.models import (
     Episode,
     ShareRecord,
+    SummaryRecord,
     Transcript,
     is_episode_key,
 )
 
 DECODED_DIR: Final = "transcripts"
+SUMMARIES_DIR: Final = "summaries"
+_JOB_ID = re.compile(r"[0-9a-f]{32}")
 _AUDIO_NAME = re.compile(r"audio\.[a-z0-9]{1,5}")
 
 
@@ -81,6 +84,7 @@ class ArtifactStore:
     def __init__(self, data_dir: Path) -> None:
         self._root = data_dir / "episodes"
         self._decoded_root = data_dir / DECODED_DIR
+        self._summaries_root = data_dir / SUMMARIES_DIR
 
     @property
     def root(self) -> Path:
@@ -238,6 +242,55 @@ class ArtifactStore:
             if name not in ("transcript.json", "transcript.txt") and not name.startswith(
                 ".transcript."
             ):
+                continue
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            entry.unlink()
+            removed += 1
+        with contextlib.suppress(OSError):
+            directory.rmdir()
+        return removed
+
+    # -- summaries (/v1, step 37) -------------------------------------------------------
+
+    def summary_dir(self, job_id: str) -> Path:
+        if _JOB_ID.fullmatch(job_id) is None:
+            raise ValueError(f"not a job id: {job_id!r}")
+        return self._summaries_root / job_id
+
+    def summary_path(self, job_id: str) -> Path:
+        return self.summary_dir(job_id) / "summary.json"
+
+    def write_summary(self, record: SummaryRecord) -> Path:
+        """Write ``summaries/<job_id>/summary.json`` (directory 0700, file 0600)."""
+        path = self.summary_path(record.job_id)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write_text(path, record.model_dump_json(indent=2) + "\n", mode=0o600)
+        return path
+
+    def read_summary(self, job_id: str) -> SummaryRecord | None:
+        path = self.summary_path(job_id)
+        record = self._read_json(path, SummaryRecord)
+        if record is not None and record.job_id != job_id:
+            raise _corrupt(path)
+        return record
+
+    def has_summary(self, job_id: str) -> bool:
+        return self.summary_path(job_id).is_file()
+
+    def remove_summary(self, job_id: str) -> int:
+        """Delete the summary file of ``job_id`` and its directory; return the file count.
+
+        Symlinks are neither followed nor removed, and nothing else in the directory is
+        touched (``rmdir`` then fails and is ignored).
+        """
+        directory = self.summary_dir(job_id)
+        if not directory.is_dir():
+            return 0
+        removed = 0
+        for entry in sorted(directory.iterdir()):
+            name = entry.name
+            if name != "summary.json" and not name.startswith(".summary.json."):
                 continue
             if entry.is_symlink() or not entry.is_file():
                 continue

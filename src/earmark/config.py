@@ -19,6 +19,7 @@ AsrBackend = Literal["faster_whisper", "remote", "fake"]
 NotifyBackend = Literal["ntfy", "fake", "none"]
 MailBackend = Literal["smtp", "fake"]
 SmtpSecurity = Literal["starttls", "tls"]
+LlmBackend = Literal["none", "ollama", "llama_cpp", "vllm", "fake"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 AsrDevice = Literal["auto", "cpu", "cuda"]
 AsrComputeType = Literal[
@@ -42,6 +43,10 @@ ASR_BATCH_SIZE_MAX: Final = 64
 # 10 s write, 10 s read) and the job-store writes. tests/test_deploy.py pins this.
 WORKER_STOP_MARGIN_S: Final = 30.0
 
+LLM_MIN_CONTEXT_TOKENS: Final = 8192
+LLM_MAX_OUTPUT_TOKENS_LIMIT: Final = 131_072
+LLM_MAX_TRANSCRIPT_CHARS_LIMIT: Final = 10_000_000
+
 ENV_PREFIX: Final = "EARMARK_"
 REDACTED: Final = "**********"
 NTFY_TOPIC_PATTERN: Final = re.compile(r"[-_A-Za-z0-9]{1,64}")
@@ -58,6 +63,28 @@ API_URL_PLAIN_HTTP: Final = (
     "plain http is allowed only to a loopback address such as http://127.0.0.1:8787; "
     "use https, or the API token would cross the network unencrypted"
 )
+
+LLM_URL_SHAPE: Final = (
+    "must be the model server's root URL, such as http://127.0.0.1:11434 or http://ollama:11434"
+)
+LLM_URL_CREDENTIALS: Final = "must not contain credentials; use EARMARK_LLM_API_KEY"
+LLM_URL_QUERY: Final = "must not contain a query or fragment"
+LLM_URL_PATH: Final = (
+    "must be the server's root URL, without a path (earmark adds /api/chat or /v1/chat/completions)"
+)
+LLM_URL_NOT_LOCAL: Final = (
+    "must name a loopback or private-network address or a local host name (localhost, a "
+    "single-label name such as ollama, or a name under .internal, .local, .lan or "
+    ".home.arpa); earmark sends transcripts only to a model server on this machine or its "
+    "private network"
+)
+_LOCAL_NETWORKS: Final = tuple(
+    ipaddress.ip_network(n)
+    for n in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7")
+)
+_DNS_LABEL: Final = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+_LOCAL_SUFFIXES: Final = (".internal", ".local", ".lan", ".home.arpa")
+LLM_MODEL_PATTERN: Final = re.compile(r"[^\s\x00-\x1f\x7f]{1,200}")
 
 
 class ConfigError(Exception):
@@ -101,6 +128,62 @@ def check_api_url(url: str) -> str:
         raise ValueError(API_URL_PATH)
     if scheme == "http" and not is_loopback_ip(hostname):
         raise ValueError(API_URL_PLAIN_HTTP)
+    return f"{scheme}://{parts.netloc}"
+
+
+def is_local_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for 127/8, 10/8, 172.16/12, 192.168/16, ::1 and fc00::/7 (an IPv4-mapped IPv6
+    address is checked as its IPv4 address); false for everything else."""
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return any(address in net for net in _LOCAL_NETWORKS if net.version == address.version)
+
+
+def is_local_host_name(name: str) -> bool:
+    """True for localhost, a name under .localhost, a single label, and names under
+    .internal, .local, .lan and .home.arpa; false otherwise (IP literals included)."""
+    name = name.lower().removesuffix(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        return False
+    labels = name.split(".")
+    if not all(_DNS_LABEL.fullmatch(label) for label in labels):
+        return False
+    if len(labels) == 1 or name == "localhost" or name.endswith(".localhost"):
+        return True
+    return name.endswith(_LOCAL_SUFFIXES)
+
+
+def check_local_base_url(url: str) -> str:
+    """The URL as 'scheme://netloc'; ValueError with one of the LLM_URL_* messages
+    otherwise. Never puts the input in the message."""
+    text = url.strip()
+    try:
+        parts = urlsplit(text)
+        hostname = parts.hostname
+        _ = parts.port
+    except ValueError:
+        raise ValueError(LLM_URL_SHAPE) from None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not hostname:
+        raise ValueError(LLM_URL_SHAPE)
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError(LLM_URL_CREDENTIALS)
+    if parts.query or parts.fragment or "?" in text or "#" in text:
+        raise ValueError(LLM_URL_QUERY)
+    if parts.path not in ("", "/"):
+        raise ValueError(LLM_URL_PATH)
+    try:
+        local = is_local_ip(ipaddress.ip_address(hostname))
+    except ValueError:
+        local = is_local_host_name(hostname)
+    if not local:
+        raise ValueError(LLM_URL_NOT_LOCAL)
     return f"{scheme}://{parts.netloc}"
 
 
@@ -178,7 +261,65 @@ class Settings(BaseSettings):
     max_attachment_mb: int = Field(
         10, gt=0, description="Cap on the transcript and instructions together (MiB)."
     )
+    llm_backend: LlmBackend = Field(
+        "none",
+        description="Summaries (POST /v1/summaries): none (off), ollama, llama_cpp, vllm or fake.",
+    )
+    llm_base_url: str | None = Field(
+        None,
+        description="The local model server's root URL (loopback, private or a local name).",
+    )
+    llm_model: str | None = Field(None, description="The model name the server serves.")
+    llm_api_key: SecretStr | None = Field(None, description="The model server's API key.")
+    llm_context_tokens: int | None = Field(
+        None,
+        ge=LLM_MIN_CONTEXT_TOKENS,
+        description="ollama only: the context window earmark asks for (num_ctx).",
+    )
+    llm_max_output_tokens: int = Field(
+        8192,
+        ge=256,
+        le=LLM_MAX_OUTPUT_TOKENS_LIMIT,
+        description="The most tokens a summary may have.",
+    )
+    llm_timeout_seconds: float = Field(
+        3600.0, gt=0, description="How long to wait for the model server's answer."
+    )
+    llm_max_transcript_chars: int = Field(
+        400_000,
+        ge=1000,
+        le=LLM_MAX_TRANSCRIPT_CHARS_LIMIT,
+        description="Longest transcript POST /v1/summaries accepts (characters).",
+    )
     log_level: LogLevel = Field("INFO", description="Log level.")
+
+    @field_validator("llm_backend", mode="before")
+    @classmethod
+    def _lower_llm_backend(cls, v: object) -> object:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("llm_base_url")
+    @classmethod
+    def _check_llm_base_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return check_local_base_url(v) if v else None
+
+    @field_validator("llm_model")
+    @classmethod
+    def _check_llm_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if LLM_MODEL_PATTERN.fullmatch(v) is None:
+            raise ValueError(
+                "must be a model name of at most 200 characters, without spaces or control "
+                "characters"
+            )
+        return v
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -344,7 +485,7 @@ class Settings(BaseSettings):
         except ValueError:
             raise ValueError("must be one email address") from None
 
-    @field_validator("asr_api_key", "ntfy_token")
+    @field_validator("asr_api_key", "ntfy_token", "llm_api_key")
     @classmethod
     def _check_api_key(cls, v: SecretStr | None) -> SecretStr | None:
         if v is None:

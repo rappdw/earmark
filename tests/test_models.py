@@ -13,6 +13,7 @@ from earmark.models import (
     AUDIO_SHOW_ID,
     MAX_INITIAL_PROMPT_CHARS,
     MAX_INSTRUCTIONS_CHARS,
+    MAX_SUMMARY_INSTRUCTIONS_CHARS,
     MAX_TITLE_CHARS,
     MAX_URL_CHARS,
     REQUEST_ERROR_TYPES,
@@ -28,6 +29,10 @@ from earmark.models import (
     Segment,
     ShareRecord,
     Source,
+    SummaryFields,
+    SummaryInput,
+    SummaryRecord,
+    SummaryResult,
     Transcript,
     TranscriptionRequest,
     UploadFields,
@@ -38,6 +43,8 @@ from earmark.models import (
     format_hms,
     is_episode_key,
     source_key,
+    summary_input_bytes,
+    v1_kind,
     youtube_key,
 )
 from tests.factories import PST, SHA, T0, TO, make_episode, make_job, make_transcript
@@ -70,6 +77,23 @@ def _audio_job(source: Source) -> Job:
         upload_file="2" * 32 + ".mp3" if upload else None,
         upload_name="a.mp3" if upload else None,
         content_sha256=SHA if upload else None,
+        run_after=T0,
+        shared_at=T0,
+        created_at=T0,
+        updated_at=T0,
+    )
+
+
+def _summary_job() -> Job:
+    return Job(
+        id="3" * 32,
+        kind="summary",
+        status="queued",
+        source="upload",
+        url=None,
+        upload_file="4" * 32 + ".json",
+        content_sha256=SHA,
+        delivery="none",
         run_after=T0,
         shared_at=T0,
         created_at=T0,
@@ -114,10 +138,35 @@ CASES: list[Model] = [
     DecodeOptions(initial_prompt="Alice", language="en"),
     V1UploadFields(),
     V1UploadFields(initial_prompt="Alice", language="en"),
+    SummaryFields(transcript="t", instructions="i"),
+    SummaryInput(transcript="t", instructions="i"),
+    SummaryResult(text="s", model="m", finish_reason="stop"),
+    SummaryResult(
+        text="s",
+        model="m",
+        finish_reason=None,
+        prompt_tokens=10,
+        completion_tokens=2,
+        context_tokens=8192,
+        warnings=("w",),
+    ),
+    SummaryRecord(job_id="a" * 32, backend="fake", model="m", text="s", created_at=T0),
+    SummaryRecord(
+        job_id="a" * 32,
+        backend="fake",
+        model="m",
+        text="s",
+        warnings=("w",),
+        prompt_tokens=1,
+        completion_tokens=2,
+        context_tokens=3,
+        created_at=T0,
+    ),
     make_job(),
     _minimal_job(),
     _audio_job("upload"),
     _audio_job("url"),
+    _summary_job(),
 ]
 
 
@@ -270,7 +319,7 @@ def test_job_kind_requirements() -> None:
     base: dict[str, Any] = _minimal_job().model_dump(mode="json")
     with pytest.raises(ValidationError, match="requires url"):
         Job.model_validate(base | {"url": None})
-    assert typing.get_args(JobKind) == ("ingest",)
+    assert typing.get_args(JobKind) == ("ingest", "summary")
 
 
 def test_source_values() -> None:
@@ -412,11 +461,14 @@ def test_request_timestamp_out_of_range() -> None:
 def test_request_error_types_registry() -> None:
     assert sorted(REQUEST_ERROR_TYPES) == [
         "initial_prompt_too_long",
+        "instructions_empty",
         "instructions_too_long",
         "language_invalid",
+        "summary_instructions_too_long",
         "timestamp_out_of_range",
         "title_too_long",
         "to_invalid",
+        "transcript_empty",
         "url_empty",
         "url_too_long",
     ]
@@ -692,3 +744,82 @@ def test_decode_key_stable() -> None:
 def test_job_result_language_optional() -> None:
     assert JobResult.model_validate_json('{"duration_s": 12.5}') == JobResult(duration_s=12.5)
     assert JobResult.model_validate_json('{"duration_s": 1.0}').language is None
+
+
+# -- step 37: summaries ---------------------------------------------------------------------
+
+
+def test_summary_fields_keep_text_verbatim() -> None:
+    fields = SummaryFields(transcript="  \n[00:00:00] hi \r\n  ", instructions="\tSummarise.  ")
+    assert fields.transcript == "  \n[00:00:00] hi \r\n  "
+    assert fields.instructions == "\tSummarise.  "
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ('{"transcript": " \\n", "instructions": "i"}', "transcript must not be empty"),
+        ('{"transcript": "t", "instructions": ""}', "instructions must not be empty"),
+        ('{"transcript": "t", "instructions": "  "}', "instructions must not be empty"),
+    ],
+)
+def test_summary_fields_refuse_blank(body: str, message: str) -> None:
+    with pytest.raises(ValidationError) as info:
+        SummaryFields.model_validate_json(body)
+    assert [e["msg"] for e in info.value.errors()] == [message]
+    assert {e["type"] for e in info.value.errors()} <= REQUEST_ERROR_TYPES
+
+
+def test_summary_fields_instructions_cap() -> None:
+    assert MAX_SUMMARY_INSTRUCTIONS_CHARS == 20_000
+    SummaryFields(transcript="t", instructions="é" * 20_000)
+    with pytest.raises(ValidationError) as info:
+        SummaryFields(transcript="t", instructions="é" * 20_001)
+    [error] = info.value.errors()
+    assert error["type"] == "summary_instructions_too_long"
+    assert error["msg"] == "instructions is too long (at most 20000 characters)"
+
+
+def test_summary_fields_refuse_unknown_and_missing() -> None:
+    with pytest.raises(ValidationError) as info:
+        SummaryFields.model_validate_json('{"transcript": "t", "instructions": "i", "to": "x"}')
+    assert info.value.errors()[0]["type"] == "extra_forbidden"
+    with pytest.raises(ValidationError) as info:
+        SummaryFields.model_validate_json('{"transcript": "t"}')
+    assert info.value.errors()[0]["type"] == "missing"
+
+
+def test_summary_input_bytes_stable() -> None:
+    fields = SummaryFields(transcript="[00:00:00] caf\u00e9\n", instructions='Say "hi".')
+    assert summary_input_bytes(fields) == (
+        b'{"instructions":"Say \\"hi\\".","transcript":"[00:00:00] caf\xc3\xa9\\n"}'
+    )
+    assert SummaryInput.model_validate_json(summary_input_bytes(fields)) == SummaryInput(
+        transcript=fields.transcript, instructions=fields.instructions
+    )
+
+
+def test_summary_result_counts_are_validated() -> None:
+    with pytest.raises(ValidationError):
+        SummaryResult(text="s", model="m", finish_reason="stop", prompt_tokens=-1)
+    with pytest.raises(ValidationError):
+        SummaryResult(text="s", model="m", finish_reason="stop", context_tokens=0)
+
+
+def test_job_summary_rules() -> None:
+    job = _summary_job()
+    assert job.decode_options() is None
+    assert v1_kind(job) == "summary"
+    assert v1_kind(_audio_job("upload")) == "transcription"
+    base: dict[str, Any] = job.model_dump(mode="json")
+    for change in (
+        {"delivery": "mail", "to": TO},
+        {"source": "url", "upload_file": None, "url": "https://audio.example.net/a.mp3"},
+        {"upload_file": "4" * 32 + ".mp3"},
+        {"initial_prompt": "x"},
+        {"language": "en"},
+    ):
+        with pytest.raises(ValidationError):
+            Job.model_validate(base | change)
+    with pytest.raises(ValidationError):
+        Job.model_validate(base | {"to": TO})  # the delivery-free rules still apply

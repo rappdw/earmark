@@ -42,6 +42,7 @@ UNREADABLE: Final = (
     "delete episodes/{key}/ and share it again"
 )
 
+SUMMARY_ELSEWHERE: Final = "this job is a summary; fetch it from /v1/jobs/{id}/summary"
 V1_ELSEWHERE: Final = "this job was sent to /v1; fetch its transcript from /v1/jobs/{id}/transcript"
 
 UnavailableReason = Literal["not_ready", "gone", "unreadable"]
@@ -95,10 +96,13 @@ def episode_for_job(job: Job, artifacts: ArtifactStore) -> Episode | None:
     upload: audio_episode(job, job.content_sha256), no file read.
     url: audio_episode(job, <hex of episode.json's sha256: guid>).
     apple_podcasts, youtube: episode.json as stored.
+    summary: None, a summary has no episode.
     None when there is nothing to read from. Raises PermanentError when episode.json is
     corrupt, or when a URL job's episode.json has no sha256 guid or a key other than the
     job's.
     """
+    if job.kind == "summary":
+        return None
     if job.source == "upload":
         if job.content_sha256 is None:
             return None
@@ -144,6 +148,8 @@ def read_transcript_file(
     job: Job, artifacts: ArtifactStore, fmt: TranscriptFormat
 ) -> TranscriptFile:
     """The job's transcript in ``fmt``. Raises TranscriptUnavailable."""
+    if job.kind == "summary":
+        raise TranscriptUnavailable("not_ready", SUMMARY_ELSEWHERE)
     if job.delivery == "none":
         raise TranscriptUnavailable("not_ready", V1_ELSEWHERE)
     if not has_transcript(job):

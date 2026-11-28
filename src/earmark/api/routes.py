@@ -30,6 +30,7 @@ from earmark.recipients import RecipientRefused
 from earmark.resolve.apple import UnsupportedUrlError
 from earmark.submission import Intake
 from earmark.transcripts import JOB_NOT_FOUND, TranscriptUnavailable, read_transcript_file
+from earmark.v1_jobs import SummaryLimits
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,13 @@ def _accepted(enqueued: Enqueued) -> JSONResponse:
     )
 
 
-def build_router(intake: Intake, *, artifacts: ArtifactStore, max_upload_bytes: int) -> APIRouter:
+def build_router(
+    intake: Intake,
+    *,
+    artifacts: ArtifactStore,
+    max_upload_bytes: int,
+    summaries: SummaryLimits | None = None,
+) -> APIRouter:
     router = APIRouter()
     store = intake.store
 
@@ -180,5 +187,7 @@ def build_router(intake: Intake, *, artifacts: ArtifactStore, max_upload_bytes: 
     def healthz() -> Health:
         return Health(status="ok")
 
-    add_v1_routes(router, intake, artifacts=artifacts, max_upload_bytes=max_upload_bytes)
+    add_v1_routes(
+        router, intake, artifacts=artifacts, max_upload_bytes=max_upload_bytes, summaries=summaries
+    )
     return router

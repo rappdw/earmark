@@ -14,6 +14,7 @@ from earmark.fakes import (
     FakeMailer,
     FakeNotifier,
     FakeResolver,
+    FakeSummarizer,
     FakeTranscriber,
     FakeYoutubeSource,
 )
@@ -29,6 +30,7 @@ FIELDS: dict[str, tuple[typing.Any, typing.Mapping[str, object]]] = {
     "asr_backend": (config.AsrBackend, factory.TRANSCRIBERS),
     "mail_backend": (config.MailBackend, factory.MAILERS),
     "notify_backend": (config.NotifyBackend, factory.NOTIFIERS),
+    "llm_backend": (config.LlmBackend, factory.SUMMARIZERS),
 }
 
 
@@ -88,6 +90,7 @@ def test_all_fake_builds_fakes(tmp_path: Path) -> None:
     assert isinstance(b.transcriber, FakeTranscriber)
     assert isinstance(b.mailer, FakeMailer)
     assert isinstance(b.notifier, FakeNotifier)
+    assert isinstance(b.summarizer, FakeSummarizer)
     none = factory.build_backends(_fake_settings(tmp_path, notify_backend="none"), artifacts)
     assert none.notifier is None
 
@@ -355,3 +358,42 @@ def test_ytdlp_backend_builds_from_a_runtime(
     )
     assert isinstance(b.youtube, ytdlp.YtDlpYoutubeSource)
     assert not fake.sessions
+
+
+def test_summarizer_none_builds_none_and_fake_builds_the_fake(tmp_path: Path) -> None:
+    artifacts = ArtifactStore(tmp_path / "data")
+    off = factory.build_backends(_fake_settings(tmp_path, llm_backend="none"), artifacts)
+    assert off.summarizer is None
+    on = factory.build_backends(
+        _fake_settings(tmp_path, llm_backend="fake", llm_model="example-model"), artifacts
+    )
+    assert isinstance(on.summarizer, FakeSummarizer)
+    assert on.summarizer.model == "example-model"
+    assert on.summarizer.max_output_tokens == 8192
+    default = factory.build_backends(_fake_settings(tmp_path, llm_backend="fake"), artifacts)
+    assert isinstance(default.summarizer, FakeSummarizer)
+    assert default.summarizer.model == "fake-llm"
+
+
+@pytest.mark.parametrize("backend", ["ollama", "llama_cpp", "vllm"])
+def test_real_summarizer_is_a_config_error_until_step_37b(tmp_path: Path, backend: str) -> None:
+    settings = _fake_settings(tmp_path, llm_backend=backend)
+    with pytest.raises(ConfigError) as info:
+        factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
+    [line] = info.value.errors
+    assert line.startswith(f"{env_var('llm_backend')}: ")
+    assert repr(backend) in line
+    assert "step 37b" in line
+    with pytest.raises(ConfigError):
+        factory.build_worker(settings)
+    assert not (tmp_path / "data").exists()
+
+
+def test_factory_imports_no_summarize_client() -> None:
+    code = (
+        "import sys\n"
+        "import earmark.pipeline.factory\n"
+        "print(sorted(m for m in sys.modules if m.startswith('earmark.summarize')))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "['earmark.summarize', 'earmark.summarize.base']"

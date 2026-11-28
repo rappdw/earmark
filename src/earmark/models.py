@@ -33,10 +33,13 @@ GUID_SHA256_PREFIX: Final = "sha256:"
 YOUTUBE_SHOW_ID: Final = "youtube"  # the synthetic show id of a YouTube episode
 GUID_YOUTUBE_PREFIX: Final = "youtube:"
 YOUTUBE_ID: Final = re.compile(r"[A-Za-z0-9_-]{11}")
-JobKind = Literal["ingest"]
+JobKind = Literal["ingest", "summary"]
+V1Kind = Literal["transcription", "summary"]  # /v1's name for a job's kind
 JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
 TranscriptFormat = Literal["note", "text", "json"]
-Stage = Literal["resolve", "fetch", "transcribe", "deliver", "notify"]  # "notify" is never set
+Stage = Literal[
+    "resolve", "fetch", "transcribe", "summarize", "deliver", "notify"
+]  # never "notify"
 DeliveryState = Literal["sending", "sent"]
 Delivery = Literal["mail", "none"]
 Clock = Callable[[], datetime]
@@ -58,6 +61,9 @@ REQUEST_ERROR_TYPES: Final = frozenset(
         "timestamp_out_of_range",
         "initial_prompt_too_long",
         "language_invalid",
+        "transcript_empty",
+        "instructions_empty",
+        "summary_instructions_too_long",
     }
 )
 # The field names a request accepts, in the order error messages list them.
@@ -170,6 +176,8 @@ WHISPER_LANGUAGES: Final[tuple[str, ...]] = (
     "yue",
 )
 V1_FORM_FIELDS: Final = ("initial_prompt", "language")
+MAX_SUMMARY_INSTRUCTIONS_CHARS: Final = 20_000
+SUMMARY_FIELDS: Final = ("transcript", "instructions")
 
 EpisodeKey = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{20}$")]
 JobId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
@@ -388,6 +396,61 @@ class V1UploadFields(Model):
         return v
 
 
+class SummaryFields(Model):
+    """The JSON body of POST /v1/summaries. Both kept verbatim (not stripped)."""
+
+    transcript: str
+    instructions: str
+
+    @field_validator("transcript", mode="after")
+    @classmethod
+    def _check_transcript(cls, v: str) -> str:
+        if not v.strip():
+            raise PydanticCustomError("transcript_empty", "transcript must not be empty")
+        return v
+
+    @field_validator("instructions", mode="after")
+    @classmethod
+    def _check_instructions(cls, v: str) -> str:
+        if not v.strip():
+            raise PydanticCustomError("instructions_empty", "instructions must not be empty")
+        if len(v) > MAX_SUMMARY_INSTRUCTIONS_CHARS:
+            raise PydanticCustomError(
+                "summary_instructions_too_long",
+                f"instructions is too long (at most {MAX_SUMMARY_INSTRUCTIONS_CHARS} characters)",
+            )
+        return v
+
+
+class SummaryInput(Model):
+    """The staged input file of a summary job: what the worker sends to the model."""
+
+    transcript: str
+    instructions: str
+
+
+class SummaryResult(Model):
+    """What a Summarizer returns. The runner stores it only if check_result accepts it."""
+
+    text: str
+    model: str
+    finish_reason: str | None  # "stop", "length", or the server's other value
+    prompt_tokens: int | None = Field(None, ge=0)
+    completion_tokens: int | None = Field(None, ge=0)
+    context_tokens: int | None = Field(None, gt=0)
+    warnings: tuple[str, ...] = ()
+
+
+def summary_input_bytes(fields: SummaryFields) -> bytes:
+    """The canonical JSON of a summary's input, so identical requests hash alike."""
+    return json.dumps(
+        {"instructions": fields.instructions, "transcript": fields.transcript},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def decode_key(content_sha256: str, options: DecodeOptions) -> str:
     """Key of the transcript of this audio made with these options (20 hex)."""
     if re.fullmatch("[0-9a-f]{64}", content_sha256) is None:
@@ -483,6 +546,20 @@ class JobResult(Model):
     language: str | None = None  # the transcript's language
 
 
+class SummaryRecord(Model):
+    """summaries/<job_id>/summary.json."""
+
+    job_id: JobId
+    backend: str
+    model: str
+    text: str
+    warnings: tuple[str, ...] = ()
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    context_tokens: int | None = None
+    created_at: AwareDatetime
+
+
 class Job(Model):
     id: JobId
     kind: JobKind
@@ -518,8 +595,8 @@ class Job(Model):
     purged_at: AwareDatetime | None = None
 
     def decode_options(self) -> DecodeOptions | None:
-        """None for a mail job, else the options of this /v1 job."""
-        if self.delivery == "mail":
+        """None for a mail job or a summary, else the options of this /v1 job."""
+        if self.delivery == "mail" or self.kind == "summary":
             return None
         return DecodeOptions(initial_prompt=self.initial_prompt, language=self.language)
 
@@ -544,6 +621,19 @@ class Job(Model):
         return self
 
     @model_validator(mode="after")
+    def _summary_rules(self) -> Self:
+        if self.kind == "summary" and (
+            self.delivery != "none"
+            or self.source != "upload"
+            or self.upload_file is None
+            or not self.upload_file.endswith(".json")
+            or self.initial_prompt is not None
+            or self.language is not None
+        ):
+            raise ValueError("a summary job is a delivery-free upload of a .json input")
+        return self
+
+    @model_validator(mode="after")
     def _delivery_requirements(self) -> Self:
         if self.delivery_state in ("sending", "sent") and self.message_id is None:
             raise ValueError("a delivery in progress or done requires message_id")
@@ -564,3 +654,8 @@ class Job(Model):
             if self.upload_file is not None:
                 raise ValueError("only an upload job has upload_file")
         return self
+
+
+def v1_kind(job: Job) -> V1Kind:
+    """/v1's name for the job's kind."""
+    return "summary" if job.kind == "summary" else "transcription"

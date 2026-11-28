@@ -1254,3 +1254,57 @@ def test_transcript_command_points_a_v1_job_at_v1(fake_env: Path) -> None:
     listed = runner.invoke(app, ["jobs", "--json"])
     [shown] = json.loads(listed.stdout)["jobs"]
     assert (shown["id"], shown["source"], shown["to"]) == (job.id, "upload", None)
+
+
+def test_jobs_labels_a_summary_job(fake_env: Path) -> None:
+    from earmark.config import Settings
+    from earmark.jobs import NewJob, open_job_store
+
+    store = open_job_store(Settings(_env_file=None, data_dir=fake_env / "data"))
+    job = store.enqueue(
+        NewJob(
+            kind="summary",
+            source="upload",
+            to=None,
+            upload_file="a" * 32 + ".json",
+            content_sha256="b" * 64,
+            delivery="none",
+        )
+    ).job
+    [line] = runner.invoke(app, ["jobs"]).stdout.splitlines()
+    assert line.split("  ")[0] == job.id
+    assert line.endswith("  summary")
+    [shown] = json.loads(runner.invoke(app, ["jobs", "--json"]).stdout)["jobs"]
+    assert (shown["id"], shown["kind"], shown["source"], shown["to"]) == (
+        job.id,
+        "summary",
+        "upload",
+        None,
+    )
+    mail = _submit(SHARE).split()[0]
+    kinds = {
+        j["id"]: j["kind"]
+        for j in json.loads(runner.invoke(app, ["jobs", "--json"]).stdout)["jobs"]
+    }
+    assert kinds == {job.id: "summary", mail: "ingest"}
+
+
+def test_transcript_command_points_a_summary_job_at_its_route(fake_env: Path) -> None:
+    from earmark.config import Settings
+    from earmark.jobs import NewJob, open_job_store
+
+    store = open_job_store(Settings(_env_file=None, data_dir=fake_env / "data"))
+    job = store.enqueue(
+        NewJob(
+            kind="summary",
+            source="upload",
+            to=None,
+            upload_file="a" * 32 + ".json",
+            content_sha256="b" * 64,
+            delivery="none",
+        )
+    ).job
+    for fmt in ("note", "text", "json"):
+        result = runner.invoke(app, ["transcript", job.id, "--format", fmt])
+        assert result.exit_code == 1
+        assert "this job is a summary; fetch it from /v1/jobs/{id}/summary" in result.stderr

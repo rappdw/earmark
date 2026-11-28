@@ -370,3 +370,40 @@ def test_fake_transcriber_options(tmp_path: Path) -> None:
     assert [s.text for s in plain.segments][-1] == "Thanks for listening."
     with pytest.raises(PermanentError, match="uploaded audio only"):
         fb.transcriber.cached(make_episode(), prompted)
+
+
+def test_fake_summarizer_records_sizes_never_text() -> None:
+    from earmark.fakes import FakeSummarizer
+    from earmark.models import SummaryInput
+
+    fake = FakeSummarizer()
+    result = fake.summarize(SummaryInput(transcript="SECRET words", instructions="SECRET"))
+    assert result.text == "Summary of 12 characters.\n"
+    assert "SECRET" not in result.text
+    assert (result.model, result.finish_reason) == ("fake-llm", "stop")
+    assert [(c.transcript_chars, c.instructions_chars) for c in fake.calls] == [(12, 6)]
+    assert "SECRET" not in repr(fake.calls)
+    assert fake.computed == 1
+
+
+def test_fake_summarizer_scripts_and_fails() -> None:
+    from earmark.fakes import FakeSummarizer
+    from earmark.models import SummaryInput
+
+    scripted = FakeSummarizer(
+        text="T", model="m", finish_reason="length", prompt_tokens=5, completion_tokens=6
+    )
+    request = SummaryInput(transcript="a", instructions="b")
+    result = scripted.summarize(request)
+    assert (result.text, result.model, result.finish_reason) == ("T", "m", "length")
+    assert (result.prompt_tokens, result.completion_tokens) == (5, 6)
+    scripted.fail_next(PermanentError("boom"))
+    with pytest.raises(PermanentError, match="boom"):
+        scripted.summarize(request)
+    assert scripted.call_count == 2
+    assert scripted.computed == 1  # a failed call computed nothing
+
+
+def test_fake_backends_carry_a_summarizer(tmp_path: Path) -> None:
+    fb = make_fake_backends(tmp_path)
+    assert fb.backends().summarizer is fb.summarizer

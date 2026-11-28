@@ -65,3 +65,8 @@ between its markers by hash and checks every example response in it against the 
 (`tests/test_api_v1_contract.py`; the examples are built by `tests/api_v1_examples.py`). It
 changes only additively; a breaking change is `/v2`, with its own file. It has no samples
 folder or checker: the examples in the text are the samples.
+
+Version 1.1 (step 37) added summaries: `POST /v1/summaries`, `GET /v1/jobs/{id}/summary`, a
+`kind` field on the job, and the input caps. A transcript and instructions go to a model
+server the operator runs on the service's host or its private network, never to a cloud
+model. Section 13 of the text lists the revisions.

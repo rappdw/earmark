@@ -71,7 +71,8 @@ Update this table when a step passes verification. Each step is one commit title
 | 34 | The CLI as an API client | 33 | done |
 | 35 | Your own certificate | 34 | done |
 | 36 | Transcription without delivery: the /v1 API | 35 | done |
-| 37 | Summaries on a local model: /v1/summaries | 36 | todo |
+| 37a | Summaries I: summary jobs on a fake model | 36 | done |
+| 37b | Summaries II: the local model servers | 37a | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline
 running end to end on fakes. After that, each step replaces one fake with a real
@@ -646,6 +647,8 @@ and filing, each with its own context. earmark's job is:
    data. The other holds the requester's instructions. The body carries only text earmark
    generates, and the subject carries only the sanitised, capped title.
 4. Send an ntfy push saying the transcript was sent, or why the job failed.
+
+*Partly reversed on 2026-11-28 (step 37), by the operator:* summaries return under `/v1` only (`POST /v1/summaries`), made by a local model server on the Spark or its private network. There is still no cloud model, and analysis of shared episodes, the vault, entities and search stay removed.
 
 **Decisions (the operator's, 2026-11-23).**
 
@@ -1785,6 +1788,20 @@ turning batching on by default; that last one is the operator's setting
 - `make check` passes.
 
 ## Step 37: Summaries on a local model: /v1/summaries
+
+**Split (operator, 2026-11-28).** Built as two steps, each verified and committed on its own,
+from one plan, `docs/steps/37-v1-summaries.md`, on its pass A / pass B seam:
+
+- **37a, Summaries I: summary jobs on a fake model** (plan phases 1–4): the models, the
+  migration, the store, the runner, the routes, the purge, the contract, the offline doctor
+  check and the docs, end to end on a fake summarizer. Files that only 37b builds are marked
+  `step 37b` where the docs list them as planned.
+- **37b, Summaries II: the local model servers** (plan phases 5–7): the Ollama, llama-server
+  and vLLM clients, the local-only transport, the per-server fit checks, the online doctor
+  check and the stub-server tests.
+
+The acceptance below is for the two together. 37a meets every criterion that does not need
+a real server client; 37b meets the rest.
 
 **Goal.** A program on the operator's hardware can send a transcript and its own
 instructions to the Spark, have a local language model summarise it, and fetch the result

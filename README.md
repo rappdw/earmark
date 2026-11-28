@@ -67,8 +67,12 @@ details.
 **The `/v1` API.** A program on your own hardware uploads audio to `POST /v1/transcriptions`
 and fetches the transcript by job id: no mail and no push, and nothing leaves the Spark. It
 can pass an `initial_prompt` and a `language`, and deletes the transcript when it is done.
+Since step 37 it also takes `POST /v1/summaries`: a transcript and instructions, summarised
+by a model server you run on the Spark or its private network (never a cloud model, and
+off until `EARMARK_LLM_BACKEND` is set), fetched by job id and deleted the same way.
 The contract is [contract/api-v1.md](contract/api-v1.md); [docs/deploy.md](docs/deploy.md)
-section 20 says how to reach it, what to send and what a delete removes.
+section 20 says how to reach it, what to send and what a delete removes, and section 21
+how to run the model server.
 
 **What the service keeps.** The job table and a transcript cache, both under
 `EARMARK_DATA_DIR`. It is not a system of record: the notes live with the PKAs.
@@ -89,7 +93,8 @@ export EARMARK_API_TOKEN=demo-token
 export EARMARK_ALLOWED_RECIPIENTS=you@example.org
 export EARMARK_DATA_DIR="$demo/data"
 export EARMARK_RESOLVER_BACKEND=fake EARMARK_FETCH_BACKEND=fake EARMARK_YOUTUBE_BACKEND=fake \
-  EARMARK_ASR_BACKEND=fake EARMARK_MAIL_BACKEND=fake EARMARK_NOTIFY_BACKEND=fake
+  EARMARK_ASR_BACKEND=fake EARMARK_MAIL_BACKEND=fake EARMARK_NOTIFY_BACKEND=fake \
+  EARMARK_LLM_BACKEND=fake
 uv run earmark doctor
 
 uv run earmark serve &
@@ -191,7 +196,7 @@ Run them as `uv run earmark <command>`.
 
 **Client mode.** With `EARMARK_API_URL` set in your shell, `jobs`, `submit` and `transcript` call the running API with `EARMARK_API_TOKEN` instead of reading `EARMARK_DATA_DIR`: from the API's host (`http://127.0.0.1:8787`) or from another machine (its HTTPS name). See [docs/deploy.md](docs/deploy.md) section 19.
 
-The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs/{id}/transcript`, `GET /jobs`, `GET|HEAD /healthz`, and the `/v1` routes `POST /v1/transcriptions`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/transcript` and `DELETE /v1/jobs/{id}`.
+The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs/{id}/transcript`, `GET /jobs`, `GET|HEAD /healthz`, and the `/v1` routes `POST /v1/transcriptions`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/transcript`, `POST /v1/summaries`, `GET /v1/jobs/{id}/summary` and `DELETE /v1/jobs/{id}`.
 Everything except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
@@ -251,6 +256,28 @@ See [docs/asr.md](docs/asr.md). Used when `EARMARK_ASR_BACKEND=remote`.
 | `EARMARK_ASR_API_KEY` | unset | Bearer key for the server (secret). |
 | `EARMARK_ASR_MAX_UPLOAD_MB` | unset | Refuse uploads larger than this, before sending. Unset means no limit. |
 | `EARMARK_ASR_TIMEOUT_SECONDS` | `10800` | How long to wait for the server's answer. |
+
+### Summaries
+
+`POST /v1/summaries`; see [docs/deploy.md](docs/deploy.md) section 21. Off unless
+`EARMARK_LLM_BACKEND` is set. The model server must be on this machine or its private
+network: the URL is checked when settings load, and step 37b adds a second check at every
+connect.
+
+**Until step 37b, only `none` and `fake` run.** `ollama`, `llama_cpp` and `vllm` stop the
+worker at startup with a configuration error that names step 37b, so do not set them on the
+Spark yet. Step 37b adds the three server clients.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EARMARK_LLM_BACKEND` | `none` | `none` (off: the route answers 503), `fake`, or (from step 37b) `ollama`, `llama_cpp` or `vllm`. |
+| `EARMARK_LLM_BASE_URL` | unset | The model server's root URL, such as `http://ollama:11434`: a loopback or private address, or a local name. |
+| `EARMARK_LLM_MODEL` | unset | The model name the server serves, such as `gpt-oss:120b`. |
+| `EARMARK_LLM_API_KEY` | unset | Bearer key for the model server (secret). |
+| `EARMARK_LLM_CONTEXT_TOKENS` | unset | `ollama` only: the context window earmark asks for (`num_ctx`), such as `131072`. |
+| `EARMARK_LLM_MAX_OUTPUT_TOKENS` | `8192` | The most tokens a summary may have. A summary cut off at the limit fails the job. |
+| `EARMARK_LLM_TIMEOUT_SECONDS` | `3600.0` | How long to wait for the model server's answer. |
+| `EARMARK_LLM_MAX_TRANSCRIPT_CHARS` | `400000` | The longest transcript `POST /v1/summaries` accepts, in characters (about a 4-hour meeting). |
 
 ### Mail
 

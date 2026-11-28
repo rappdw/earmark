@@ -8,6 +8,7 @@ from earmark.fakes import (
     FakeMailer,
     FakeNotifier,
     FakeResolver,
+    FakeSummarizer,
     FakeTranscriber,
     FakeYoutubeSource,
 )
@@ -17,6 +18,7 @@ from earmark.pipeline.stages import (
     Mailer,
     Notifier,
     Resolver,
+    Summarizer,
     Transcriber,
     YoutubeSource,
 )
@@ -119,3 +121,9 @@ def test_protocol_mismatch_fails_mypy(tmp_path: Path) -> None:
     assert "[assignment]" in error_lines[bad_f]
     assert "[assignment]" in error_lines[bad_t]
     assert good not in error_lines
+
+
+def test_summarizers_satisfy_the_protocol() -> None:
+    # Checked by mypy: the assignment fails the type check unless FakeSummarizer fits.
+    fake: Summarizer = FakeSummarizer()
+    assert (fake.backend, fake.model, fake.max_output_tokens) == ("fake", "fake-llm", 8192)

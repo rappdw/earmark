@@ -101,6 +101,7 @@ class OfflineChecks:
             results.append(guarded("asr cuda", self.asr_cuda))
         results.append(guarded("mail", self.mail))
         results.append(guarded("notify", self.notify))
+        results.append(guarded("llm", self.llm))
         results.append(guarded("client mode", self.client_mode))
         return results
 
@@ -408,6 +409,21 @@ class OfflineChecks:
             "fail",
             "on, but EARMARK_API_TOKEN is not set; the API refuses every call without it",
         )
+
+    def llm(self) -> CheckResult:
+        from earmark.pipeline.factory import SUMMARIZERS
+
+        s = self.settings
+        if s.llm_backend == "none":
+            return CheckResult("llm", "ok", "off: POST /v1/summaries answers 503")
+        if s.llm_backend == "fake":
+            return CheckResult("llm", "warn", "fake summarizer (for tests): no model is called")
+        try:
+            built = SUMMARIZERS[s.llm_backend](self._context())
+        except ConfigError as exc:
+            return CheckResult("llm", "fail", config_text(exc))
+        close_quietly(built)
+        return CheckResult("llm", "ok", f"{s.llm_backend} summarizer")
 
     def notify(self) -> CheckResult:
         from earmark.notify.ntfy import NtfyOptions

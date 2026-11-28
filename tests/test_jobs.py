@@ -1036,3 +1036,112 @@ def test_mark_purged_siblings(store: JobStore, clock: MutableClock) -> None:
 
 def test_checkpoint_passes_through(store: JobStore) -> None:
     assert store.checkpoint() is True
+
+
+# -- step 37: summary jobs ------------------------------------------------------------------------
+
+
+def _summary_new(sha: str = "cd" * 32, name: str | None = None) -> NewJob:
+    return NewJob(
+        kind="summary",
+        source="upload",
+        to=None,
+        upload_file=name or f"{sha[:32]}.json",
+        content_sha256=sha,
+        delivery="none",
+    )
+
+
+def test_enqueue_summary_validates(store: JobStore) -> None:
+    from dataclasses import replace
+
+    good = _summary_new()
+    for bad in (
+        replace(good, delivery="mail"),
+        replace(good, source="url", url="https://a.test/x", upload_file=None),
+        replace(good, to="you@example.org"),
+        replace(good, instructions="x"),
+        replace(good, title="t"),
+        replace(good, upload_name="a.json"),
+        replace(good, url="https://a.test/x"),
+        replace(good, upload_file=None),
+        replace(good, upload_file="a" * 32 + ".mp3"),
+        replace(good, content_sha256=None),
+        replace(good, initial_prompt="p"),
+        replace(good, language="en"),
+    ):
+        with pytest.raises(ValueError, match="summary job"):
+            store.enqueue(bad)
+    assert store.list_recent() == []
+    created = store.enqueue(good)
+    assert created.created
+    job = created.job
+    assert (job.kind, job.delivery, job.source, job.to, job.stage) == (
+        "summary",
+        "none",
+        "upload",
+        None,
+        None,
+    )
+    stored = store.get(job.id)
+    assert stored == job
+
+
+def test_summary_dedupe_key_is_a_two_element_hash(tmp_path: Path, store: JobStore) -> None:
+    import hashlib
+
+    sha = "cd" * 32
+    store.enqueue(_summary_new(sha))
+    store.enqueue(_v1_new(sha))
+    store.enqueue(new_upload_job(sha))
+    keys = [r["dedupe_key"] for r in raw(tmp_path, "SELECT dedupe_key FROM jobs ORDER BY seq")]
+    assert len(set(keys)) == 3
+    expected = hashlib.sha256(json.dumps(["summary", "sha256:" + sha]).replace(" ", "").encode())
+    assert keys[0] == expected.hexdigest()
+
+
+def test_summary_dedupe_returns_the_active_and_the_done(
+    store: JobStore, clock: MutableClock
+) -> None:
+    first = store.enqueue(_summary_new())
+    assert first.created
+    assert store.enqueue(_summary_new()).job.id == first.job.id
+    _finish(store)
+    again = store.enqueue(_summary_new())
+    assert (again.created, again.job.id) == (False, first.job.id)  # done, inside the window
+    clock.advance(601)
+    assert store.enqueue(_summary_new()).created
+
+
+def test_mark_purged_summary_only_named(store: JobStore, clock: MutableClock) -> None:
+    ids = []
+    for _ in range(2):  # the same input twice, the second after the dedupe window
+        ids.append(store.enqueue(_summary_new()).job.id)
+        _finish(store)
+        clock.advance(1000)
+    # the same bytes as a /v1 transcription: another kind, so another key
+    other = store.enqueue(_v1_new("cd" * 32)).job
+    purged = store.mark_purged(ids[0])
+    assert [j.id for j in purged] == [ids[0]]
+    assert purged[0].purged_at == clock()
+    second = store.get(ids[1])
+    assert second is not None
+    assert second.purged_at is None
+    untouched = store.get(other.id)
+    assert untouched is not None
+    assert untouched.purged_at is None
+    assert store.mark_purged(ids[0]) == purged  # repeatable
+
+
+def test_mark_purged_summary_refuses_active_and_frees_the_key(
+    tmp_path: Path, store: JobStore
+) -> None:
+    from earmark.jobs import JobActiveError
+
+    job = store.enqueue(_summary_new()).job
+    with pytest.raises(JobActiveError):
+        store.mark_purged(job.id)
+    _finish(store, status="failed")
+    store.mark_purged(job.id)
+    assert raw(tmp_path, "SELECT dedupe_key FROM jobs")[0]["dedupe_key"] == "purged:" + job.id
+    assert store.enqueue(_summary_new()).created

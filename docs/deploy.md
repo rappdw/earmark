@@ -794,10 +794,10 @@ grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PA
 - **Upgrade** with `git pull`, `docker compose build` (the GPU image rebuilds CTranslate2,
   so it takes long), and `docker compose up -d`. Migrations run on start. After a rebuild,
   repeat smoke steps 2 and 4 (section 7.3).
-- **The database moves to schema 5** the first time this version starts (the `/v1` columns,
-  after schema 4's `youtube` source). An older image then refuses the database as newer than
-  it supports, so back up `earmark.db` (and its `-wal` and `-shm` files, with earmark
-  stopped) before upgrading. A
+- **The database moves to schema 6** the first time this version starts (the `summary` job
+  kind of step 37, after schema 5's `/v1` columns and schema 4's `youtube` source). An older
+  image then refuses the database as newer than it supports, so back up `earmark.db` (and
+  its `-wal` and `-shm` files, with earmark stopped) before upgrading. A
   native install that skips `--extra youtube` on upgrade must add it, or set
   `EARMARK_YOUTUBE_BACKEND=fake`: the worker refuses to start without the extra.
 
@@ -1090,3 +1090,215 @@ id, status, times, language, duration and a hash of the audio. The database over
 space and truncates its log after a delete, but this is deletion, not shredding: filesystem
 blocks and backups of `EARMARK_DATA_DIR` are outside earmark's reach, and a remote ASR server
 keeps whatever it keeps.
+
+## 21. Summaries on a local model
+
+### 21.1 What it is
+
+`POST /v1/summaries` is for a program such as earshot that has a transcript and its own
+instructions and wants a summary back. earmark sends both to a model server that you run on
+the Spark, and keeps the answer for the program to fetch. Nothing leaves the Spark: there is
+no cloud model, no mail and no push. It is off until `EARMARK_LLM_BACKEND` is set; until then
+the route answers 503. The text a client builds against is
+[contract/api-v1.md](../contract/api-v1.md).
+
+**Until step 37b, only `none` and `fake` run.** `ollama`, `llama_cpp` and `vllm` stop the
+worker at startup with a configuration error that names step 37b, so do not set them on the
+Spark yet. Everything below describes what step 37b adds (the server clients, the checks at
+every job and every connect) and what to prepare for it; the job, route, caps, delete and
+failure behaviour is already there and can be tried with `fake`.
+
+The model server is not part of earmark's `compose.yaml`, and earmark does not start it.
+Install it yourself (21.5). earmark never summarises part of the input: a summary is stored
+only when the server provably read all of it and the model stopped on its own.
+
+One worker runs one job at a time, so a long summary delays queued transcriptions, and the
+reverse.
+
+### 21.2 Choosing a server and its flags
+
+Set `EARMARK_LLM_BACKEND` to the server's type, because each type reports an over-long prompt
+in its own way and earmark checks each differently. Nothing here was run in this repository's
+sandbox: the flags come from each server's documentation and source, so check them against
+the release you install.
+
+- **`ollama`: Ollama 0.40.17 or later.** earmark calls its native `/api/chat` with
+  `truncate: false` and `shift: false`, and (step 37b) checks the version on every job, because older
+  releases cut the middle out of a long prompt without saying so. Set
+  `OLLAMA_NUM_PARALLEL=1`, or Ollama reserves memory for several requests at once. Note
+  `OLLAMA_KEEP_ALIVE`: a loaded model holds its memory until it expires. from step 37b earmark
+  sets `num_ctx` itself, from `EARMARK_LLM_CONTEXT_TOKENS`.
+- **`llama_cpp`: llama-server.** Set `-c <context>` explicitly and `-np 1`, never
+  `--context-shift`, and choose the reasoning format that suits the model, so thinking
+  arrives apart from the answer.
+- **`vllm`.** Set `--max-model-len`, and an explicit `--gpu-memory-utilization` or
+  `--kv-cache-memory-bytes`: without one, vLLM can take the memory Whisper needs. Use the
+  model's reasoning parser.
+
+### 21.3 The context a 4-hour meeting needs
+
+A 4-hour meeting is 30 to 60 thousand words. Measured on a synthetic 60 000-word transcript in
+earshot's shape (`[HH:MM:SS] **Name:** text`), that is about 400 000 characters, and 104 000
+to 112 000 tokens with the tokenizers of gpt-oss, Llama 3.3 and Qwen3: 3.6 to 3.9 characters
+a token for English. Another sample, of a novel, came to 83 000 to 85 000 tokens. Add up to
+5 000 tokens for the instructions and the tokens of the summary.
+
+So **a context of 131 072 tokens** is the recommendation, with gpt-oss-120b on a 128 GB Spark.
+The three settings fit together like this:
+
+- `EARMARK_LLM_MAX_TRANSCRIPT_CHARS` (400000) is the longest transcript the API accepts. It is
+  a character count, because the API makes no call to the model server and cannot count tokens.
+- `EARMARK_LLM_MAX_OUTPUT_TOKENS` (8192) is the most a summary may have.
+- `EARMARK_LLM_CONTEXT_TOKENS` is the context earmark asks Ollama for. It must be at least
+  the output limit plus 1024. The other two servers report their own context, and earmark
+  reads it on every job.
+
+400 000 characters at 3.6 characters a token is about 111 000 tokens, plus the instructions
+and the output: 124 000 of 131 072. A transcript under the cap can still be too long for the
+model, for example a language that takes more tokens a character. The job then fails with a
+message that starts `the transcript and instructions do not fit the model's context`, and
+nothing is stored.
+
+### 21.4 Memory on the Spark
+
+Weights and the key-value cache at a 131 072-token context, by arithmetic from each model's
+configuration (not measured):
+
+| Model | Weights | Native context | KV cache at 131 072 |
+|---|---|---|---|
+| gpt-oss-120b (MXFP4) | 65 GB | 131 072 | 4.5 GiB |
+| gpt-oss-20b (MXFP4) | 14 GB | 131 072 | 3 GiB |
+| Qwen3-30B-A3B | 19 GB at 4 bits | 32 768 (131 072 only with YaRN) | 12 GiB |
+| Llama-3.3-70B | 43 GB at 4 bits | 131 072 | 40 GiB |
+
+Whisper large-v3 in the worker needs about 3 GB of weights, 4.5 to 6 GB on the GPU while it
+decodes, and about 12 GB more of CPU-side features for a 4-hour file. gpt-oss-120b with Whisper
+and such a file comes to about 90 GB of the Spark's 128 GB, so both stay loaded and nothing
+needs unloading. Cap the model server's memory all the same (21.2). On a 64 GB Spark, use
+gpt-oss-20b. Qwen3 holds only 32 768 tokens natively, so it is not the model for a 4-hour
+meeting.
+
+What Ollama detects as memory on the Spark's GPU, the real speed, and both models loaded
+under load were not checked. Your first run (21.10) shows them.
+
+### 21.5 Reaching the server from the worker
+
+The worker runs in a container on a bridge network, so a server on the Spark's host that is
+bound to `127.0.0.1` is not reachable from it. The base URL must name a loopback or private
+address or a local name: a single-label name such as `ollama`, `localhost`, or a name under
+`.internal`, `.local`, `.lan` or `.home.arpa`. earmark checks this when settings load, and
+resolves the name again at every connect (step 37b), so a name that points at a public address is
+refused. So are a tailnet address (the carrier-grade NAT range), a link-local address and any
+public address.
+
+**Route (a), recommended.** Run the server as a container on earmark's own network, in a
+`compose.override.yaml` that you write next to `compose.yaml`. It publishes no port, so
+nothing on the network can reach a server that has no login:
+
+```yaml
+services:
+  ollama:
+    image: ollama/ollama@sha256:<image-hash>
+    gpus: all
+    restart: unless-stopped
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KEEP_ALIVE: 10m
+    volumes:
+      - ollama-models:/root/.ollama
+
+volumes:
+  ollama-models:
+```
+
+Pin the image by its hash, and pull the model once with
+`docker compose exec ollama ollama pull gpt-oss:120b`. Then set, in `.env`:
+
+```bash
+EARMARK_LLM_BACKEND=ollama
+EARMARK_LLM_BASE_URL=http://ollama:11434
+EARMARK_LLM_MODEL=gpt-oss:120b
+EARMARK_LLM_CONTEXT_TOKENS=131072
+```
+
+**Route (b).** A server installed on the host and reached as `host.docker.internal`. The
+override gives the worker the name:
+
+```yaml
+services:
+  worker:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+Bind the server to the Docker bridge's address, not to every interface, and set
+`EARMARK_LLM_BASE_URL=http://host.docker.internal:11434`. A server bound only to `127.0.0.1`
+cannot be reached this way.
+
+Neither route was run in this repository's sandbox. Whether Ollama's image uses the Spark's
+GPU is for your first run to show. The API container reads the same `.env`, so it sees
+`EARMARK_LLM_BACKEND` and the transcript cap, but it never contacts the model server.
+
+### 21.6 The settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EARMARK_LLM_BACKEND` | `none` | `none` (off), `ollama`, `llama_cpp`, `vllm` or `fake` (for tests). |
+| `EARMARK_LLM_BASE_URL` | unset | The server's root URL, with no path. |
+| `EARMARK_LLM_MODEL` | unset | The model name the server serves. |
+| `EARMARK_LLM_API_KEY` | unset | Sent as a bearer key, if the server asks for one (secret). |
+| `EARMARK_LLM_CONTEXT_TOKENS` | unset | `ollama` only: `num_ctx`, at least 8192. |
+| `EARMARK_LLM_MAX_OUTPUT_TOKENS` | `8192` | The most a summary may have; a summary cut off here fails. |
+| `EARMARK_LLM_TIMEOUT_SECONDS` | `3600.0` | How long to wait for the server. A timeout fails the job without a retry. |
+| `EARMARK_LLM_MAX_TRANSCRIPT_CHARS` | `400000` | The longest transcript the API accepts. |
+
+The README has the same table.
+
+### 21.7 An example
+
+Build the request file with `jq`, so the transcript and the instructions are escaped for you:
+
+```bash
+jq -n --rawfile t meeting.md --rawfile i notes-format.md \
+  '{transcript: $t, instructions: $i}' > request.json
+curl -s -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  -H 'Content-Type: application/json' --data-binary @request.json \
+  http://127.0.0.1:8787/v1/summaries
+# {"job_id":"7b1e4d9a2c3f4e5a8b6c0d1e2f3a4b5c","status":"queued"}
+curl -s -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  http://127.0.0.1:8787/v1/jobs/<job_id>
+curl -s -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  http://127.0.0.1:8787/v1/jobs/<job_id>/summary
+curl -s -X DELETE -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  http://127.0.0.1:8787/v1/jobs/<job_id>
+```
+
+Without `jq`, `python3 -c` does the same with `json.dumps`. Poll the job until `status` is
+`done`. The summary's `text` is the model's Markdown exactly as the server returned it.
+
+### 21.8 What a failed summary means
+
+The job's `error` is earmark's own text. It never contains the server's error text, the
+transcript, the instructions or the output.
+
+| `error` starts with | What to change |
+|---|---|
+| `the transcript and instructions do not fit the model's context` | Send less text, or raise the server's context (and `EARMARK_LLM_CONTEXT_TOKENS` for Ollama). |
+| `the summary was cut off` | The model hit `EARMARK_LLM_MAX_OUTPUT_TOKENS` or the end of its context. Raise the limit, or ask for a shorter summary. |
+| `summaries are not configured on the worker` | `EARMARK_LLM_BACKEND` is `none` on the worker. |
+| `the model server at <host>` | The server is unreachable, refused the request or answered something earmark cannot read; check the URL, the model name and the key. |
+
+### 21.9 What DELETE removes
+
+The transcript and the instructions are deleted from the Spark's disk when the job ends, whether it
+succeeded or failed. `DELETE /v1/jobs/<job_id>` removes the summary and anything left of the
+input, and refuses a queued or running job. A summary is never shared between jobs, so it
+deletes only that job. The model server keeps whatever it keeps: its own logs and cache are
+outside earmark's reach.
+
+### 21.10 Checking it
+
+`docker compose run --rm worker doctor` reports the summary settings: off, fake, or the
+server type. Then send one real 4-hour transcript, fetch its summary, and send the same text
+twice in one request to see it refused with `the transcript and instructions do not fit the
+model's context`. Watch the server's memory while Whisper has a file.

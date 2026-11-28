@@ -19,6 +19,8 @@ from earmark.models import (
     Episode,
     Job,
     Segment,
+    SummaryInput,
+    SummaryResult,
     Transcript,
     episode_key,
 )
@@ -286,6 +288,51 @@ class FakeNotifier(FakeStage[NotifyCall]):
         self._enter(NotifyCall(job, episode))
 
 
+@dataclass(frozen=True)
+class SummarizeCall:
+    transcript_chars: int
+    instructions_chars: int
+
+
+class FakeSummarizer(FakeStage[SummarizeCall]):
+    """Returns scripted text, or a line that never contains the input."""
+
+    backend = "fake"
+
+    def __init__(
+        self,
+        *,
+        text: str | None = None,
+        model: str = "fake-llm",
+        finish_reason: str | None = "stop",
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        max_output_tokens: int = 8192,
+    ) -> None:
+        super().__init__()
+        self._text = text
+        self.model = model
+        self._finish_reason = finish_reason
+        self._prompt_tokens = prompt_tokens
+        self._completion_tokens = completion_tokens
+        self.max_output_tokens = max_output_tokens
+        self.computed = 0
+
+    def summarize(self, request: SummaryInput) -> SummaryResult:
+        self._enter(SummarizeCall(len(request.transcript), len(request.instructions)))
+        self.computed += 1
+        text = self._text
+        if text is None:
+            text = f"Summary of {len(request.transcript)} characters.\n"
+        return SummaryResult(
+            text=text,
+            model=self.model,
+            finish_reason=self._finish_reason,
+            prompt_tokens=self._prompt_tokens,
+            completion_tokens=self._completion_tokens,
+        )
+
+
 @dataclass
 class FakeBackends:
     artifacts: ArtifactStore
@@ -295,6 +342,7 @@ class FakeBackends:
     transcriber: FakeTranscriber
     mailer: FakeMailer
     notifier: FakeNotifier
+    summarizer: FakeSummarizer
 
     def backends(self) -> Backends:
         return Backends(
@@ -304,6 +352,7 @@ class FakeBackends:
             transcriber=self.transcriber,
             mailer=self.mailer,
             notifier=self.notifier,
+            summarizer=self.summarizer,
         )
 
 
@@ -317,4 +366,5 @@ def make_fake_backends(data_dir: Path) -> FakeBackends:
         transcriber=FakeTranscriber(artifacts),
         mailer=FakeMailer(),
         notifier=FakeNotifier(),
+        summarizer=FakeSummarizer(),
     )

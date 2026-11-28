@@ -83,6 +83,7 @@ class NewJob:
     delivery: Delivery = "mail"
     initial_prompt: str | None = None
     language: str | None = None
+    kind: JobKind = "ingest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,12 @@ def _v1_dedupe_key(content_sha256: str, initial_prompt: str | None, language: st
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _summary_dedupe_key(content_sha256: str) -> str:
+    """A list of two elements; mail keys have five and /v1 transcription keys six."""
+    payload = json.dumps(["summary", "sha256:" + content_sha256], separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -226,7 +233,7 @@ class JobStore:
         offset_min = None if new.shared_at is None else _offset_minutes(new.shared_at)
         job = Job(
             id=uuid.uuid4().hex,
-            kind="ingest",
+            kind=new.kind,
             status="queued",
             source=new.source,
             url=new.url,
@@ -245,7 +252,9 @@ class JobStore:
             initial_prompt=new.initial_prompt,
             language=new.language,
         )
-        if new.delivery == "none" and new.content_sha256 is not None:
+        if new.kind == "summary" and new.content_sha256 is not None:
+            key = _summary_dedupe_key(new.content_sha256)
+        elif new.delivery == "none" and new.content_sha256 is not None:
             key = _v1_dedupe_key(new.content_sha256, new.initial_prompt, new.language)
         elif new.to is not None:
             key = _dedupe_key("ingest", new.source, subject, new.to, new.instructions)
@@ -274,13 +283,14 @@ class JobStore:
                                   attempts, run_after, warnings, shared_at, created_at,
                                   updated_at, utc_offset_min, delivery, initial_prompt,
                                   language)
-                VALUES (:id, 'ingest', 'queued', :source, :url, :to, :instructions, :title,
+                VALUES (:id, :kind, 'queued', :source, :url, :to, :instructions, :title,
                         :upload_file, :upload_name, :content_sha256, :key, 0, :now, '[]',
                         :shared, :now, :now, :offset_min, :delivery, :initial_prompt,
                         :language)
                 """,
                 {
                     "id": job.id,
+                    "kind": new.kind,
                     "source": new.source,
                     "url": new.url,
                     "to": new.to,
@@ -303,6 +313,27 @@ class JobStore:
     @staticmethod
     def _validate(new: NewJob) -> str:
         """The dedupe subject of ``new``; ValueError if it breaks the source rules."""
+        if new.kind == "summary":
+            if (
+                new.delivery != "none"
+                or new.source != "upload"
+                or new.to is not None
+                or new.instructions != ""
+                or new.title is not None
+                or new.upload_name is not None
+                or new.url is not None
+                or not new.upload_file
+                or not new.upload_file.endswith(".json")
+                or not new.content_sha256
+                or new.initial_prompt is not None
+                or new.language is not None
+            ):
+                raise ValueError(
+                    "a summary job is a delivery-free upload of a .json input with "
+                    "content_sha256, and no recipient, instructions, title, name, url or "
+                    "decode options"
+                )
+            return "sha256:" + new.content_sha256
         if new.delivery == "none":
             if (
                 new.source != "upload"
@@ -337,6 +368,8 @@ class JobStore:
     def mark_purged(self, job_id: str) -> list[Job]:
         """Mark a finished /v1 job, and every finished one sharing its transcript, purged.
 
+        A summary job is purged alone.
+
         Raises JobNotFoundError for an unknown or mail job and JobActiveError while the job
         is queued or running. Returns the named job first, then the others by seq.
         """
@@ -352,17 +385,29 @@ class JobStore:
                 return [job]
             if job.status in ("queued", "running"):
                 raise JobActiveError(job)
-            rows = conn.execute(
-                """
-                UPDATE jobs
-                SET purged_at = :now, initial_prompt = NULL, dedupe_key = 'purged:' || id,
-                    updated_at = :now
-                WHERE delivery = 'none' AND dedupe_key = :key
-                  AND status IN ('done', 'failed', 'skipped') AND purged_at IS NULL
-                RETURNING *
-                """,
-                {"now": now, "key": row["dedupe_key"]},
-            ).fetchall()
+            if job.kind == "summary":
+                # A summary's files are its own; nothing is shared with a sibling.
+                rows = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET purged_at = :now, dedupe_key = 'purged:' || id, updated_at = :now
+                    WHERE id = :id AND purged_at IS NULL
+                    RETURNING *
+                    """,
+                    {"now": now, "id": job_id},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET purged_at = :now, initial_prompt = NULL,
+                        dedupe_key = 'purged:' || id, updated_at = :now
+                    WHERE delivery = 'none' AND dedupe_key = :key
+                      AND status IN ('done', 'failed', 'skipped') AND purged_at IS NULL
+                    RETURNING *
+                    """,
+                    {"now": now, "key": row["dedupe_key"]},
+                ).fetchall()
         ordered = sorted(rows, key=lambda r: (r["id"] != job_id, r["seq"]))
         return [_row_to_job(r) for r in ordered]
 

@@ -572,3 +572,75 @@ def test_v1_enqueue_log_line(tmp_path: Path, log_stream: io.StringIO) -> None:
     assert lines[0].endswith(
         f"enqueued job {job_id}: upload of 64 bytes, no delivery (created=True)"
     )
+
+
+# -- summaries (step 37) --------------------------------------------------------------------
+
+SUMMARY_TRANSCRIPT = "MARKTRANSCRIPT-" + "t" * 20_000
+SUMMARY_INSTRUCTIONS = "MARKINSTR-" + "i" * 200
+SUMMARY_OUTPUT = "MARKOUTPUT-" + "o" * 200
+
+
+def test_summary_job_leaks_nothing(tmp_path: Path, log_stream: io.StringIO) -> None:
+    from earmark.cli import app as cli_app
+    from tests.summary_env import summary_env, summary_fakes
+
+    fakes = summary_fakes(tmp_path, text=SUMMARY_OUTPUT)
+    with summary_env(tmp_path, fakes=fakes, no_dedupe=True) as v1:
+        job_id = v1.submit_summary(transcript=SUMMARY_TRANSCRIPT, instructions=SUMMARY_INSTRUCTIONS)
+        assert v1.run().status == "done"
+        assert v1.client.get(f"/v1/jobs/{job_id}").status_code == 200
+        served = v1.summary(job_id)
+        assert "MARKOUTPUT" in served.text  # the check can see it
+        assert v1.transcript(job_id).status_code == 409
+        assert v1.client.delete(f"/v1/jobs/{job_id}").status_code == 200
+        assert v1.summary(job_id).status_code == 410
+        # a failed job logs and records nothing of the request either
+        fakes.summarizer.fail_next(PermanentError("summarising failed"))
+        failed = v1.submit_summary(
+            transcript=SUMMARY_TRANSCRIPT + "x", instructions=SUMMARY_INSTRUCTIONS
+        )
+        assert v1.run().status == "failed"
+        # a rejected request is not logged with its text either
+        refused = v1.post_summary(transcript=" ", instructions=SUMMARY_INSTRUCTIONS)
+        assert refused.status_code == 422
+        errors = [
+            v1.client.get(f"/v1/jobs/{failed}").text,
+            v1.client.get(f"/jobs/{failed}").text,
+            refused.text,
+        ]
+        listing = v1.client.get("/jobs").text
+        files = _v1_bytes(tmp_path / "data")
+        from typer.testing import CliRunner
+
+        shown = CliRunner().invoke(cli_app, ["jobs"], env={"EARMARK_DATA_DIR": str(v1.data_dir)})
+    text = log_stream.getvalue()
+    assert "enqueued job" in text  # the requests really were logged
+    assert "summary of" in text
+    assert "purged" in text
+    for marker in ("MARKTRANSCRIPT", "MARKINSTR", "MARKOUTPUT"):
+        assert marker not in text
+        for shown_text in (*errors, listing, shown.output):
+            assert marker not in shown_text
+        # after the purge and the failure, nothing is on disk, the database and its log included
+        assert "earmark.db" in files
+        for name, data in files.items():
+            assert marker.encode() not in data, (name, marker)
+
+
+def test_summary_enqueue_log_line(tmp_path: Path, log_stream: io.StringIO) -> None:
+    from tests.summary_env import summary_env
+
+    with summary_env(tmp_path) as v1:
+        job_id = v1.submit_summary(transcript="t" * 30, instructions="i" * 12)
+        v1.post_summary(transcript="t" * 30, instructions="i" * 12)  # a dedupe hit
+    lines = [ln for ln in log_stream.getvalue().splitlines() if "enqueued job" in ln]
+    assert len(lines) == 2
+    assert lines[0].endswith(
+        f"enqueued job {job_id}: summary of 30 transcript and 12 instructions characters, "
+        "no delivery (created=True)"
+    )
+    assert lines[1].endswith(
+        f"enqueued job {job_id}: summary of 30 transcript and 12 instructions characters, "
+        "no delivery (created=False)"
+    )

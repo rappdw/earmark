@@ -563,6 +563,39 @@ def test_doctor_notify_none_and_fake(tmp_path: Path) -> None:
     assert status(make_settings(tmp_path, notify_backend="fake"), "notify").status == "warn"
 
 
+def test_llm_off(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path), "llm")
+    assert result.status == "ok"
+    assert result.detail.startswith("off")
+    assert "503" in result.detail
+
+
+def test_llm_fake_warns(tmp_path: Path) -> None:
+    result = status(make_settings(tmp_path, llm_backend="fake"), "llm")
+    assert result.status == "warn"
+    assert "fake summarizer" in result.detail
+
+
+@pytest.mark.parametrize("backend", ["ollama", "llama_cpp", "vllm"])
+def test_llm_real_backend_fails_until_step_37b(tmp_path: Path, backend: str) -> None:
+    result = status(make_settings(tmp_path, llm_backend=backend), "llm")
+    assert result.status == "fail"
+    assert "EARMARK_LLM_BACKEND" in result.detail
+    assert "step 37b" in result.detail
+
+
+def test_llm_check_makes_no_request_and_names_no_secret(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        llm_backend="ollama",
+        llm_base_url="http://ollama:11434",
+        llm_api_key=SecretStr("sentinel-llm-key-77"),
+    )
+    result = status(settings, "llm")
+    assert "sentinel-llm-key-77" not in result.detail
+    assert "ollama:11434" not in result.detail
+
+
 def ntfy_settings(tmp_path: Path, **overrides: Any) -> Settings:
     values: dict[str, Any] = {"notify_backend": "ntfy", "ntfy_url": SecretStr(TOPIC_URL)}
     values.update(overrides)
@@ -1023,6 +1056,7 @@ def test_doctor_check_names_in_order(tmp_path: Path) -> None:
         "asr",
         "mail",
         "notify",
+        "llm",
         "client mode",
     ]
 

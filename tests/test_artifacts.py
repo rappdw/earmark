@@ -12,6 +12,7 @@ from earmark.artifacts import (
     atomic_writer,
 )
 from earmark.errors import PermanentError
+from earmark.models import SummaryRecord
 from tests.factories import T0, make_episode, make_transcript
 
 KEY = make_episode().key
@@ -340,3 +341,110 @@ def test_remove_decoded_ignores_symlinks(tmp_path: Path) -> None:
     assert store.remove_decoded(DKEY) == 0
     assert target.read_text() == "precious"
     assert (directory / "transcript.txt").is_symlink()
+
+
+# -- summaries (step 37) --------------------------------------------------------------------
+
+JOB_ID = "ab" * 16
+
+
+def _record(job_id: str = JOB_ID, text: str = "## Notes\r\n- café \U0001f600\n  ") -> SummaryRecord:
+    return SummaryRecord(
+        job_id=job_id,
+        backend="fake",
+        model="example-model",
+        text=text,
+        warnings=("w",),
+        prompt_tokens=10,
+        completion_tokens=3,
+        context_tokens=8192,
+        created_at=T0,
+    )
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "../" + "a" * 29, "A" * 32, "a" * 33, "g" * 32])
+def test_summary_paths_validated(tmp_path: Path, bad: str) -> None:
+    store = ArtifactStore(tmp_path)
+    for call in (
+        store.summary_dir,
+        store.summary_path,
+        store.read_summary,
+        store.has_summary,
+        store.remove_summary,
+    ):
+        with pytest.raises(ValueError, match="not a job id"):
+            call(bad)
+    with pytest.raises(ValueError, match="not a job id"):
+        store.write_summary(
+            SummaryRecord.model_construct(
+                job_id=bad, backend="b", model="m", text="t", created_at=T0
+            )
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_summary_paths(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    assert store.summary_dir(JOB_ID) == tmp_path / "summaries" / JOB_ID
+    assert store.summary_path(JOB_ID) == tmp_path / "summaries" / JOB_ID / "summary.json"
+    assert store.read_summary(JOB_ID) is None
+    assert store.has_summary(JOB_ID) is False
+    assert store.remove_summary(JOB_ID) == 0
+    assert not (tmp_path / "summaries").exists()  # nothing is created until a write
+
+
+def test_write_read_summary_modes(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    record = _record()
+    path = store.write_summary(record)
+    assert path == store.summary_path(JOB_ID)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert path.read_text().endswith("}\n")
+    assert store.read_summary(JOB_ID) == record
+    assert store.has_summary(JOB_ID)
+    assert _files(path.parent) == ["summary.json"]
+    again = _record(text="second")
+    store.write_summary(again)
+    assert store.read_summary(JOB_ID) == again
+
+
+def test_read_summary_corrupt_or_other_job(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    store.write_summary(_record())
+    store.summary_path(JOB_ID).write_text("{ nope")
+    with pytest.raises(PermanentError, match="corrupt artifact"):
+        store.read_summary(JOB_ID)
+    other = "cd" * 16
+    store.write_summary(_record(other))
+    store.summary_path(JOB_ID).write_text(store.summary_path(other).read_text())
+    with pytest.raises(PermanentError, match="corrupt artifact"):
+        store.read_summary(JOB_ID)
+
+
+def test_remove_summary_spares_other_files(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    assert store.remove_summary(JOB_ID) == 0
+    store.write_summary(_record())
+    directory = store.summary_dir(JOB_ID)
+    (directory / ".summary.json.abc.tmp").write_text("x")
+    (directory / "keep.txt").write_text("keep")
+    assert store.remove_summary(JOB_ID) == 2
+    assert _files(directory) == ["keep.txt"]  # rmdir failed and was ignored
+    (directory / "keep.txt").unlink()
+    store.write_summary(_record())
+    assert store.remove_summary(JOB_ID) == 1
+    assert not directory.exists()
+
+
+def test_remove_summary_ignores_symlinks(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    store.write_summary(_record())
+    directory = store.summary_dir(JOB_ID)
+    target = tmp_path / "outside.txt"
+    target.write_text("precious")
+    (directory / "summary.json").unlink()
+    (directory / "summary.json").symlink_to(target)
+    assert store.remove_summary(JOB_ID) == 0
+    assert target.read_text() == "precious"
+    assert (directory / "summary.json").is_symlink()

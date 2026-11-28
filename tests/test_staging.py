@@ -255,3 +255,32 @@ def test_release_clears_youtube_downloads(tmp_path: Path) -> None:
     other.write_bytes(b"someone else's")
     staging.release(video)
     assert [p.name for p in staging.downloads_dir.iterdir()] == [other.name]
+
+
+def test_stage_document(staging: Staging) -> None:
+    data = '{"transcript":"café","instructions":"i"}'.encode()
+    staged = staging.stage_document(data, "json")
+    assert re.fullmatch(r"[0-9a-f]{32}\.json", staged.name)
+    assert staged.path == staging.upload_path(staged.name)
+    assert staged.path.read_bytes() == data
+    assert staged.size == len(data)
+    assert staged.sha256 == hashlib.sha256(data).hexdigest()
+    assert (staged.path.stat().st_mode & 0o777) == 0o600
+    assert sorted(p.name for p in staging.uploads_dir.iterdir()) == [staged.name]
+
+
+def test_stage_document_removes_the_partial_file_on_failure(
+    staging: Staging, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(fd: int) -> None:
+        raise OSError("disk")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError, match="disk"):
+        staging.stage_document(b"x", "json")
+    assert list(staging.uploads_dir.iterdir()) == []
+
+
+def test_stage_document_rejects_a_bad_extension(staging: Staging) -> None:
+    with pytest.raises(ValueError, match="extension"):
+        staging.stage_document(b"x", "../json")

@@ -739,8 +739,10 @@ def test_routes_are_exactly_the_kept_ones(store: JobStore, tmp_path: Path) -> No
         ("/v1/jobs/{job_id}", frozenset({"GET"})),
         ("/v1/jobs/{job_id}/transcript", frozenset({"GET"})),
         ("/v1/jobs/{job_id}", frozenset({"DELETE"})),
+        ("/v1/summaries", frozenset({"POST"})),
+        ("/v1/jobs/{job_id}/summary", frozenset({"GET"})),
     }
-    assert len(router.routes) == 9
+    assert len(router.routes) == 11
 
 
 def test_create_app_refuses_v010_database(settings: Settings, tmp_path: Path) -> None:
@@ -774,7 +776,8 @@ def test_job_view_fields(client: TestClient) -> None:
     for hidden in ("heartbeat_at", "upload_file", "upload_name", "content_sha256", "lease_token"):
         assert hidden not in view
     assert set(view) == {
-        "id", "status", "stage", "source", "url", "to", "instructions", "title", "episode_key",
+        "id", "kind", "status", "stage", "source", "url", "to", "instructions", "title",
+        "episode_key",
         "attempts", "run_after", "error", "warnings", "result", "delivery_state", "sent_at",
         "shared_at", "created_at", "updated_at",
     }  # fmt: skip

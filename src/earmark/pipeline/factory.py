@@ -18,6 +18,7 @@ from earmark.fakes import (
     FakeMailer,
     FakeNotifier,
     FakeResolver,
+    FakeSummarizer,
     FakeTranscriber,
     FakeYoutubeSource,
 )
@@ -30,11 +31,13 @@ from earmark.pipeline.stages import (
     Mailer,
     Notifier,
     Resolver,
+    Summarizer,
     Transcriber,
     YoutubeSource,
 )
 from earmark.pipeline.worker import Worker, heartbeat_interval
 from earmark.staging import Staging
+from earmark.summarize.base import NOT_BUILT_YET
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,13 @@ def _ntfy_notifier(ctx: BuildContext) -> Notifier | None:
     return build_ntfy_notifier(ctx.settings)
 
 
+def _local_summarizer(ctx: BuildContext) -> Summarizer:
+    # Step 37b replaces this body with the lazy import of earmark.summarize.build.
+    raise ConfigError(
+        [f"{env_var('llm_backend')}: {NOT_BUILT_YET.format(backend=ctx.settings.llm_backend)}"]
+    )
+
+
 RESOLVERS: Final[Mapping[str, Builder[Resolver]]] = {
     "apple": _apple_resolver,
     "fake": lambda ctx: FakeResolver(),
@@ -119,6 +129,16 @@ NOTIFIERS: Final[Mapping[str, Builder[Notifier | None]]] = {
     "none": lambda ctx: None,
     "ntfy": _ntfy_notifier,
 }
+SUMMARIZERS: Final[Mapping[str, Builder[Summarizer | None]]] = {
+    "fake": lambda ctx: FakeSummarizer(
+        model=ctx.settings.llm_model or "fake-llm",
+        max_output_tokens=ctx.settings.llm_max_output_tokens,
+    ),
+    "llama_cpp": _local_summarizer,
+    "none": lambda ctx: None,
+    "ollama": _local_summarizer,
+    "vllm": _local_summarizer,
+}
 
 
 def _lookup[T](
@@ -144,6 +164,7 @@ def build_backends(
     transcriber = _lookup(TRANSCRIBERS, "asr_backend", settings.asr_backend, problems)
     mailer = _lookup(MAILERS, "mail_backend", settings.mail_backend, problems)
     notifier = _lookup(NOTIFIERS, "notify_backend", settings.notify_backend, problems)
+    summarizer = _lookup(SUMMARIZERS, "llm_backend", settings.llm_backend, problems)
     if (
         problems
         or resolver is None
@@ -152,6 +173,7 @@ def build_backends(
         or transcriber is None
         or mailer is None
         or notifier is None
+        or summarizer is None
     ):
         raise ConfigError(problems)
     ctx = BuildContext(settings=settings, artifacts=artifacts, clock=clock)
@@ -162,6 +184,7 @@ def build_backends(
         transcriber=transcriber(ctx),
         mailer=mailer(ctx),
         notifier=notifier(ctx),
+        summarizer=summarizer(ctx),
     )
 
 
@@ -195,13 +218,14 @@ def build_worker(
         recipient_policy=settings.recipient_policy(),
     )
     logger.info(
-        "backends: resolver=%s fetch=%s youtube=%s asr=%s mail=%s notify=%s",
+        "backends: resolver=%s fetch=%s youtube=%s asr=%s mail=%s notify=%s llm=%s",
         settings.resolver_backend,
         settings.fetch_backend,
         settings.youtube_backend,
         settings.asr_backend,
         settings.mail_backend,
         settings.notify_backend,
+        settings.llm_backend,
     )
     return Worker(
         jobs,

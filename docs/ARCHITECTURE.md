@@ -17,7 +17,7 @@ outside this repo.
 | Part | What it is | Runs on | Lives in | Built and run |
 |---|---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link to the service | the operator's iPhone | `docs/shortcut.md`, which says how to build it by hand; `shortcut/earmark.shortcut` from step 31 | Never run on a phone. The file is not built (step 31). |
-| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27, 32 (a request may also be a YouTube video link) and 36 (the `/v1` API for programs) and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
+| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27, 32 (a request may also be a YouTube video link) 36 (the `/v1` API for programs) and 37 (summaries on a local model under `/v1`), and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
 | 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Built in step 30 (version 1.1.0 since step 32): the `earmark-pka` plugin, its marketplace and the skill, tested on the contract 1 and contract 2 samples under CPython 3.9.6 and 3.13. It has never run in a PKA (runbook phase 12). |
 
 ### The three seams
@@ -26,7 +26,7 @@ outside this repo.
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`: the request model in code, and "HTTP API" below | the service's API tests (`tests/test_api.py`), and the doc tests that post `docs/shortcut.md`'s JSON example and upload fields to the app; no Shortcut has sent one yet |
 | Mail | service → AMAP → receiving skill | the mail contract: `contract: 2` (step 32), in `contract/mail-v2.md`, which the service sends; and `contract: 1`, in `contract/mail-v1.md`, which the receiving skill still accepts ("The mail contract" below) | the sample emails in `contract/samples/v2/` (step 32), which the service's tests reproduce byte for byte from the real mail code, and `contract/samples/v1/` (step 29, frozen since step 32 and pinned by hash); the checker passes on both on CPython 3.9.6 and 3.13; the receiving skill's tests (step 30), which run its recognising, checking and de-duplicating over every sample |
-| API | a program on the operator's hardware → service | `/v1` (step 36), in `contract/api-v1.md`: upload audio, fetch the transcript by job id, delete it; nothing leaves the Spark. Its first client is earshot, the operator's meeting transcriber, outside this repo | the `/v1` API tests (`tests/test_api_v1.py`, `tests/test_v1_jobs.py`), and `tests/test_api_v1_contract.py`, which pins the text by hash and checks every example response against the app; no earshot has called it yet |
+| API | a program on the operator's hardware → service | `/v1` (step 36; version 1.1 since step 37), in `contract/api-v1.md`: upload audio, fetch the transcript by job id, delete it; and (step 37) send a transcript with instructions and fetch a local model's summary; nothing leaves the Spark. Its first client is earshot, the operator's meeting transcriber, outside this repo | the `/v1` API tests (`tests/test_api_v1.py`, `tests/test_v1_jobs.py`, `tests/test_api_v1_summaries.py`), and `tests/test_api_v1_contract.py`, which pins the text by hash and checks every example response against the app; no earshot has called it yet |
 
 - The request seam has no folder: its contract is the request model in code plus this
   document.
@@ -222,6 +222,11 @@ push. The operator's PKA instances do the analysis and filing, through the recei
 A program on the operator's hardware can also upload audio through `/v1` (step 36): the job
 is transcribed and kept for that client, with no destination, no mail and no push, and the
 client fetches the transcript by job id and deletes it when done (`contract/api-v1.md`).
+The same program can send a transcript and its own instructions to `POST /v1/summaries`
+(step 37): one call to a local model server that the operator runs on the Spark (Ollama,
+llama.cpp's `llama-server` or vLLM), with the result kept for the client. There is no cloud
+model. This partly reverses the re-scope of 2026-11-23, under `/v1` only ("Re-scope
+decisions").
 
 On the DGX Spark the worker transcribes on the GB10 GPU in-process, from a GPU build of the
 image that compiles CTranslate2 with CUDA (step 26).
@@ -246,11 +251,12 @@ backend, not the pipeline.
 
 | Question | Decision | How to change it |
 |---|---|---|
-| Scope | The service transcribes, and delivers the transcript by email (step 25). Its sources are Apple Podcasts episodes, YouTube videos (step 32), direct audio URLs and uploads. It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
-| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). The per-options transcripts of `/v1` jobs under `transcripts/<decode_key>/`, kept until the client deletes them (step 36). Per-job staging files for uploads, direct URLs and YouTube audio (`uploads/`, `downloads/`, deleted when the job ends; steps 24, 32), and Deno's small cache (`cache/deno/`, step 32). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
+| Scope | The service transcribes, and delivers the transcript by email (step 25). Under `/v1` it also summarises a client's transcript on a local model (step 37). Its sources are Apple Podcasts episodes, YouTube videos (step 32), direct audio URLs and uploads. It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
+| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). The per-options transcripts of `/v1` jobs under `transcripts/<decode_key>/`, kept until the client deletes them (step 36). The summaries of `/v1` summary jobs under `summaries/<job_id>/`, kept until the client deletes them (step 37). Per-job staging files for uploads, direct URLs, YouTube audio and summary inputs (`uploads/`, `downloads/`, deleted when the job ends; steps 24, 32, 37), and Deno's small cache (`cache/deno/`, step 32). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
 | Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 2` since step 32, drafted by pka-skills, owned by this repo; the text is `contract/mail-v2.md`, a list of changes to `contract/mail-v1.md`, which the receiving skill still accepts). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
-| Requests | `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). And `POST /v1/transcriptions` (step 36), a streamed multipart upload with optional `initial_prompt` and `language` and no `to`: a delivery-free job, behind the bearer token only. | See "HTTP API", `docs/steps/24-transcription-requests.md` and `docs/steps/36-v1-api.md`. |
+| Requests | `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). And `POST /v1/transcriptions` (step 36), a streamed multipart upload with optional `initial_prompt` and `language` and no `to`: a delivery-free job, behind the bearer token only. And `POST /v1/summaries` (step 37), JSON `{transcript, instructions}`: a delivery-free summary job. | See "HTTP API", `docs/steps/24-transcription-requests.md`, `docs/steps/36-v1-api.md` and `docs/steps/37-v1-summaries.md`. |
+| Summaries | Step 37. One non-streaming chat call to a model server the operator runs on the Spark or its private network: `ollama` (native `/api/chat` with `truncate` and `shift` false, Ollama 0.40.17 or later), `llama_cpp` or `vllm` (`/v1/chat/completions`, with a token-count preflight). The base URL must name a loopback or private address or a local name. No cloud model. A summary is stored only when the server provably read the whole input and the model stopped on its own. | `EARMARK_LLM_BACKEND` (`none` by default), `EARMARK_LLM_*`; see "Summarizing". |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative for a server elsewhere (`remote`, step 09; see `docs/asr.md`). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so the GPU image (`Dockerfile.gpu`, step 26) builds CTranslate2 from source with CUDA for `sm_121` and swaps it into the venv; the compose worker runs it with `EARMARK_ASR_DEVICE=cuda`. faster-whisper's batched pipeline is optional (`EARMARK_ASR_BATCH_SIZE`). | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_DEVICE`, `EARMARK_ASR_BATCH_SIZE`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge (the Cloudflare token lives only with the proxy). Or the operator's own certificate, installed by `deploy/caddy/install-cert.sh`, with stock Caddy, on another port if 443 is taken (step 35). Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
@@ -302,6 +308,18 @@ Worker ── resolve (the staged upload's sha256) → transcribe with the reque
 Client ── GET /v1/jobs/{id}, GET /v1/jobs/{id}/transcript, DELETE /v1/jobs/{id}
 ```
 
+A `/v1` summary job (step 37):
+
+```
+program (earshot)
+   │  POST /v1/summaries   JSON {transcript, instructions}
+   ▼
+API ── validates, stages the input as data/uploads/<id>.json, enqueues kind = summary
+Worker ── summarize: one call to the local model server (fit checked per server type)
+          → data/summaries/<job_id>/summary.json → done; the input deleted; no mail, no push
+Client ── GET /v1/jobs/{id}, GET /v1/jobs/{id}/summary, DELETE /v1/jobs/{id}
+```
+
 ## Module layout
 
 These are the service's modules. The whole repo's layout is "Repo layout" under "System".
@@ -335,7 +353,8 @@ src/earmark/
   staging.py           Staging: data/uploads/ (UploadWriter) and data/downloads/, release at a
                        terminal state, startup sweeps (step 24)
   v1_jobs.py           the delivery-free jobs of /v1: v1_job, read_v1_transcript (the JSON and
-                       text views), purge_job; light imports (step 36)
+                       text views), purge_job; light imports (step 36); read_v1_summary,
+                       SummaryLimits and the summary messages (step 37)
   sanitize.py          untrusted text to file names and YAML, fit_chars, and the frontmatter
                        emitter; standard library only (step 22)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
@@ -370,6 +389,12 @@ src/earmark/
                        OpenAI-compatible /v1/audio/transcriptions client, step 09),
                        compat.py (known-incompatible extra versions from package
                        metadata, light; step 19)
+  summarize/           base.py (messages, check_result; light, the runner imports it; step 37a),
+                       http.py (LocalNetworkBackend, LocalEndpoint: the local-only client),
+                       openai_compat.py (llama_cpp and vllm), ollama.py (native /api/chat),
+                       build.py (LlmOptions, build_summarizer; imported only by the factory's
+                       builder, so the runner and factory load no httpx2); these four are
+                       step 37b
   notify/              ntfy.py (split_topic_url, clean_field, compose, NtfyClient,
                        NtfyNotifier: the `ntfy` Notifier; step 15)
   doctor/              report.py (CheckResult, render, exit code), checks.py (offline checks),
@@ -478,11 +503,19 @@ to job text.
     `sha256(json ["v1", content_sha256, initial_prompt, language])`. It names the job's
     transcript directory, `transcripts/<decode_key>/`, so the same bytes with the same
     options share one transcript and other options get another.
+- **Summary models** (step 37). `SummaryFields`, the JSON body of `POST /v1/summaries`
+  (`transcript` and `instructions`, both non-blank and kept verbatim; instructions at most
+  `MAX_SUMMARY_INSTRUCTIONS_CHARS`, 20 000; the transcript's cap is the setting
+  `LLM_MAX_TRANSCRIPT_CHARS`). `SummaryInput`, the staged input file. `SummaryResult`, what a
+  `Summarizer` returns (text, model, finish reason, token counts, context, warnings).
+  `SummaryRecord`, `summaries/<job_id>/summary.json`. `summary_input_bytes` is the canonical
+  JSON of the input, so identical requests hash alike.
 - `ShareRecord`: the content of `shared.json`, the earliest share time of the episode,
   recorded by the runner on every job (earliest wins). `record_share` returns it, and the
   note's `shared_at` is that time (step 25).
-- `Job`: `id` (`uuid4().hex`), `kind` (`ingest`, the only `JobKind`), `status`, `stage`
-  (`Stage` is `resolve`, `fetch`, `transcribe`, `deliver` or `notify`; `notify` is never set),
+- `Job`: `id` (`uuid4().hex`), `kind` (`JobKind`: `ingest`, or `summary` since step 37),
+  `status`, `stage` (`Stage` is `resolve`, `fetch`, `transcribe`, `summarize` (step 37),
+  `deliver` or `notify`; `notify` is never set),
   `source`, `url`, `to | None`, `instructions` (`""` when none), `title | None`,
   `upload_file | None`, `upload_name | None`, `content_sha256 | None`, `episode_key | None`
   (set after resolve), `attempts`, `run_after`, `error` (failure message or skip reason),
@@ -505,6 +538,10 @@ to job text.
     `upload_name` (the file name is never stored) and never has a delivery state. A `mail`
     job has no decode options and is never purged. `Job.decode_options()` gives the
     `DecodeOptions` of a `none` job, `None` for a mail job.
+  - **Step 37: summary jobs** have `kind = summary`, `delivery = none`, `source = upload` with
+    `upload_file` the staged input (`<32 hex>.json`) and `content_sha256` its hash, and no
+    decode options; `decode_options()` is `None`. `/v1` names the kinds `transcription` and
+    `summary` (`v1_kind`).
   - **Per source:**
     - `apple_podcasts`: `url` is the canonical episode URL, so `Episode.url` is canonical
       too.
@@ -572,6 +609,19 @@ class Mailer(Protocol):  # step 25
 
 class Notifier(Protocol):
     def notify(self, job: Job, episode: Episode | None, /) -> None: ...
+
+
+class Summarizer(Protocol):  # step 37
+    @property
+    def backend(self) -> str: ...
+
+    @property
+    def model(self) -> str: ...
+
+    @property
+    def max_output_tokens(self) -> int: ...
+
+    def summarize(self, request: SummaryInput, /) -> SummaryResult: ...
 ```
 
 `Notifier` receives the job in its terminal state. `OutgoingMail` (a frozen dataclass in
@@ -636,8 +686,9 @@ Rules every backend follows:
 
 Step 05; exact signatures in `docs/steps/05-worker.md`.
 
-- **Backends.** `Backends` (in `stages.py`) holds the six stages (resolver, fetcher,
-  youtube, transcriber, mailer, notifier); `notifier` is `None` when its backend is `none`. `factory.build_backends` is the
+- **Backends.** `Backends` (in `stages.py`) holds the stages (resolver, fetcher,
+  youtube, transcriber, mailer, notifier, and since step 37 summarizer); `notifier` is `None`
+  when its backend is `none`, and `summarizer` when `LLM_BACKEND` is `none` (its default). `factory.build_backends` is the
   only code that constructs backends: one registry per setting maps a backend name to a
   builder, and a name with no builder is a `ConfigError` naming the variable, raised
   before the database is opened. Real backends import their heavy modules inside the
@@ -696,6 +747,17 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   5. `finish` releases the staged upload. `Pipeline.notify` returns at once for a `none` job,
      so no path (success, failure, skip, a stale lease) pushes anything, and nothing composes
      or sends mail.
+- **Summary jobs** (`kind = summary`, step 37) take their own path:
+  1. stage `summarize`; no summarizer configured is permanent;
+  2. the staged input must exist and match `content_sha256` (permanent otherwise), and parse
+     as `SummaryInput`;
+  3. `summarizer.summarize(input)`, then `summarize.base.check_result` (finish reason `stop`
+     and some text, else permanent; nothing is stored);
+  4. `summaries/<job_id>/summary.json` is written, the job `complete`d with no result, and
+     `finish` deletes the input. Notify returns at once (`delivery = none`).
+  The call runs inside the interruptible window. The heartbeat keeps the lease through it:
+  socket I/O releases the GIL (measured in step 37: a ticking thread's longest pause was
+  0.064 s while the main thread waited on a 3 s answer).
 - **Retention** (step 24). `Pipeline.finish(job, episode)` releases the staging files of an
   upload (`uploads/<upload_file>`), a direct URL or a YouTube video (`downloads/<job_id>.*`),
   then notifies.
@@ -1016,6 +1078,51 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
   `EARMARK_ASR_*` settings; prints `[HH:MM:SS] text` lines or the `Transcript` JSON
   (warnings on stderr), and writes nothing outside the model cache.
 
+### Summarizing
+
+Step 37; exact rules in `docs/steps/37-v1-summaries.md` sections 4.6, 5.1 and 5.4.
+
+**Built in two steps.** Step 37a builds everything below except the three server clients: the
+summary jobs, the runner path, `check_result`, the `fake` backend and the offline doctor line.
+Until step 37b, `ollama`, `llama_cpp` and `vllm` are a startup `ConfigError` that names step
+37b (`factory._local_summarizer`), and doctor reports the same as a failure. The local-only
+connect policy, the per-server fit checks and the online doctor line are step 37b.
+
+- **Backends** (`LLM_BACKEND`): `none` (the default; `POST /v1/summaries` is 503), `ollama`,
+  `llama_cpp`, `vllm`, and `fake` for tests. The request is always [system: the
+  instructions, user: the transcript], verbatim, non-streaming, with the output capped at
+  `LLM_MAX_OUTPUT_TOKENS`.
+- **Local only.** `LLM_BASE_URL` is the server's root URL. At settings load its host must be a
+  loopback or private IP literal (127/8, 10/8, 172.16/12, 192.168/16, `::1`, `fc00::/7`) or a
+  local name (`localhost`, a single label such as a compose service, or a name under
+  `.localhost`, `.internal`, `.local`, `.lan`, `.home.arpa`). At every connect
+  `summarize.http.LocalNetworkBackend` resolves the host, refuses unless every address is
+  loopback or private, and connects to the address it checked. No redirects, no proxy
+  variables, cookies cleared, responses capped, the key only in the per-request header.
+- **No silent truncation**, per server:
+  - `llama_cpp`: `GET /props` (the slot's `n_ctx`) and `POST /v1/chat/completions/input_tokens`
+    (the exact count `N`) first; `N + max_output > n_ctx` is refused before generating; then
+    the chat call; a 400 `exceed_context_size_error` is refused; a 200 must have
+    `prompt_tokens >= N - 8` and `prompt + completion <= n_ctx` (no context shift).
+  - `vllm`: the same, with `POST /tokenize` (messages, `add_generation_prompt`) giving `N` and
+    `max_model_len`, and its 400 "maximum context length" refused.
+  - `ollama`: `GET /api/version` must be 0.40.17 or later (the first release whose
+    `shift: false` refuses a prompt that does not fit); then `POST /api/chat` with
+    `truncate: false`, `shift: false` and `options: {num_ctx: LLM_CONTEXT_TOKENS, num_predict}`;
+    its 400 "the prompt is longer than the context length…" (or llama-server's, passed
+    through) is refused; a 200 must have `prompt_eval_count + eval_count <= num_ctx`.
+    Ollama's `/v1/chat/completions` is never used: it cuts the middle out of an over-long
+    prompt and says so only in its own log.
+  - Every input-fit failure is permanent and its message starts with `the transcript and
+    instructions do not fit the model's context`; a finish reason of `length` is `the summary
+    was cut off…`. A read timeout (`LLM_TIMEOUT_SECONDS`) is permanent; unreachable, 408,
+    429 and 5xx are transient.
+- **Server text is never copied** into a job, a log or a response: a server may echo its
+  input. Status codes and the known context-error shapes (integers only) map to earmark's
+  own messages.
+- **The text** is stored and served exactly as the server returned `content` (thinking fields
+  are ignored and never stored); only lone surrogates become U+FFFD.
+
 ### Delivering
 
 Step 25; exact rules in `docs/steps/25-delivery.md` sections 4 and 5.
@@ -1324,6 +1431,8 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
     "sha256:<hex>", initial_prompt, language])`, which can never equal a mail key, with the
     same lookup: the same bytes and options while queued or running, or done within the window,
     return that job.
+  - **Summary jobs** (step 37) use `sha256(json ["summary", "sha256:<hex of the input file>"])`,
+    a two-element list, with the same lookup.
 - **Purge** (step 36). `mark_purged(job_id)` takes a finished delivery-free job and, in one
   `BEGIN IMMEDIATE`, sets `purged_at`, clears `initial_prompt` and replaces `dedupe_key` with
   `purged:<id>` on it and on every other finished delivery-free job with the same dedupe key
@@ -1331,7 +1440,8 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
   `JobNotFoundError`, a queued or running job `JobActiveError`, an already purged job is
   returned unchanged. Every connection runs with `PRAGMA secure_delete = ON`, and
   `checkpoint()` (`PRAGMA wal_checkpoint(TRUNCATE)`, best effort) follows a purge, so the prompt
-  does not linger in the database's freed space or its write-ahead log.
+  does not linger in the database's freed space or its write-ahead log. A summary job (step 37)
+  is purged alone: its files are its own, so no sibling is marked.
   - **Normalisation.** `to` is normalised and `instructions` stripped before the key is
     computed.
   - **Content.** The same bytes as an upload and as a URL are different requests, because a
@@ -1382,6 +1492,10 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
   'mail'`, `CHECK IN ('mail', 'none')`), `initial_prompt`, `language` and `purged_at`, by
   `ALTER TABLE ADD COLUMN`, with no rebuild (34 columns). Earlier rows get `'mail'` and
   `NULL`. An image from before step 36 then refuses the database as newer than it supports.
+- Step 37 appended `0006_summaries`, so `SCHEMA_VERSION` is 6. It rebuilds `jobs` as `0004`
+  did (same 34 columns in the same order, every row copied by an explicit column list, the
+  three indexes recreated) with `kind` allowing `summary`. An image from before step 37
+  refuses the database as newer than it supports.
 - The lineage is marked by `PRAGMA application_id = 0x45524D4B` (`b"ERMK"`), stamped in
   the same transaction that creates `jobs`.
 - `identity_error(path, application_id, user_version)` decides:
@@ -1410,13 +1524,15 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
-  earmark.db                    jobs (application id ERMK, schema 5); WAL mode, secure_delete
+  earmark.db                    jobs (application id ERMK, schema 6); WAL mode, secure_delete
   outbox/<job_id>.eml           only with EARMARK_MAIL_BACKEND=fake: the message the fake
                                 mailer "sent" (0o600; step 25)
   uploads/                      staging.Staging, owned by the API (mode 0o700; step 24)
     .<upload_id>.<ext>.part     an upload still streaming (0o600); swept at API startup
     <upload_id>.<ext>           a received upload (0o600); deleted when its job ends, or by the
                                 API's startup sweep when no queued or running job names it
+    <upload_id>.json            a summary job's input, transcript and instructions (0o600;
+                                step 37), with the same lifetime
   downloads/                    staging.Staging, owned by the worker (step 24)
     <job_id>.<ext>              a direct URL's or YouTube video's audio for one job; deleted when
                                 the job ends
@@ -1436,6 +1552,8 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
                                 (step 36); written by the worker, removed by DELETE /v1/jobs/{id}
     transcript.json             written last, stamped with the profile (no prompt text in it)
     transcript.txt              Transcript.to_text()
+  summaries/<job_id>/           a summary job's output (0o700; step 37), removed by DELETE
+    summary.json                SummaryRecord (0o600)
   huggingface/hub/              in the container image only (HF_HOME=/data/huggingface):
                                 faster-whisper's model cache when ASR_MODEL_DIR is unset (step 16)
 ```
@@ -1468,7 +1586,9 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 | `POST /v1/transcriptions` | Step 36, `contract/api-v1.md`. `multipart/form-data` only: one `file` part plus the optional text fields `initial_prompt` and `language`. 202 `{job_id, status}` with `Location: /v1/jobs/{id}`. 401, 413, 415 (not multipart, or not audio), 422 (any other field, `to` and `title` included; no or an empty file; an over-long `initial_prompt`; a bad `language`). |
 | `GET /v1/jobs/{id}` | `V1JobView` of a delivery-free job. 404 for an unknown id or a mail job. |
 | `GET /v1/jobs/{id}/transcript` | `?format=json` (the default) or `text`. 404; 409 not yet, failed, skipped; 410 purged or gone; 422 an unknown format; 500 unreadable. |
-| `DELETE /v1/jobs/{id}` | Purges a finished delivery-free job: 200 `V1JobView` with `purged_at`, repeatable. 404; 409 queued or running. |
+| `DELETE /v1/jobs/{id}` | Purges a finished delivery-free job, a transcription or a summary: 200 `V1JobView` with `purged_at`, repeatable. 404; 409 queued or running. |
+| `POST /v1/summaries` | Step 37. JSON `{transcript, instructions}` only; 202 `{job_id, status}` with `Location`. 401; 413 a body over 12 × the caps; 415 not JSON; 422 any other field, a missing or blank field, instructions over 20 000 characters, a transcript over `EARMARK_LLM_MAX_TRANSCRIPT_CHARS`; 503 when `EARMARK_LLM_BACKEND` is `none`. |
+| `GET /v1/jobs/{id}/summary` | Step 37. `{job_id, model, text, warnings}`. 404; 409 not yet, failed, or a transcription job; 410 purged or gone; 500 unreadable. The transcript route answers 409 for a summary job. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
 
 **`POST /transcriptions`** (step 24; exact rules in `docs/steps/24-transcription-requests.md`
@@ -1572,6 +1692,15 @@ and the same messages.
 **The `/v1` API** (step 36; exact rules in `docs/steps/36-v1-api.md` sections 4 and 5; the
 client-facing text is `contract/api-v1.md`, pinned by hash).
 
+- **Two kinds** (step 37). `V1JobView` has `kind`, `transcription` or `summary`; a summary's
+  `language` and `duration_s` are `null`. Each kind's result route answers 409 for the other
+  kind, naming the right route, and the unversioned transcript route answers 409 for a
+  summary. `JobView` carries the internal `kind` (`ingest`, `summary`).
+- **Summaries** (step 37; `contract/api-v1.md` §3, §7, §8). The handler checks, in order: off
+  (503, before the body), JSON (415), the byte cap (413), `SummaryFields` (422), the
+  transcript's character cap (422); then `Intake.submit_summary` stages the canonical input
+  and enqueues. It makes no outbound request. Logs carry ids, sizes, token counts and timings,
+  never the transcript, instructions or output.
 - **One job type.** `/v1` creates and shows delivery-free jobs only. A mail job's id under
   `/v1` is 404, as an unknown one. The unversioned routes list `/v1` jobs (an upload with
   `to: null`), and the unversioned transcript route answers 409 for one, naming
@@ -1650,6 +1779,12 @@ shared `.env` may hold other tools' keys. `Settings` is frozen.
 | `ALLOWED_RECIPIENTS` | unset (every request refused) | Comma-separated exact addresses, or `all` (any address; a written acceptance of risk, warned about at `serve` startup and by doctor). Matching is exact on the local part and case-insensitive on the domain. Cannot mix `all` with addresses. Shown masked by `earmark config` (step 24) |
 | `MAX_UPLOAD_MB` | `1024` | Upload size cap in MiB, for `POST /transcriptions` and `earmark submit FILE` (step 24) |
 | `DEDUPE_WINDOW_S` | `600` | Seconds a `done` job is returned for an identical request (same source, `to` and `instructions`); `0` dedupes active jobs only (step 24) |
+| `LLM_BACKEND` | `none` | Summaries (step 37): `none` (off; `POST /v1/summaries` answers 503), `ollama`, `llama_cpp`, `vllm`, `fake` |
+| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | unset | The model server's root URL (http(s); host a loopback or private IP literal or a local name, see "Summarizing"; no credentials, path, query or fragment), its model name, and an optional bearer key (secret). URL and model are required for the three real backends |
+| `LLM_CONTEXT_TOKENS` | unset | `ollama` only, and required there: the context earmark asks for (`num_ctx`), at least 8192 and at least `LLM_MAX_OUTPUT_TOKENS` + 1024. llama-server and vLLM report their own |
+| `LLM_MAX_OUTPUT_TOKENS` | `8192` | The summary's output cap (256–131072); a summary that reaches it fails |
+| `LLM_TIMEOUT_SECONDS` | `3600` | How long the worker waits for the model's whole answer; a timeout fails the job |
+| `LLM_MAX_TRANSCRIPT_CHARS` | `400000` | The longest transcript `POST /v1/summaries` accepts, in characters (1000–10000000); about a 4-hour meeting |
 | `SMTP_HOST` | unset; required for `smtp` | The SMTP submission server (a host name, no scheme) (step 25) |
 | `SMTP_PORT` | unset: `587` for `starttls`, `465` for `tls` | SMTP port |
 | `SMTP_SECURITY` | `starttls` | `starttls` (STARTTLS required; delivery fails if the server does not offer it) or `tls` (implicit TLS). There is no plaintext option |
@@ -1844,6 +1979,13 @@ and handles text they wrote.
     WARNING at startup, and doctor reports it. earmark never defaults `to`.
   - **It does not apply to `/v1`** (step 36). A `/v1` job has no `to` and sends nothing: no
     mail and no push, on any outcome. The bearer token is its only gate.
+- **Summaries are local only** (step 37). The model server's URL must be loopback, private or a
+  local name, checked at settings load and at every connect ("Summarizing"); there is no cloud
+  backend. The transcript and instructions are kept only as the staged input file, while the job
+  is queued or running; the summary until DELETE. No log line or `job.error` carries the
+  transcript, the instructions or the output, and the server's error text is never copied
+  (`tests/test_leaks.py` feeds marked values, including a server that echoes its input). The
+  model server keeps whatever it keeps in its own logs; `docs/deploy.md` section 21 says so.
 - **Leak rules for `/v1`** (step 36), tested in `tests/test_leaks.py` with marked values fed
   through submit, run, fetch and purge:
   - no log line carries the upload's file name, the `initial_prompt` or transcript text; the
@@ -2061,8 +2203,8 @@ and handles text they wrote.
     units (see Deployment). Setting it to `0` (or leaving it empty outside compose) turns
     telemetry back on, unless one of the other variables is set. earmark's Python code does
     not set it.
-- **Secrets.** `API_TOKEN`, `ASR_API_KEY`, `NTFY_URL`, `NTFY_TOKEN` and `SMTP_PASSWORD`
-  (step 25) are `SecretStr`,
+- **Secrets.** `API_TOKEN`, `ASR_API_KEY`, `NTFY_URL`, `NTFY_TOKEN`, `SMTP_PASSWORD`
+  (step 25) and `LLM_API_KEY` (step 37) are `SecretStr`,
   redacted in `earmark config` and `earmark doctor`, and never logged. `EARMARK_NTFY_URL`
   is a `SecretStr` because on public ntfy.sh the topic is the password. Doctor prints only
   its host. `Settings.secret_values()` also returns the bare topic when it is at least 12
@@ -2120,7 +2262,12 @@ The remote ASR tests use `httpx2.MockTransport`, a recording transport that iter
 request body (to prove streaming), and `tests/asr_stub.py`, a threaded stdlib HTTP server
 on a unix socket reached with `httpx2.HTTPTransport(uds=...)`, which the socket block
 allows. The ntfy client (step 15) is tested with `httpx2.MockTransport` and
-`tests/ntfy_stub.py`, a unix-socket ntfy server with recorded ntfy.sh bodies. Doctor is
+`tests/ntfy_stub.py`, a unix-socket ntfy server with recorded ntfy.sh bodies. The summary
+backends (step 37b) are tested against `tests/llm_stub.py`, a unix-socket server scripted per
+route with Ollama's, llama-server's and vLLM's answers (their context errors included), and the
+local-only connect policy with `tests/http_helpers`' resolver and network stubs. The summary
+jobs (step 37a) are tested over the fake summarizer, through the real API and worker
+(`tests/summary_env.py`). Doctor is
 tested through `doctor.Probes`: injected transports, an injected `GuardedFetcher`, and
 missing extras simulated with `sys.modules` stubs. `tests/legacy_db.py` builds the
 v0.1.0-shaped database for the refusal tests.
@@ -2456,6 +2603,14 @@ Step planners should check these against current documentation instead of assumi
     "no audio-only stream". Datacenter addresses get bot checks, so CI never downloads from
     YouTube; the Spark's own line is what matters, and runbook phase 4 checks it. The address
     guard does not cover yt-dlp ("Security").
+12. **The local model server** (step 37). The no-truncation guarantee for Ollama rests on its
+    code as read at v0.40.17–v0.40.19 (`truncate`/`shift` false), gated by a version check; a
+    later release could change it, and Ollama has no tokenizer to cross-check. llama-server and
+    vLLM are cross-checked by a token count. Ollama silently steps an auto-sized context down to
+    fit memory, which is why earmark always sends `num_ctx`. vLLM v0.34.0 takes all free
+    memory unless `--gpu-memory-utilization` is set, which on the Spark's unified memory
+    starves the worker. None of this ran on the Spark here; `docs/deploy.md` section 21 has the
+    smoke test.
 
 ## Re-scope decisions (2026-11-23)
 
@@ -2478,6 +2633,8 @@ context. earmark's job is:
    data. The other holds the requester's instructions. The body carries only text earmark
    generates, and the subject carries only the sanitised, capped title.
 4. Send an ntfy push saying the transcript was sent, or why the job failed.
+
+*Partly reversed on 2026-11-28 (step 37), by the operator:* summaries return under `/v1` only (`POST /v1/summaries`), made by a local model server on the Spark or its private network. There is still no cloud model, and analysis of shared episodes, the vault, entities and search stay removed. See "Summarizing" under Stage contracts.
 
 ### Operator decisions (2026-11-23)
 
@@ -2703,7 +2860,8 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
 `docs/PLAN.md` "Backlog" lists what the design leaves room for: a send-rate cap, re-shares
 as a reference only, an "analysis done" push, speaker diarization, other sources (other
 podcast platforms and video files; YouTube is built, step 32), and an async transcription API
-for other callers. None is designed here.
+for other callers. None is designed here. Chunking a transcript that does not fit the model
+(map-reduce) is the client's job, not earmark's (step 37).
 
 ## History: removed in step 22
 

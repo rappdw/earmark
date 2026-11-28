@@ -19,6 +19,7 @@ from earmark.jobs import JobStore, open_job_store
 from earmark.models import JSON_FIELDS, REQUEST_ERROR_TYPES
 from earmark.staging import Staging
 from earmark.submission import Intake
+from earmark.v1_jobs import SummaryLimits
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,9 @@ def create_app(
     if policy.allow_all:
         logger.warning(ALL_RECIPIENTS_WARNING)
     limit = settings.max_upload_mb * MIB if max_upload_bytes is None else max_upload_bytes
+    summaries = (
+        None if settings.llm_backend == "none" else SummaryLimits(settings.llm_max_transcript_chars)
+    )
     app = FastAPI(
         title="earmark",
         version=__version__,
@@ -117,6 +121,7 @@ def create_app(
             Intake(store, policy, staging),
             artifacts=ArtifactStore(settings.data_dir),
             max_upload_bytes=limit,
+            summaries=summaries,
         )
     )
     app.add_exception_handler(RequestValidationError, _on_validation_error)

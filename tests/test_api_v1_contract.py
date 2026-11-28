@@ -10,22 +10,43 @@ from earmark.api import upload
 from earmark.api.app import STORE_UNAVAILABLE_DETAIL
 from earmark.api.auth import UNAUTHORIZED_DETAIL
 from earmark.fetch import MIB, limit_text
-from earmark.models import MAX_INITIAL_PROMPT_CHARS, WHISPER_LANGUAGES
+from earmark.models import (
+    MAX_INITIAL_PROMPT_CHARS,
+    MAX_SUMMARY_INSTRUCTIONS_CHARS,
+    WHISPER_LANGUAGES,
+)
+from earmark.summarize.base import CONTEXT_PREFIX, NOT_CONFIGURED
 from earmark.transcripts import JOB_NOT_FOUND, NOT_YET, NOT_YET_AT_STAGE, SKIPPED
 from earmark.v1_jobs import (
     DELETE_FAILED,
+    NOT_A_SUMMARY,
+    NOT_A_TRANSCRIPTION,
     PURGED,
     STILL_ACTIVE,
+    SUMMARIES_OFF,
+    SUMMARY_BODY_TOO_LARGE,
+    SUMMARY_DELETE_FAILED,
+    SUMMARY_FAILED,
+    SUMMARY_GONE,
+    SUMMARY_MISSING_BODY,
+    SUMMARY_NOT_YET,
+    SUMMARY_NOT_YET_AT_STAGE,
+    SUMMARY_ONLY_JSON,
+    SUMMARY_PURGED,
+    SUMMARY_SKIPPED,
+    SUMMARY_UNREADABLE,
+    TRANSCRIPT_TOO_LONG,
     V1_FAILED,
     V1_GONE,
     V1_ONLY_MULTIPART,
     V1_UNREADABLE,
 )
-from tests.api_v1_examples import EXAMPLE_NAMES, build_examples
+from tests.api_v1_examples import EXAMPLE_NAMES, STEP36_EXAMPLES, build_examples
 from tests.doc_helpers import between_markers, read_doc
 from tests.test_docs import _assert_placeholders
 
-API_V1_SHA256 = "6823155ddaee3f08f01abb72735a7f3390f9a987a8ab619cf891dc9f3fab419d"
+# Version 1.0 (step 36) was 6823155ddaee3f08f01abb72735a7f3390f9a987a8ab619cf891dc9f3fab419d.
+API_V1_SHA256 = "89126dfad44ce1aa159548aa9226c3edac474f3c23c37d74c0afddb155ce9669"
 
 
 def _block() -> str:
@@ -108,6 +129,29 @@ def _code_messages() -> set[str]:
         V1_UNREADABLE,
         DELETE_FAILED,
         STORE_UNAVAILABLE_DETAIL,
+        SUMMARIES_OFF,
+        SUMMARY_ONLY_JSON,
+        SUMMARY_BODY_TOO_LARGE.format(limit="<limit>"),
+        SUMMARY_MISSING_BODY,
+        TRANSCRIPT_TOO_LONG.format(n="<n>"),
+        SUMMARY_NOT_YET.format(status="<status>"),
+        SUMMARY_NOT_YET_AT_STAGE.format(status="<status>", stage="<stage>"),
+        SUMMARY_FAILED,
+        SUMMARY_SKIPPED,
+        NOT_A_SUMMARY,
+        NOT_A_TRANSCRIPTION,
+        SUMMARY_PURGED,
+        SUMMARY_GONE,
+        SUMMARY_UNREADABLE,
+        SUMMARY_DELETE_FAILED,
+        "transcript must not be empty",
+        "instructions must not be empty",
+        "instructions is too long (at most 20000 characters)",
+        "unknown field '<name>' (allowed: transcript, instructions)",
+        "transcript is required",
+        "instructions is required",
+        "request body is not valid JSON",
+        "request body must be a JSON object sent with Content-Type: application/json",
     }
 
 
@@ -127,6 +171,18 @@ def test_api_v1_error_statuses() -> None:
     assert by_detail[V1_ONLY_MULTIPART] == 415
     assert by_detail[STILL_ACTIVE.format(status="<status>")] == 409
     assert by_detail[UNAUTHORIZED_DETAIL] == 401
+    assert by_detail[SUMMARIES_OFF] == 503
+    assert by_detail[SUMMARY_ONLY_JSON] == 415
+    assert by_detail[SUMMARY_BODY_TOO_LARGE.format(limit="<limit>")] == 413
+    assert by_detail[SUMMARY_MISSING_BODY] == 422
+    assert by_detail[TRANSCRIPT_TOO_LONG.format(n="<n>")] == 422
+    assert by_detail[SUMMARY_NOT_YET.format(status="<status>")] == 409
+    assert by_detail[NOT_A_SUMMARY] == 409
+    assert by_detail[NOT_A_TRANSCRIPTION] == 409
+    assert by_detail[SUMMARY_PURGED] == 410
+    assert by_detail[SUMMARY_GONE] == 410
+    assert by_detail[SUMMARY_UNREADABLE] == 500
+    assert by_detail[SUMMARY_DELETE_FAILED] == 500
 
 
 def test_api_v1_languages_listed() -> None:
@@ -142,7 +198,63 @@ def test_api_v1_cap_stated() -> None:
     assert "223 tokens" in block
     assert "EARMARK_MAX_UPLOAD_MB" in block
     assert "600 s" in block
+    assert MAX_SUMMARY_INSTRUCTIONS_CHARS == 20_000
+    for needle in (
+        "20000 characters",
+        "400000 characters",
+        "EARMARK_LLM_MAX_TRANSCRIPT_CHARS",
+        "EARMARK_LLM_BACKEND",
+    ):
+        assert needle in block, needle
 
 
 def test_api_v1_contract_placeholders_only() -> None:
     _assert_placeholders(read_doc("contract/api-v1.md"), "contract/api-v1.md")
+
+
+def _section(number: int) -> str:
+    block = _block()
+    start = block.index(f"\n## {number}. ")
+    following = re.search(rf"\n## {number + 1}\. ", block)
+    assert following is not None
+    return block[start : following.start()]
+
+
+def test_api_v1_summary_failures_stated() -> None:
+    text = re.sub(r"\s+", " ", _section(8))
+    assert CONTEXT_PREFIX in text
+    assert "the summary was cut off" in text
+    assert NOT_CONFIGURED in text
+    assert "ever stored or served" in text
+
+
+def test_api_v1_revisions_listed() -> None:
+    text = re.sub(r"\s+", " ", _block().split("\n## 13. ")[1])
+    assert "**1.0** (step 36" in text
+    assert "**1.1** (step 37" in text
+    assert "Additive" in text
+
+
+def test_api_v1_sections_are_numbered_in_order() -> None:
+    numbers = [int(n) for n in re.findall(r"^## (\d+)\. ", _block(), re.MULTILINE)]
+    assert numbers == list(range(1, 14))
+
+
+def test_api_v1_step36_examples_still_hold(examples: dict[str, str]) -> None:
+    assert set(STEP36_EXAMPLES) == {
+        "accepted",
+        "job-queued",
+        "transcript-json",
+        "error",
+        "job-done",
+        "transcript-text",
+        "deleted",
+    }
+    for name, frozen in STEP36_EXAMPLES.items():
+        current = examples[name]
+        if name == "transcript-text":
+            assert current == frozen
+            continue
+        old, new = frozen, json.loads(current)
+        assert set(new) - set(old) <= {"kind"}, name
+        assert {k: new[k] for k in old} == old, name

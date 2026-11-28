@@ -358,7 +358,8 @@ def _job_lines(view: "JobView") -> list[str]:
     from datetime import UTC
 
     created = view.created_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    subject = view.url or ("upload" if view.source == "upload" else "-")
+    subject = "summary" if view.kind == "summary" else view.url
+    subject = subject or ("upload" if view.source == "upload" else "-")
     fields = (view.id, view.status, view.stage or "-", view.attempts, created, subject)
     lines = ["  ".join(_clean(f) for f in fields)]
     if view.error:

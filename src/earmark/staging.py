@@ -136,6 +136,12 @@ class Staging:
         fd = os.open(part, flags, _FILE_MODE)
         return UploadWriter(self._uploads, name, os.fdopen(fd, "wb"), part)
 
+    def stage_document(self, data: bytes, ext: str, /) -> StagedUpload:
+        """``begin_upload(ext)``, write, commit; the partial file is removed on any failure."""
+        with self.begin_upload(ext) as writer:
+            writer.write(data)
+            return writer.commit()
+
     def upload_path(self, name: str) -> Path:
         if _UPLOAD_NAME.fullmatch(name) is None:
             raise ValueError("not a staged upload name")

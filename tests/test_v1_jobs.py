@@ -10,9 +10,10 @@ from earmark.artifacts import ArtifactStore
 from earmark.db import Database
 from earmark.errors import PermanentError
 from earmark.models import Segment
-from earmark.v1_jobs import PURGED, V1_FAILED, V1_GONE, V1_UNREADABLE
+from earmark.v1_jobs import PURGED, SUMMARY_PURGED, V1_FAILED, V1_GONE, V1_UNREADABLE
 from tests.factories import new_upload_job
 from tests.multipart_helpers import audio
+from tests.summary_env import SummaryEnv, summary_env
 from tests.v1_env import V1Env, v1_env
 
 SEGMENTS = (
@@ -275,6 +276,7 @@ def test_v1_job_view_fields(tmp_path: Path) -> None:
         queued = v1.client.get(f"/v1/jobs/{job_id}").json()
         assert list(queued) == [
             "job_id",
+            "kind",
             "status",
             "stage",
             "error",
@@ -302,3 +304,103 @@ def test_v1_job_view_hides_what_it_does_not_name(tmp_path: Path) -> None:
     with v1_env(tmp_path) as v1:
         job_id = v1.submit(initial_prompt="SECRET-PROMPT-1")
         assert "SECRET-PROMPT-1" not in v1.client.get(f"/v1/jobs/{job_id}").text
+
+
+# -- summary jobs (step 37) ----------------------------------------------------------------
+
+
+def _summary_done(v1: SummaryEnv, **kwargs: str) -> str:
+    job_id = v1.submit_summary(**kwargs)
+    v1.run()
+    return job_id
+
+
+def test_purge_summary_job(tmp_path: Path) -> None:
+    with summary_env(tmp_path) as v1:
+        job_id = _summary_done(v1)
+        assert (v1.data_dir / "summaries" / job_id / "summary.json").is_file()
+        deleted = v1.client.delete(f"/v1/jobs/{job_id}")
+        assert deleted.status_code == 200
+        body = deleted.json()
+        assert body["purged_at"] is not None
+        assert body["kind"] == "summary"
+        assert not (v1.data_dir / "summaries" / job_id).exists()
+        assert v1.uploads == []
+        gone = v1.summary(job_id)
+        assert (gone.status_code, gone.json()) == (410, {"detail": SUMMARY_PURGED})
+        again = v1.client.delete(f"/v1/jobs/{job_id}")
+        assert (again.status_code, again.json()) == (200, body)
+
+
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_purge_summary_refuses_active(tmp_path: Path, state: str) -> None:
+    with summary_env(tmp_path) as v1:
+        job_id = v1.submit_summary()
+        if state == "running":
+            assert v1.jobs.claim_next() is not None
+        denied = v1.client.delete(f"/v1/jobs/{job_id}")
+        assert denied.status_code == 409
+        assert denied.json() == {
+            "detail": f"this job is still {state}; delete it once it has finished"
+        }
+        assert len(v1.uploads) == 1
+        assert v1.client.get(f"/v1/jobs/{job_id}").json()["purged_at"] is None
+
+
+def test_purge_summary_only_that_job(tmp_path: Path) -> None:
+    with summary_env(tmp_path, no_dedupe=True) as v1:
+        a = _summary_done(v1)
+        b = _summary_done(v1)
+        assert a != b  # the same input, window 0
+        assert v1.client.delete(f"/v1/jobs/{a}").status_code == 200
+        assert not (v1.data_dir / "summaries" / a).exists()
+        assert (v1.data_dir / "summaries" / b / "summary.json").is_file()
+        assert v1.client.get(f"/v1/jobs/{b}").json()["purged_at"] is None
+        assert v1.summary(b).status_code == 200
+
+
+def test_purge_summary_files_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with summary_env(tmp_path) as v1:
+        job_id = _summary_done(v1)
+        real = ArtifactStore.remove_summary
+
+        def broken(self: ArtifactStore, job: str) -> int:
+            raise OSError("disk says no")
+
+        monkeypatch.setattr(ArtifactStore, "remove_summary", broken)
+        failed = v1.client.delete(f"/v1/jobs/{job_id}")
+        assert failed.status_code == 500
+        assert failed.json() == {"detail": "could not delete the summary files; try again"}
+        assert v1.client.get(f"/v1/jobs/{job_id}").json()["purged_at"] is None
+        assert v1.summary(job_id).status_code == 200
+        monkeypatch.setattr(ArtifactStore, "remove_summary", real)
+        assert v1.client.delete(f"/v1/jobs/{job_id}").status_code == 200
+
+
+def test_purge_summary_leaves_only_the_row(tmp_path: Path) -> None:
+    with summary_env(tmp_path) as v1:
+        job_id = _summary_done(v1)
+        assert v1.client.delete(f"/v1/jobs/{job_id}").status_code == 200
+        assert v1.files() == []
+        assert set(_files(v1.data_dir)) <= {"earmark.db", "earmark.db-wal", "earmark.db-shm"}
+        assert "earmark.db" in _files(v1.data_dir)
+
+
+def test_purge_failed_summary_job(tmp_path: Path) -> None:
+    with summary_env(tmp_path) as v1:
+        job_id = v1.submit_summary()
+        v1.fakes.summarizer.fail_next(PermanentError("nope"))
+        v1.run()
+        deleted = v1.client.delete(f"/v1/jobs/{job_id}")
+        assert deleted.status_code == 200
+        assert deleted.json()["status"] == "failed"
+        assert deleted.json()["purged_at"] is not None
+
+
+def test_purge_leaves_a_transcription_untouched_by_a_summary_purge(tmp_path: Path) -> None:
+    with summary_env(tmp_path) as v1:
+        audio_job = v1.submit()
+        v1.run()
+        summary_job = _summary_done(v1)
+        assert v1.client.delete(f"/v1/jobs/{summary_job}").status_code == 200
+        assert v1.transcript(audio_job).status_code == 200

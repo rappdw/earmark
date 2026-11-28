@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from earmark.models import DecodeOptions, Episode, Job, Transcript
+from earmark.models import DecodeOptions, Episode, Job, SummaryInput, SummaryResult, Transcript
 
 
 class Resolver(Protocol):
@@ -82,6 +82,25 @@ class Notifier(Protocol):
         ...
 
 
+class Summarizer(Protocol):
+    @property
+    def backend(self) -> str:
+        """``ollama``, ``llama_cpp``, ``vllm`` or ``fake``."""
+        ...
+
+    @property
+    def model(self) -> str: ...
+
+    @property
+    def max_output_tokens(self) -> int: ...
+
+    def summarize(self, request: SummaryInput, /) -> SummaryResult:
+        """One model call. Raises PermanentError (context exceeded, refused, malformed
+        answer) or TransientError (unreachable, HTTP 5xx, 408, 429). Never puts server
+        text, the transcript, the instructions or the output into a message."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class OutgoingMail:
     """One composed message, ready to hand to a Mailer."""
@@ -111,7 +130,7 @@ class Mailer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Backends:
-    """The six stage implementations the runner drives."""
+    """The stage implementations the runner drives."""
 
     resolver: Resolver
     fetcher: AudioFetcher
@@ -119,3 +138,4 @@ class Backends:
     transcriber: Transcriber
     mailer: Mailer
     notifier: Notifier | None  # None when EARMARK_NOTIFY_BACKEND=none
+    summarizer: Summarizer | None = None  # None when EARMARK_LLM_BACKEND=none

@@ -18,6 +18,7 @@ from earmark import sources
 from earmark.api.app import STORE_UNAVAILABLE_DETAIL, create_app
 from earmark.config import Settings, env_var
 from earmark.db import open_database
+from earmark.fakes import FAKE_NOW
 from earmark.jobs import JobStore
 from earmark.models import FORM_FIELDS, TranscriptionRequest, UploadFields
 from earmark.recipients import RecipientPolicy
@@ -74,7 +75,14 @@ DOCS = [
     "docs/runbook-spark.md",
     "docs/asr.md",
 ]
-SECRET_FIELDS = ("api_token", "asr_api_key", "ntfy_url", "ntfy_token", "smtp_password")
+SECRET_FIELDS = (
+    "api_token",
+    "asr_api_key",
+    "llm_api_key",
+    "ntfy_url",
+    "ntfy_token",
+    "smtp_password",
+)
 ACTIONS = [
     "Receive input from Share Sheet",
     "Choose from Menu",
@@ -164,7 +172,7 @@ def test_quickstart_block_present() -> None:
 def test_quickstart_uses_fake_backends() -> None:
     script = _quickstart()
     fields = [n for n in Settings.model_fields if n.endswith("_backend")]
-    assert len(fields) == 6
+    assert len(fields) == 7
     for name in fields:
         assert re.search(rf"\b{env_var(name)}=fake\b", script), name
 
@@ -555,7 +563,8 @@ REMOVED = [
     r"lancedb",
     r"fastembed",
     r"embedding",
-    r"EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)",
+    r"EARMARK_(VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)",
+    r"EARMARK_LLM_(PROVIDER|EFFORT|FALLBACKS|RESPONSE_FORMAT)",
     r"anthropic",
     r"\bclaude\b",
     r"asr:8000",
@@ -595,8 +604,7 @@ def _removed_hits(doc: str, text: str) -> list[str]:
     text = without_blocks(text, "upgrade-v0.1.0")
     if doc == RUNBOOK:
         text = _without_plugin_cli_terms(text)
-    patterns = REMOVED if doc == "docs/asr.md" else [*REMOVED, r"\bvllm\b"]
-    return [m[0] for pattern in patterns for m in re.finditer(pattern, text, re.IGNORECASE)]
+    return [m[0] for pattern in REMOVED for m in re.finditer(pattern, text, re.IGNORECASE)]
 
 
 @pytest.mark.parametrize("doc", DOCS)
@@ -634,7 +642,8 @@ def test_plugin_cli_terms_only_in_phase_11() -> None:
 EMAIL = re.compile(r"[\w.+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
 IPV4 = re.compile(r"\b(\d{1,3}\.){3}\d{1,3}\b")
 SECRET_LINE = re.compile(
-    r"^(export )?EARMARK_(API_TOKEN|SMTP_PASSWORD|NTFY_TOKEN|ASR_API_KEY)=(?P<value>.*)$"
+    r"^(export )?EARMARK_(API_TOKEN|SMTP_PASSWORD|NTFY_TOKEN|ASR_API_KEY|LLM_API_KEY)="
+    r"(?P<value>.*)$"
 )
 
 
@@ -1704,5 +1713,70 @@ def test_deploy_doc_v1_section() -> None:
         assert needle in text, needle
     for heading in ("### 20.1 ", "### 20.2 ", "### 20.3 ", "### 20.4 ", "### 20.5 ", "### 20.6 "):
         assert heading in text, heading
-    assert "moves to schema 5" in section(deploy, "## 15. Backups and upgrades")
+    assert "moves to schema 6" in section(deploy, "## 15. Backups and upgrades")
     assert "#system-three-parts-and-three-seams" in section(deploy, "### 8.5 The PKA side")
+
+
+# --- step 37: summaries -------------------------------------------------------------------
+
+REVERSAL_NOTE = (
+    "*Partly reversed on 2026-11-28 (step 37), by the operator:* summaries return under `/v1` "
+    "only (`POST /v1/summaries`), made by a local model server on the Spark or its private "
+    "network. There is still no cloud model, and analysis of shared episodes, the vault, "
+    "entities and search stay removed."
+)
+
+
+@pytest.mark.parametrize("doc", ["docs/PLAN.md", ARCH])
+def test_rescope_partial_reversal_in_both(doc: str) -> None:
+    assert REVERSAL_NOTE in _flat(read_doc(doc))
+
+
+def test_deploy_doc_summaries_section() -> None:
+    deploy = read_doc("docs/deploy.md")
+    assert "\n## 21. Summaries on a local model\n" in deploy
+    text = _flat(deploy.split("\n## 21. Summaries on a local model\n", 1)[1])
+    for needle in (
+        "EARMARK_LLM_BACKEND",
+        "EARMARK_LLM_CONTEXT_TOKENS",
+        "EARMARK_LLM_MAX_TRANSCRIPT_CHARS",
+        "0.40.17",
+        "OLLAMA_NUM_PARALLEL",
+        "--gpu-memory-utilization",
+        "-np 1",
+        "compose.override.yaml",
+        "host.docker.internal",
+        "--data-binary @request.json",
+        "do not fit the model's context",
+    ):
+        assert needle in text, needle
+    for number in range(1, 11):
+        assert f"### 21.{number} " in text, number
+
+
+def test_claude_md_states_summaries_are_local_only() -> None:
+    flat = _flat(read_doc("CLAUDE.md"))
+    assert "Summaries are local only" in flat
+    assert "EARMARK_LLM_API_KEY" in flat
+    assert "truncate: false" in flat
+
+
+def test_until_step_37b_notes_match_the_factory(tmp_path: Path) -> None:
+    """The docs say the real server types do not run yet exactly while the factory refuses them."""
+    from earmark.artifacts import ArtifactStore
+    from earmark.config import ConfigError
+    from earmark.pipeline import factory
+    from earmark.pipeline.factory import BuildContext
+
+    def refused(name: str) -> bool:
+        settings = _settings(tmp_path, llm_backend=name)
+        ctx = BuildContext(settings, ArtifactStore(tmp_path / "data"), lambda: FAKE_NOW)
+        try:
+            factory.SUMMARIZERS[name](ctx)
+        except ConfigError as exc:
+            return "step 37b" in str(exc)
+        return False
+
+    stubbed = all(refused(name) for name in ("ollama", "llama_cpp", "vllm"))
+    for doc in ("README.md", "docs/deploy.md", ".env.example"):
+        assert ("Until step 37b" in _flat(read_doc(doc))) == stubbed, doc
