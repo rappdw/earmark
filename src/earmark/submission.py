@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass
 
 from earmark.jobs import Enqueued, JobStore, NewJob
-from earmark.models import TranscriptionRequest, UploadFields
+from earmark.models import TranscriptionRequest, UploadFields, V1UploadFields
 from earmark.recipients import RecipientPolicy, mask_address
 from earmark.sources import parse_source_url, url_host
 from earmark.staging import StagedUpload, Staging
@@ -74,6 +74,35 @@ class Intake:
         if not enqueued.created:
             self.staging.release_staged(staged)
         self._log(enqueued, f"upload of {staged.size} bytes", fields.to, fields.instructions)
+        return enqueued
+
+    def submit_v1(self, fields: V1UploadFields, staged: StagedUpload, /) -> Enqueued:
+        """Enqueue a delivery-free upload. Deletes ``staged`` when this raises or finds an
+        existing job. No recipient check: nothing is sent."""
+        try:
+            enqueued = self.store.enqueue(
+                NewJob(
+                    source="upload",
+                    to=None,
+                    upload_file=staged.name,
+                    upload_name=None,
+                    content_sha256=staged.sha256,
+                    delivery="none",
+                    initial_prompt=fields.initial_prompt,
+                    language=fields.language,
+                )
+            )
+        except BaseException:
+            self.staging.release_staged(staged)
+            raise
+        if not enqueued.created:
+            self.staging.release_staged(staged)
+        logger.info(
+            "enqueued job %s: upload of %d bytes, no delivery (created=%s)",
+            enqueued.job.id,
+            staged.size,
+            enqueued.created,
+        )
         return enqueued
 
     @staticmethod

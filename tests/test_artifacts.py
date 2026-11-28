@@ -282,3 +282,61 @@ def test_has_episode(tmp_path: Path) -> None:
     assert s.has_episode(KEY)
     with pytest.raises(ValueError, match="episode key"):
         s.has_episode("../etc")
+
+
+# -- the per-options tree (/v1) ----------------------------------------------------------------
+
+DKEY = "0123456789abcdef0123"
+
+
+def test_decoded_paths_validated(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    assert store.decoded_dir(DKEY) == tmp_path / "transcripts" / DKEY
+    assert store.decoded_json_path(DKEY).name == "transcript.json"
+    assert store.decoded_text_path(DKEY).name == "transcript.txt"
+    for bad in ("", "../x", "G" * 20, "a" * 19, "a" * 21):
+        with pytest.raises(ValueError, match="not an episode key"):
+            store.decoded_dir(bad)
+
+
+def test_write_read_decoded(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    transcript = make_transcript()
+    assert store.read_decoded(DKEY, transcript.episode_key) is None
+    assert not store.has_decoded(DKEY)
+    store.write_decoded(DKEY, transcript)
+    assert store.has_decoded(DKEY)
+    assert store.read_decoded(DKEY, transcript.episode_key) == transcript
+    assert store.decoded_text_path(DKEY).read_text() == transcript.to_text()
+    assert not store.has_transcript(transcript.episode_key)  # the mail tree is untouched
+    with pytest.raises(PermanentError, match="corrupt artifact"):
+        store.read_decoded(DKEY, "f" * 20)
+    store.decoded_json_path(DKEY).write_text("{")
+    with pytest.raises(PermanentError, match="corrupt artifact"):
+        store.read_decoded(DKEY, transcript.episode_key)
+
+
+def test_remove_decoded_counts_and_spares_other_files(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    assert store.remove_decoded(DKEY) == 0
+    store.write_decoded(DKEY, make_transcript())
+    directory = store.decoded_dir(DKEY)
+    (directory / ".transcript.json.abc.tmp").write_bytes(b"partial")
+    assert store.remove_decoded(DKEY) == 3
+    assert not directory.exists()
+    store.write_decoded(DKEY, make_transcript())
+    (directory / "stranger.txt").write_text("keep")
+    assert store.remove_decoded(DKEY) == 2
+    assert _files(directory) == ["stranger.txt"]
+
+
+def test_remove_decoded_ignores_symlinks(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    target = tmp_path / "outside.txt"
+    target.write_text("precious")
+    directory = store.decoded_dir(DKEY)
+    directory.mkdir(parents=True)
+    (directory / "transcript.txt").symlink_to(target)
+    assert store.remove_decoded(DKEY) == 0
+    assert target.read_text() == "precious"
+    assert (directory / "transcript.txt").is_symlink()

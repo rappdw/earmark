@@ -62,6 +62,7 @@ CONTRACT_DOCS = [
     "contract/samples/v1/README.md",
     "contract/mail-v2.md",
     "contract/samples/v2/README.md",
+    "contract/api-v1.md",
 ]
 CONTRACT_V1_SHA256 = "7361f3d0fb20fa3edb0c5b98529c0c998532ba035f53ac8392fb47aea9dcd82d"
 CONTRACT_V2_SHA256 = "210d64fb6c872b231a08702490dcd3877aeed980adf2e61cb1f335cc0d4a7f94"
@@ -1126,7 +1127,7 @@ def test_deploy_doc_hf_telemetry_section() -> None:
 
 # --- the system scope (step 28) -------------------------------------------------------------
 
-SYSTEM_HEADING = "## System: three parts and two seams"
+SYSTEM_HEADING = "## System: three parts and three seams"
 DONE_SENTENCE = (
     "One episode shared on the phone is transcribed on the Spark, emailed, read by a PKA "
     "through the receiving skill, and filed, with the instructions acted on."
@@ -1159,9 +1160,9 @@ def test_architecture_system_parts() -> None:
 
 
 def test_architecture_system_seams() -> None:
-    rows = _table(_system(), "### The two seams")
-    assert [r[0] for r in rows] == ["Request", "Mail"]
-    request, mail = rows
+    rows = _table(_system(), "### The three seams")
+    assert [r[0] for r in rows] == ["Request", "Mail", "API"]
+    request, mail, api = rows
     assert "POST /transcriptions" in request[2]
     assert "contract: 2" in mail[2]
     assert "contract: 1" in mail[2]
@@ -1169,6 +1170,10 @@ def test_architecture_system_seams() -> None:
     assert "contract/samples/v2/" in mail[3]
     assert "32" in step_numbers(mail[3])
     assert "29" in step_numbers(mail[3])
+    assert "/v1" in api[2]
+    assert "contract/api-v1.md" in api[2]
+    assert "36" in step_numbers(api[2])
+    assert "tests/test_api_v1_contract.py" in api[3]
 
 
 def test_architecture_mail_reaches_pka_through_amap() -> None:
@@ -1656,3 +1661,48 @@ def test_architecture_names_own_certificate() -> None:
     assert "install-cert.sh" in row
     assert "step 35" in row
     assert "Settled by step 35" in arch
+
+
+def test_v1_rules_in_claude_md_and_readme() -> None:
+    claude = _flat(read_doc("CLAUDE.md"))
+    for needle in (
+        "three seams",
+        "contract/api-v1.md",
+        "`/v1` is a contract",
+        "additive changes only",
+        "a breaking change is `/v2`",
+        "no mail and no push",
+        "bearer token as its only gate",
+        "no log line carries the upload's file name",
+    ):
+        assert needle in claude, needle
+    readme = _flat(read_doc("README.md"))
+    for needle in (
+        "three seams",
+        "contract/api-v1.md",
+        "no mail and no push",
+        "#system-three-parts-and-three-seams",
+        "docs/deploy.md",
+    ):
+        assert needle in readme, needle
+
+
+def test_deploy_doc_v1_section() -> None:
+    deploy = read_doc("docs/deploy.md")
+    assert "\n## 20. The /v1 API for programs\n" in deploy
+    text = deploy.split("\n## 20. The /v1 API for programs\n", 1)[1]
+    for needle in (
+        "ssh -N -L 8787:127.0.0.1:8787",
+        "16 kHz",
+        "EARMARK_MAX_UPLOAD_MB",
+        "EARMARK_ASR_BATCH_SIZE",
+        "DELETE",
+        "--form-string",
+        "initial_prompt",
+        "deletion, not shredding",
+    ):
+        assert needle in text, needle
+    for heading in ("### 20.1 ", "### 20.2 ", "### 20.3 ", "### 20.4 ", "### 20.5 ", "### 20.6 "):
+        assert heading in text, heading
+    assert "moves to schema 5" in section(deploy, "## 15. Backups and upgrades")
+    assert "#system-three-parts-and-three-seams" in section(deploy, "### 8.5 The PKA side")

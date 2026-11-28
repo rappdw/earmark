@@ -5,6 +5,7 @@ hashable and really immutable), datetimes are timezone-aware, and floats are fin
 """
 
 import hashlib
+import json
 import math
 import re
 from collections.abc import Callable
@@ -37,6 +38,7 @@ JobStatus = Literal["queued", "running", "done", "failed", "skipped"]
 TranscriptFormat = Literal["note", "text", "json"]
 Stage = Literal["resolve", "fetch", "transcribe", "deliver", "notify"]  # "notify" is never set
 DeliveryState = Literal["sending", "sent"]
+Delivery = Literal["mail", "none"]
 Clock = Callable[[], datetime]
 
 TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset({"done", "failed", "skipped"})
@@ -54,11 +56,120 @@ REQUEST_ERROR_TYPES: Final = frozenset(
         "instructions_too_long",
         "title_too_long",
         "timestamp_out_of_range",
+        "initial_prompt_too_long",
+        "language_invalid",
     }
 )
 # The field names a request accepts, in the order error messages list them.
 JSON_FIELDS: Final = ("url", "to", "instructions", "title", "timestamp")
 FORM_FIELDS: Final = ("to", "instructions", "title", "timestamp")
+
+MAX_INITIAL_PROMPT_CHARS: Final = 1000
+WHISPER_PROMPT_TOKENS: Final = 223  # documentation only: 448 // 2 - 1, faster-whisper 1.2.1
+# The language codes faster-whisper 1.2.1 accepts, in its order (a slow test pins the list).
+WHISPER_LANGUAGES: Final[tuple[str, ...]] = (
+    "af",
+    "am",
+    "ar",
+    "as",
+    "az",
+    "ba",
+    "be",
+    "bg",
+    "bn",
+    "bo",
+    "br",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "en",
+    "es",
+    "et",
+    "eu",
+    "fa",
+    "fi",
+    "fo",
+    "fr",
+    "gl",
+    "gu",
+    "ha",
+    "haw",
+    "he",
+    "hi",
+    "hr",
+    "ht",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "jw",
+    "ka",
+    "kk",
+    "km",
+    "kn",
+    "ko",
+    "la",
+    "lb",
+    "ln",
+    "lo",
+    "lt",
+    "lv",
+    "mg",
+    "mi",
+    "mk",
+    "ml",
+    "mn",
+    "mr",
+    "ms",
+    "mt",
+    "my",
+    "ne",
+    "nl",
+    "nn",
+    "no",
+    "oc",
+    "pa",
+    "pl",
+    "ps",
+    "pt",
+    "ro",
+    "ru",
+    "sa",
+    "sd",
+    "si",
+    "sk",
+    "sl",
+    "sn",
+    "so",
+    "sq",
+    "sr",
+    "su",
+    "sv",
+    "sw",
+    "ta",
+    "te",
+    "tg",
+    "th",
+    "tk",
+    "tl",
+    "tr",
+    "tt",
+    "uk",
+    "ur",
+    "uz",
+    "vi",
+    "yi",
+    "yo",
+    "zh",
+    "yue",
+)
+V1_FORM_FIELDS: Final = ("initial_prompt", "language")
 
 EpisodeKey = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{20}$")]
 JobId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
@@ -232,6 +343,63 @@ class UploadFields(RequestFields):
     """The text fields of a multipart upload."""
 
 
+class DecodeOptions(Model):
+    """Per-request decoding options of a /v1 job. ``language`` None means detect."""
+
+    initial_prompt: str | None = None
+    language: str | None = None
+
+
+class V1UploadFields(Model):
+    """The text fields of a /v1 multipart upload."""
+
+    initial_prompt: str | None = None
+    language: str | None = None
+
+    @field_validator("initial_prompt", mode="after")
+    @classmethod
+    def _normalise_prompt(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > MAX_INITIAL_PROMPT_CHARS:
+            raise PydanticCustomError(
+                "initial_prompt_too_long",
+                f"initial_prompt is too long (at most {MAX_INITIAL_PROMPT_CHARS} characters)",
+            )
+        return v
+
+    @field_validator("language", mode="after")
+    @classmethod
+    def _normalise_language(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if not v:
+            return None
+        if v not in WHISPER_LANGUAGES:
+            raise PydanticCustomError(
+                "language_invalid",
+                "language must be a Whisper language code such as 'en'; "
+                "leave it out to detect the language",
+            )
+        return v
+
+
+def decode_key(content_sha256: str, options: DecodeOptions) -> str:
+    """Key of the transcript of this audio made with these options (20 hex)."""
+    if re.fullmatch("[0-9a-f]{64}", content_sha256) is None:
+        raise ValueError("content_sha256 must be 64 lower-case hex characters")
+    payload = json.dumps(
+        ["v1", content_sha256, options.initial_prompt, options.language],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:EPISODE_KEY_LENGTH]
+
+
 class EpisodeRef(Model):
     source: Source
     show_id: str
@@ -312,6 +480,7 @@ class ShareRecord(Model):
 
 class JobResult(Model):
     duration_s: Seconds  # Transcript.duration_s of the finished job
+    language: str | None = None  # the transcript's language
 
 
 class Job(Model):
@@ -343,6 +512,36 @@ class Job(Model):
     message_id: str | None = None
     sent_at: AwareDatetime | None = None
     resent: bool = False
+    delivery: Delivery = "mail"
+    initial_prompt: str | None = None  # /v1 only; cleared by a purge
+    language: str | None = None  # /v1 only: the requested language; None means detect
+    purged_at: AwareDatetime | None = None
+
+    def decode_options(self) -> DecodeOptions | None:
+        """None for a mail job, else the options of this /v1 job."""
+        if self.delivery == "mail":
+            return None
+        return DecodeOptions(initial_prompt=self.initial_prompt, language=self.language)
+
+    @model_validator(mode="after")
+    def _delivery_rules(self) -> Self:
+        if self.delivery == "none":
+            if (
+                self.source != "upload"
+                or self.to is not None
+                or self.instructions != ""
+                or self.title is not None
+                or self.upload_name is not None
+                or self.delivery_state is not None
+            ):
+                raise ValueError("a delivery-free job is an upload with no recipient or mail")
+        elif (
+            self.initial_prompt is not None
+            or self.language is not None
+            or self.purged_at is not None
+        ):
+            raise ValueError("only a delivery-free job has decode options or a purge")
+        return self
 
     @model_validator(mode="after")
     def _delivery_requirements(self) -> Self:

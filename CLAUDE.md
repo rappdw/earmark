@@ -9,17 +9,19 @@ own context.
 - Part 3, the receiving skill each chosen PKA instance installs from this repo's plugin
   marketplace: `plugins/earmark-pka/` (built in step 30, never run in a PKA; its contract checker is step 29).
 
-The two seams are the request (`POST /transcriptions`) and the mail contract
-(`contract: 2` since step 32; the receiving skill still accepts `contract: 1`). AMAP, outside this repo, carries the mail from the service to each PKA.
+The three seams are the request (`POST /transcriptions`), the mail contract
+(`contract: 2` since step 32; the receiving skill still accepts `contract: 1`), and the `/v1`
+API for programs such as earshot (`contract/api-v1.md`, step 36). AMAP, outside this repo, carries the mail from the service to each PKA.
 `docs/ARCHITECTURE.md` "System" has the parts, the seams, the definition of done and the
 repo layout. The service files nothing; the PKA files, through the receiving skill.
 
-The service today (after step 32): a request is an Apple Podcasts episode link, a YouTube
+The service today (after step 36): a request is an Apple Podcasts episode link, a YouTube
 video link, a direct audio URL, or an uploaded file, with a destination address and instructions. The worker
 resolves or downloads the audio, transcribes it, caches the transcript, emails the
 transcript note and the instructions to the destination as two Markdown attachments, and
 sends an ntfy push. On the Spark the worker runs the GPU image (`Dockerfile.gpu`, step 26),
-which builds CTranslate2 with CUDA.
+which builds CTranslate2 with CUDA. A `/v1` upload is transcribed and kept for its client,
+with no mail and no push.
 
 ## Status
 
@@ -104,11 +106,16 @@ The whole repo's layout is "Repo layout" in `docs/ARCHITECTURE.md`.
   and from step 25 the SMTP password. `Settings` holds them as `SecretStr`.
 - **Recipients and instructions must not leak** (step 24). Instructions never appear in
   logs or pushes. An address appears in logs and pushes only masked (`j…@example.org`).
-  A direct URL appears in logs and pushes host-only.
+  A direct URL appears in logs and pushes host-only. For a `/v1` job (step 36) no log line
+  carries the upload's file name (never stored), the `initial_prompt` or transcript text;
+  logs carry ids, sizes, timings, status and errors.
 - **The recipient allowlist is the gate** (step 24). Every `to` is checked against
   `EARMARK_ALLOWED_RECIPIENTS`. Unset refuses every request. `all` is the operator's
   written acceptance of a risk, warned about at startup and by doctor. earmark never
-  defaults the recipient or the sender.
+  defaults the recipient or the sender. A `/v1` job has no `to`, sends nothing, and has the
+  bearer token as its only gate.
+- **`/v1` is a contract** (step 36): `contract/api-v1.md`, pinned by hash; additive changes
+  only; a breaking change is `/v2`; the unversioned routes stay as they are.
 - **Mail follows the contract exactly** (step 25): `contract: 2` since step 32 (contract 1
   is still accepted by the receiving skill), drafted by pka-skills and owned by this repo,
   still a draft. The texts are `contract/mail-v2.md` (a list of changes to

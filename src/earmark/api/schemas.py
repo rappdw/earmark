@@ -91,6 +91,40 @@ def job_view(job: Job) -> JobView:
     )
 
 
+class V1Accepted(ApiModel):
+    job_id: JobId
+    status: JobStatus
+
+
+class V1JobView(ApiModel):
+    """What /v1 shows of a delivery-free job."""
+
+    job_id: JobId
+    status: JobStatus
+    stage: Stage | None
+    error: str | None  # scrub_urls(job.error)
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    language: str | None
+    duration_s: float | None
+    purged_at: AwareDatetime | None
+
+
+def v1_job_view(job: Job) -> V1JobView:
+    result = job.result
+    return V1JobView(
+        job_id=job.id,
+        status=job.status,
+        stage=job.stage,
+        error=None if job.error is None else scrub_urls(job.error),
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        language=result.language if result is not None else job.language,
+        duration_s=None if result is None else result.duration_s,
+        purged_at=job.purged_at,
+    )
+
+
 class JobList(ApiModel):
     jobs: tuple[JobView, ...]
 

@@ -20,13 +20,14 @@ from earmark.artifacts import ArtifactStore
 from earmark.config import ConfigError, Settings
 from earmark.errors import PermanentError, TransientError
 from earmark.log import adopt_library_loggers
-from earmark.models import Segment, Transcript, content_key, format_hms
+from earmark.models import DecodeOptions, Segment, Transcript, content_key, format_hms
 from earmark.sources import sha256_file
 from earmark.transcribe.base import (
     CachedTranscriber,
     NoSpeechError,
     UnusableAudioError,
     asr_profile,
+    with_decode_options,
 )
 from earmark.transcribe.base import (
     SegmentLike as SegmentLike,
@@ -79,7 +80,14 @@ class InfoLike(Protocol):
 
 class WhisperModelLike(Protocol):
     def transcribe(
-        self, audio: object, /, *, language: str | None, beam_size: int, vad_filter: bool
+        self,
+        audio: object,
+        /,
+        *,
+        language: str | None,
+        beam_size: int,
+        vad_filter: bool,
+        initial_prompt: str | None,
     ) -> tuple[Iterable[SegmentLike], InfoLike]: ...
 
 
@@ -92,6 +100,7 @@ class BatchedPipelineLike(Protocol):
         language: str | None,
         beam_size: int,
         vad_filter: bool,
+        initial_prompt: str | None,
         batch_size: int,
     ) -> tuple[Iterable[SegmentLike], InfoLike]: ...
 
@@ -110,13 +119,21 @@ class BatchedWhisper:
         return getattr(self._whisper, "model", None)
 
     def transcribe(
-        self, audio: object, /, *, language: str | None, beam_size: int, vad_filter: bool
+        self,
+        audio: object,
+        /,
+        *,
+        language: str | None,
+        beam_size: int,
+        vad_filter: bool,
+        initial_prompt: str | None,
     ) -> tuple[Iterable[SegmentLike], InfoLike]:
         return self._pipeline.transcribe(
             audio,
             language=language,
             beam_size=beam_size,
             vad_filter=vad_filter,
+            initial_prompt=initial_prompt,
             batch_size=self._batch_size,
         )
 
@@ -335,6 +352,9 @@ class FasterWhisperEngine:
 
     @property
     def profile(self) -> str:
+        return self.profile_for(None)
+
+    def profile_for(self, options: DecodeOptions | None, /) -> str:
         o = self._options
         fields: dict[str, str | int | bool | None] = {
             "model": o.model,
@@ -346,7 +366,7 @@ class FasterWhisperEngine:
         }
         if o.batch_size > 0:
             fields["batch_size"] = o.batch_size
-        return asr_profile("faster_whisper", fields)
+        return asr_profile("faster_whisper", with_decode_options(fields, options))
 
     @property
     def options(self) -> WhisperOptions:
@@ -397,14 +417,20 @@ class FasterWhisperEngine:
             self._model = model
             return model
 
-    def _value_error(self, exc: ValueError) -> PermanentError:
+    def _value_error(self, exc: ValueError, options: DecodeOptions | None) -> PermanentError:
         detail = _collapse(str(exc))
-        if self._options.language is not None:
+        if options is not None:
+            detail += " (check the request's language)"
+        elif self._options.language is not None:
             detail += " (check EARMARK_ASR_LANGUAGE)"
         return PermanentError(f"transcription failed: {detail}")
 
-    def transcribe_file(self, audio: Path, episode_key: str, /) -> Transcript:
+    def transcribe_file(
+        self, audio: Path, episode_key: str, options: DecodeOptions | None = None, /
+    ) -> Transcript:
         model = self._load()
+        requested = self._options.language if options is None else options.language
+        prompt = None if options is None else options.initial_prompt
         try:
             decoded = self._runtime.decode_audio(audio)
         except AudioDecodeError as exc:
@@ -419,13 +445,14 @@ class FasterWhisperEngine:
         try:
             raw_segments, info = model.transcribe(
                 decoded.samples,
-                language=self._options.language,
+                language=requested,
                 beam_size=BEAM_SIZE,
                 vad_filter=VAD_FILTER,
+                initial_prompt=prompt,
             )
         except ValueError as exc:
             if LANGUAGE_ERROR_MARK in str(exc):
-                raise self._value_error(exc) from exc
+                raise self._value_error(exc, options) from exc
             raise
         info_duration = float(info.duration)
         duration = (
@@ -462,7 +489,7 @@ class FasterWhisperEngine:
                 f"no speech found in {audio.name} ({format_hms(duration)} of audio)"
             )
         elapsed = max(self._monotonic() - started, 1e-9)
-        language = self._options.language or info.language or None
+        language = requested or info.language or None
         logger.info(
             "transcribed %s: %d segments, language %s, %.1f s (%.2fx real time)",
             episode_key,

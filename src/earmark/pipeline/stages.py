@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from earmark.models import Episode, Job, Transcript
+from earmark.models import DecodeOptions, Episode, Job, Transcript
 
 
 class Resolver(Protocol):
@@ -51,18 +51,24 @@ class YoutubeSource(Protocol):
 
 
 class Transcriber(Protocol):
-    def cached(self, episode: Episode, /) -> Transcript | None:
+    def cached(
+        self, episode: Episode, options: DecodeOptions | None = None, /
+    ) -> Transcript | None:
         """The cached transcript if one exists for this transcriber's profile.
 
+        With ``options`` (a /v1 job) the transcript is looked up per audio and options.
         Never loads a model.
         """
         ...
 
-    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
+    def transcribe(
+        self, episode: Episode, audio: Path, options: DecodeOptions | None = None, /
+    ) -> Transcript:
         """Return the cached transcript if ``cached`` has one (loading no model).
 
         Otherwise transcribe ``audio`` and write both transcript files through
-        ``ArtifactStore.write_transcript``.
+        ``ArtifactStore.write_transcript`` (``write_decoded`` with ``options``).
+        ``options=None`` is the mail path, unchanged.
         """
         ...
 

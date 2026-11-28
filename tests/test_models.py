@@ -11,10 +11,13 @@ from pydantic import ValidationError
 import earmark.models
 from earmark.models import (
     AUDIO_SHOW_ID,
+    MAX_INITIAL_PROMPT_CHARS,
     MAX_INSTRUCTIONS_CHARS,
     MAX_TITLE_CHARS,
     MAX_URL_CHARS,
     REQUEST_ERROR_TYPES,
+    WHISPER_LANGUAGES,
+    DecodeOptions,
     Episode,
     EpisodeRef,
     Job,
@@ -28,7 +31,9 @@ from earmark.models import (
     Transcript,
     TranscriptionRequest,
     UploadFields,
+    V1UploadFields,
     content_key,
+    decode_key,
     episode_key,
     format_hms,
     is_episode_key,
@@ -104,6 +109,11 @@ CASES: list[Model] = [
     ShareRecord(episode_key=KEY, first_shared_at=T0),
     JobResult(duration_s=0.0),
     JobResult(duration_s=3600.5),
+    JobResult(duration_s=1.0, language="en"),
+    DecodeOptions(),
+    DecodeOptions(initial_prompt="Alice", language="en"),
+    V1UploadFields(),
+    V1UploadFields(initial_prompt="Alice", language="en"),
     make_job(),
     _minimal_job(),
     _audio_job("upload"),
@@ -401,7 +411,9 @@ def test_request_timestamp_out_of_range() -> None:
 
 def test_request_error_types_registry() -> None:
     assert sorted(REQUEST_ERROR_TYPES) == [
+        "initial_prompt_too_long",
         "instructions_too_long",
+        "language_invalid",
         "timestamp_out_of_range",
         "title_too_long",
         "to_invalid",
@@ -584,3 +596,99 @@ def test_youtube_job_requires_url() -> None:
     assert Job.model_validate(data).source == "youtube"
     with pytest.raises(ValidationError, match="requires url"):
         Job.model_validate(data | {"url": None})
+
+
+# -- step 36: /v1 models -----------------------------------------------------------------------
+
+
+def _v1_job(**extra: Any) -> Job:
+    fields: dict[str, Any] = {
+        "id": "3" * 32,
+        "kind": "ingest",
+        "status": "queued",
+        "source": "upload",
+        "url": None,
+        "to": None,
+        "upload_file": "4" * 32 + ".flac",
+        "content_sha256": SHA,
+        "delivery": "none",
+        "run_after": T0,
+        "shared_at": T0,
+        "created_at": T0,
+        "updated_at": T0,
+    }
+    fields.update(extra)
+    return Job(**fields)
+
+
+def test_job_delivery_rules() -> None:
+    job = _v1_job(initial_prompt="Alice", language="en")
+    assert job.decode_options() == DecodeOptions(initial_prompt="Alice", language="en")
+    assert _v1_job().decode_options() == DecodeOptions()
+    assert _audio_job("upload").decode_options() is None
+    assert _audio_job("upload").delivery == "mail"
+    for bad in (
+        {"to": TO},
+        {"instructions": "x"},
+        {"title": "t"},
+        {"upload_name": "a.flac"},
+        {"delivery_state": "sending", "message_id": "<m@example.org>"},
+        {"source": "url", "upload_file": None, "content_sha256": None, "url": "https://a.test/x"},
+    ):
+        with pytest.raises(ValidationError):
+            _v1_job(**bad)
+    for bad_mail in ({"initial_prompt": "x"}, {"language": "en"}, {"purged_at": T0}):
+        fields = _audio_job("upload").model_dump() | bad_mail
+        with pytest.raises(ValidationError, match="only a delivery-free job"):
+            Job(**fields)
+    assert _v1_job(purged_at=T0).purged_at == T0
+
+
+def test_v1_upload_fields_prompt() -> None:
+    assert V1UploadFields().initial_prompt is None
+    assert V1UploadFields(initial_prompt="  Alice \n Bob  ").initial_prompt == "Alice \n Bob"
+    assert V1UploadFields(initial_prompt="   ").initial_prompt is None
+    assert V1UploadFields(initial_prompt="a" * MAX_INITIAL_PROMPT_CHARS).initial_prompt
+    assert V1UploadFields(initial_prompt="é" * MAX_INITIAL_PROMPT_CHARS).initial_prompt
+    with pytest.raises(ValidationError, match="at most 1000 characters") as info:
+        V1UploadFields(initial_prompt="a" * (MAX_INITIAL_PROMPT_CHARS + 1))
+    assert info.value.errors()[0]["type"] == "initial_prompt_too_long"
+    assert MAX_INITIAL_PROMPT_CHARS == 1000
+
+
+def test_v1_upload_fields_language() -> None:
+    assert V1UploadFields(language=" EN ").language == "en"
+    assert V1UploadFields(language="").language is None
+    assert V1UploadFields(language="yue").language == "yue"
+    for bad in ("xx", "auto", "english", "zh-CN"):
+        with pytest.raises(ValidationError, match="Whisper language code") as info:
+            V1UploadFields(language=bad)
+        assert info.value.errors()[0]["type"] == "language_invalid"
+    with pytest.raises(ValidationError):
+        V1UploadFields.model_validate({"to": TO})
+
+
+def test_whisper_languages_shape() -> None:
+    assert len(WHISPER_LANGUAGES) == 100
+    assert len(set(WHISPER_LANGUAGES)) == 100
+    assert WHISPER_LANGUAGES[0] == "af"
+    assert WHISPER_LANGUAGES[-1] == "yue"
+
+
+def test_decode_key_stable() -> None:
+    assert decode_key(SHA, DecodeOptions()) == "d42fe62736ec2972c0de"
+    assert (
+        decode_key(SHA, DecodeOptions(initial_prompt="Alice", language="en"))
+        == "204f1a3d1b14dc313877"
+    )
+    assert decode_key(SHA, DecodeOptions(language="en")) != decode_key(SHA, DecodeOptions())
+    assert decode_key(SHA, DecodeOptions(initial_prompt="")) != decode_key(SHA, DecodeOptions())
+    assert is_episode_key(decode_key(SHA, DecodeOptions()))
+    for bad in ("", "AB" * 32, "ab" * 31):
+        with pytest.raises(ValueError, match="64 lower-case hex"):
+            decode_key(bad, DecodeOptions())
+
+
+def test_job_result_language_optional() -> None:
+    assert JobResult.model_validate_json('{"duration_s": 12.5}') == JobResult(duration_s=12.5)
+    assert JobResult.model_validate_json('{"duration_s": 1.0}').language is None

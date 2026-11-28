@@ -1238,3 +1238,19 @@ def test_transcript_command_at_a_terminal(fake_env: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr("earmark.cli._stdout_is_terminal", lambda: True)
     shown = runner.invoke(app, ["transcript", job_id, "--format", "text"])
     assert shown.stdout == "[00:00:00] hi ?[2J there\n"
+
+
+def test_transcript_command_points_a_v1_job_at_v1(fake_env: Path) -> None:
+    from earmark.config import Settings
+    from earmark.jobs import open_job_store
+    from tests.factories import new_v1_job
+
+    store = open_job_store(Settings(_env_file=None, data_dir=fake_env / "data"))
+    job = store.enqueue(new_v1_job()).job
+    for fmt in ("note", "text", "json"):
+        result = runner.invoke(app, ["transcript", job.id, "--format", fmt])
+        assert result.exit_code == 1
+        assert "/v1/jobs/{id}/transcript" in result.stderr
+    listed = runner.invoke(app, ["jobs", "--json"])
+    [shown] = json.loads(listed.stdout)["jobs"]
+    assert (shown["id"], shown["source"], shown["to"]) == (job.id, "upload", None)

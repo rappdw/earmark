@@ -901,3 +901,138 @@ def test_open_existing_job_store_opens_existing(tmp_path: Path) -> None:
     assert [j.id for j in again.list_recent(10, status=None)] == [
         j.id for j in first.list_recent(10, status=None)
     ]
+
+
+# -- step 36: delivery-free (/v1) jobs ------------------------------------------------------------
+
+
+def _v1_new(
+    sha: str = "ab" * 32, *, initial_prompt: str | None = None, language: str | None = None
+) -> NewJob:
+    from tests.factories import new_v1_job
+
+    return new_v1_job(sha, initial_prompt=initial_prompt, language=language)
+
+
+def test_enqueue_v1_validates(store: JobStore) -> None:
+    from dataclasses import replace
+
+    good = _v1_new()
+    for bad in (
+        replace(good, source="url", url="https://a.test/x", upload_file=None, content_sha256=None),
+        replace(good, to="you@example.org"),
+        replace(good, instructions="x"),
+        replace(good, title="t"),
+        replace(good, upload_name="a.flac"),
+        replace(good, url="https://a.test/x"),
+        replace(good, upload_file=None),
+        replace(good, content_sha256=None),
+    ):
+        with pytest.raises(ValueError, match="delivery-free"):
+            store.enqueue(bad)
+    mail = new_upload_job()
+    for bad_mail in (
+        replace(mail, to=None),
+        replace(mail, initial_prompt="p"),
+        replace(mail, language="en"),
+    ):
+        with pytest.raises(ValueError, match=r"to must not be empty|only a delivery-free"):
+            store.enqueue(bad_mail)
+    assert store.list_recent() == []
+    created = store.enqueue(good)
+    assert created.created
+    job = created.job
+    assert (job.delivery, job.to, job.upload_name) == ("none", None, None)
+
+
+def test_v1_dedupe_key_differs_from_mail(tmp_path: Path, store: JobStore) -> None:
+    store.enqueue(new_upload_job("ab" * 32))
+    store.enqueue(_v1_new("ab" * 32))
+    keys = [r["dedupe_key"] for r in raw(tmp_path, "SELECT dedupe_key FROM jobs ORDER BY seq")]
+    assert len(set(keys)) == 2
+    store.enqueue(_v1_new("ab" * 32, initial_prompt="p"))
+    store.enqueue(_v1_new("ab" * 32, language="en"))
+    assert len(raw(tmp_path, "SELECT 1 FROM jobs")) == 4
+    assert not store.enqueue(_v1_new("ab" * 32, language="en")).created
+
+
+def test_mail_dedupe_key_unchanged(tmp_path: Path, store: JobStore) -> None:
+    store.enqueue(new_podcast_job(URL))
+    [row] = raw(tmp_path, "SELECT dedupe_key FROM jobs")
+    assert row["dedupe_key"] == ("ec73ba8d86391afe1420e2ffcf34482cb9fea0d9ad853dbfe4c5ba56d86bb017")
+
+
+def _finish(store: JobStore, *, status: str = "done") -> str:
+    claim = claim_one(store)
+    if status == "done":
+        store.complete(claim, JobResult(duration_s=1.0))
+    else:
+        store.fail(claim, "boom", transient=False)
+    return claim.job.id
+
+
+def test_mark_purged_unknown_and_mail(store: JobStore) -> None:
+    with pytest.raises(JobNotFoundError):
+        store.mark_purged("f" * 32)
+    with pytest.raises(JobNotFoundError):
+        store.mark_purged("not-an-id")
+    mail = store.enqueue(new_upload_job()).job
+    with pytest.raises(JobNotFoundError):
+        store.mark_purged(mail.id)
+
+
+def test_mark_purged_refuses_active(store: JobStore) -> None:
+    from earmark.jobs import JobActiveError
+
+    job = store.enqueue(_v1_new(initial_prompt="p")).job
+    with pytest.raises(JobActiveError) as queued:
+        store.mark_purged(job.id)
+    assert queued.value.job.status == "queued"
+    claim_one(store)
+    with pytest.raises(JobActiveError) as running:
+        store.mark_purged(job.id)
+    assert running.value.job.status == "running"
+    done = store.get(job.id)
+    assert done is not None
+    assert done.initial_prompt == "p"
+    assert done.purged_at is None
+
+
+def test_mark_purged_clears_prompt_and_dedupe(
+    tmp_path: Path, store: JobStore, clock: MutableClock
+) -> None:
+    job = store.enqueue(_v1_new(initial_prompt="p")).job
+    _finish(store)
+    clock.advance(5)
+    [purged] = store.mark_purged(job.id)
+    assert purged.purged_at == clock()
+    assert purged.initial_prompt is None
+    assert purged.status == "done"
+    assert purged.result is not None
+    assert raw(tmp_path, "SELECT dedupe_key FROM jobs")[0]["dedupe_key"] == "purged:" + job.id
+    assert store.mark_purged(job.id) == [purged]  # repeatable, and unchanged
+    again = store.enqueue(_v1_new(initial_prompt="p"))
+    assert again.created  # a purged job is never returned as a duplicate
+    assert again.job.id != job.id
+
+
+def test_mark_purged_siblings(store: JobStore, clock: MutableClock) -> None:
+    ids = []
+    for _ in range(3):
+        ids.append(store.enqueue(_v1_new(initial_prompt="p")).job.id)
+        if len(ids) < 3:
+            _finish(store, status="done" if len(ids) == 1 else "failed")
+            clock.advance(1000)  # past the dedupe window
+    other = store.enqueue(_v1_new(initial_prompt="different")).job
+    purged = store.mark_purged(ids[1])
+    assert [j.id for j in purged] == [ids[1], ids[0]]  # the named job first, then by seq
+    third = store.get(ids[2])
+    assert third is not None
+    assert (third.purged_at, third.initial_prompt) == (None, "p")
+    kept = store.get(other.id)
+    assert kept is not None
+    assert kept.initial_prompt == "different"
+
+
+def test_checkpoint_passes_through(store: JobStore) -> None:
+    assert store.checkpoint() is True

@@ -14,6 +14,7 @@ from starlette.requests import ClientDisconnect
 
 from earmark.api.schemas import Health, JobList, JobView, TranscriptionResponse, job_view
 from earmark.api.upload import UploadRejected, log_rejection, receive_upload
+from earmark.api.v1 import add_v1_routes
 from earmark.artifacts import ArtifactStore
 from earmark.fetch import media_type
 from earmark.jobs import LIST_LIMIT_MAX, Enqueued
@@ -179,4 +180,5 @@ def build_router(intake: Intake, *, artifacts: ArtifactStore, max_upload_bytes: 
     def healthz() -> Health:
         return Health(status="ok")
 
+    add_v1_routes(router, intake, artifacts=artifacts, max_upload_bytes=max_upload_bytes)
     return router

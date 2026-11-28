@@ -107,10 +107,17 @@ class Pipeline:
         try:
             with interruptible():
                 transcript = self._stage_work(claim, state)
-                self._jobs.set_stage(claim, "deliver")
-                mail = self._compose(job, state, transcript)
+                result = JobResult(duration_s=transcript.duration_s, language=transcript.language)
+                if job.delivery == "none":
+                    mail = None
+                else:
+                    self._jobs.set_stage(claim, "deliver")
+                    mail = self._compose(job, state, transcript)
             # Delivery runs outside the interruptible window: a SIGTERM waits for it.
-            done = self._deliver(claim, mail, JobResult(duration_s=transcript.duration_s))
+            if mail is None:
+                done = self._jobs.complete(claim, result)
+            else:
+                done = self._deliver(claim, mail, result)
         except LeaseLostError:
             logger.warning("lost the lease on job %s; abandoning it", job.id)
             return None
@@ -138,7 +145,7 @@ class Pipeline:
 
     def notify(self, job: Job, episode: Episode | None) -> None:
         notifier = self._b.notifier
-        if notifier is None:
+        if notifier is None or job.delivery == "none":
             return
         try:
             notifier.notify(job, episode)
@@ -229,11 +236,15 @@ class Pipeline:
         else:
             raise PermanentError("unknown source")
         state.episode = episode
-        self._artifacts.write_episode(episode)
-        jobs.set_episode_key(claim, episode.key)
-        state.first_shared_at = self._artifacts.record_share(episode.key, job.shared_at)
-
-        transcript = b.transcriber.cached(episode)
+        options = job.decode_options()
+        if options is None:
+            self._artifacts.write_episode(episode)
+            jobs.set_episode_key(claim, episode.key)
+            state.first_shared_at = self._artifacts.record_share(episode.key, job.shared_at)
+            transcript = b.transcriber.cached(episode)
+        else:
+            jobs.set_episode_key(claim, episode.key)
+            transcript = b.transcriber.cached(episode, options)
         if transcript is None:
             if audio is None:
                 jobs.set_stage(claim, "fetch")
@@ -246,7 +257,10 @@ class Pipeline:
                 else:
                     audio = b.fetcher.fetch(episode)
             jobs.set_stage(claim, "transcribe")
-            transcript = b.transcriber.transcribe(episode, audio)
+            if options is None:
+                transcript = b.transcriber.transcribe(episode, audio)
+            else:
+                transcript = b.transcriber.transcribe(episode, audio, options)
         else:
             logger.info("job %s: transcript for %s is cached", job.id, episode.key)
         if transcript.episode_key != episode.key:

@@ -735,8 +735,12 @@ def test_routes_are_exactly_the_kept_ones(store: JobStore, tmp_path: Path) -> No
         ("/jobs/{job_id}/transcript", frozenset({"GET"})),
         ("/jobs", frozenset({"GET"})),
         ("/healthz", frozenset({"GET", "HEAD"})),
+        ("/v1/transcriptions", frozenset({"POST"})),
+        ("/v1/jobs/{job_id}", frozenset({"GET"})),
+        ("/v1/jobs/{job_id}/transcript", frozenset({"GET"})),
+        ("/v1/jobs/{job_id}", frozenset({"DELETE"})),
     }
-    assert len(router.routes) == 5
+    assert len(router.routes) == 9
 
 
 def test_create_app_refuses_v010_database(settings: Settings, tmp_path: Path) -> None:

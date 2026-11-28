@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -381,3 +382,56 @@ def test_sigterm_while_composing_releases_the_job(tmp_path: Path) -> None:
     assert job.delivery_state is None
     assert mailer.call_count == 0
     assert env.fakes.notifier.call_count == 0
+
+
+# -- step 36: delivery-free jobs -----------------------------------------------------------------
+
+
+def _stage_v1_job(env: PipelineEnv, **options: Any) -> Job:
+    from tests.factories import new_v1_job
+
+    with env.staging.begin_upload("flac") as writer:
+        writer.write(b"ID3" + bytes(200))
+        staged = writer.commit()
+    return env.jobs.enqueue(new_v1_job(staged.sha256, upload_file=staged.name, **options)).job
+
+
+def test_v1_stale_lease_failure_without_push(tmp_path: Path) -> None:
+    env = make_env(tmp_path, max_attempts=1, lease_s=10)
+    queued = _stage_v1_job(env)
+    claim = env.jobs.claim_next()  # a worker that then crashed
+    assert claim is not None
+    assert env.staging.upload_path(queued.upload_file or "").is_file()
+    env.clock.advance(11)
+    assert env.worker.run_once() is None
+    job = _stored(env, queued)
+    assert job.status == "failed"
+    assert (job.error or "").startswith("worker stopped responding")
+    assert env.fakes.notifier.calls == []
+    assert env.fakes.mailer.calls == []
+    assert not env.staging.upload_path(queued.upload_file or "").exists()
+
+
+def test_v1_long_transcription_keeps_its_lease(tmp_path: Path) -> None:
+    stale: list[list[Job]] = []
+
+    def make(env: PipelineEnv) -> Callable[[], None]:
+        def callback() -> None:
+            store = counting_store(env)
+            env.clock.advance(31)
+            start = store.beats
+            assert store.wait_for_beats(start + 2)
+            stale.append(env.jobs.requeue_stale())
+
+        return callback
+
+    env = make_blocking_env(
+        tmp_path, make, store_type=CountingJobStore, lease_s=30, heartbeat_s=0.01
+    )
+    _stage_v1_job(env, initial_prompt="long one")
+    job = env.worker.run_once()
+    assert job is not None
+    assert job.status == "done"
+    assert stale == [[]]
+    assert counting_store(env).beats >= 2
+    assert env.fakes.notifier.calls == []

@@ -5,12 +5,15 @@ from datetime import UTC, datetime, timedelta, timezone
 
 from earmark.jobs import NewJob
 from earmark.models import (
+    AUDIO_SHOW_ID,
+    GUID_SHA256_PREFIX,
     Episode,
     Job,
     JobResult,
     Segment,
     Source,
     Transcript,
+    content_key,
     episode_key,
 )
 from earmark.sources import audio_episode
@@ -230,4 +233,40 @@ def make_transcript_with(
         duration_s=max((seg.end for seg in segments), default=0.0),
         model="fake-asr",
         segments=tuple(segments),
+    )
+
+
+def make_upload_episode(sha256: str = SHA) -> Episode:
+    """The episode of an upload of the bytes with this hash."""
+    return Episode(
+        key=content_key(sha256),
+        source="upload",
+        show_id=AUDIO_SHOW_ID,
+        episode_id="",
+        guid=GUID_SHA256_PREFIX + sha256,
+        title="Uploaded audio",
+        show_title="",
+        published_at=None,
+        duration_s=None,
+        audio_url="",
+        feed_url=None,
+        url="",
+    )
+
+
+def new_v1_job(
+    sha256: str = SHA,
+    *,
+    initial_prompt: str | None = None,
+    language: str | None = None,
+    upload_file: str | None = None,
+) -> NewJob:
+    return NewJob(
+        source="upload",
+        to=None,
+        upload_file=upload_file or f"{sha256[:32]}.mp3",
+        content_sha256=sha256,
+        delivery="none",
+        initial_prompt=initial_prompt,
+        language=language,
     )

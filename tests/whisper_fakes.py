@@ -47,7 +47,14 @@ class FakeWhisperModel:
         self.calls: list[dict[str, object]] = []
 
     def transcribe(
-        self, audio: object, /, *, language: str | None, beam_size: int, vad_filter: bool
+        self,
+        audio: object,
+        /,
+        *,
+        language: str | None,
+        beam_size: int,
+        vad_filter: bool,
+        initial_prompt: str | None = None,
     ) -> tuple[Iterable[FakeSegment], FakeInfo]:
         self.calls.append(
             {
@@ -55,6 +62,7 @@ class FakeWhisperModel:
                 "language": language,
                 "beam_size": beam_size,
                 "vad_filter": vad_filter,
+                "initial_prompt": initial_prompt,
             }
         )
         if self.transcribe_error is not None:
@@ -164,6 +172,7 @@ class StubPipeline:
         language: str | None,
         beam_size: int,
         vad_filter: bool,
+        initial_prompt: str | None = None,
         batch_size: int,
     ) -> tuple[Iterable[FakeSegment], FakeInfo]:
         self.calls.append(
@@ -171,11 +180,16 @@ class StubPipeline:
                 "language": language,
                 "beam_size": beam_size,
                 "vad_filter": vad_filter,
+                "initial_prompt": initial_prompt,
                 "batch_size": batch_size,
             }
         )
         return self.delegate.transcribe(
-            audio, language=language, beam_size=beam_size, vad_filter=vad_filter
+            audio,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            initial_prompt=initial_prompt,
         )
 
 

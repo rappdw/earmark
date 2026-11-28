@@ -25,6 +25,7 @@ from earmark.db import Database, MissingDatabaseError, database_path, open_datab
 from earmark.models import (
     MAX_UTC_OFFSET_MIN,
     Clock,
+    Delivery,
     Job,
     JobKind,
     JobResult,
@@ -52,6 +53,14 @@ class LeaseLostError(RuntimeError):
 class JobNotFoundError(LookupError): ...
 
 
+class JobActiveError(RuntimeError):
+    """The job is queued or running; it cannot be purged."""
+
+    def __init__(self, job: Job) -> None:
+        super().__init__(job.id)
+        self.job = job
+
+
 @dataclass(frozen=True, slots=True)
 class Claim:
     job: Job  # the job as claimed: status "running", attempts already incremented
@@ -63,7 +72,7 @@ class NewJob:
     """What ``JobStore.enqueue`` needs to create one job."""
 
     source: Source
-    to: str  # normalised, non-empty
+    to: str | None  # mail: normalised, non-empty; delivery "none": None
     instructions: str = ""
     title: str | None = None
     url: str | None = None  # apple_podcasts: canonical; url: direct
@@ -71,6 +80,9 @@ class NewJob:
     upload_name: str | None = None
     content_sha256: str | None = None
     shared_at: datetime | None = None
+    delivery: Delivery = "mail"
+    initial_prompt: str | None = None
+    language: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +144,16 @@ def _dedupe_key(kind: JobKind, source: Source, subject: str, to: str, instructio
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _v1_dedupe_key(content_sha256: str, initial_prompt: str | None, language: str | None) -> str:
+    """A list of another length than a mail key, so the two can never be equal."""
+    payload = json.dumps(
+        ["ingest", "upload", "none", "sha256:" + content_sha256, initial_prompt, language],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _row_to_job(row: sqlite3.Row) -> Job:
     result_text: str | None = row["result"]
     return Job(
@@ -162,6 +184,10 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         message_id=row["message_id"],
         sent_at=_opt_from_db(row["sent_at"]),
         resent=bool(row["resent"]),
+        delivery=row["delivery"],
+        initial_prompt=row["initial_prompt"],
+        language=row["language"],
+        purged_at=_opt_from_db(row["purged_at"]),
     )
 
 
@@ -215,8 +241,16 @@ class JobStore:
             created_at=now,
             updated_at=now,
             utc_offset_min=offset_min,
+            delivery=new.delivery,
+            initial_prompt=new.initial_prompt,
+            language=new.language,
         )
-        key = _dedupe_key("ingest", new.source, subject, new.to, new.instructions)
+        if new.delivery == "none" and new.content_sha256 is not None:
+            key = _v1_dedupe_key(new.content_sha256, new.initial_prompt, new.language)
+        elif new.to is not None:
+            key = _dedupe_key("ingest", new.source, subject, new.to, new.instructions)
+        else:  # pragma: no cover - _validate refuses it
+            raise ValueError("a job needs a recipient or no delivery")
         cutoff = _to_db(now - self._dedupe_window)
         with self._db.transaction() as conn:
             row = conn.execute(
@@ -238,10 +272,12 @@ class JobStore:
                 INSERT INTO jobs (id, kind, status, source, url, recipient, instructions,
                                   title, upload_file, upload_name, content_sha256, dedupe_key,
                                   attempts, run_after, warnings, shared_at, created_at,
-                                  updated_at, utc_offset_min)
+                                  updated_at, utc_offset_min, delivery, initial_prompt,
+                                  language)
                 VALUES (:id, 'ingest', 'queued', :source, :url, :to, :instructions, :title,
                         :upload_file, :upload_name, :content_sha256, :key, 0, :now, '[]',
-                        :shared, :now, :now, :offset_min)
+                        :shared, :now, :now, :offset_min, :delivery, :initial_prompt,
+                        :language)
                 """,
                 {
                     "id": job.id,
@@ -257,6 +293,9 @@ class JobStore:
                     "now": _to_db(now),
                     "shared": _to_db(shared),
                     "offset_min": offset_min,
+                    "delivery": new.delivery,
+                    "initial_prompt": new.initial_prompt,
+                    "language": new.language,
                 },
             )
         return Enqueued(job, True)
@@ -264,7 +303,27 @@ class JobStore:
     @staticmethod
     def _validate(new: NewJob) -> str:
         """The dedupe subject of ``new``; ValueError if it breaks the source rules."""
+        if new.delivery == "none":
+            if (
+                new.source != "upload"
+                or new.to is not None
+                or new.instructions != ""
+                or new.title is not None
+                or new.upload_name is not None
+                or new.url is not None
+                or not new.upload_file
+                or not new.content_sha256
+            ):
+                raise ValueError(
+                    "a delivery-free job is an upload with upload_file and content_sha256, "
+                    "and no recipient, instructions, title, name or url"
+                )
+            return "sha256:" + new.content_sha256
+        if new.to is None:
+            raise ValueError("to must not be empty")
         _require_text(new.to, "to")
+        if new.initial_prompt is not None or new.language is not None:
+            raise ValueError("only a delivery-free job has decode options")
         if new.source == "upload":
             if new.url is not None or not new.upload_file or not new.content_sha256:
                 raise ValueError("an upload job needs upload_file and content_sha256, not a url")
@@ -274,6 +333,41 @@ class JobStore:
         if new.upload_file is not None:
             raise ValueError("only an upload job has upload_file")
         return new.url
+
+    def mark_purged(self, job_id: str) -> list[Job]:
+        """Mark a finished /v1 job, and every finished one sharing its transcript, purged.
+
+        Raises JobNotFoundError for an unknown or mail job and JobActiveError while the job
+        is queued or running. Returns the named job first, then the others by seq.
+        """
+        if _JOB_ID_RE.fullmatch(job_id) is None:
+            raise JobNotFoundError(job_id)
+        now = _to_db(self._now())
+        with self._db.transaction() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None or row["delivery"] != "none":
+                raise JobNotFoundError(job_id)
+            job = _row_to_job(row)
+            if job.purged_at is not None:
+                return [job]
+            if job.status in ("queued", "running"):
+                raise JobActiveError(job)
+            rows = conn.execute(
+                """
+                UPDATE jobs
+                SET purged_at = :now, initial_prompt = NULL, dedupe_key = 'purged:' || id,
+                    updated_at = :now
+                WHERE delivery = 'none' AND dedupe_key = :key
+                  AND status IN ('done', 'failed', 'skipped') AND purged_at IS NULL
+                RETURNING *
+                """,
+                {"now": now, "key": row["dedupe_key"]},
+            ).fetchall()
+        ordered = sorted(rows, key=lambda r: (r["id"] != job_id, r["seq"]))
+        return [_row_to_job(r) for r in ordered]
+
+    def checkpoint(self) -> bool:
+        return self._db.checkpoint()
 
     # -- claim and lease --------------------------------------------------------------
 

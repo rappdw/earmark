@@ -13,9 +13,17 @@ from typing import Final
 
 from earmark.artifacts import ArtifactStore, atomic_write_bytes
 from earmark.errors import PermanentError
-from earmark.models import Clock, Episode, Job, Segment, Transcript, episode_key
+from earmark.models import (
+    Clock,
+    DecodeOptions,
+    Episode,
+    Job,
+    Segment,
+    Transcript,
+    episode_key,
+)
 from earmark.pipeline.stages import Backends, OutgoingMail
-from earmark.transcribe.base import asr_profile
+from earmark.transcribe.base import asr_profile, decoded_key_for, with_decode_options
 from earmark.youtube.links import youtube_episode
 
 FAKE_NOW: Final = datetime(2026, 1, 1, tzinfo=UTC)
@@ -80,6 +88,7 @@ class YoutubeDownloadCall:
 class TranscribeCall:
     episode: Episode
     audio: Path
+    options: DecodeOptions | None = None
 
 
 @dataclass(frozen=True)
@@ -203,17 +212,28 @@ class FakeTranscriber(FakeStage[TranscribeCall]):
 
     @property
     def profile(self) -> str:
-        return asr_profile("fake", {"model": self.model, "language": self.language})
+        return self.profile_for(None)
 
-    def cached(self, episode: Episode) -> Transcript | None:
-        stored = self._artifacts.read_transcript(episode.key)
-        if stored is None or stored.asr_profile != self.profile:
+    def profile_for(self, options: DecodeOptions | None) -> str:
+        return asr_profile(
+            "fake",
+            with_decode_options({"model": self.model, "language": self.language}, options),
+        )
+
+    def cached(self, episode: Episode, options: DecodeOptions | None = None) -> Transcript | None:
+        if options is None:
+            stored = self._artifacts.read_transcript(episode.key)
+        else:
+            stored = self._artifacts.read_decoded(decoded_key_for(episode, options), episode.key)
+        if stored is None or stored.asr_profile != self.profile_for(options):
             return None
         return stored
 
-    def transcribe(self, episode: Episode, audio: Path) -> Transcript:
-        self._enter(TranscribeCall(episode, audio))
-        cached = self.cached(episode)
+    def transcribe(
+        self, episode: Episode, audio: Path, options: DecodeOptions | None = None
+    ) -> Transcript:
+        self._enter(TranscribeCall(episode, audio, options))
+        cached = self.cached(episode, options)
         if cached is not None:
             return cached
         if not audio.is_file():
@@ -225,17 +245,24 @@ class FakeTranscriber(FakeStage[TranscribeCall]):
                 Segment(start=5.0, end=10.0, text=f"Today: {episode.title}."),
                 Segment(start=10.0, end=15.0, text="Thanks for listening."),
             )
+            if options is not None and options.initial_prompt is not None:
+                h = hashlib.sha256(options.initial_prompt.encode("utf-8")).hexdigest()[:12]
+                segments = (*segments, Segment(start=15.0, end=20.0, text=f"Prompt {h}."))
         last_end = segments[-1].end if segments else 0.0
+        language = self.language if options is None else (options.language or self.language)
         transcript = Transcript(
             episode_key=episode.key,
-            language=self.language,
+            language=language,
             duration_s=max(episode.duration_s or 0.0, last_end, 0.0),
             model=self.model,
             segments=segments,
             warnings=self.warnings,
-            asr_profile=self.profile,
+            asr_profile=self.profile_for(options),
         )
-        self._artifacts.write_transcript(transcript)
+        if options is None:
+            self._artifacts.write_transcript(transcript)
+        else:
+            self._artifacts.write_decoded(decoded_key_for(episode, options), transcript)
         self.computed += 1
         return transcript
 

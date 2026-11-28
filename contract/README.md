@@ -1,4 +1,4 @@
-# The mail seam
+# The mail seam and the /v1 API
 
 earmark sends a transcript to a PKA instance as one email with two Markdown attachments.
 This folder is that seam: the contract text, sample emails built by the real mail code, and
@@ -56,3 +56,12 @@ unreadable file) and 64 (a usage error).
 `samples/v2/README.md` and `samples/v1/README.md` say what each sample shows. `make samples`
 regenerates the v2 samples from `tests/contract_samples.py`; review the diff before
 committing. The v1 samples are never regenerated.
+
+## The /v1 API
+
+`api-v1.md` (step 36) is the text of the `/v1` API, which programs such as earshot use to
+have audio transcribed with no mail and no push. It is the third seam. A test pins the text
+between its markers by hash and checks every example response in it against the real app
+(`tests/test_api_v1_contract.py`; the examples are built by `tests/api_v1_examples.py`). It
+changes only additively; a breaking change is `/v2`, with its own file. It has no samples
+folder or checker: the examples in the text are the samples.

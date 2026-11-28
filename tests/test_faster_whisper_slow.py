@@ -239,3 +239,29 @@ def test_load_runtime_leaves_no_library_handlers(restore_root_logging: None) -> 
         if not isinstance(handler, logging.NullHandler)
     ]
     assert offenders == []
+
+
+def test_whisper_languages_match_faster_whisper() -> None:
+    from earmark.models import WHISPER_LANGUAGES
+
+    tokenizer = importlib.import_module("faster_whisper.tokenizer")
+    assert tuple(tokenizer._LANGUAGE_CODES) == WHISPER_LANGUAGES
+
+
+@pytest.mark.usefixtures("whisper_runtime")
+@pytest.mark.parametrize("batch_size", [0, 2])
+def test_real_transcription_with_initial_prompt(tmp_path: Path, batch_size: int) -> None:
+    from earmark.models import DecodeOptions
+
+    settings = _settings(tmp_path).model_copy(update={"asr_batch_size": batch_size})
+    engine = FasterWhisperEngine(WhisperOptions.from_settings(settings), load_runtime())
+    clip = tmp_path / "clip.flac"
+    shutil.copyfile(slow_assets.fetch_clip(), clip)
+    transcript = engine.transcribe_file(
+        clip,
+        "0123456789abcdef0123",
+        DecodeOptions(initial_prompt="Ask not what your country can do for you.", language="en"),
+    )
+    assert transcript.segments
+    assert transcript.language == "en"
+    assert transcript.model == "faster-whisper:" + slow_assets.SLOW_MODEL

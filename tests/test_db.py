@@ -350,7 +350,7 @@ def test_fresh_database_identity(tmp_path: Path) -> None:
     path = tmp_path / "earmark.db"
     db = open_database(path)
     assert db.identity() == (APPLICATION_ID, SCHEMA_VERSION)
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     with db.connect() as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert names == {"jobs"}
@@ -432,8 +432,8 @@ def test_migration_0003_adds_delivery_columns(tmp_path: Path) -> None:
         )
     finally:
         conn.close()
-    db = open_database(path)
-    assert db.schema_version() == SCHEMA_VERSION == 4
+    db = open_database(path, migrations=MIGRATIONS[:4])
+    assert db.schema_version() == 4
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM jobs").fetchone()
         for bad in (
@@ -445,7 +445,7 @@ def test_migration_0003_adds_delivery_columns(tmp_path: Path) -> None:
                 conn.execute(bad)
     assert (row["utc_offset_min"], row["delivery_state"], row["message_id"]) == (None, None, None)
     assert (row["sent_at"], row["resent"]) == (None, 0)
-    job = JobStore(db).get("c" * 32)
+    job = JobStore(open_database(path)).get("c" * 32)  # now at the current schema
     assert job is not None
     assert (job.to, job.instructions, job.status) == ("you@example.org", "q", "done")
     assert (job.utc_offset_min, job.delivery_state, job.resent) == (None, None, False)
@@ -538,7 +538,7 @@ def test_migration_0004_keeps_rows(tmp_path: Path) -> None:
         before = [dict(r) for r in conn.execute("SELECT * FROM jobs ORDER BY seq")]
     finally:
         conn.close()
-    db = open_database(path)
+    db = open_database(path, migrations=MIGRATIONS[:4])
     assert db.schema_version() == 4
     with db.connect() as conn:
         after = [dict(r) for r in conn.execute("SELECT * FROM jobs ORDER BY seq")]
@@ -573,6 +573,88 @@ def test_migration_0004_keeps_active_dedupe(tmp_path: Path) -> None:
         _insert_row(conn, "c" * 32, "youtube", status="done", dedupe_key="same")
 
 
-def test_schema_version_is_4() -> None:
-    assert SCHEMA_VERSION == 4
-    assert MIGRATIONS[-1].name == "0004_youtube"
+def test_schema_version_is_5() -> None:
+    assert SCHEMA_VERSION == 5
+    assert MIGRATIONS[-1].name == "0005_v1"
+
+
+# -- step 36 ------------------------------------------------------------------------------------
+
+
+def test_migration_0005_keeps_rows(tmp_path: Path) -> None:
+    path = tmp_path / "earmark.db"
+    open_database(path, migrations=MIGRATIONS[:4])
+    conn = sqlite3.connect(path, autocommit=True)
+    try:
+        _insert_row(conn, "a" * 32, "apple_podcasts")
+        _insert_row(
+            conn,
+            "b" * 32,
+            "upload",
+            url=None,
+            upload_file="1" * 32 + ".m4a",
+            content_sha256="2" * 64,
+        )
+    finally:
+        conn.close()
+    db = open_database(path)
+    assert db.schema_version() == SCHEMA_VERSION == 5
+    with db.connect() as conn:
+        rows = conn.execute("SELECT * FROM jobs ORDER BY seq").fetchall()
+        assert [r["delivery"] for r in rows] == ["mail", "mail"]
+        assert all(r["initial_prompt"] is None for r in rows)
+        assert all(r["language"] is None and r["purged_at"] is None for r in rows)
+        assert [r["id"] for r in rows] == ["a" * 32, "b" * 32]
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_row(conn, "c" * 32, "apple_podcasts", delivery="post")
+    assert db.identity() == (APPLICATION_ID, 5)
+
+
+def test_secure_delete_on(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+
+
+def test_secure_delete_zeroes_freed_text(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    marker = "MARKER-" + "z" * 900
+    with db.connect() as conn:
+        _insert_row(conn, "a" * 32, "apple_podcasts", instructions=marker)
+        conn.execute("UPDATE jobs SET instructions = ''")
+    assert db.checkpoint() is True
+    assert marker.encode() not in (tmp_path / "earmark.db").read_bytes()
+    wal = tmp_path / "earmark.db-wal"
+    assert not wal.exists() or marker.encode() not in wal.read_bytes()
+
+
+def test_checkpoint_truncates_wal(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    holder = sqlite3.connect(tmp_path / "earmark.db", autocommit=True)  # keeps the WAL alive
+    try:
+        holder.execute("SELECT count(*) FROM jobs").fetchone()
+        with db.connect() as conn:
+            for n in range(20):
+                _insert_row(conn, f"{n:032x}", "apple_podcasts")
+        wal = tmp_path / "earmark.db-wal"
+        assert wal.exists()
+        assert wal.stat().st_size > 0
+        assert db.checkpoint() is True
+        assert wal.stat().st_size == 0
+    finally:
+        holder.close()
+
+
+def test_checkpoint_busy_returns_false(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "earmark.db")
+    reader = sqlite3.connect(tmp_path / "earmark.db", autocommit=True)
+    try:
+        with db.connect() as conn:
+            _insert_row(conn, "a" * 32, "apple_podcasts")
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM jobs").fetchone()
+        with db.connect() as conn:
+            _insert_row(conn, "b" * 32, "apple_podcasts")
+        assert db.checkpoint() is False
+    finally:
+        reader.close()

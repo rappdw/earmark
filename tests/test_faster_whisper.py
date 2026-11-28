@@ -1136,7 +1136,7 @@ def test_sequential_when_batch_zero(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     loaded = load_runtime().load_model(_options())
     assert loaded is model
     assert stub.pipelines == []
-    loaded.transcribe("a", language=None, beam_size=5, vad_filter=True)
+    loaded.transcribe("a", language=None, beam_size=5, vad_filter=True, initial_prompt=None)
     assert all("batch_size" not in call for call in model.calls)
 
 
@@ -1147,11 +1147,19 @@ def test_batched_pipeline_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(loaded, fw.BatchedWhisper)
     [pipeline] = stub.pipelines
     assert pipeline.model is model
-    segments, info = loaded.transcribe("a", language="en", beam_size=5, vad_filter=True)
+    segments, info = loaded.transcribe(
+        "a", language="en", beam_size=5, vad_filter=True, initial_prompt=None
+    )
     assert [seg.text for seg in segments] == [seg.text for seg in THREE]
     assert info.language == "en"
     assert pipeline.calls == [
-        {"language": "en", "beam_size": 5, "vad_filter": True, "batch_size": 8}
+        {
+            "language": "en",
+            "beam_size": 5,
+            "vad_filter": True,
+            "initial_prompt": None,
+            "batch_size": 8,
+        }
     ]
 
 
@@ -1223,3 +1231,105 @@ def test_worker_refuses_cuda_without_device(
         factory.build_backends(settings, ArtifactStore(tmp_path / "data"))
     assert "no CUDA device" in str(info.value)
     assert "Dockerfile.gpu" in str(info.value)
+
+
+# -- step 36: per-request options --------------------------------------------------------------
+
+
+def _engine_for(fake: FakeRuntime, **options: Any) -> FasterWhisperEngine:
+    return FasterWhisperEngine(_options(**options), fake.runtime())
+
+
+def test_initial_prompt_passed_sequential(tmp_path: Path) -> None:
+    from earmark.models import DecodeOptions
+
+    fake = _fake()
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _engine_for(fake).transcribe_file(
+        audio, "a" * 20, DecodeOptions(initial_prompt="Alice, Kubernetes", language="de")
+    )
+    [call] = fake.model.calls
+    assert call["initial_prompt"] == "Alice, Kubernetes"
+    assert call["language"] == "de"
+
+
+def test_initial_prompt_passed_batched(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, stub = _stub_model()
+    stub.install(monkeypatch)
+    loaded = load_runtime().load_model(_options(batch_size=4))
+    loaded.transcribe("a", language="de", beam_size=5, vad_filter=True, initial_prompt="Alice")
+    [pipeline] = stub.pipelines
+    assert pipeline.calls[0]["initial_prompt"] == "Alice"
+    assert pipeline.calls[0]["batch_size"] == 4
+    assert model.calls[0]["initial_prompt"] == "Alice"
+
+
+def test_mail_path_passes_none_and_setting_language(tmp_path: Path) -> None:
+    fake = _fake()
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    transcript = _engine_for(fake, language="en").transcribe_file(audio, "a" * 20)
+    [call] = fake.model.calls
+    assert call["initial_prompt"] is None
+    assert call["language"] == "en"
+    assert transcript.language == "en"
+
+
+def test_options_language_overrides_setting(tmp_path: Path) -> None:
+    from earmark.models import DecodeOptions
+
+    fake = _fake(language="fr")
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    engine = _engine_for(fake, language="en")
+    detect = engine.transcribe_file(audio, "a" * 20, DecodeOptions())
+    german = engine.transcribe_file(audio, "a" * 20, DecodeOptions(language="de"))
+    assert [c["language"] for c in fake.model.calls] == [None, "de"]
+    assert (detect.language, german.language) == ("fr", "de")  # None: the detected one
+
+
+def test_profile_for_options() -> None:
+    import hashlib
+
+    from earmark.models import DecodeOptions
+
+    engine = _engine_for(_fake(), language="en")
+    assert engine.profile_for(None) == engine.profile
+    prompted = engine.profile_for(DecodeOptions(initial_prompt="Alice", language="de"))
+    digest = hashlib.sha256(b"Alice").hexdigest()
+    assert f'"initial_prompt_sha256":"{digest}"' in prompted
+    assert '"language":"de"' in prompted
+    assert "Alice" not in prompted
+    assert '"language":null' in engine.profile_for(DecodeOptions())
+    assert "initial_prompt_sha256" not in engine.profile_for(DecodeOptions(language="de"))
+    assert prompted != engine.profile_for(DecodeOptions(initial_prompt="Bob", language="de"))
+
+
+def test_profile_unchanged_without_options() -> None:
+    off = FasterWhisperEngine(_options(language="en"), _fake().runtime())
+    assert off.profile == (
+        'faster_whisper {"beam_size":5,"compute_type":"int8","device":"cpu","language":"en",'
+        '"model":"tiny","vad_filter":true}'
+    )
+    on = FasterWhisperEngine(_options(batch_size=8), _fake().runtime())
+    assert on.profile == (
+        'faster_whisper {"batch_size":8,"beam_size":5,"compute_type":"int8","device":"cpu",'
+        '"language":null,"model":"tiny","vad_filter":true}'
+    )
+
+
+def test_language_error_hint_names_request(tmp_path: Path) -> None:
+    from earmark.models import DecodeOptions
+
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    detail = "'xx' is not a valid language code (accepted language codes: af, am)"
+    engine = _engine_for(_fake(transcribe_error=ValueError(detail)), language="en")
+    with pytest.raises(PermanentError) as info:
+        engine.transcribe_file(audio, "a" * 20, DecodeOptions(language="xx"))
+    assert str(info.value).endswith("(check the request's language)")
+    assert "EARMARK_ASR_LANGUAGE" not in str(info.value)
+    with pytest.raises(PermanentError) as setting:
+        engine.transcribe_file(audio, "a" * 20)
+    assert str(setting.value).endswith("(check EARMARK_ASR_LANGUAGE)")

@@ -5,7 +5,7 @@ import pytest
 
 from earmark.artifacts import ArtifactStore
 from earmark.errors import PermanentError, TransientError
-from earmark.models import Episode, Segment, Transcript
+from earmark.models import DecodeOptions, Episode, Segment, Transcript
 from earmark.pipeline.stages import Transcriber
 from earmark.pipeline.worker import Shutdown
 from earmark.transcribe.base import (
@@ -14,6 +14,7 @@ from earmark.transcribe.base import (
     TranscriptionEngine,
     UnusableAudioError,
     asr_profile,
+    with_decode_options,
 )
 from tests.factories import make_episode
 
@@ -32,9 +33,18 @@ class RecordingEngine:
         self.key = key
         self.profile = profile
         self.calls: list[tuple[Path, str]] = []
+        self.options_seen: list[DecodeOptions | None] = []
 
-    def transcribe_file(self, audio: Path, episode_key: str, /) -> Transcript:
+    def profile_for(self, options: DecodeOptions | None, /) -> str:
+        if options is None:
+            return self.profile
+        return f"{self.profile} {options.language} {options.initial_prompt}"
+
+    def transcribe_file(
+        self, audio: Path, episode_key: str, options: DecodeOptions | None = None, /
+    ) -> Transcript:
         self.calls.append((audio, episode_key))
+        self.options_seen.append(options)
         if self.error is not None:
             raise self.error
         return Transcript(
@@ -295,3 +305,91 @@ def test_segment_from_lives_in_base() -> None:
     from earmark.transcribe import base, faster_whisper
 
     assert faster_whisper.segment_from is base.segment_from
+
+
+# -- /v1: per-request options ------------------------------------------------------------------
+
+
+def _upload_setup(tmp_path: Path) -> tuple[ArtifactStore, Episode, Path]:
+    from tests.factories import make_upload_episode
+
+    artifacts = ArtifactStore(tmp_path / "data")
+    audio = tmp_path / "staged.mp3"
+    audio.write_bytes(b"audio")
+    return artifacts, make_upload_episode(), audio
+
+
+def test_cached_with_options_reads_decoded_tree(tmp_path: Path) -> None:
+    artifacts, episode, audio = _upload_setup(tmp_path)
+    engine = RecordingEngine(key=episode.key)
+    t = _make(artifacts, engine, keep_audio=True)
+    options = DecodeOptions(initial_prompt="Alice", language="de")
+    assert t.cached(episode, options) is None
+    written = t.transcribe(episode, audio, options)
+    assert engine.options_seen == [options]
+    assert written.asr_profile == engine.profile_for(options)
+    assert t.cached(episode, options) == written
+    assert t.transcribe(episode, audio, options) == written
+    assert len(engine.calls) == 1
+    assert t.cached(episode) is None  # the mail tree is separate
+    assert not artifacts.has_transcript(episode.key)
+    [directory] = (tmp_path / "data" / "transcripts").iterdir()
+    assert sorted(p.name for p in directory.iterdir()) == ["transcript.json", "transcript.txt"]
+    assert t.cached(episode, DecodeOptions(initial_prompt="Bob", language="de")) is None
+
+
+def test_profile_mismatch_retranscribes_decoded(tmp_path: Path) -> None:
+    artifacts, episode, audio = _upload_setup(tmp_path)
+    engine = RecordingEngine(key=episode.key)
+    t = _make(artifacts, engine, keep_audio=True)
+    options = DecodeOptions(language="en")
+    t.transcribe(episode, audio, options)
+    engine.profile = "recording {other}"
+    assert t.cached(episode, options) is None
+    t.transcribe(episode, audio, options)
+    assert len(engine.calls) == 2
+    stored = t.cached(episode, options)
+    assert stored is not None
+    assert stored.asr_profile == "recording {other} en None"
+
+
+def test_options_need_sha256_episode(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    t = _make(artifacts, RecordingEngine())
+    with pytest.raises(PermanentError, match="uploaded audio only"):
+        t.cached(episode, DecodeOptions(language="en"))
+    with pytest.raises(PermanentError, match="uploaded audio only"):
+        t.transcribe(episode, audio, DecodeOptions(language="en"))
+
+
+def test_with_decode_options_hashes_prompt() -> None:
+    import hashlib
+
+    fields = {"model": "m", "language": "en"}
+    assert with_decode_options(fields, None) == fields
+    assert with_decode_options(fields, None) is not fields
+    merged = with_decode_options(fields, DecodeOptions(initial_prompt="Alice Smith", language=None))
+    assert merged == {
+        "model": "m",
+        "language": None,
+        "initial_prompt_sha256": hashlib.sha256(b"Alice Smith").hexdigest(),
+    }
+    assert "Alice" not in asr_profile("x", merged)
+    assert with_decode_options(fields, DecodeOptions(language="de")) == {
+        "model": "m",
+        "language": "de",
+    }
+
+
+def test_options_none_is_unchanged(tmp_path: Path) -> None:
+    artifacts, episode, audio = _setup(tmp_path)
+    engine = RecordingEngine()
+    t = _make(artifacts, engine)
+    written = t.transcribe(episode, audio)
+    assert written.asr_profile == "recording {}"
+    assert engine.options_seen == [None]
+    assert artifacts.has_transcript(episode.key)
+    assert not (tmp_path / "data" / "transcripts").exists()
+    assert asr_profile("fake", {"language": "en", "model": "m"}) == (
+        'fake {"language":"en","model":"m"}'
+    )

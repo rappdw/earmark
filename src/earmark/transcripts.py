@@ -42,6 +42,8 @@ UNREADABLE: Final = (
     "delete episodes/{key}/ and share it again"
 )
 
+V1_ELSEWHERE: Final = "this job was sent to /v1; fetch its transcript from /v1/jobs/{id}/transcript"
+
 UnavailableReason = Literal["not_ready", "gone", "unreadable"]
 
 
@@ -142,6 +144,8 @@ def read_transcript_file(
     job: Job, artifacts: ArtifactStore, fmt: TranscriptFormat
 ) -> TranscriptFile:
     """The job's transcript in ``fmt``. Raises TranscriptUnavailable."""
+    if job.delivery == "none":
+        raise TranscriptUnavailable("not_ready", V1_ELSEWHERE)
     if not has_transcript(job):
         raise _not_ready(job)
     key = job.episode_key

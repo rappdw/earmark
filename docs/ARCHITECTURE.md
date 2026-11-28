@@ -1,10 +1,11 @@
 # Architecture
 
 This repo holds a small system in three parts, the iOS Shortcut, the service and the
-receiving skill, joined at two seams. "System" below says how they fit. The rest of this
-document describes part 2, the service.
+receiving skill, joined at three seams: the request, the mail, and the `/v1` API for programs
+(step 36). "System" below says how they fit. The rest of this document describes part 2, the
+service.
 
-## System: three parts and two seams
+## System: three parts and three seams
 
 One repo holds the whole system. That is the operator's decision of 2026-11-24: the project
 is too small to split, one plan and one runbook cover the system, and a change across a seam
@@ -16,19 +17,22 @@ outside this repo.
 | Part | What it is | Runs on | Lives in | Built and run |
 |---|---|---|---|---|
 | 1. The Shortcut | The iOS Shortcut that sends audio or a link to the service | the operator's iPhone | `docs/shortcut.md`, which says how to build it by hand; `shortcut/earmark.shortcut` from step 31 | Never run on a phone. The file is not built (step 31). |
-| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27 and 32 (a request may also be a YouTube video link) and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
+| 2. The service | API, worker, GPU transcription, mail delivery | the DGX Spark | `src/earmark/`, with its deployment files at the top level | Built in steps 01–27, 32 (a request may also be a YouTube video link) and 36 (the `/v1` API for programs) and tested in CI on fakes and stubs. Never run on the Spark: the GPU image has never been built, and no real mail has been sent. |
 | 3. The receiving skill | Handles an earmark email that AMAP has delivered: checks it, files the note, acts on the instructions within a narrow scope | each PKA instance the operator chooses | `plugins/earmark-pka/`, listed in this repo's plugin marketplace (steps 29, 30) | Built in step 30 (version 1.1.0 since step 32): the `earmark-pka` plugin, its marketplace and the skill, tested on the contract 1 and contract 2 samples under CPython 3.9.6 and 3.13. It has never run in a PKA (runbook phase 12). |
 
-### The two seams
+### The three seams
 
 | Seam | Between | Contract | Tested by |
 |---|---|---|---|
 | Request | Shortcut → service | `POST /transcriptions`: the request model in code, and "HTTP API" below | the service's API tests (`tests/test_api.py`), and the doc tests that post `docs/shortcut.md`'s JSON example and upload fields to the app; no Shortcut has sent one yet |
 | Mail | service → AMAP → receiving skill | the mail contract: `contract: 2` (step 32), in `contract/mail-v2.md`, which the service sends; and `contract: 1`, in `contract/mail-v1.md`, which the receiving skill still accepts ("The mail contract" below) | the sample emails in `contract/samples/v2/` (step 32), which the service's tests reproduce byte for byte from the real mail code, and `contract/samples/v1/` (step 29, frozen since step 32 and pinned by hash); the checker passes on both on CPython 3.9.6 and 3.13; the receiving skill's tests (step 30), which run its recognising, checking and de-duplicating over every sample |
+| API | a program on the operator's hardware → service | `/v1` (step 36), in `contract/api-v1.md`: upload audio, fetch the transcript by job id, delete it; nothing leaves the Spark. Its first client is earshot, the operator's meeting transcriber, outside this repo | the `/v1` API tests (`tests/test_api_v1.py`, `tests/test_v1_jobs.py`), and `tests/test_api_v1_contract.py`, which pins the text by hash and checks every example response against the app; no earshot has called it yet |
 
 - The request seam has no folder: its contract is the request model in code plus this
   document.
-- The mail seam's folder, `contract/`, covers that seam only (step 29).
+- `contract/` holds the mail seam (step 29) and the `/v1` API's text, `api-v1.md` (step 36).
+  `/v1` changes only additively; a breaking change is `/v2`, with its own file. The
+  unversioned routes stay as they are.
 
 ### The mail seam
 
@@ -177,10 +181,11 @@ plugins/earmark-pka/              part 3: the plugin
   .claude-plugin/plugin.json
   skills/earmark-receive/SKILL.md
   skills/earmark-receive/scripts/   the contract checker (step 29) and the receiver (step 30)
-contract/                         the mail seam only (step 29)
+contract/                         the mail seam (step 29) and the `/v1` API text
   README.md                         what the seam is, its versions, where the checker lives
   mail-v1.md                        the contract 1 text
   mail-v2.md                        the contract 2 text (step 32): YouTube, `type: video`
+  api-v1.md                         the `/v1` API contract for programs (step 36)
   samples/v1/                       sample emails, frozen since step 32
   samples/v2/                       sample emails the mail code reproduces (step 32)
 shortcut/earmark.shortcut         part 1: the signed export, the folder's only file (step 31)
@@ -214,6 +219,10 @@ as two Markdown attachments, in the mail contract's format (step 25). Last, it s
 push. The operator's PKA instances do the analysis and filing, through the receiving skill
 (part 3).
 
+A program on the operator's hardware can also upload audio through `/v1` (step 36): the job
+is transcribed and kept for that client, with no destination, no mail and no push, and the
+client fetches the transcript by job id and deletes it when done (`contract/api-v1.md`).
+
 On the DGX Spark the worker transcribes on the GB10 GPU in-process, from a GPU build of the
 image that compiles CTranslate2 with CUDA (step 26).
 
@@ -238,10 +247,10 @@ backend, not the pipeline.
 | Question | Decision | How to change it |
 |---|---|---|
 | Scope | The service transcribes, and delivers the transcript by email (step 25). Its sources are Apple Podcasts episodes, YouTube videos (step 32), direct audio URLs and uploads. It files nothing: the PKA files, through the receiving skill (part 3, steps 29–30). | See "System", "Re-scope decisions" and "Delivering". |
-| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). Per-job staging files for uploads, direct URLs and YouTube audio (`uploads/`, `downloads/`, deleted when the job ends; steps 24, 32), and Deno's small cache (`cache/deno/`, step 32). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
+| State | The job table (SQLite, WAL), including each job's delivery state (step 25). The per-episode cache under `DATA_DIR` (`episode.json`, `shared.json`, `transcript.json`, `transcript.txt`, podcast audio while it is needed). The per-options transcripts of `/v1` jobs under `transcripts/<decode_key>/`, kept until the client deletes them (step 36). Per-job staging files for uploads, direct URLs and YouTube audio (`uploads/`, `downloads/`, deleted when the job ends; steps 24, 32), and Deno's small cache (`cache/deno/`, step 32). earmark is not a system of record. A database from earlier than step 22 is refused, not migrated (see "Database identity"). | A new migration in `db.py`. |
 | Delivery | Ordinary email over SMTP submission (stdlib `smtplib`, verified TLS, AUTH) from a sending mailbox on the operator's domain. It carries two Markdown attachments in the mail contract (`contract: 2` since step 32, drafted by pka-skills, owned by this repo; the text is `contract/mail-v2.md`, a list of changes to `contract/mail-v1.md`, which the receiving skill still accepts). AMAP, outside this repo, carries the mail to the PKA. Delivery is at-least-once: a resend keeps the `Message-ID` and `job_id` (step 25). | Implement another `Mailer`. |
 | Notification | ntfy, off unless `EARMARK_NTFY_URL` is set: one JSON publish to the server root per finished job, with no link (steps 15, 22, 24, 25). A delivered job's push reads `Sent: <label>`, with the masked recipient and the duration. Works with public ntfy.sh or a self-hosted server on the LAN or tailnet. The Shortcut can also poll `GET /jobs/{id}`. | Implement another `Notifier`. |
-| Requests | One route, `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). | See "HTTP API" and `docs/steps/24-transcription-requests.md`. |
+| Requests | `POST /transcriptions`, taking JSON or a streamed multipart upload; every request names one `to` from `EARMARK_ALLOWED_RECIPIENTS` (step 24). And `POST /v1/transcriptions` (step 36), a streamed multipart upload with optional `initial_prompt` and `language` and no `to`: a delivery-free job, behind the bearer token only. | See "HTTP API", `docs/steps/24-transcription-requests.md` and `docs/steps/36-v1-api.md`. |
 | Queue | A SQLite job table and a separate worker process. No Redis. | Swap `JobStore`. |
 | Transcription | faster-whisper `large-v3` in the worker process (the `transcribe` extra), with a remote OpenAI-compatible ASR endpoint as the alternative for a server elsewhere (`remote`, step 09; see `docs/asr.md`). The PyPI CTranslate2 wheel for linux/aarch64 is CPU-only (step 08), so the GPU image (`Dockerfile.gpu`, step 26) builds CTranslate2 from source with CUDA for `sm_121` and swaps it into the venv; the compose worker runs it with `EARMARK_ASR_DEVICE=cuda`. faster-whisper's batched pipeline is optional (`EARMARK_ASR_BATCH_SIZE`). | `EARMARK_ASR_BACKEND`, `EARMARK_ASR_MODEL`, `EARMARK_ASR_DEVICE`, `EARMARK_ASR_BATCH_SIZE`, `EARMARK_ASR_BASE_URL`. |
 | Reachability | Private network only: the API is never exposed publicly. It listens on `127.0.0.1:8787` (compose publishes it only there). A reverse proxy on the host's LAN interface (Caddy, `deploy/caddy/Caddyfile`) terminates TLS for a name such as `earmark.example.com`. That name is a DNS-only (never proxied) Cloudflare `A` record for the server's private address, with a Let's Encrypt certificate from the DNS-01 challenge (the Cloudflare token lives only with the proxy). Or the operator's own certificate, installed by `deploy/caddy/install-cert.sh`, with stock Caddy, on another port if 443 is taken (step 35). Away from home the phone and Mac reach that address through a WireGuard split tunnel. Tailscale Serve is the alternative; `tailscale funnel` is never used (step 16). | See `docs/deploy.md` (step 16). |
@@ -281,6 +290,18 @@ the request's `timestamp` (step 25). `to` and `instructions` are part of the ded
 After enqueue, only delivery reads `to` and `instructions` (step 25). `title` names uploads
 and direct URLs, and is ignored for podcasts and YouTube videos.
 
+A `/v1` job (step 36) takes a shorter path:
+
+```
+program (earshot), through an SSH tunnel to 127.0.0.1:8787
+   │  POST /v1/transcriptions   multipart: file + initial_prompt?, language?
+   ▼
+API ── validates, enqueues with delivery = none, returns 202 {job_id, status}
+Worker ── resolve (the staged upload's sha256) → transcribe with the request's options
+          → data/transcripts/<decode_key>/ → done; staging released; no mail, no push
+Client ── GET /v1/jobs/{id}, GET /v1/jobs/{id}/transcript, DELETE /v1/jobs/{id}
+```
+
 ## Module layout
 
 These are the service's modules. The whole repo's layout is "Repo layout" under "System".
@@ -313,6 +334,8 @@ src/earmark/
                        transcript route and `earmark transcript`; step 33)
   staging.py           Staging: data/uploads/ (UploadWriter) and data/downloads/, release at a
                        terminal state, startup sweeps (step 24)
+  v1_jobs.py           the delivery-free jobs of /v1: v1_job, read_v1_transcript (the JSON and
+                       text views), purge_job; light imports (step 36)
   sanitize.py          untrusted text to file names and YAML, fit_chars, and the frontmatter
                        emitter; standard library only (step 22)
   endpoint.py          host_label, error_detail: shared by the operator-endpoint clients
@@ -330,8 +353,9 @@ src/earmark/
                        for doctor); step 25
   cli.py               `earmark` entry point
   api/                 app.py (create_app), auth.py (bearer middleware), routes.py, schemas.py
-                       (responses and JobView), upload.py (receive_upload: the streaming
-                       multipart reader; step 24)
+                       (responses, JobView, V1JobView), upload.py (receive_upload: the streaming
+                       multipart reader; step 24), v1.py (build_v1_router, the /v1 routes,
+                       included by build_router; step 36)
   pipeline/
     stages.py          stage Protocols, Backends (the six stage implementations)
     runner.py          Pipeline: runs one claimed job, maps exceptions to job outcomes
@@ -438,7 +462,22 @@ to job text.
   "Transcribing"; `None` on transcripts written earlier). `to_text()` renders one
   `[HH:MM:SS] text` line per segment (whitespace collapsed, hours unbounded, trailing
   newline); it is the content of `transcript.txt`.
-- `JobResult`: `duration_s` (required), the transcript's duration (step 22).
+- `JobResult`: `duration_s` (required), the transcript's duration (step 22), and
+  `language: str | None = None`, the transcript's language (step 36; older rows load
+  without it).
+- **`/v1` request models** (step 36).
+  - `V1UploadFields`, the text fields of `POST /v1/transcriptions`:
+    - `initial_prompt`: stripped; empty becomes `None`; at most `MAX_INITIAL_PROMPT_CHARS`
+      (1000) code points; otherwise verbatim;
+    - `language`: stripped and lower-cased; empty becomes `None` (detect); otherwise one of
+      `WHISPER_LANGUAGES`, the 100 codes of faster-whisper 1.2.1's `_LANGUAGE_CODES` (a `slow`
+      test pins the copy).
+  - `DecodeOptions`: `initial_prompt` and `language` (`None`: detect), the per-request
+    decode options a delivery-free job carries to the transcriber.
+  - `decode_key(content_sha256, options)`: the first 20 hex of
+    `sha256(json ["v1", content_sha256, initial_prompt, language])`. It names the job's
+    transcript directory, `transcripts/<decode_key>/`, so the same bytes with the same
+    options share one transcript and other options get another.
 - `ShareRecord`: the content of `shared.json`, the earliest share time of the episode,
   recorded by the runner on every job (earliest wins). `record_share` returns it, and the
   note's `shared_at` is that time (step 25).
@@ -456,6 +495,16 @@ to job text.
     - `message_id`, required in both delivery states;
     - `sent_at`, required when `sent`;
     - `resent: bool`, set when a delivery starts while an earlier one was left `sending`.
+  - **Step 36 added these fields** (migration `0005_v1`):
+    - `delivery: "mail" | "none"`, `"mail"` for every earlier job;
+    - `initial_prompt` and `language`, the request's decode options, on `none` jobs only
+      (`initial_prompt` is cleared when the job is purged);
+    - `purged_at`, set when `DELETE /v1/jobs/{id}` purged the job.
+
+    A `none` job is an upload with no `to`, no `instructions`, no `title` and no
+    `upload_name` (the file name is never stored) and never has a delivery state. A `mail`
+    job has no decode options and is never purged. `Job.decode_options()` gives the
+    `DecodeOptions` of a `none` job, `None` for a mail job.
   - **Per source:**
     - `apple_podcasts`: `url` is the canonical episode URL, so `Episode.url` is canonical
       too.
@@ -505,9 +554,14 @@ class YoutubeSource(Protocol):  # step 32
     def download(self, video_id: str, destination: Callable[[str], Path], /) -> Path: ...
 
 
-class Transcriber(Protocol):
-    def cached(self, episode: Episode, /) -> Transcript | None: ...  # step 24
-    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript: ...
+class Transcriber(Protocol):  # options: step 36; None is the mail path, unchanged
+    def cached(
+        self, episode: Episode, options: DecodeOptions | None = None, /
+    ) -> Transcript | None: ...  # step 24
+
+    def transcribe(
+        self, episode: Episode, audio: Path, options: DecodeOptions | None = None, /
+    ) -> Transcript: ...
 
 
 class Mailer(Protocol):  # step 25
@@ -536,6 +590,10 @@ attachment file names.
   field, `youtube`.
 - `Transcriber.cached` returns the cached transcript only when it was made with this
   transcriber's ASR profile, and never loads a model.
+- With `options` (step 36, delivery-free jobs only), both read and write
+  `transcripts/<decode_key>/` instead of `episodes/<key>/`, the profile includes the options
+  (see "Transcribing"), and the episode must be an upload or URL episode (a `sha256:` guid);
+  otherwise `PermanentError`. `options=None` is the mail path, byte for byte as before.
 - `Resolver.resolve` is called only for `apple_podcasts` jobs, so nothing else reaches it.
 
 Every stage has a fake in `fakes.py` that records each call (`calls`), can be told to
@@ -585,7 +643,8 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   before the database is opened. Real backends import their heavy modules inside the
   builder.
 - **Order.** `Pipeline.run(claim)` runs the stages below. Each stage sets `job.stage` before
-  it runs. Every job that completes ends at `deliver` (step 25); one with a cached
+  it runs. Every mail job that completes ends at `deliver` (step 25), and a delivery-free
+  job at `transcribe`, or `resolve` on a cache hit (step 36, below); a mail job with a cached
   transcript goes straight from `resolve` (or `fetch` for a direct URL) to `deliver`. A
   failed job keeps the stage it failed in, and `notify` is never set as a stage.
   1. **The episode** (`resolve`), by source (step 24):
@@ -626,6 +685,17 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
 
      A claimed job already `sent` (only possible by hand) completes without sending.
   8. **Finish:** `staging.release(job)`, then notify.
+- **Delivery-free jobs** (`delivery = none`, step 36) take a shorter path:
+  1. `resolve`: the upload checks above; `audio_episode(job, content_sha256)`, whose title
+     is `Uploaded audio` because the file name is not stored.
+  2. Only the episode key is recorded: no `episode.json`, no `shared.json`.
+  3. `transcriber.cached(episode, job.decode_options())`, else stage `transcribe` and
+     `transcriber.transcribe(episode, audio, options)`. There is no `fetch` stage.
+  4. No `deliver` stage: after the interruptible window the job is `complete`d with
+     `JobResult(duration_s, language)`.
+  5. `finish` releases the staged upload. `Pipeline.notify` returns at once for a `none` job,
+     so no path (success, failure, skip, a stale lease) pushes anything, and nothing composes
+     or sends mail.
 - **Retention** (step 24). `Pipeline.finish(job, episode)` releases the staging files of an
   upload (`uploads/<upload_file>`), a direct URL or a YouTube video (`downloads/<job_id>.*`),
   then notifies.
@@ -647,7 +717,11 @@ Step 05; exact signatures in `docs/steps/05-worker.md`.
   job as written (warnings included) and the episode if resolution got that far. Not for
   a requeued retry, a released job, or a lost lease.
 - **Heartbeat.** A thread heartbeats every `min(60 s, JOB_LEASE_SECONDS / 4)` while a
-  job runs. It shows the process is alive, not that a stage progresses.
+  job runs. It shows the process is alive, not that a stage progresses. It keeps beating
+  through a long transcription: CTranslate2, numpy's FFT and PyAV release the GIL (measured
+  in step 36: the longest pause of a ticking thread was 0.16 s, during the log-mel features
+  of one hour of audio), so a 4-hour file keeps its 900 s lease. `requeue_stale` runs only in
+  the worker's own loop, before a claim.
 - **Shutdown.** SIGTERM and SIGINT stop the worker from claiming. During stage work and
   composing, the handler raises a `Shutdown` (`BaseException`) out of the stage, and the
   worker `release`s the job (back to `queued`, attempt undone). Once the job is delivering,
@@ -844,6 +918,28 @@ Step 08; exact signatures in `docs/steps/08-transcribe.md`.
     re-transcribes. That overwrites the episode's one `transcript.json` and
     `transcript.txt`, so a `tiny` dry-run transcript is never reused for `large-v3`.
   - **`earmark transcribe`** writes nothing and is unaffected.
+- **Per-request decode options** (step 36; `docs/steps/36-v1-api.md` section 2.1). A
+  delivery-free job carries `DecodeOptions(initial_prompt, language)`.
+  - **The engines.** `TranscriptionEngine.profile_for(options)` and
+    `transcribe_file(audio, key, options)`. `faster_whisper` always passes `initial_prompt`
+    (`None` on the mail path) and the effective `language` (the request's, where `None` means
+    detect, whatever `ASR_LANGUAGE` says; on the mail path `ASR_LANGUAGE`) to
+    `WhisperModel.transcribe` or `BatchedInferencePipeline.transcribe`; both take them in
+    1.2.1. `remote` sends `language` and the OpenAI field `prompt`, and redacts the prompt from
+    the server's error text.
+  - **The profile.** `with_decode_options` sets `language` to the request's and adds
+    `initial_prompt_sha256` when there is a prompt. The prompt itself is never in a profile or
+    a `transcript.json`. Without options every profile is unchanged.
+  - **The cache.** `transcripts/<decode_key>/transcript.json` and `transcript.txt`, stamped
+    and checked like the episode cache; a delivery-free job never reads or writes
+    `episodes/<key>/`. A miss with another profile overwrites that directory, as on the mail
+    path.
+  - **What the prompt does.** faster-whisper keeps only the last 223 tokens of a prompt (448 //
+    2 - 1) and drops the start of a longer one silently. Sequential decoding conditions the
+    first window on it and then its own previous text, which soon pushes the prompt out (a
+    temperature fallback above 0.5 resets it). Batched decoding (`ASR_BATCH_SIZE` above 0)
+    prepends it to every chunk. So for a long meeting the prompt reaches past the first minute
+    only with batching, which stays the operator's setting.
 - **`faster_whisper` engine.** `transcribe.faster_whisper.FasterWhisperEngine` imports
   `faster_whisper` and `ctranslate2` only through `load_runtime()`
   (`importlib.import_module`), which the factory's builder calls; without the extra the
@@ -1224,6 +1320,18 @@ they cannot be guessed or enumerated through `GET /jobs/{id}`.
     transcript.
   - **The index.** A partial unique index on `dedupe_key` still enforces one active job per
     request.
+  - **Delivery-free jobs** (step 36) use `sha256(json ["ingest", "upload", "none",
+    "sha256:<hex>", initial_prompt, language])`, which can never equal a mail key, with the
+    same lookup: the same bytes and options while queued or running, or done within the window,
+    return that job.
+- **Purge** (step 36). `mark_purged(job_id)` takes a finished delivery-free job and, in one
+  `BEGIN IMMEDIATE`, sets `purged_at`, clears `initial_prompt` and replaces `dedupe_key` with
+  `purged:<id>` on it and on every other finished delivery-free job with the same dedupe key
+  (the jobs sharing its transcript). It returns them. An unknown id or a mail job is
+  `JobNotFoundError`, a queued or running job `JobActiveError`, an already purged job is
+  returned unchanged. Every connection runs with `PRAGMA secure_delete = ON`, and
+  `checkpoint()` (`PRAGMA wal_checkpoint(TRUNCATE)`, best effort) follows a purge, so the prompt
+  does not linger in the database's freed space or its write-ahead log.
   - **Normalisation.** `to` is normalised and `instructions` stripped before the key is
     computed.
   - **Content.** The same bytes as an upload and as a URL are different requests, because a
@@ -1263,13 +1371,17 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
   - `resent` (`INTEGER NOT NULL DEFAULT 0`, `CHECK IN (0, 1)`).
 
   Earlier rows get `NULL` and `0`.
-- Step 32 appended `0004_youtube`, so `SCHEMA_VERSION` is 4. SQLite cannot alter a `CHECK`,
+- Step 32 appended `0004_youtube` (schema version 4). SQLite cannot alter a `CHECK`,
   so it rebuilds `jobs` with `source` allowing `youtube`: it creates `jobs_0004` with the
   same 30 columns in the same order, copies every row by an explicit column list, drops
   `jobs`, renames the new table, and recreates the three indexes, all inside the
   migration's `BEGIN IMMEDIATE`. Rows, the application id and the partial unique index are
   kept. An image from before step 32 then refuses the database as newer than it supports
   (`docs/deploy.md` section 15 says to back it up first).
+- Step 36 appended `0005_v1`, so `SCHEMA_VERSION` is 5: `delivery` (`TEXT NOT NULL DEFAULT
+  'mail'`, `CHECK IN ('mail', 'none')`), `initial_prompt`, `language` and `purged_at`, by
+  `ALTER TABLE ADD COLUMN`, with no rebuild (34 columns). Earlier rows get `'mail'` and
+  `NULL`. An image from before step 36 then refuses the database as newer than it supports.
 - The lineage is marked by `PRAGMA application_id = 0x45524D4B` (`b"ERMK"`), stamped in
   the same transaction that creates `jobs`.
 - `identity_error(path, application_id, user_version)` decides:
@@ -1298,7 +1410,7 @@ Step 22; exact rules in `docs/steps/22-rescope-remove.md` section 4.2.
 
 ```
 $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no NFS/SMB)
-  earmark.db                    jobs (application id ERMK, schema 4); WAL mode
+  earmark.db                    jobs (application id ERMK, schema 5); WAL mode, secure_delete
   outbox/<job_id>.eml           only with EARMARK_MAIL_BACKEND=fake: the message the fake
                                 mailer "sent" (0o600; step 25)
   uploads/                      staging.Staging, owned by the API (mode 0o700; step 24)
@@ -1320,6 +1432,10 @@ $EARMARK_DATA_DIR/               a local filesystem: WAL needs shared memory (no
     .audio.<ext>.<random>.part  download in progress; renamed to audio.<ext> when complete
     transcript.json             written last; its existence marks the transcript cached
     transcript.txt              Transcript.to_text()
+  transcripts/<decode_key>/     a delivery-free job's transcript, per audio and decode options
+                                (step 36); written by the worker, removed by DELETE /v1/jobs/{id}
+    transcript.json             written last, stamped with the profile (no prompt text in it)
+    transcript.txt              Transcript.to_text()
   huggingface/hub/              in the container image only (HF_HOME=/data/huggingface):
                                 faster-whisper's model cache when ASR_MODEL_DIR is unset (step 16)
 ```
@@ -1328,7 +1444,9 @@ An episode key is checked against `[0-9a-f]{20}`, an upload name against
 `[0-9a-f]{32}\.[a-z0-9]{1,5}`, and a job id against `[0-9a-f]{32}`, before any of them
 becomes a path. Nothing outside `DATA_DIR` is written, and uploads never touch the system
 temp dir. For an upload or URL episode (a content key), `episode.json` is rewritten by each
-job, so it holds the last job's title. Its audio is never stored under `episodes/`.
+job, so it holds the last job's title. Its audio is never stored under `episodes/`. A decode
+key is checked against `[0-9a-f]{20}` too, and a delivery-free job writes nothing under
+`episodes/` (step 36).
 
 ## HTTP API
 
@@ -1347,6 +1465,10 @@ input. A `sqlite3.Error` is 503 with `Retry-After`. Details in `docs/steps/04-ap
 | `GET /jobs/{id}` | The job's `JobView`. 404 if unknown. |
 | `GET /jobs/{id}/transcript` | The job's transcript from the cache (step 33). `?format=note` (the default: the note exactly as the mail code renders it, `text/markdown`, with the attachment's file name in `Content-Disposition`), `text` (`transcript.txt`, `text/plain`) or `json` (`TranscriptView`, `application/json`). 404 unknown job. 409 no transcript yet, or the job failed or was skipped before it had one. 410 the cache is gone. 422 an unknown format. 500 an unreadable cache file. |
 | `GET /jobs` | `?limit=1..500` (default 20), `?status=`. `{"jobs": [JobView, …]}`, newest first. |
+| `POST /v1/transcriptions` | Step 36, `contract/api-v1.md`. `multipart/form-data` only: one `file` part plus the optional text fields `initial_prompt` and `language`. 202 `{job_id, status}` with `Location: /v1/jobs/{id}`. 401, 413, 415 (not multipart, or not audio), 422 (any other field, `to` and `title` included; no or an empty file; an over-long `initial_prompt`; a bad `language`). |
+| `GET /v1/jobs/{id}` | `V1JobView` of a delivery-free job. 404 for an unknown id or a mail job. |
+| `GET /v1/jobs/{id}/transcript` | `?format=json` (the default) or `text`. 404; 409 not yet, failed, skipped; 410 purged or gone; 422 an unknown format; 500 unreadable. |
+| `DELETE /v1/jobs/{id}` | Purges a finished delivery-free job: 200 `V1JobView` with `purged_at`, repeatable. 404; 409 queued or running. |
 | `GET`, `HEAD /healthz` | Liveness, no auth, `{"status": "ok"}`. |
 
 **`POST /transcriptions`** (step 24; exact rules in `docs/steps/24-transcription-requests.md`
@@ -1446,6 +1568,33 @@ and the same messages.
   changed the mail code.
 - **Logs** name the job and the format, and the reason code of a refusal. Never the
   content, the recipient or the instructions.
+
+**The `/v1` API** (step 36; exact rules in `docs/steps/36-v1-api.md` sections 4 and 5; the
+client-facing text is `contract/api-v1.md`, pinned by hash).
+
+- **One job type.** `/v1` creates and shows delivery-free jobs only. A mail job's id under
+  `/v1` is 404, as an unknown one. The unversioned routes list `/v1` jobs (an upload with
+  `to: null`), and the unversioned transcript route answers 409 for one, naming
+  `/v1/jobs/{id}/transcript`.
+- **Upload.** `api.upload.receive_upload(..., text_fields=("initial_prompt", "language"))`,
+  the same streaming reader, caps, part limit, audio check and cleanup as step 24. Then
+  `V1UploadFields`, then `Intake.submit_v1`, which checks no recipient (nothing is sent) and
+  logs `enqueued job <id>: upload of <n> bytes, no delivery (created=…)`. The upload's file
+  name is used for the audio check only. Dedupe as in "Jobs".
+- **`V1JobView`**: `job_id`, `status`, `stage`, `error` (scrubbed), `created_at`,
+  `updated_at`, `language` (requested until done, then the transcript's), `duration_s` (once
+  done) and `purged_at`. Nothing else: no file name, no prompt, no paths, no episode key.
+- **The transcript** (`v1_jobs.read_v1_transcript`): `json` is `{job_id, language,
+  duration_s, segments: [{start, end, text}], warnings}`, indented by 2 with a final newline;
+  `text` is `transcript.txt`. Both UTF-8 with `Cache-Control: no-store`. It reads the job row
+  and `transcripts/<decode_key>/` only, and writes nothing.
+- **Purge** (`v1_jobs.purge_job`, `DELETE`). Files first, then the row: it unlinks the
+  job's `transcripts/<decode_key>/` files (never `rmtree`, never through a symlink) and any
+  staged upload, then `mark_purged` (see "Jobs"), then removes the staged uploads of the
+  siblings it purged, then checkpoints the WAL. A failure before the row is written leaves the
+  job unpurged (500), so a retry works. The transcript is shared by every job with the same
+  audio and options, so purging one purges it for all the finished ones; a queued or running
+  one is left alone and writes its own. There is no cancel.
 
 **Client mode** (step 34; exact rules in `docs/steps/34-cli-api-client.md` sections 4 and 5).
 With `EARMARK_API_URL` set, `earmark jobs`, `earmark jobs JOB_ID`, `earmark submit` and
@@ -1693,6 +1842,19 @@ and handles text they wrote.
   - `all` is the operator's written acceptance of a risk. Anyone holding the API token can
     then have earmark mail anyone, and can instruct both PKAs. `serve` logs a
     WARNING at startup, and doctor reports it. earmark never defaults `to`.
+  - **It does not apply to `/v1`** (step 36). A `/v1` job has no `to` and sends nothing: no
+    mail and no push, on any outcome. The bearer token is its only gate.
+- **Leak rules for `/v1`** (step 36), tested in `tests/test_leaks.py` with marked values fed
+  through submit, run, fetch and purge:
+  - no log line carries the upload's file name, the `initial_prompt` or transcript text; the
+    lines carry job ids, sizes, timings, status and earmark's error messages;
+  - the file name is never stored; the prompt is stored only in the job row, until a purge,
+    and only as its sha256 in a transcript's profile;
+  - the remote ASR engine redacts the prompt from the server's error text;
+  - after a purge whose checkpoint completed (best effort: a busy database defers it to
+    SQLite's next one), neither the prompt nor the transcript is in any file under
+    `EARMARK_DATA_DIR`, the database and its write-ahead log included. Deleted files are unlinked, not overwritten; filesystem blocks and backups
+    are outside earmark's reach, and `contract/api-v1.md` says so.
 - **Leak rules** (step 24). Each has a test that captures the log, the push or the API
   response (`tests/test_leaks.py`, `tests/test_api.py`):
   - `instructions` never appears in logs or pushes;
@@ -2020,6 +2182,14 @@ stdlib `smtpd` is gone in 3.13.
   boundary. The leak tests configure earmark's real handler on a `StringIO` at DEBUG, and
 capture ntfy bodies with `httpx2.MockTransport`.
 
+`/v1` tests (step 36): `tests/test_api_v1.py` drives the real app and an in-process worker on
+the fakes, with a mailer and a notifier that raise a `BaseException` if called, through every
+outcome; `tests/test_v1_jobs.py` covers the transcript states and the purge, including what is
+left on disk; `tests/test_api_v1_contract.py` pins `contract/api-v1.md` by hash and compares
+each example response, built from fixed inputs by `tests/api_v1_examples.py`, with the app's;
+a `slow` test pins `WHISPER_LANGUAGES` to the installed faster-whisper and transcribes with a
+prompt in both decoding modes.
+
 Documents are tested against the code (step 16).
 
 - **Markers.** `tests/doc_helpers.py` extracts content by HTML-comment markers
@@ -2029,7 +2199,8 @@ Documents are tested against the code (step 16).
   lists in `docs/steps/27-docs-runbook-shortcut.md` and `docs/steps/28-system-scope.md`
   section 6).
   - This file opens with "System": the three parts with what is not built or never run, the
-    two seams, how mail reaches a PKA through AMAP, and the definition of done.
+    three seams (the `/v1` API since step 36), how mail reaches a PKA through AMAP, and the
+    definition of done.
   - The repo layout's paths exist or carry a `todo` step from the `docs/PLAN.md` status
     table, and it names every top-level directory.
   - While a planned path does not exist, no doc names it in a paragraph without the step
@@ -2372,6 +2543,13 @@ The planners of steps 24–28 settled these. Each step plan, section 8, has the 
   - `prompt` became `instructions`, carried over;
   - for uploads and URLs, the resolve stage builds the episode from the job and the bytes;
   - the dedupe window applies to `done` jobs only.
+- **Settled by step 36** (see `docs/steps/36-v1-api.md`, its opening and section 8):
+  - `initial_prompt` is capped at 1000 characters, Whisper's window of 223 tokens for names;
+  - a `/v1` job without `language` is detected, whatever `EARMARK_ASR_LANGUAGE` says;
+  - `/v1` shows delivery-free jobs only; the unversioned routes list them too;
+  - identical requests share one transcript, and a purge removes it for every finished one;
+  - `/v1` dedupes like the unversioned route; `DELETE` answers 200 and is repeatable;
+  - the database runs with `secure_delete` and checkpoints after a purge.
 - **Settled by step 25** (see `docs/steps/25-delivery.md` section 8):
   - **The time zone.** It is the offset of the request's `timestamp`, stored as
     `utc_offset_min`, or UTC when there is none. No setting and no zone database. The

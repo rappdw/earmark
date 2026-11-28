@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Final
 
 from pydantic import BaseModel, ValidationError
 
@@ -20,6 +20,7 @@ from earmark.models import (
     is_episode_key,
 )
 
+DECODED_DIR: Final = "transcripts"
 _AUDIO_NAME = re.compile(r"audio\.[a-z0-9]{1,5}")
 
 
@@ -79,6 +80,7 @@ class ArtifactStore:
 
     def __init__(self, data_dir: Path) -> None:
         self._root = data_dir / "episodes"
+        self._decoded_root = data_dir / DECODED_DIR
 
     @property
     def root(self) -> Path:
@@ -194,3 +196,53 @@ class ArtifactStore:
             for p in self._root.iterdir()
             if is_episode_key(p.name) and (p / "episode.json").is_file()
         )
+
+    # -- per-options transcripts (/v1) --------------------------------------------------
+
+    def decoded_dir(self, dkey: str) -> Path:
+        _check_key(dkey)
+        return self._decoded_root / dkey
+
+    def decoded_json_path(self, dkey: str) -> Path:
+        return self.decoded_dir(dkey) / "transcript.json"
+
+    def decoded_text_path(self, dkey: str) -> Path:
+        return self.decoded_dir(dkey) / "transcript.txt"
+
+    def read_decoded(self, dkey: str, episode_key: str) -> Transcript | None:
+        path = self.decoded_json_path(dkey)
+        transcript = self._read_json(path, Transcript)
+        if transcript is not None and transcript.episode_key != episode_key:
+            raise _corrupt(path)
+        return transcript
+
+    def write_decoded(self, dkey: str, transcript: Transcript) -> Path:
+        atomic_write_text(self.decoded_text_path(dkey), transcript.to_text())
+        return self._write_json(self.decoded_json_path(dkey), transcript)
+
+    def has_decoded(self, dkey: str) -> bool:
+        return self.decoded_json_path(dkey).is_file()
+
+    def remove_decoded(self, dkey: str) -> int:
+        """Delete the transcript files of ``dkey`` and its directory; return the file count.
+
+        Symlinks are neither followed nor removed, and nothing else in the directory is
+        touched (``rmdir`` then fails and is ignored).
+        """
+        directory = self.decoded_dir(dkey)
+        if not directory.is_dir():
+            return 0
+        removed = 0
+        for entry in sorted(directory.iterdir()):
+            name = entry.name
+            if name not in ("transcript.json", "transcript.txt") and not name.startswith(
+                ".transcript."
+            ):
+                continue
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            entry.unlink()
+            removed += 1
+        with contextlib.suppress(OSError):
+            directory.rmdir()
+        return removed

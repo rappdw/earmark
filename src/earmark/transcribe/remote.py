@@ -28,13 +28,14 @@ from earmark.endpoint import error_detail as error_detail  # re-export
 from earmark.endpoint import host_label
 from earmark.errors import PermanentError, TransientError
 from earmark.fetch import AUDIO_EXTENSIONS, MIB, USER_AGENT, parse_retry_after
-from earmark.models import Segment, Transcript, format_hms, utc_now
+from earmark.models import DecodeOptions, Segment, Transcript, format_hms, utc_now
 from earmark.transcribe.base import (
     CachedTranscriber,
     NoSpeechError,
     UnusableAudioError,
     asr_profile,
     segment_from,
+    with_decode_options,
 )
 
 logger = logging.getLogger(__name__)
@@ -225,9 +226,14 @@ class RemoteAsrEngine:
 
     @property
     def profile(self) -> str:
-        return asr_profile(
-            "remote", {"model": self._options.model, "language": self._options.language}
-        )
+        return self.profile_for(None)
+
+    def profile_for(self, options: DecodeOptions | None, /) -> str:
+        fields: dict[str, str | int | bool | None] = {
+            "model": self._options.model,
+            "language": self._options.language,
+        }
+        return asr_profile("remote", with_decode_options(fields, options))
 
     @property
     def options(self) -> RemoteOptions:
@@ -255,12 +261,21 @@ class RemoteAsrEngine:
         if client is not None:
             client.close()
 
-    def _secrets(self) -> list[str]:
+    def _secrets(self, prompt: str | None = None) -> list[str]:
         key = self._options.api_key
-        return [key.get_secret_value()] if key is not None else []
+        secrets = [key.get_secret_value()] if key is not None else []
+        if prompt:
+            # A server that echoes its input must not put the prompt into job.error; the
+            # detail is whitespace-collapsed before redaction, so redact that form too.
+            secrets.extend(dict.fromkeys((prompt, _collapse(prompt))))
+        return secrets
 
-    def transcribe_file(self, audio: Path, episode_key: str, /) -> Transcript:
+    def transcribe_file(
+        self, audio: Path, episode_key: str, options: DecodeOptions | None = None, /
+    ) -> Transcript:
         o = self._options
+        language = o.language if options is None else options.language
+        prompt = None if options is None else options.initial_prompt
         size = audio.stat().st_size
         if size == 0:
             raise UnusableAudioError(f"{audio.name} is empty")
@@ -280,8 +295,10 @@ class RemoteAsrEngine:
             "response_format": RESPONSE_FORMAT,
             "timestamp_granularities[]": "segment",
         }
-        if o.language is not None:
-            fields["language"] = o.language
+        if language is not None:
+            fields["language"] = language
+        if prompt is not None:
+            fields["prompt"] = prompt
         headers: dict[str, str] = {}
         if o.api_key is not None:
             headers["Authorization"] = f"Bearer {o.api_key.get_secret_value()}"
@@ -307,7 +324,7 @@ class RemoteAsrEngine:
                     headers=headers,
                 ) as response,
             ):
-                body = self._read_response(response)
+                body = self._read_response(response, prompt)
         except httpx2.ReadTimeout as exc:
             raise TransientError(
                 f"remote ASR at {o.host} did not answer within {o.timeout_s:g} s "
@@ -332,7 +349,7 @@ class RemoteAsrEngine:
             payload,
             episode_key=episode_key,
             model_name=self.name,
-            language=o.language,
+            language=language,
             audio_name=audio.name,
         )
         elapsed = self._monotonic() - started
@@ -348,10 +365,10 @@ class RemoteAsrEngine:
             logger.warning("remote ASR transcript for %s: %s", episode_key, warning)
         return transcript
 
-    def _read_response(self, response: httpx2.Response) -> bytes:
+    def _read_response(self, response: httpx2.Response, prompt: str | None = None) -> bytes:
         status = response.status_code
         if status != 200:
-            raise self._status_error(response)
+            raise self._status_error(response, prompt)
         chunks: list[bytes] = []
         total = 0
         for chunk in response.iter_bytes():
@@ -364,18 +381,22 @@ class RemoteAsrEngine:
             chunks.append(chunk)
         return b"".join(chunks)
 
-    def _detail(self, response: httpx2.Response) -> str:
+    def _detail(self, response: httpx2.Response, prompt: str | None = None) -> str:
         body = bytearray()
         for chunk in response.iter_bytes():
             body.extend(chunk)
             if len(body) >= MAX_ERROR_BYTES:
                 break
         detail = error_detail(
-            bytes(body[:MAX_ERROR_BYTES]), response.headers.get("Content-Type"), self._secrets()
+            bytes(body[:MAX_ERROR_BYTES]),
+            response.headers.get("Content-Type"),
+            self._secrets(prompt),
         )
         return "" if detail is None else f": {detail}"
 
-    def _status_error(self, response: httpx2.Response) -> PermanentError | TransientError:
+    def _status_error(
+        self, response: httpx2.Response, prompt: str | None = None
+    ) -> PermanentError | TransientError:
         status = response.status_code
         host = self._options.host
         if 300 <= status < 400:
@@ -385,7 +406,7 @@ class RemoteAsrEngine:
             )
         if not 400 <= status < 600:
             return PermanentError(f"remote ASR at {host} returned unexpected HTTP {status}")
-        detail = self._detail(response)
+        detail = self._detail(response, prompt)
         if status in (408, 429) or status >= 500:
             return TransientError(
                 f"remote ASR at {host} failed: HTTP {status}{detail}",

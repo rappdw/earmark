@@ -74,7 +74,7 @@ def test_podcast_request_transcribes_on_fakes(
     assert front["title"] == "Fake episode " + front["guid"].rsplit(":", 1)[-1][:6]
     assert parsed.note_name == mail.note_filename
     assert parsed.instructions.endswith(b"---\n" + instructions.encode())
-    assert job.result == JobResult(duration_s=900.0)
+    assert job.result == JobResult(duration_s=900.0, language="en")
     assert job.to == TO
     assert job.instructions == instructions
     episode_dir = tmp_path / "data" / "episodes" / key

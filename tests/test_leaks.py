@@ -499,3 +499,76 @@ def test_api_client_leaks_no_token(tmp_path: Path, log_stream: io.StringIO) -> N
     with ac.ApiClient(url, token, transport=httpx2.MockTransport(boom)) as broken:
         attempt(lambda: broken.list_jobs(limit=1, status=None))
     assert CLIENT_TOKEN not in log_stream.getvalue()
+
+
+# -- /v1 ------------------------------------------------------------------------------------
+
+V1_NAME = "MARKNAME-q7.flac"
+V1_PROMPT = "MARKPROMPT-4e1a " + "x" * 984
+V1_TEXT = "MARKTEXT-b83d the quarterly numbers"
+
+
+def _v1_bytes(root: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_v1_job_leaks_nothing(tmp_path: Path, log_stream: io.StringIO) -> None:
+    from tests.v1_env import v1_env
+
+    segments = (Segment(start=0.0, end=3.0, text=V1_TEXT),)
+    with v1_env(tmp_path, segments=segments) as v1:
+        job_id = v1.submit(filename=V1_NAME, initial_prompt=V1_PROMPT, language="en")
+        done = v1.run()
+        assert done.status == "done"
+        assert done.upload_name is None
+        v1.client.get(f"/v1/jobs/{job_id}")
+        as_json = v1.transcript(job_id)
+        as_text = v1.transcript(job_id, "text")
+        assert V1_TEXT in as_json.text
+        assert V1_TEXT in as_text.text
+        assert v1.client.delete(f"/v1/jobs/{job_id}").status_code == 200
+        v1.client.get(f"/v1/jobs/{job_id}")
+        v1.transcript(job_id)
+        # a failed job logs nothing of the request either
+        v1.fakes.transcriber.fail_next(PermanentError("transcription failed"))
+        failed_id = v1.submit(filename=V1_NAME, initial_prompt=V1_PROMPT[:-1] + "y", language="en")
+        assert v1.run().id == failed_id
+        files = _v1_bytes(tmp_path / "data")
+    text = log_stream.getvalue()
+    assert "enqueued job" in text  # the requests really were logged
+    assert "purged" in text
+    for marker in ("MARKNAME", "MARKPROMPT", "MARKTEXT"):
+        assert marker not in text
+    assert V1_NAME not in text
+    # after the purge nothing of the first job is on disk, the database and its log included
+    assert "earmark.db" in files
+    for name, data in files.items():
+        for needle in (b"MARKNAME", b"MARKTEXT"):
+            assert needle not in data, (name, needle)
+    # the first job's prompt is gone; the failed job's (kept until it is deleted) is the only copy
+    assert sum(data.count(b"MARKPROMPT-4e1a") for data in files.values()) <= 1
+
+
+def test_v1_job_purge_leaves_no_prompt_in_the_database(tmp_path: Path) -> None:
+    from tests.v1_env import v1_env
+
+    with v1_env(tmp_path) as v1:
+        job_id = v1.submit(filename=V1_NAME, initial_prompt=V1_PROMPT)
+        v1.run()
+        before = _v1_bytes(tmp_path / "data")
+        assert any(b"MARKPROMPT" in data for data in before.values())  # the check can see it
+        assert v1.client.delete(f"/v1/jobs/{job_id}").status_code == 200
+        after = _v1_bytes(tmp_path / "data")
+    assert all(b"MARKPROMPT" not in data for data in after.values())
+
+
+def test_v1_enqueue_log_line(tmp_path: Path, log_stream: io.StringIO) -> None:
+    from tests.v1_env import v1_env
+
+    with v1_env(tmp_path) as v1:
+        job_id = v1.submit(initial_prompt="p", language="de", payload=b"ID3" + bytes(61))
+    lines = [ln for ln in log_stream.getvalue().splitlines() if "enqueued job" in ln]
+    assert len(lines) == 1
+    assert lines[0].endswith(
+        f"enqueued job {job_id}: upload of 64 bytes, no delivery (created=True)"
+    )

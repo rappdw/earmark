@@ -337,3 +337,36 @@ def test_fake_backends_carry_a_youtube_source(tmp_path: Path) -> None:
     fb = make_fake_backends(tmp_path)
     assert isinstance(fb.youtube, FakeYoutubeSource)
     assert fb.backends().youtube is fb.youtube
+
+
+def test_fake_transcriber_options(tmp_path: Path) -> None:
+    from earmark.models import DecodeOptions
+    from tests.factories import make_upload_episode
+
+    fb = make_fake_backends(tmp_path)
+    episode = make_upload_episode()
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    prompted = DecodeOptions(initial_prompt="Alice", language="de")
+    other = DecodeOptions(initial_prompt="Bob")
+    assert fb.transcriber.cached(episode, prompted) is None
+    first = fb.transcriber.transcribe(episode, audio, prompted)
+    second = fb.transcriber.transcribe(episode, audio, other)
+    assert fb.transcriber.computed == 2
+    assert fb.transcriber.calls[0].options == prompted
+    assert (first.language, second.language) == ("de", "en")
+    assert first.segments[-1].text != second.segments[-1].text
+    assert first.segments[-1].text.startswith("Prompt ")
+    assert "Alice" not in first.model_dump_json()
+    assert fb.transcriber.cached(episode, prompted) == first
+    assert fb.transcriber.transcribe(episode, audio, prompted) == first
+    assert fb.transcriber.computed == 2
+    assert fb.transcriber.cached(episode) is None  # the mail tree is separate
+    assert fb.transcriber.profile_for(None) == fb.transcriber.profile
+    assert "Alice" not in fb.transcriber.profile_for(prompted)
+    assert len(list((tmp_path / "transcripts").iterdir())) == 2
+    assert not (tmp_path / "episodes").exists()
+    plain = fb.transcriber.transcribe(episode, audio, DecodeOptions())
+    assert [s.text for s in plain.segments][-1] == "Thanks for listening."
+    with pytest.raises(PermanentError, match="uploaded audio only"):
+        fb.transcriber.cached(make_episode(), prompted)

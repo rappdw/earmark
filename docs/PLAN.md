@@ -70,7 +70,7 @@ Update this table when a step passes verification. Each step is one commit title
 | 33 | The transcript by job id | 32 | done |
 | 34 | The CLI as an API client | 33 | done |
 | 35 | Your own certificate | 34 | done |
-| 36 | Transcription without delivery: the /v1 API | 35 | todo |
+| 36 | Transcription without delivery: the /v1 API | 35 | done |
 | 37 | Summaries on a local model: /v1/summaries | 36 | todo |
 
 Steps 01–05 are strictly sequential and end with a walking skeleton: the whole pipeline

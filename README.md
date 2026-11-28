@@ -25,11 +25,12 @@ that address as two Markdown attachments, and an ntfy push follows. Python 3.13.
   marketplace, built in step 30 and installed per PKA in runbook phase 11. It has never run
   in a PKA. Its contract checker (step 29) and its receiver are tested under Python 3.9.
 
-The two seams are the request (`POST /transcriptions`) and the mail contract
-(`contract: 2`, with `contract: 1` still accepted by the receiving skill). AMAP, outside this repository, delivers the mail to each PKA. The service
-files nothing; the PKA files, through the receiving skill. The parts, the seams, the
-definition of done and the repo layout are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#system-three-parts-and-two-seams).
+The three seams are the request (`POST /transcriptions`), the mail contract
+(`contract: 2`, with `contract: 1` still accepted by the receiving skill), and the `/v1` API
+for programs such as earshot (`contract/api-v1.md`, step 36). AMAP, outside this repository,
+delivers the mail to each PKA. The service files nothing; the PKA files, through the
+receiving skill. The parts, the seams, the definition of done and the repo layout are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#system-three-parts-and-three-seams).
 
 ## How it works
 
@@ -62,6 +63,12 @@ both files. Delivery is at-least-once, so a PKA may see a message twice and must
 the duplicate. Sharing the same item again is a new job that reuses the cached transcript.
 "Delivering" and the mail contract in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) have the
 details.
+
+**The `/v1` API.** A program on your own hardware uploads audio to `POST /v1/transcriptions`
+and fetches the transcript by job id: no mail and no push, and nothing leaves the Spark. It
+can pass an `initial_prompt` and a `language`, and deletes the transcript when it is done.
+The contract is [contract/api-v1.md](contract/api-v1.md); [docs/deploy.md](docs/deploy.md)
+section 20 says how to reach it, what to send and what a delete removes.
 
 **What the service keeps.** The job table and a transcript cache, both under
 `EARMARK_DATA_DIR`. It is not a system of record: the notes live with the PKAs.
@@ -184,7 +191,7 @@ Run them as `uv run earmark <command>`.
 
 **Client mode.** With `EARMARK_API_URL` set in your shell, `jobs`, `submit` and `transcript` call the running API with `EARMARK_API_TOKEN` instead of reading `EARMARK_DATA_DIR`: from the API's host (`http://127.0.0.1:8787`) or from another machine (its HTTPS name). See [docs/deploy.md](docs/deploy.md) section 19.
 
-The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs/{id}/transcript`, `GET /jobs`, and `GET|HEAD /healthz`.
+The HTTP API is `POST /transcriptions`, `GET /jobs/{id}`, `GET /jobs/{id}/transcript`, `GET /jobs`, `GET|HEAD /healthz`, and the `/v1` routes `POST /v1/transcriptions`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/transcript` and `DELETE /v1/jobs/{id}`.
 Everything except `/healthz` needs `Authorization: Bearer $EARMARK_API_TOKEN`. See "HTTP API" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration

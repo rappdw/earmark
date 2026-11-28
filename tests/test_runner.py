@@ -12,7 +12,16 @@ from pydantic import SecretStr
 from earmark.config import REDACTED, Settings
 from earmark.errors import PermanentError, SkipEpisode, TransientError
 from earmark.fakes import FakeAudioFetcher, FakeTranscriber, FakeYoutubeSource, make_fake_backends
-from earmark.models import Episode, Job, JobResult, Segment, Transcript, content_key, youtube_key
+from earmark.models import (
+    DecodeOptions,
+    Episode,
+    Job,
+    JobResult,
+    Segment,
+    Transcript,
+    content_key,
+    youtube_key,
+)
 from earmark.pipeline.runner import MAX_ERROR_CHARS, describe_error
 from earmark.sources import audio_episode
 from earmark.staging import StagedUpload
@@ -358,10 +367,14 @@ def test_unexpected_error_redacts_secrets(tmp_path: Path) -> None:
 
 
 class _WrongTranscriber:
-    def cached(self, episode: Episode, /) -> Transcript | None:
+    def cached(
+        self, episode: Episode, options: DecodeOptions | None = None, /
+    ) -> Transcript | None:
         return None
 
-    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
+    def transcribe(
+        self, episode: Episode, audio: Path, options: DecodeOptions | None = None, /
+    ) -> Transcript:
         return make_transcript(guid="urn:example:other")
 
 
@@ -421,7 +434,7 @@ def test_done_result_is_transcript_duration(tmp_path: Path) -> None:
     env = make_env(tmp_path, fakes=fakes)
     job = _enqueue_and_run(env)
     assert job.status == "done"
-    assert job.result == JobResult(duration_s=42.0)
+    assert job.result == JobResult(duration_s=42.0, language="en")
 
 
 # -- request sources: uploads and direct URLs -------------------------------------------
@@ -837,3 +850,43 @@ def test_load_episode_for_youtube(tmp_path: Path) -> None:
     loaded = env.pipeline.load_episode(job)
     assert loaded is not None
     assert loaded.key == youtube_key(YOUTUBE_ID)
+
+
+# -- step 36: the mail path is unchanged ---------------------------------------------------------
+
+
+def test_mail_job_still_delivers(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    with env.staging.begin_upload("flac") as writer:
+        writer.write(b"ID3" + bytes(200))
+        staged = writer.commit()
+    env.jobs.enqueue(new_upload_job(staged.sha256, upload_file=staged.name))
+    job = _run(env)
+    assert (job.status, job.delivery_state) == ("done", "sent")
+    assert len(env.fakes.mailer.calls) == 1
+    assert len(env.fakes.notifier.calls) == 1
+    assert env.fakes.transcriber.calls[0].options is None
+    assert (tmp_path / "data" / "episodes").is_dir()
+    assert not (tmp_path / "data" / "transcripts").exists()
+
+
+def test_v1_job_runs_only_the_transcribe_stages(tmp_path: Path) -> None:
+    from tests.factories import new_v1_job
+
+    env = make_env(tmp_path)
+    with env.staging.begin_upload("flac") as writer:
+        writer.write(b"ID3" + bytes(200))
+        staged = writer.commit()
+    env.jobs.enqueue(
+        new_v1_job(staged.sha256, upload_file=staged.name, initial_prompt="p", language="de")
+    )
+    job = _run(env)
+    assert (job.status, job.stage, job.delivery_state) == ("done", "transcribe", None)
+    assert job.result is not None
+    assert job.result.language == "de"
+    assert env.fakes.transcriber.calls[0].options == DecodeOptions(
+        initial_prompt="p", language="de"
+    )
+    assert not (tmp_path / "data" / "episodes").exists()  # no episode.json, no shared.json
+    assert env.fakes.mailer.calls == []
+    assert env.fakes.notifier.calls == []

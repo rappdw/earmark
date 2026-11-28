@@ -597,7 +597,7 @@ the server's). Doctor never sends mail.
 - How mail reaches a PKA: earmark sends plain email to the PKA's address; AMAP, outside this
   repo, applies the allowlist and DMARC and provides it to the PKA through AMMP; the PKA
   reads it with its `inbox` tools after a doorbell in its session. See
-  [ARCHITECTURE.md "System"](ARCHITECTURE.md#system-three-parts-and-two-seams).
+  [ARCHITECTURE.md "System"](ARCHITECTURE.md#system-three-parts-and-three-seams).
 - **The sender allowlist is AMAP router configuration.** Add `earmark@example.org` to the
   AMAP router's allowlist for each PKA's address. You set it; it is not something to ask a
   PKA for. earmark cannot see whether it was done: SMTP's 250 reply is all it learns.
@@ -794,9 +794,10 @@ grep -nE '^(EARMARK_(LLM|VAULT|OBSIDIAN|STORE|INDEX|EMBED|TZ)|ANTHROPIC|VAULT_PA
 - **Upgrade** with `git pull`, `docker compose build` (the GPU image rebuilds CTranslate2,
   so it takes long), and `docker compose up -d`. Migrations run on start. After a rebuild,
   repeat smoke steps 2 and 4 (section 7.3).
-- **The database moves to schema 4** the first time this version starts (the `youtube`
-  source). An older image then refuses the database as newer than it supports, so back up
-  `earmark.db` (and its `-wal` and `-shm` files, with earmark stopped) before upgrading. A
+- **The database moves to schema 5** the first time this version starts (the `/v1` columns,
+  after schema 4's `youtube` source). An older image then refuses the database as newer than
+  it supports, so back up `earmark.db` (and its `-wal` and `-shm` files, with earmark
+  stopped) before upgrading. A
   native install that skips `--extra youtube` on upgrade must add it, or set
   `EARMARK_YOUTUBE_BACKEND=fake`: the worker refuses to start without the extra.
 
@@ -1009,3 +1010,83 @@ be ignored.
 | `the certificate of <host> did not verify` | The server needs a certificate this machine trusts, with its intermediates. |
 | `could not reach the API at <host>` | Wrong `EARMARK_API_URL`, or the service is not running. |
 | `EARMARK_DATA_DIR (…) does not exist` (local mode) | Nothing was created. Set `EARMARK_API_URL`, or use `docker compose exec api earmark …`. |
+
+## 20. The /v1 API for programs
+
+`/v1` is for a program on your own hardware, such as earshot, that wants a transcript back
+and nothing else: no mail, no push, no recipient. The program uploads audio, fetches the
+transcript by job id, and deletes it when done. The text a client builds against is
+[contract/api-v1.md](../contract/api-v1.md). Nothing leaves the Spark, except to a remote ASR
+server if you chose one (`EARMARK_ASR_BACKEND=remote`), which receives the audio and the
+`initial_prompt`. The only gate is the bearer token: `EARMARK_ALLOWED_RECIPIENTS` does not
+apply, because nothing is sent.
+
+### 20.1 Reaching it over an SSH tunnel
+
+The API listens on loopback. From the machine that runs the program, tunnel to it, then use
+`http://127.0.0.1:8787` with the token. The tunnel is encrypted, so the program needs no TLS
+(`http://` to a loopback address is the one plain-HTTP form earmark accepts):
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 spark.example.com
+```
+
+Add your user name and `@` before the host if it differs from your local one.
+
+The HTTPS name of section 6 works as well.
+
+### 20.2 An example
+
+```bash
+export EARMARK_API_TOKEN='<the token from the Spark>'
+curl -s -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  -F "file=@meeting.flac;type=audio/flac" \
+  --form-string "initial_prompt=Alice Johnson, Bob Smith, Kubernetes" \
+  --form-string "language=en" \
+  http://127.0.0.1:8787/v1/transcriptions
+# {"job_id":"3f9c2a7e5b1d4c8e9a6f0b2d4e6a8c01","status":"queued"}
+curl -s -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  http://127.0.0.1:8787/v1/jobs/<job_id>
+curl -s -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  "http://127.0.0.1:8787/v1/jobs/<job_id>/transcript?format=text"
+curl -s -X DELETE -H "Authorization: Bearer $EARMARK_API_TOKEN" \
+  http://127.0.0.1:8787/v1/jobs/<job_id>
+```
+
+Use `--form-string` for `initial_prompt` and `language`, so a prompt that starts with `@` or
+`<` is sent as text, and `-F file=@...` for the audio. Leave `language` out to have the
+language detected. Poll the job until `status` is `done`.
+
+### 20.3 The upload cap and the audio format
+
+The cap is `EARMARK_MAX_UPLOAD_MB` (1024 MiB by default), and a larger upload is a 413.
+Whisper resamples everything to 16 kHz mono, so send 16 kHz mono: a FLAC of speech is about
+60 MB per hour, so a 4-hour meeting is about 250 MB, well under the default. The same
+meeting at 48 kHz stereo is several times larger and passes the cap after about an hour and a
+half.
+
+### 20.4 Time and memory
+
+A 4-hour file takes tens of minutes on the GPU and needs on the order of 12 GB of memory on
+the worker; the Spark has far more. A job is not resumable: if the worker stops (a restart,
+`docker compose stop`), the next run starts the file over. The worker's heartbeat keeps the
+job's lease through a long transcription, so a long file is not requeued while it runs.
+
+### 20.5 What the prompt reaches
+
+Whisper conditions on the last 223 tokens of the `initial_prompt`; earmark caps it at 1000
+characters. With the default sequential decoding the prompt conditions only the first
+windows of a long recording, then the transcript's own text takes over. With
+`EARMARK_ASR_BATCH_SIZE` set above 0 (your setting, off by default) the prompt is applied to
+every chunk, which suits a long meeting with names to get right. Section 7 covers batching.
+
+### 20.6 What DELETE removes, and what it does not
+
+`DELETE /v1/jobs/<job_id>` unlinks the job's transcript files and any staged upload, and
+clears the stored `initial_prompt`. It refuses a queued or running job (409; there is no
+cancel) and can be repeated. The transcript is shared by every job with the same audio and
+options, so deleting one deletes it for all the finished ones. What remains is the job's row:
+id, status, times, language, duration and a hash of the audio. The database overwrites freed
+space and truncates its log after a delete, but this is deletion, not shredding: filesystem
+blocks and backups of `EARMARK_DATA_DIR` are outside earmark's reach, and a remote ASR server
+keeps whatever it keeps.

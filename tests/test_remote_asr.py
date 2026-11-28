@@ -999,3 +999,71 @@ def test_profile_includes_model_and_language() -> None:
     assert _engine(language="fr").profile != base
     assert _engine(timeout_s=5.0).profile == base
     assert _engine().profile == base
+
+
+# -- step 36: per-request options --------------------------------------------------------------
+
+
+def _fields(recorder: RecordingTransport) -> dict[str, str]:
+    assert recorder.headers is not None
+    fields, *_ = parse_multipart(recorder.headers["content-type"], recorder.body)
+    return fields
+
+
+def test_remote_sends_prompt_and_language(tmp_path: Path) -> None:
+    from earmark.models import DecodeOptions
+
+    audio = _audio(tmp_path)
+    recorder = RecordingTransport(lambda r: httpx2.Response(200, content=THREE))
+    engine = RemoteAsrEngine(_options(language="en"), transport=recorder)
+    transcript = engine.transcribe_file(
+        audio, EKEY, DecodeOptions(initial_prompt="Alice, Bob", language="de")
+    )
+    fields = _fields(recorder)
+    assert fields["prompt"] == "Alice, Bob"
+    assert fields["language"] == "de"
+    assert transcript.language == "de"
+    detect = RecordingTransport(lambda r: httpx2.Response(200, content=THREE))
+    RemoteAsrEngine(_options(language="en"), transport=detect).transcribe_file(
+        audio, EKEY, DecodeOptions()
+    )
+    fields = _fields(detect)
+    assert "language" not in fields  # None means detect, whatever the setting says
+    assert "prompt" not in fields
+
+
+def test_remote_omits_prompt_without_options(tmp_path: Path) -> None:
+    audio = _audio(tmp_path)
+    recorder = RecordingTransport(lambda r: httpx2.Response(200, content=THREE))
+    RemoteAsrEngine(_options(language="en"), transport=recorder).transcribe_file(audio, EKEY)
+    fields = _fields(recorder)
+    assert "prompt" not in fields
+    assert fields["language"] == "en"
+
+
+def test_remote_redacts_prompt_from_server_error(tmp_path: Path) -> None:
+    from earmark.models import DecodeOptions
+
+    audio = _audio(tmp_path)
+    prompt = "Alice\nSmith   and the secret roadmap"
+    echoed = {"error": {"message": "bad request: " + " ".join(prompt.split())}}
+    for body in (echoed, {"error": {"message": "bad request: " + prompt}}):
+        server = Server(_json(400, body))
+        engine = _engine(server)
+        with pytest.raises(PermanentError) as info:
+            engine.transcribe_file(audio, EKEY, DecodeOptions(initial_prompt=prompt))
+        assert "secret roadmap" not in str(info.value)
+        assert "Alice" not in str(info.value)
+        assert "bad request" in str(info.value)
+
+
+def test_remote_profile_for_options() -> None:
+    from earmark.models import DecodeOptions
+
+    engine = _engine(language="en")
+    assert engine.profile_for(None) == engine.profile
+    assert engine.profile == 'remote {"language":"en","model":"whisper-x"}'
+    prompted = engine.profile_for(DecodeOptions(initial_prompt="Alice", language=None))
+    assert '"language":null' in prompted
+    assert "initial_prompt_sha256" in prompted
+    assert "Alice" not in prompted

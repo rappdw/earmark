@@ -13,7 +13,7 @@ from typing import Any
 from earmark.db import open_database
 from earmark.fakes import FakeBackends, make_fake_backends
 from earmark.jobs import Claim, JobStore
-from earmark.models import Episode, Stage, Transcript
+from earmark.models import DecodeOptions, Episode, Stage, Transcript
 from earmark.pipeline.runner import Pipeline
 from earmark.pipeline.stages import Backends, Transcriber
 from earmark.pipeline.worker import Worker
@@ -70,12 +70,16 @@ class BlockingTranscriber:
         self.inner = inner
         self.callback = callback
 
-    def cached(self, episode: Episode, /) -> Transcript | None:
-        return self.inner.cached(episode)
+    def cached(
+        self, episode: Episode, options: DecodeOptions | None = None, /
+    ) -> Transcript | None:
+        return self.inner.cached(episode, options)
 
-    def transcribe(self, episode: Episode, audio: Path, /) -> Transcript:
+    def transcribe(
+        self, episode: Episode, audio: Path, options: DecodeOptions | None = None, /
+    ) -> Transcript:
         self.callback()
-        return self.inner.transcribe(episode, audio)
+        return self.inner.transcribe(episode, audio, options)
 
 
 def signal_and_sleep(signum: int = signal.SIGTERM) -> Callable[[], None]:

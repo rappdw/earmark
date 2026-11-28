@@ -46,6 +46,15 @@ NOT_AUDIO: Final = (
     "audio/mpeg, or a file name ending in an audio extension such as .mp3 or .m4a"
 )
 ONE_FILE: Final = "the form must have exactly one file field named 'file'"
+NO_BOUNDARY: Final = "the multipart form has no boundary"
+INCOMPLETE: Final = "the multipart form is incomplete"
+TOO_MANY_PARTS: Final = "the form has too many parts"
+EMPTY_FILE: Final = "the uploaded file is empty"
+FIELD_NOT_TEXT: Final = "field '{name}' must be a text field"
+FIELD_REPEATED: Final = "field '{name}' is given more than once"
+FIELD_TOO_LONG: Final = "field '{name}' is too long"
+FIELD_NOT_UTF8: Final = "field '{name}' is not valid UTF-8"
+UNKNOWN_FIELD: Final = "unknown field '{name}' (allowed: {allowed})"
 
 
 class UploadRejected(Exception):  # noqa: N818  # a rejection, named for what it says
@@ -74,6 +83,7 @@ class _State:
     """Everything the parser callbacks collect. Callbacks run inside ``parser.write``."""
 
     staging: Staging
+    text_fields: tuple[str, ...] = FORM_FIELDS
     parts: int = 0
     ended: bool = False
     writer: UploadWriter | None = None
@@ -92,7 +102,7 @@ class _State:
     def on_part_begin(self) -> None:
         self.parts += 1
         if self.parts > MAX_PARTS:
-            raise UploadRejected(422, "the form has too many parts")
+            raise UploadRejected(422, TOO_MANY_PARTS)
         self.kind = None
         self.text_name = None
         self.headers = {}
@@ -121,16 +131,17 @@ class _State:
         name = raw_name.decode("utf-8", "replace")
         if name == FILE_FIELD:
             self._begin_file(params.get(b"filename"))
-        elif name in TEXT_FIELDS:
+        elif name in self.text_fields:
             if b"filename" in params:
-                raise UploadRejected(422, f"field '{name}' must be a text field")
+                raise UploadRejected(422, FIELD_NOT_TEXT.format(name=name))
             if name in self.texts:
-                raise UploadRejected(422, f"field '{name}' is given more than once")
+                raise UploadRejected(422, FIELD_REPEATED.format(name=name))
             self.kind = "text"
             self.text_name = name
             self.texts[name] = bytearray()
         else:
-            raise UploadRejected(422, f"unknown field '{name[:40]}' (allowed: {ALLOWED_FIELDS})")
+            allowed = ", ".join((FILE_FIELD, *self.text_fields))
+            raise UploadRejected(422, UNKNOWN_FIELD.format(name=name[:40], allowed=allowed))
 
     def _begin_file(self, raw_filename: bytes | None) -> None:
         if self.writer is not None:
@@ -152,7 +163,7 @@ class _State:
             buffer = self.texts[self.text_name]
             buffer += data[start:end]
             if len(buffer) > MAX_FIELD_BYTES:
-                raise UploadRejected(422, f"field '{self.text_name}' is too long")
+                raise UploadRejected(422, FIELD_TOO_LONG.format(name=self.text_name))
 
     def on_end(self) -> None:
         self.ended = True
@@ -178,18 +189,23 @@ def _boundary(headers: Headers) -> bytes:
     _, params = parse_options_header(headers.get("content-type"))
     boundary = params.get(b"boundary")
     if not boundary:
-        raise UploadRejected(422, "the multipart form has no boundary")
+        raise UploadRejected(422, NO_BOUNDARY)
     return boundary
 
 
 async def receive_upload(
-    headers: Headers, stream: AsyncIterator[bytes], staging: Staging, *, max_file_bytes: int
+    headers: Headers,
+    stream: AsyncIterator[bytes],
+    staging: Staging,
+    *,
+    max_file_bytes: int,
+    text_fields: tuple[str, ...] = FORM_FIELDS,
 ) -> ReceivedUpload:
     """Read a multipart body into a staged, uncommitted upload.
 
     Raises ``UploadRejected``. Whatever it staged is removed before any exception leaves.
     """
-    state = _State(staging)
+    state = _State(staging, text_fields)
     try:
         return await _receive(headers, stream, state, max_file_bytes)
     except BaseException:
@@ -235,19 +251,19 @@ async def _receive(
     except FormParserError:
         raise UploadRejected(422, MALFORMED) from None
     if not state.ended:
-        raise UploadRejected(422, "the multipart form is incomplete")
+        raise UploadRejected(422, INCOMPLETE)
 
     writer = state.writer
     if writer is None:
         raise UploadRejected(422, ONE_FILE)
     if writer.size == 0:
-        raise UploadRejected(422, "the uploaded file is empty")
+        raise UploadRejected(422, EMPTY_FILE)
     fields: dict[str, str] = {}
     for name, raw in state.texts.items():
         try:
             fields[name] = bytes(raw).decode("utf-8")
         except UnicodeDecodeError:
-            raise UploadRejected(422, f"field '{name}' is not valid UTF-8") from None
+            raise UploadRejected(422, FIELD_NOT_UTF8.format(name=name)) from None
     return ReceivedUpload(fields=fields, writer=writer, filename=state.filename)
 
 

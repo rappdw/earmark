@@ -201,6 +201,18 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             "CREATE INDEX jobs_by_dedupe ON jobs (dedupe_key, status, updated_at)",
         ),
     ),
+    Migration(
+        "0005_v1",
+        (
+            """
+            ALTER TABLE jobs ADD COLUMN delivery TEXT NOT NULL DEFAULT 'mail'
+                CHECK (delivery IN ('mail', 'none'))
+            """,
+            "ALTER TABLE jobs ADD COLUMN initial_prompt TEXT",
+            "ALTER TABLE jobs ADD COLUMN language TEXT",
+            "ALTER TABLE jobs ADD COLUMN purged_at TEXT",
+        ),
+    ),
 )
 SCHEMA_VERSION: Final = len(MIGRATIONS)
 
@@ -239,6 +251,7 @@ class Database:
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA secure_delete = ON")
             yield conn
         finally:
             conn.close()
@@ -273,6 +286,17 @@ class Database:
                 f"cannot enable WAL on {self._path} (journal mode is {mode!r}); "
                 "the filesystem probably lacks shared-memory support"
             )
+
+    def checkpoint(self) -> bool:
+        """Truncate the write-ahead log. False when a reader or writer kept it busy."""
+        with self.connect() as conn:
+            try:
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            except sqlite3.OperationalError as exc:
+                if _is_busy(exc) or "locked" in str(exc).lower():
+                    return False
+                raise
+        return bool(row is not None and int(row[0]) == 0)
 
     def schema_version(self) -> int:
         with self.connect() as conn:
